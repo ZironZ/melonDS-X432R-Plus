@@ -82,6 +82,9 @@ add_library(core STATIC
     sha1/sha1.c
     tiny-AES-c/aes.c
     xxhash/xxhash.c
+    xbrz/xbrz.cpp
+    xbrz/xbrz.h
+    xbrz/config.h
 
     blip-buf/blip_buf.c)
 

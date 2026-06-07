@@ -26,6 +26,9 @@
 #include <string>
 #include <algorithm>
 
+#include <QMutexLocker>
+#include <QTextStream>
+
 #include <SDL2/SDL.h>
 
 #include "main.h"
@@ -54,6 +57,7 @@
 #include "Savestate.h"
 
 #include "EmuInstance.h"
+#include "Screen.h"
 
 using namespace melonDS;
 
@@ -65,6 +69,139 @@ EmuThread::EmuThread(EmuInstance* inst, QObject* parent) : QThread(parent)
     emuStatus = emuStatus_Paused;
     emuPauseStack = emuPauseStackRunning;
     emuActive = false;
+    wholeSceneTimingLogEnabled.store(false);
+    wholeSceneTimingLogFrame = 0;
+    wholeSceneTimingLogHeaderWritten = false;
+    wholeSceneTimingLastTouching = false;
+}
+
+bool EmuThread::startWholeSceneTimingLog(const QString& filename, QString& errorstr)
+{
+    QMutexLocker lock(&wholeSceneTimingLogMutex);
+
+    wholeSceneTimingLogEnabled.store(false);
+    SetScreenPresentationTimingEnabled(false);
+    if (wholeSceneTimingLogFile.isOpen())
+    {
+        if (!wholeSceneTimingLogBuffer.isEmpty())
+        {
+            wholeSceneTimingLogFile.write(wholeSceneTimingLogBuffer.toUtf8());
+            wholeSceneTimingLogBuffer.clear();
+        }
+        wholeSceneTimingLogFile.close();
+    }
+
+    wholeSceneTimingLogFile.setFileName(filename);
+    if (!wholeSceneTimingLogFile.open(QIODevice::WriteOnly | QIODevice::Text | QIODevice::Truncate))
+    {
+        errorstr = wholeSceneTimingLogFile.errorString();
+        return false;
+    }
+
+    wholeSceneTimingLogBuffer.clear();
+    wholeSceneTimingLogFrame = 0;
+    wholeSceneTimingLogHeaderWritten = false;
+    wholeSceneTimingLastTouching = emuInstance && emuInstance->isTouching;
+    wholeSceneTimingLogEnabled.store(true);
+    return true;
+}
+
+QString EmuThread::stopWholeSceneTimingLog()
+{
+    QMutexLocker lock(&wholeSceneTimingLogMutex);
+
+    wholeSceneTimingLogEnabled.store(false);
+    SetScreenPresentationTimingEnabled(false);
+    const QString filename = wholeSceneTimingLogFile.fileName();
+    if (wholeSceneTimingLogFile.isOpen())
+    {
+        if (!wholeSceneTimingLogBuffer.isEmpty())
+        {
+            wholeSceneTimingLogFile.write(wholeSceneTimingLogBuffer.toUtf8());
+            wholeSceneTimingLogBuffer.clear();
+        }
+        wholeSceneTimingLogFile.close();
+    }
+    return filename;
+}
+
+void EmuThread::appendWholeSceneTimingLog(u32 nlines,
+                                          u64 runFrameUS,
+                                          u64 drawScreenUS,
+                                          u64 presentPreSwapUS,
+                                          u64 presentSwapUS,
+                                          u32 presentSwapCount,
+                                          bool touchActive,
+                                          bool touchPress,
+                                          bool touchRelease,
+                                          int touchX,
+                                          int touchY,
+                                          u64 totalUS)
+{
+    if (!wholeSceneTimingLogEnabled.load())
+        return;
+
+    std::string rendererHeader;
+    std::string rendererRow;
+    const bool rendererTimingAvailable =
+        emuInstance && emuInstance->nds &&
+        emuInstance->nds->GPU.GetRenderer().ReadWholeScene2DTimingCSV(rendererHeader, rendererRow);
+
+    QMutexLocker lock(&wholeSceneTimingLogMutex);
+    if (!wholeSceneTimingLogEnabled.load() || !wholeSceneTimingLogFile.isOpen())
+        return;
+
+    if (!wholeSceneTimingLogHeaderWritten)
+    {
+        wholeSceneTimingLogBuffer += "frame,total_us,runframe_us,drawscreen_us,present_pre_swap_us,present_swap_us,present_swap_count,nlines,touch_active,touch_press,touch_release,touch_x,touch_y,renderer_timing";
+        if (rendererTimingAvailable && !rendererHeader.empty())
+        {
+            wholeSceneTimingLogBuffer += ",";
+            wholeSceneTimingLogBuffer += QString::fromStdString(rendererHeader);
+        }
+        wholeSceneTimingLogBuffer += "\n";
+        wholeSceneTimingLogHeaderWritten = true;
+    }
+
+    wholeSceneTimingLogBuffer += QString::number(wholeSceneTimingLogFrame++);
+    wholeSceneTimingLogBuffer += ",";
+    wholeSceneTimingLogBuffer += QString::number(totalUS);
+    wholeSceneTimingLogBuffer += ",";
+    wholeSceneTimingLogBuffer += QString::number(runFrameUS);
+    wholeSceneTimingLogBuffer += ",";
+    wholeSceneTimingLogBuffer += QString::number(drawScreenUS);
+    wholeSceneTimingLogBuffer += ",";
+    wholeSceneTimingLogBuffer += QString::number(presentPreSwapUS);
+    wholeSceneTimingLogBuffer += ",";
+    wholeSceneTimingLogBuffer += QString::number(presentSwapUS);
+    wholeSceneTimingLogBuffer += ",";
+    wholeSceneTimingLogBuffer += QString::number(presentSwapCount);
+    wholeSceneTimingLogBuffer += ",";
+    wholeSceneTimingLogBuffer += QString::number(nlines);
+    wholeSceneTimingLogBuffer += ",";
+    wholeSceneTimingLogBuffer += touchActive ? "1" : "0";
+    wholeSceneTimingLogBuffer += ",";
+    wholeSceneTimingLogBuffer += touchPress ? "1" : "0";
+    wholeSceneTimingLogBuffer += ",";
+    wholeSceneTimingLogBuffer += touchRelease ? "1" : "0";
+    wholeSceneTimingLogBuffer += ",";
+    wholeSceneTimingLogBuffer += QString::number(touchX);
+    wholeSceneTimingLogBuffer += ",";
+    wholeSceneTimingLogBuffer += QString::number(touchY);
+    wholeSceneTimingLogBuffer += ",";
+    wholeSceneTimingLogBuffer += rendererTimingAvailable ? "1" : "0";
+    if (rendererTimingAvailable && !rendererRow.empty())
+    {
+        wholeSceneTimingLogBuffer += ",";
+        wholeSceneTimingLogBuffer += QString::fromStdString(rendererRow);
+    }
+    wholeSceneTimingLogBuffer += "\n";
+
+    if (wholeSceneTimingLogBuffer.size() >= 65536)
+    {
+        wholeSceneTimingLogFile.write(wholeSceneTimingLogBuffer.toUtf8());
+        wholeSceneTimingLogBuffer.clear();
+    }
 }
 
 void EmuThread::attachWindow(MainWindow* window)
@@ -259,6 +396,13 @@ void EmuThread::run()
             else
                 emuInstance->nds->ReleaseScreen();
 
+            const bool frameTouching = emuInstance->isTouching;
+            const bool frameTouchPress = frameTouching && !wholeSceneTimingLastTouching;
+            const bool frameTouchRelease = !frameTouching && wholeSceneTimingLastTouching;
+            const int frameTouchX = frameTouching ? emuInstance->touchX : -1;
+            const int frameTouchY = frameTouching ? emuInstance->touchY : -1;
+            wholeSceneTimingLastTouching = frameTouching;
+
             if (emuInstance->hotkeyPressed(HK_Lid))
             {
                 bool lid = !emuInstance->nds->IsLidClosed();
@@ -300,6 +444,8 @@ void EmuThread::run()
 
 
             // emulate
+            const u64 frameWorkStart = SDL_GetPerformanceCounter();
+            const u64 runFrameStart = frameWorkStart;
             u32 nlines;
             if (emuInstance->nds->GPU.GetRenderer().NeedsShaderCompile())
             {
@@ -310,6 +456,7 @@ void EmuThread::run()
             {
                 nlines = emuInstance->nds->RunFrame();
             }
+            const u64 runFrameEnd = SDL_GetPerformanceCounter();
 
             if (emuInstance->ndsSave)
                 emuInstance->ndsSave->CheckFlush();
@@ -320,7 +467,34 @@ void EmuThread::run()
             if (emuInstance->firmwareSave)
                 emuInstance->firmwareSave->CheckFlush();
 
+            const bool timingLogActive = wholeSceneTimingLogEnabled.load();
+            SetScreenPresentationTimingEnabled(timingLogActive);
+            if (timingLogActive)
+                ResetScreenPresentationTiming();
+
+            const u64 drawScreenStart = SDL_GetPerformanceCounter();
             emuInstance->drawScreen();
+            const u64 drawScreenEnd = SDL_GetPerformanceCounter();
+            const auto counterDeltaUS = [perfCountsSec](u64 start, u64 end)
+            {
+                return static_cast<u64>(((end - start) * perfCountsSec * 1000000.0) + 0.5);
+            };
+            const u64 drawScreenUS = counterDeltaUS(drawScreenStart, drawScreenEnd);
+            const u64 presentSwapUS = timingLogActive ? GetScreenPresentationSwapUS() : 0;
+            const u32 presentSwapCount = timingLogActive ? GetScreenPresentationSwapCount() : 0;
+            const u64 presentPreSwapUS = (drawScreenUS > presentSwapUS) ? (drawScreenUS - presentSwapUS) : 0;
+            appendWholeSceneTimingLog(nlines,
+                                      counterDeltaUS(runFrameStart, runFrameEnd),
+                                      drawScreenUS,
+                                      presentPreSwapUS,
+                                      presentSwapUS,
+                                      presentSwapCount,
+                                      frameTouching,
+                                      frameTouchPress,
+                                      frameTouchRelease,
+                                      frameTouchX,
+                                      frameTouchY,
+                                      counterDeltaUS(frameWorkStart, drawScreenEnd));
 
 #ifdef MELONCAP
             MelonCap::Update();
@@ -421,7 +595,7 @@ void EmuThread::run()
                     winUpdateFreq = 1;
                     
                 double actualfps = (59.8261 * 263.0) / nlines;
-                snprintf(melontitle, sizeof(melontitle), "[%d/%.0f] melonDS " MELONDS_VERSION, fps, actualfps);
+                snprintf(melontitle, sizeof(melontitle), "[%d/%.0f] melonDS 1.1 X432R+", fps, actualfps);
                 changeWindowTitle(melontitle);
             }
         }
@@ -434,7 +608,7 @@ void EmuThread::run()
 
             emit windowUpdate();
 
-            snprintf(melontitle, sizeof(melontitle), "melonDS " MELONDS_VERSION);
+            snprintf(melontitle, sizeof(melontitle), "melonDS 1.1 X432R+");
             changeWindowTitle(melontitle);
 
             SDL_Delay(75);
@@ -878,10 +1052,67 @@ void EmuThread::updateRenderer()
     lastVideoRenderer = videoRenderer;
 
     auto& cfg = emuInstance->getGlobalConfig();
+    auto readScaleAlgorithm = [&cfg](const char* algorithmKey, const char* legacyArtCNNKey, bool allowXBRZ)
+    {
+        if (cfg.GetBool(legacyArtCNNKey))
+            return melonDS::RendererSettings::GLScaleAlgorithm::ArtCNN;
+        auto algorithm = melonDS::RendererSettings::GetGLScaleAlgorithm(cfg.GetInt(algorithmKey));
+        if (!allowXBRZ && algorithm == melonDS::RendererSettings::GLScaleAlgorithm::XBRZ)
+            algorithm = melonDS::RendererSettings::GLScaleAlgorithm::Spline36;
+        return algorithm;
+    };
     melonDS::RendererSettings settings = {
         .ScaleFactor = cfg.GetInt("3D.GL.ScaleFactor"),
+        .WholeScene2D = {
+            .Enabled = cfg.GetBool("3D.GL.WholeScene2DScale"),
+            .SourceBoundaryGuard = cfg.GetBool("3D.GL.WholeScene2DScaleSourceBoundaryGuard"),
+            .Mode = melonDS::RendererSettings::GetWholeScene2DScaleMode(cfg.GetInt("3D.GL.WholeScene2DScaleMode")),
+            .Algorithm = readScaleAlgorithm("3D.GL.WholeScene2DScaleAlgorithm", "3D.GL.WholeScene2DScaleArtCNN", true),
+            .FragmentationFallback = melonDS::RendererSettings::GetWholeScene2DFragmentationFallback(
+                cfg.GetInt("3D.GL.WholeScene2DScaleFragmentationFallback")),
+            .ExactFinalFallback = cfg.GetBool("3D.GL.WholeScene2DScaleExactFinalFallback"),
+            .ForegroundOverlay = cfg.GetBool("3D.GL.WholeScene2DScaleForegroundOverlay"),
+            .CaptureBacked = cfg.GetBool("3D.GL.WholeScene2DScaleCaptureBacked"),
+            .DebugTint = cfg.GetBool("3D.GL.WholeScene2DScaleDebugTint"),
+            .NoWrapFilterTaps = cfg.GetBool("3D.GL.WholeScene2DScaleNoWrapFilterTaps"),
+            .FinalUpscaleRender3DNative = cfg.GetBool("3D.GL.WholeScene2DScaleFinalUpscaleRender3DNative"),
+            .FinalUpscale3DFilter = melonDS::RendererSettings::GetFinalUpscale3DDownsampleFilter(
+                cfg.GetInt("3D.GL.WholeScene2DScaleFinalUpscale3DFilter")),
+            .FinalUpscale3DCoverageAware = cfg.GetBool("3D.GL.WholeScene2DScaleFinalUpscale3DCoverageAware"),
+            .FinalUpscale3DRepresentativeSemantics = cfg.GetBool("3D.GL.WholeScene2DScaleFinalUpscale3DRepresentativeSemantics"),
+            .FinalUpscale3DSplitSemantics = cfg.GetBool("3D.GL.WholeScene2DScaleFinalUpscale3DSplitSemantics"),
+            .FinalUpscale3DSharpenSplitCoverage = cfg.GetBool("3D.GL.WholeScene2DScaleFinalUpscale3DSharpenSplitCoverage"),
+            .OverlayLegacyUnderlay = cfg.GetBool("3D.GL.WholeScene2DScaleOverlayLegacyUnderlay"),
+            .HybridWindowEdgeAssist = cfg.GetBool("3D.GL.WholeScene2DScaleHybridWindowEdgeAssist"),
+            .HybridTarget2AlphaBlendAssist = cfg.GetBool("3D.GL.WholeScene2DScaleHybridTarget2AlphaBlendAssist"),
+            .HybridNativeEffectGuard = cfg.GetBool("3D.GL.WholeScene2DScaleHybridNativeEffectGuard"),
+            .HybridForeground2DBase = cfg.GetBool("3D.GL.WholeScene2DScaleHybridForeground2DBase"),
+            .HybridCleanLegacyCandidate = cfg.GetBool("3D.GL.WholeScene2DScaleHybridCleanLegacyCandidate"),
+        },
+        .ReadableTextureCache = cfg.GetBool("3D.GL.ReadableTextureCache"),
+        .TextureFilter = {
+            .Anisotropy = cfg.GetInt("3D.GL.TextureAnisotropy"),
+            .BinaryAlphaHandling = cfg.GetBool("3D.GL.TextureFilterBinaryAlphaHandling"),
+            .TopologyAwareMipHandling = cfg.GetBool("3D.GL.TextureFilterMipmapPremultipliedAlphaHandling"),
+            .MipmapSubrectHandling = cfg.GetBool("3D.GL.TextureFilterMipmapSubrectHandling"),
+            .MipmapAlphaHandling = cfg.GetBool("3D.GL.TextureFilterMipmapAlphaHandling"),
+            .MipDepth = melonDS::RendererSettings::GetTextureFilterMipDepth(cfg.GetInt("3D.GL.TextureFilterMipDepth")),
+            .LosslessRGB6Repack = cfg.GetBool("3D.GL.TextureLosslessRGB6Repack"),
+        },
+        .TextureScaling = {
+            .Enabled = cfg.GetBool("3D.GL.TextureScaling"),
+            .Algorithm = readScaleAlgorithm("3D.GL.TextureScalingAlgorithm", "3D.GL.TextureScalingArtCNN", true),
+            .FrequentChangePolicy = cfg.GetBool("3D.GL.TextureScalingFrequentChangePolicy"),
+            .Deferred = cfg.GetBool("3D.GL.TextureScalingDeferred"),
+            .NativeMipFloor = cfg.GetBool("3D.GL.TextureScalingNativeMipFloor"),
+            .SourceMips = cfg.GetBool("3D.GL.TextureScalingSourceMips"),
+            .EdgeExtendUnusedMargins = cfg.GetBool("3D.GL.TextureScalingEdgeExtendUnusedMargins"),
+            .LegacyAlphaHandling = cfg.GetBool("3D.GL.TextureScalingLegacyAlphaHandling"),
+            .QualityAlphaHandling = cfg.GetBool("3D.GL.TextureScalingQualityAlphaHandling"),
+        },
         .Threaded = cfg.GetBool("3D.Soft.Threaded"),
         .HiresCoordinates = cfg.GetBool("3D.GL.HiresCoordinates"),
+        .MSAA = cfg.GetBool("3D.GL.MSAA"),
         .BetterPolygons = cfg.GetBool("3D.GL.BetterPolygons")
     };
 

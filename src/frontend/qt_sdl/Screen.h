@@ -31,6 +31,7 @@
 #include <QTimer>
 
 #include "glad/glad.h"
+#include "types.h"
 #include "ScreenLayout.h"
 #include "duckstation/gl/context.h"
 
@@ -49,6 +50,14 @@ const struct { int id; float ratio; const char* label; } aspectRatios[] =
 };
 constexpr int AspectRatiosNum = sizeof(aspectRatios) / sizeof(aspectRatios[0]);
 
+namespace melonDS
+{
+void SetScreenPresentationTimingEnabled(bool enabled);
+void ResetScreenPresentationTiming();
+u64 GetScreenPresentationSwapUS();
+u32 GetScreenPresentationSwapCount();
+}
+
 
 class ScreenPanel : public QWidget
 {
@@ -59,6 +68,7 @@ public:
     virtual ~ScreenPanel();
 
     void setFilter(bool filter);
+    void setSharpenStrength(int strength);
 
     void setMouseHide(bool enable, int delay);
 
@@ -81,6 +91,7 @@ protected:
     EmuInstance* emuInstance;
 
     bool filter;
+    int sharpenStrength;
 
     int screenRotation;
     int screenGap;
@@ -223,6 +234,7 @@ private:
     GLuint screenTexture;
     GLuint screenShaderProgram;
     GLint screenShaderTransformULoc, screenShaderScreenSizeULoc;
+    GLint screenShaderSharpenAmountULoc;
 
     QMutex screenSettingsLock;
     WindowInfo windowInfo;

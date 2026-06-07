@@ -1,8 +1,14 @@
 #version 140
 
+#ifdef FILTERABLE_TEXTURE_CACHE
+uniform sampler2DArray CurTexture;
+#else
 uniform usampler2DArray CurTexture;
+#endif
 uniform sampler2DArray Capture128Texture;
 uniform sampler2DArray Capture256Texture;
+uniform vec4 uTextureNormalize;
+uniform int uBinaryAlphaTexture;
 
 layout(std140) uniform uConfig
 {
@@ -28,6 +34,64 @@ smooth in float fZ;
 
 out vec4 oColor;
 out vec4 oAttr;
+
+#ifdef FILTERABLE_TEXTURE_CACHE
+vec4 SampleCachedTextureAtLod(vec3 texcoord, float lod)
+{
+    return textureLod(CurTexture, texcoord, lod) * (255.0 / uTextureNormalize);
+}
+
+vec4 SampleCachedTexture(vec3 texcoord)
+{
+    vec2 texSize = vec2(textureSize(CurTexture, 0).xy);
+    vec2 dx = dFdx(texcoord.xy) * texSize;
+    vec2 dy = dFdy(texcoord.xy) * texSize;
+    float lenX = length(dx);
+    float lenY = length(dy);
+    float majorLen = max(lenX, lenY);
+    float minorLen = max(min(lenX, lenY), 0.00001);
+
+    if (majorLen <= 1.0)
+        return SampleCachedTextureAtLod(texcoord, 0.0);
+
+    vec2 majorVec = lenX >= lenY ? dx : dy;
+    float sampleCountF = 1.0;
+    float maxAniso = float(TEXTURE_ANISOTROPY);
+    float effectiveMinor = minorLen;
+    float ratio = majorLen / minorLen;
+    if (ratio > 1.0)
+    {
+        sampleCountF = min(maxAniso, floor(ratio + 0.5));
+        effectiveMinor = max(minorLen, majorLen / maxAniso);
+        if (effectiveMinor < 1.0)
+            sampleCountF = max(1.0, floor(sampleCountF * effectiveMinor + 0.5));
+    }
+
+    float lod = log2(max(effectiveMinor, 1.0));
+    if (sampleCountF <= 1.0)
+        return SampleCachedTextureAtLod(texcoord, lod);
+
+    vec2 axisDir = length(majorVec) > 0.0 ? normalize(majorVec) / texSize : vec2(0.0);
+    vec2 span = axisDir * (0.5 * majorLen);
+    int sampleCount = int(sampleCountF);
+    vec4 accum = vec4(0.0);
+    for (int i = 0; i < TEXTURE_ANISOTROPY; i++)
+    {
+        if (i >= sampleCount)
+            break;
+
+        float t = (float(i) + 0.5) / sampleCountF;
+        vec2 uv = texcoord.xy + mix(-span, span, t);
+        accum += SampleCachedTextureAtLod(vec3(uv, texcoord.z), lod);
+    }
+    return accum / sampleCountF;
+}
+#else
+vec4 SampleCachedTexture(vec3 texcoord)
+{
+    return vec4(texture(CurTexture, texcoord)) / uTextureNormalize;
+}
+#endif
 
 vec4 FinalColor()
 {
@@ -60,7 +124,15 @@ vec4 FinalColor()
         vec3 texcoord = vec3(fTexcoord, fPolygonAttr.y);
         vec4 tcol;
         if (fPolygonAttr.z == 0)
-            tcol = vec4(texture(CurTexture, texcoord)) / vec4(63,63,63,31);
+        {
+            tcol = SampleCachedTexture(texcoord);
+            if (uBinaryAlphaTexture != 0)
+            {
+                tcol.a = tcol.a >= 0.5 ? 1.0 : 0.0;
+                if (tcol.a == 0.0)
+                    tcol.rgb = vec3(0.0);
+            }
+        }
         else if (fPolygonAttr.z == 1)
             tcol = texture(Capture128Texture, texcoord);
         else

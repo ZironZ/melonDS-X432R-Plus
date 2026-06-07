@@ -20,9 +20,14 @@
 
 #ifdef OGLRENDERER_ENABLED
 #include "GPU3D.h"
+#include "GPU3D_TextureTypes.h"
 #include "OpenGLSupport.h"
 #include "GPU3D_TexcacheOpenGL.h"
 #include "NonStupidBitfield.h"
+#include "RendererSettings.h"
+#include "TextureScalingDebug.h"
+
+#include <string>
 
 namespace melonDS
 {
@@ -36,14 +41,26 @@ public:
     bool Init() override;
     void Reset() override;
 
-    void SetRenderSettings(int scale, bool betterpolygons) noexcept;
+    void SetRenderSettings(int scale, bool betterpolygons, bool readableTextureCache, bool msaa,
+                           const RendererSettings::TextureFilterSettings& textureFilter,
+                           const RendererSettings::TextureScalingSettings& textureScaling) noexcept;
     void SetBetterPolygons(bool betterpolygons) noexcept;
     void SetScaleFactor(int scale) noexcept;
+    void SetReadableTextureCache(bool readableTextureCache) noexcept;
     [[nodiscard]] bool GetBetterPolygons() const noexcept { return BetterPolygons; }
     [[nodiscard]] int GetScaleFactor() const noexcept { return ScaleFactor; }
 
     void RenderFrame() override;
     u32* GetLine(int line) override;
+    void ResetRenderFrameTiming();
+    void AppendRenderFrameTimingCSVHeader(std::string& header, const char* prefix) const;
+    void AppendRenderFrameTimingCSVRow(std::string& row) const;
+    bool GetTextureScalingDebugStats(TextureScalingDebugStats& stats, std::string* status = nullptr);
+    bool ResetTextureScalingDebugStats(std::string* status = nullptr);
+    bool GetTextureScalingDebugLastMiss(TextureScalingDebugLastMiss& miss, std::string* status = nullptr);
+    bool SetTextureScalingDebugCaptureEnabled(bool enabled, std::string* status = nullptr);
+    bool GetTextureScalingDebugFrameTextures(TextureScalingDebugFrameTextures& frame, std::string* status = nullptr);
+    bool SetTextureScalingDebugFrameCaptureEnabled(bool enabled, std::string* status = nullptr);
 
 private:
     GLRenderer& Parent;
@@ -67,6 +84,7 @@ private:
 
         GLuint TexID;
         u32 TexRepeat;
+        bool BinaryAlphaTexture;
     };
 
     //GLCompositor CurGLCompositor;
@@ -75,16 +93,43 @@ private:
     bool TexEnable;
     TexcacheOpenGL Texcache;
 
+    struct RenderFramePhaseTiming
+    {
+        u64 TotalUS = 0;
+        u64 MaxUS = 0;
+        u32 Count = 0;
+    };
+
+    struct RenderFrameTimingState
+    {
+        RenderFramePhaseTiming TextureCacheUpdate;
+        RenderFramePhaseTiming CaptureInfo;
+        RenderFramePhaseTiming ClearBitmapUpload;
+        RenderFramePhaseTiming ShaderConfig;
+        RenderFramePhaseTiming ClearPlane;
+        RenderFramePhaseTiming PolygonBuild;
+        RenderFramePhaseTiming EdgeExtendAccumulate;
+        RenderFramePhaseTiming EdgeExtendBoundsLookup;
+        RenderFramePhaseTiming EdgeExtendTextureLookup;
+        RenderFramePhaseTiming BufferUpload;
+        RenderFramePhaseTiming SceneRender;
+        RenderFramePhaseTiming MSAAResolveOnly;
+    } RenderFrameTiming;
+
+    void AddRenderFrameTiming(RenderFramePhaseTiming& phase, u64 elapsedUS);
+
     bool BuildRenderShader(bool wbuffer);
     void UseRenderShader(bool wbuffer);
     void SetupPolygon(RendererPolygon* rp, Polygon* polygon) const;
-    u32* SetupVertex(const Polygon* poly, int vid, const Vertex* vtx, u32 vtxattr, u32 texlayer, u32* vptr) const;
+    u32* SetupVertex(const Polygon* poly, int vid, const Vertex* vtx, u32 vtxattr, u32 texlayer, u32 texwidth, u32 texheight,
+                     const TextureSamplingBounds& texBounds, u32* vptr) const;
     void BuildPolygons(RendererPolygon* polygons, int npolys, int captureinfo[16]);
     void SetupPolygonTexture(const RendererPolygon* poly) const;
     int RenderSinglePolygon(int i) const;
     int RenderPolygonBatch(int i) const;
     int RenderPolygonEdgeBatch(int i) const;
     void RenderSceneChunk(int y, int h);
+    void ResolveMSAAFramebuffer();
 
 
     enum
@@ -101,7 +146,8 @@ private:
     GLuint RenderShader[2] {};
     GLint RenderModeULoc = 0;
     GLuint CurShaderID = -1;
-
+    GLint TextureNormalizeULoc[2] {};
+    GLint BinaryAlphaTextureULoc[2] {};
     GLuint FinalPassEdgeShader {};
     GLuint FinalPassFogShader {};
 
@@ -156,11 +202,20 @@ private:
 
     int ScaleFactor {};
     bool BetterPolygons {};
+    bool ReadableTextureCache = false;
+    bool MSAA = false;
+    bool MSAAActive = false;
+    int MSAASamples = 1;
+    int TextureScaleFactor = 1;
+    RendererSettings::TextureFilterSettings TextureFilter {};
+    RendererSettings::TextureScalingSettings TextureScaling {};
     int ScreenW {}, ScreenH {};
 
     GLuint ColorBufferTex {}, DepthBufferTex {}, AttrBufferTex {};
 
     GLuint MainFramebuffer {};
+    GLuint MainMSAAFramebuffer {};
+    GLuint MSAAColorBufferTex {}, MSAADepthBufferTex {}, MSAAAttrBufferTex {};
 };
 }
 #endif

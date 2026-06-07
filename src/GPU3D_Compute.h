@@ -24,12 +24,17 @@
 #include "types.h"
 
 #include "GPU3D.h"
+#include "GPU3D_TextureTypes.h"
 
 #include "OpenGLSupport.h"
 
 #include "GPU3D_TexcacheOpenGL.h"
 
 #include "NonStupidBitfield.h"
+#include "RendererSettings.h"
+#include "TextureScalingDebug.h"
+
+#include <string>
 
 namespace melonDS
 {
@@ -43,11 +48,19 @@ public:
     bool Init() override;
     void Reset() override;
 
-    void SetRenderSettings(int scale, bool highResolutionCoordinates);
+    void SetRenderSettings(int scale, bool highResolutionCoordinates, bool msaa,
+                           const RendererSettings::TextureFilterSettings& textureFilter,
+                           const RendererSettings::TextureScalingSettings& textureScaling);
 
     void RenderFrame() override;
     void RestartFrame() override;
     u32* GetLine(int line) override;
+    bool GetTextureScalingDebugStats(TextureScalingDebugStats& stats, std::string* status = nullptr);
+    bool ResetTextureScalingDebugStats(std::string* status = nullptr);
+    bool GetTextureScalingDebugLastMiss(TextureScalingDebugLastMiss& miss, std::string* status = nullptr);
+    bool SetTextureScalingDebugCaptureEnabled(bool enabled, std::string* status = nullptr);
+    bool GetTextureScalingDebugFrameTextures(TextureScalingDebugFrameTextures& frame, std::string* status = nullptr);
+    bool SetTextureScalingDebugFrameCaptureEnabled(bool enabled, std::string* status = nullptr);
 
     bool NeedsShaderCompile() override { return ShaderStepIdx != 33; }
     void ShaderCompileStep(int& current, int& count) override;
@@ -169,6 +182,7 @@ private:
     static constexpr int UniformIdxTextureSize = 1;
     static constexpr int UniformIdxTexIsCapture = 2;
     static constexpr int UniformIdxCaptureYOffset = 3;
+    static constexpr int UniformIdxBinaryAlphaTexture = 4;
 
     static constexpr int MaxFullscreenLayers = 16;
 
@@ -218,14 +232,19 @@ private:
     int ScaleFactor = -1;
     int MaxWorkTiles;
     bool HiresCoordinates;
+    bool MSAA = false;
+    RendererSettings::TextureFilterSettings TextureFilter {};
+    RendererSettings::TextureScalingSettings TextureScaling {};
 
     int ShaderStepIdx = 0;
 
     void DeleteShaders();
 
-    void SetupAttrs(SpanSetupY* span, Polygon* poly, int from, int to);
-    void SetupYSpan(RenderPolygon* rp, SpanSetupY* span, Polygon* poly, int from, int to, int side, s32 positions[10][2]);
-    void SetupYSpanDummy(RenderPolygon* rp, SpanSetupY* span, Polygon* poly, int vertex, int side, s32 positions[10][2]);
+    void SetupAttrs(SpanSetupY* span, Polygon* poly, int from, int to, const TextureSamplingBounds& texBounds);
+    void SetupYSpan(RenderPolygon* rp, SpanSetupY* span, Polygon* poly, int from, int to, int side, s32 positions[10][2],
+                    const TextureSamplingBounds& texBounds);
+    void SetupYSpanDummy(RenderPolygon* rp, SpanSetupY* span, Polygon* poly, int vertex, int side, s32 positions[10][2],
+                         const TextureSamplingBounds& texBounds);
 
     bool CompileShader(GLuint& shader, const std::string& source, const std::initializer_list<const char*>& defines);
 };

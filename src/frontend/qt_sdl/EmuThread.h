@@ -20,6 +20,7 @@
 #define EMUTHREAD_H
 
 #include <QThread>
+#include <QFile>
 #include <QMutex>
 #include <QSemaphore>
 #include <QWaitCondition>
@@ -31,6 +32,7 @@
 #include <optional>
 #include <list>
 
+#include "types.h"
 #include "NDSCart.h"
 #include "GBACart.h"
 
@@ -136,6 +138,9 @@ public:
     void returnGL();
     void updateVideoSettings() { videoSettingsDirty = true; }
     void updateVideoRenderer() { videoSettingsDirty = true; lastVideoRenderer = -1; }
+    bool startWholeSceneTimingLog(const QString& filename, QString& errorstr);
+    QString stopWholeSceneTimingLog();
+    bool wholeSceneTimingLogActive() const { return wholeSceneTimingLogEnabled.load(); }
 
     QWaitCondition glBorrowCond;
     QMutex glBorrowMutex;
@@ -165,6 +170,18 @@ private:
 
     void updateRenderer();
     void compileShaders();
+    void appendWholeSceneTimingLog(melonDS::u32 nlines,
+                                   melonDS::u64 runFrameUS,
+                                   melonDS::u64 drawScreenUS,
+                                   melonDS::u64 presentPreSwapUS,
+                                   melonDS::u64 presentSwapUS,
+                                   melonDS::u32 presentSwapCount,
+                                   bool touchActive,
+                                   bool touchPress,
+                                   bool touchRelease,
+                                   int touchX,
+                                   int touchY,
+                                   melonDS::u64 totalUS);
 
     enum EmuStatusKind
     {
@@ -200,6 +217,14 @@ private:
     bool useOpenGL;
     int videoRenderer;
     bool videoSettingsDirty;
+
+    std::atomic_bool wholeSceneTimingLogEnabled;
+    mutable QMutex wholeSceneTimingLogMutex;
+    QFile wholeSceneTimingLogFile;
+    QString wholeSceneTimingLogBuffer;
+    melonDS::u64 wholeSceneTimingLogFrame;
+    bool wholeSceneTimingLogHeaderWritten;
+    bool wholeSceneTimingLastTouching;
 };
 
 #endif // EMUTHREAD_H

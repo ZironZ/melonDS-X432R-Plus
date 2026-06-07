@@ -20,10 +20,15 @@
 #define GPU_H
 
 #include <memory>
+#include <string>
+#include <vector>
 
 #include "GPU2D.h"
 #include "GPU3D.h"
 #include "NonStupidBitfield.h"
+#include "RendererDebug.h"
+#include "RendererSettings.h"
+#include "TextureScalingDebug.h"
 
 namespace melonDS
 {
@@ -815,21 +820,6 @@ private:
 };
 
 
-struct RendererSettings
-{
-    // scale factor, for renderers that support upscaling
-    int ScaleFactor;
-
-    // whether to use separate threads for rendering
-    bool Threaded;
-
-    // whether to use hi-res vertex coordinates when applying upscaling
-    bool HiresCoordinates;
-
-    // "improved polygon splitting" (regular OpenGL renderer)
-    bool BetterPolygons;
-};
-
 class Renderer
 {
 public:
@@ -860,6 +850,86 @@ public:
     // a renderer may render to RAM buffers, or to something else (ie. OpenGL)
     // if the renderer uses RAM buffers, they should be 32-bit BGRA, 256x192 for each screen
     virtual bool GetFramebuffers(void** top, void** bottom) = 0;
+    virtual bool ReadWholeScene2DDebugView(int screen,
+                                           WholeScene2DDebugView view,
+                                           int& width,
+                                           int& height,
+                                           std::vector<u32>& rgba,
+                                           std::string* status = nullptr)
+    {
+        width = 0;
+        height = 0;
+        rgba.clear();
+        if (status)
+            *status = "Whole-scene 2D debug views are unavailable for this renderer.";
+        return false;
+    }
+    virtual bool SetWholeScene2DDebugPoison(bool source3D,
+                                            bool native3DResolve,
+                                            bool native3DResolveAlpha,
+                                            std::string* status = nullptr)
+    {
+        if (status)
+            *status = "Whole-scene 2D debug poison controls are unavailable for this renderer.";
+        return false;
+    }
+    virtual bool SetWholeScene2DDebugViewsActive(bool active,
+                                                 std::string* status = nullptr)
+    {
+        if (status)
+            *status = "Whole-scene 2D debug view controls are unavailable for this renderer.";
+        return false;
+    }
+    virtual bool ReadWholeScene2DTimingCSV(std::string& header, std::string& row)
+    {
+        header.clear();
+        row.clear();
+        return false;
+    }
+    virtual bool ReadTextureScalingDebugStats(TextureScalingDebugStats& stats,
+                                              std::string* status = nullptr)
+    {
+        stats = {};
+        if (status)
+            *status = "3D texture scaling debug stats are unavailable for this renderer.";
+        return false;
+    }
+    virtual bool ResetTextureScalingDebugStats(std::string* status = nullptr)
+    {
+        if (status)
+            *status = "3D texture scaling debug stats are unavailable for this renderer.";
+        return false;
+    }
+    virtual bool ReadTextureScalingDebugLastMiss(TextureScalingDebugLastMiss& miss,
+                                                 std::string* status = nullptr)
+    {
+        miss = {};
+        if (status)
+            *status = "3D texture scaling last-miss data are unavailable for this renderer.";
+        return false;
+    }
+    virtual bool SetTextureScalingDebugCaptureEnabled(bool enabled,
+                                                      std::string* status = nullptr)
+    {
+        if (status)
+            *status = "3D texture scaling miss capture is unavailable for this renderer.";
+        return false;
+    }
+    virtual bool ReadTextureScalingDebugFrameTextures(TextureScalingDebugFrameTextures& frame,
+                                                      std::string* status = nullptr)
+    {
+        frame = {};
+        if (status)
+            *status = "3D texture frame browsing is unavailable for this renderer.";
+        return false;
+    }
+    virtual bool SetTextureScalingDebugFrameCaptureEnabled(bool enabled,
+                                                           std::string* status = nullptr)
+    {
+        if (status)
+            *status = "3D texture frame capture is unavailable for this renderer.";
+        return false;
+    }
     virtual void SwapBuffers() { BackBuffer ^= 1; }
 
     virtual bool NeedsShaderCompile() { return false; }

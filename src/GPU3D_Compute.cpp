@@ -20,6 +20,9 @@
 
 #include <assert.h>
 #include <algorithm>
+#include <cmath>
+#include <unordered_map>
+#include <vector>
 
 #include "Utils.h"
 
@@ -30,11 +33,257 @@
 namespace melonDS
 {
 
+static bool AddUniqueTexcoord(s16 value, s16 values[4], int& count)
+{
+    for (int i = 0; i < count; i++)
+    {
+        if (values[i] == value)
+            return true;
+    }
+    if (count >= 2)
+        return false;
+
+    values[count++] = value;
+    return true;
+}
+
+static bool BuildSafeTextureSamplingBounds(const Polygon* poly, u32 texWidth, u32 texHeight, TextureSamplingBounds& bounds)
+{
+    bounds = {};
+    if (poly->Type == 1 || poly->NumVertices != 4)
+        return false;
+    if (((poly->TexParam >> 16) & 0xF) != 0)
+        return false;
+
+    const s32 maxTexU = static_cast<s32>(texWidth << 4);
+    const s32 maxTexV = static_cast<s32>(texHeight << 4);
+    s32 minU = 0x7FFFFFFF, minV = 0x7FFFFFFF;
+    s32 maxU = -0x7FFFFFFF, maxV = -0x7FFFFFFF;
+    s16 uniqueU[4] = {};
+    s16 uniqueV[4] = {};
+    int uniqueUCount = 0;
+    int uniqueVCount = 0;
+
+    for (u32 i = 0; i < poly->NumVertices; i++)
+    {
+        const s32 u = poly->Vertices[i]->TexCoords[0];
+        const s32 v = poly->Vertices[i]->TexCoords[1];
+        if (u < 0 || v < 0 || u > maxTexU || v > maxTexV)
+            return false;
+        if (!AddUniqueTexcoord(static_cast<s16>(u), uniqueU, uniqueUCount) ||
+            !AddUniqueTexcoord(static_cast<s16>(v), uniqueV, uniqueVCount))
+            return false;
+
+        minU = std::min(minU, u);
+        minV = std::min(minV, v);
+        maxU = std::max(maxU, u);
+        maxV = std::max(maxV, v);
+    }
+
+    if (uniqueUCount != 2 || uniqueVCount != 2 || minU >= maxU || minV >= maxV)
+        return false;
+
+    u32 x0 = static_cast<u32>(minU >> 4);
+    u32 y0 = static_cast<u32>(minV >> 4);
+    u32 x1 = std::min<u32>(texWidth, static_cast<u32>((maxU + 15) >> 4));
+    u32 y1 = std::min<u32>(texHeight, static_cast<u32>((maxV + 15) >> 4));
+
+    if (x0 > 0) x0--;
+    if (y0 > 0) y0--;
+    if (x1 < texWidth) x1++;
+    if (y1 < texHeight) y1++;
+    if (x0 >= x1 || y0 >= y1)
+        return false;
+    if (x0 == 0 && y0 == 0 && x1 == texWidth && y1 == texHeight)
+        return false;
+
+    bounds.Valid = true;
+    bounds.X0 = static_cast<u16>(x0);
+    bounds.Y0 = static_cast<u16>(y0);
+    bounds.X1 = static_cast<u16>(x1);
+    bounds.Y1 = static_cast<u16>(y1);
+    return true;
+}
+
+static s32 ClampTextureCoordinate(s32 coord, s32 maxCoord)
+{
+    return std::min<s32>(std::max<s32>(coord, 0), maxCoord);
+}
+
+struct TextureFrameEdgeExtendCandidate
+{
+    u32 TexParam = 0;
+    u32 TexPalette = 0;
+    u32 Width = 0;
+    u32 Height = 0;
+    bool Valid = true;
+    bool Seen = false;
+    u32 X0 = 0;
+    u32 Y0 = 0;
+    u32 X1 = 0;
+    u32 Y1 = 0;
+};
+
+using TextureFrameEdgeExtendCandidateMap = std::unordered_map<u64, size_t>;
+
+static u64 MakeTextureFrameEdgeExtendCandidateKey(u32 texParam, u32 texPalette)
+{
+    return (static_cast<u64>(texParam) << 32) | texPalette;
+}
+
+static bool GetTextureDrawBounds(const Polygon* poly, u32 texWidth, u32 texHeight,
+                                 u32& x0, u32& y0, u32& x1, u32& y1)
+{
+    if (poly->Type == 1 || poly->NumVertices < 3 || poly->NumVertices > 10)
+        return false;
+
+    const s32 maxTexU = static_cast<s32>(texWidth << 4);
+    const s32 maxTexV = static_cast<s32>(texHeight << 4);
+    s32 minU = 0x7FFFFFFF, minV = 0x7FFFFFFF;
+    s32 maxU = -0x7FFFFFFF, maxV = -0x7FFFFFFF;
+
+    for (u32 i = 0; i < poly->NumVertices; i++)
+    {
+        const s32 u = ClampTextureCoordinate(poly->Vertices[i]->TexCoords[0], maxTexU);
+        const s32 v = ClampTextureCoordinate(poly->Vertices[i]->TexCoords[1], maxTexV);
+        minU = std::min(minU, u);
+        minV = std::min(minV, v);
+        maxU = std::max(maxU, u);
+        maxV = std::max(maxV, v);
+    }
+
+    if (minU >= maxU || minV >= maxV)
+        return false;
+
+    x0 = static_cast<u32>(std::max<s32>(0, minU >> 4));
+    y0 = static_cast<u32>(std::max<s32>(0, minV >> 4));
+    x1 = std::min<u32>(texWidth, static_cast<u32>((maxU + 15) >> 4));
+    y1 = std::min<u32>(texHeight, static_cast<u32>((maxV + 15) >> 4));
+    return x0 < x1 && y0 < y1;
+}
+
+static TextureFrameEdgeExtendCandidate& FindOrAddEdgeExtendCandidate(
+    std::vector<TextureFrameEdgeExtendCandidate>& candidates,
+    TextureFrameEdgeExtendCandidateMap& candidateMap,
+    u32 texParam, u32 texPalette, u32 width, u32 height)
+{
+    const u64 key = MakeTextureFrameEdgeExtendCandidateKey(texParam, texPalette);
+    auto it = candidateMap.find(key);
+    if (it != candidateMap.end())
+        return candidates[it->second];
+
+    candidates.push_back({});
+    candidateMap.emplace(key, candidates.size() - 1);
+    TextureFrameEdgeExtendCandidate& candidate = candidates.back();
+    candidate.TexParam = texParam;
+    candidate.TexPalette = texPalette;
+    candidate.Width = width;
+    candidate.Height = height;
+    return candidate;
+}
+
+static void AccumulateTextureFrameEdgeExtendCandidates(
+    Polygon* const* polygons, int npolys, bool texEnable,
+    std::vector<TextureFrameEdgeExtendCandidate>& candidates,
+    TextureFrameEdgeExtendCandidateMap& candidateMap)
+{
+    for (int i = 0; i < npolys; i++)
+    {
+        const Polygon* poly = polygons[i];
+        const u32 texParam = poly->TexParam & ~0xC00F0000;
+        const u32 textype = (texParam >> 26) & 0x7;
+        if (!texEnable || !textype)
+            continue;
+
+        const u32 texWidth = TextureWidth(texParam);
+        const u32 texHeight = TextureHeight(texParam);
+        TextureFrameEdgeExtendCandidate& candidate =
+            FindOrAddEdgeExtendCandidate(candidates, candidateMap, texParam, poly->TexPalette, texWidth, texHeight);
+
+        u32 x0, y0, x1, y1;
+        const bool eligible = ((poly->TexParam >> 16) & 0xF) == 0 &&
+            GetTextureDrawBounds(poly, texWidth, texHeight, x0, y0, x1, y1);
+        if (!eligible)
+        {
+            candidate.Valid = false;
+            continue;
+        }
+
+        if (!candidate.Seen)
+        {
+            candidate.Seen = true;
+            candidate.X0 = x0;
+            candidate.Y0 = y0;
+            candidate.X1 = x1;
+            candidate.Y1 = y1;
+        }
+        else
+        {
+            candidate.X0 = std::min(candidate.X0, x0);
+            candidate.Y0 = std::min(candidate.Y0, y0);
+            candidate.X1 = std::max(candidate.X1, x1);
+            candidate.Y1 = std::max(candidate.Y1, y1);
+        }
+    }
+}
+
+static bool FindTextureFrameEdgeExtendBounds(const std::vector<TextureFrameEdgeExtendCandidate>& candidates,
+                                             const TextureFrameEdgeExtendCandidateMap& candidateMap,
+                                             u32 texParam, u32 texPalette, TextureSamplingBounds& bounds)
+{
+    const u64 key = MakeTextureFrameEdgeExtendCandidateKey(texParam, texPalette);
+    auto it = candidateMap.find(key);
+    if (it == candidateMap.end() || it->second >= candidates.size())
+        return false;
+
+    const TextureFrameEdgeExtendCandidate& candidate = candidates[it->second];
+    if (!candidate.Valid || !candidate.Seen)
+        return false;
+    if (candidate.Width == 0 || candidate.Height == 0 ||
+        candidate.X0 >= candidate.X1 || candidate.Y0 >= candidate.Y1)
+        return false;
+    if (candidate.X0 == 0 && candidate.Y0 == 0 &&
+        candidate.X1 == candidate.Width && candidate.Y1 == candidate.Height)
+        return false;
+
+    const u32 horizontalTailThreshold = std::max<u32>(16, candidate.Width / 8);
+    const u32 verticalTailThreshold = std::max<u32>(16, candidate.Height / 8);
+    const bool hasSignificantTail =
+        candidate.X0 >= horizontalTailThreshold ||
+        candidate.Width - candidate.X1 >= horizontalTailThreshold ||
+        candidate.Y0 >= verticalTailThreshold ||
+        candidate.Height - candidate.Y1 >= verticalTailThreshold;
+    if (!hasSignificantTail)
+        return false;
+
+    bounds = {};
+    bounds.Valid = true;
+    bounds.EdgeExtendMargins = true;
+    bounds.X0 = static_cast<u16>(candidate.X0);
+    bounds.Y0 = static_cast<u16>(candidate.Y0);
+    bounds.X1 = static_cast<u16>(candidate.X1);
+    bounds.Y1 = static_cast<u16>(candidate.Y1);
+    return true;
+}
+
+static bool TextureBoundsRemapCoordinates(const TextureSamplingBounds& bounds)
+{
+    return bounds.Valid && !bounds.EdgeExtendMargins;
+}
+
+static s32 AdjustTextureCoord(s32 value, u16 origin, u16 end)
+{
+    const s32 start = static_cast<s32>(origin) << 4;
+    const s32 limit = static_cast<s32>(end) << 4;
+    return std::min<s32>(std::max<s32>(value, start), limit) - start;
+}
+
 ComputeRenderer3D::ComputeRenderer3D(melonDS::GPU3D& gpu3D, GLRenderer& parent)
     : Renderer3D(gpu3D), Parent(parent), Texcache(gpu3D.GPU, TexcacheOpenGLLoader(true))
 {
     ScaleFactor = 0;
     HiresCoordinates = false;
+    MSAA = false;
 }
 
 bool ComputeRenderer3D::CompileShader(GLuint& shader, const std::string& source, const std::initializer_list<const char*>& defines)
@@ -64,6 +313,12 @@ bool ComputeRenderer3D::CompileShader(GLuint& shader, const std::string& source,
     shaderSource += std::to_string(CoarseTileArea);
     shaderSource += "\n#define ClearCoarseBinMaskLocalSize ";
     shaderSource += std::to_string(ClearCoarseBinMaskLocalSize);
+    if (TextureFilter.Anisotropy > 1)
+    {
+        shaderSource += "\n#define FILTERABLE_TEXTURE_CACHE";
+        shaderSource += "\n#define TEXTURE_ANISOTROPY ";
+        shaderSource += std::to_string(TextureFilter.Anisotropy);
+    }
 
     shaderSource += ComputeRendererShaders::Common;
     shaderSource += source;
@@ -320,9 +575,12 @@ void ComputeRenderer3D::Reset()
     ClearBitmapDirty = 0x3;
 }
 
-void ComputeRenderer3D::SetRenderSettings(int scale, bool highResolutionCoordinates)
+void ComputeRenderer3D::SetRenderSettings(int scale, bool highResolutionCoordinates, bool msaa,
+                                          const RendererSettings::TextureFilterSettings& textureFilter,
+                                          const RendererSettings::TextureScalingSettings& textureScaling)
 {
     u8 TileScale;
+    Texcache.ApplyTextureSettings(scale, textureFilter, textureScaling);
 
     if (ScaleFactor != -1)
     {
@@ -355,8 +613,19 @@ void ComputeRenderer3D::SetRenderSettings(int scale, bool highResolutionCoordina
     TileLines = ScreenHeight/TileSize;
 
     HiresCoordinates = highResolutionCoordinates;
+    MSAA = msaa;
+    TextureFilter = textureFilter;
+    TextureScaling = textureScaling;
 
     MaxWorkTiles = TilesPerLine*TileLines*16;
+
+    const GLint samplerMinFilter = TextureFilter.Anisotropy > 1 ? GL_LINEAR_MIPMAP_LINEAR : GL_NEAREST;
+    const GLint samplerMagFilter = TextureFilter.Anisotropy > 1 ? GL_LINEAR : GL_NEAREST;
+    for (GLuint sampler : Samplers)
+    {
+        glSamplerParameteri(sampler, GL_TEXTURE_MIN_FILTER, samplerMinFilter);
+        glSamplerParameteri(sampler, GL_TEXTURE_MAG_FILTER, samplerMagFilter);
+    }
 
     for (int i = 0; i < tilememoryLayer_Num; i++)
     {
@@ -401,7 +670,7 @@ void ComputeRenderer3D::SetRenderSettings(int scale, bool highResolutionCoordina
 }
 
 
-void ComputeRenderer3D::SetupAttrs(SpanSetupY* span, Polygon* poly, int from, int to)
+void ComputeRenderer3D::SetupAttrs(SpanSetupY* span, Polygon* poly, int from, int to, const TextureSamplingBounds& texBounds)
 {
     span->Z0 = poly->FinalZ[from];
     span->W0 = poly->FinalW[from];
@@ -413,13 +682,15 @@ void ComputeRenderer3D::SetupAttrs(SpanSetupY* span, Polygon* poly, int from, in
     span->ColorR1 = poly->Vertices[to]->FinalColor[0];
     span->ColorG1 = poly->Vertices[to]->FinalColor[1];
     span->ColorB1 = poly->Vertices[to]->FinalColor[2];
-    span->TexcoordU0 = poly->Vertices[from]->TexCoords[0];
-    span->TexcoordV0 = poly->Vertices[from]->TexCoords[1];
-    span->TexcoordU1 = poly->Vertices[to]->TexCoords[0];
-    span->TexcoordV1 = poly->Vertices[to]->TexCoords[1];
+    const bool remapTexCoords = TextureBoundsRemapCoordinates(texBounds);
+    span->TexcoordU0 = remapTexCoords ? AdjustTextureCoord(poly->Vertices[from]->TexCoords[0], texBounds.X0, texBounds.X1) : poly->Vertices[from]->TexCoords[0];
+    span->TexcoordV0 = remapTexCoords ? AdjustTextureCoord(poly->Vertices[from]->TexCoords[1], texBounds.Y0, texBounds.Y1) : poly->Vertices[from]->TexCoords[1];
+    span->TexcoordU1 = remapTexCoords ? AdjustTextureCoord(poly->Vertices[to]->TexCoords[0], texBounds.X0, texBounds.X1) : poly->Vertices[to]->TexCoords[0];
+    span->TexcoordV1 = remapTexCoords ? AdjustTextureCoord(poly->Vertices[to]->TexCoords[1], texBounds.Y0, texBounds.Y1) : poly->Vertices[to]->TexCoords[1];
 }
 
-void ComputeRenderer3D::SetupYSpanDummy(RenderPolygon* rp, SpanSetupY* span, Polygon* poly, int vertex, int side, s32 positions[10][2])
+void ComputeRenderer3D::SetupYSpanDummy(RenderPolygon* rp, SpanSetupY* span, Polygon* poly, int vertex, int side,
+                                        s32 positions[10][2], const TextureSamplingBounds& texBounds)
 {
     s32 x0 = positions[vertex][0];
     if (side)
@@ -457,17 +728,18 @@ void ComputeRenderer3D::SetupYSpanDummy(RenderPolygon* rp, SpanSetupY* span, Pol
 
     span->IsDummy = true;
 
-    SetupAttrs(span, poly, vertex, vertex);
+    SetupAttrs(span, poly, vertex, vertex, texBounds);
 }
 
-void ComputeRenderer3D::SetupYSpan(RenderPolygon* rp, SpanSetupY* span, Polygon* poly, int from, int to, int side, s32 positions[10][2])
+void ComputeRenderer3D::SetupYSpan(RenderPolygon* rp, SpanSetupY* span, Polygon* poly, int from, int to, int side,
+                                   s32 positions[10][2], const TextureSamplingBounds& texBounds)
 {
     span->X0 = positions[from][0];
     span->X1 = positions[to][0];
     span->Y0 = positions[from][1];
     span->Y1 = positions[to][1];
 
-    SetupAttrs(span, poly, from, to);
+    SetupAttrs(span, poly, from, to, texBounds);
 
     s32 minXY, maxXY;
     bool negative = false;
@@ -604,15 +876,17 @@ void ComputeRenderer3D::SetupYSpan(RenderPolygon* rp, SpanSetupY* span, Polygon*
 
 struct Variant
 {
-    GLuint Texture, Sampler;
-    u16 Width, Height;
-    u8 BlendMode;
-    int CaptureYOffset;
+    GLuint Texture = 0, Sampler = 0;
+    u16 Width = 0, Height = 0;
+    u8 BlendMode = 0;
+    int CaptureYOffset = -1;
+    bool BinaryAlphaTexture = false;
 
     bool operator==(const Variant& other)
     {
         return Texture == other.Texture && Sampler == other.Sampler && BlendMode == other.BlendMode &&
-               CaptureYOffset == other.CaptureYOffset;
+               CaptureYOffset == other.CaptureYOffset && BinaryAlphaTexture == other.BinaryAlphaTexture &&
+               Width == other.Width && Height == other.Height;
     }
 };
 
@@ -635,9 +909,7 @@ void ComputeRenderer3D::RenderFrame()
     assert(!NeedsShaderCompile());
     u8 clrBitmapDirty;
     if (!Texcache.Update(clrBitmapDirty) && GPU3D.RenderFrameIdentical)
-    {
         return;
-    }
 
     // figure out which chunks of texture memory contain display captures
     int captureinfo[16];
@@ -704,10 +976,34 @@ void ComputeRenderer3D::RenderFrame()
     u32 capLastVariant[16] = {0};
 
     bool enableTextureMaps = GPU3D.RenderDispCnt & (1<<0);
+    std::vector<TextureFrameEdgeExtendCandidate> edgeExtendCandidates;
+    TextureFrameEdgeExtendCandidateMap edgeExtendCandidateMap;
+    if (TextureScaling.EdgeExtendUnusedMargins && TextureScaling.Enabled && ScaleFactor > 1)
+    {
+        edgeExtendCandidates.reserve(GPU3D.RenderNumPolygons);
+        edgeExtendCandidateMap.reserve(GPU3D.RenderNumPolygons);
+        AccumulateTextureFrameEdgeExtendCandidates(GPU3D.RenderPolygonRAM.data(), GPU3D.RenderNumPolygons,
+                                                   enableTextureMaps, edgeExtendCandidates, edgeExtendCandidateMap);
+    }
 
     for (int i = 0; i < GPU3D.RenderNumPolygons; i++)
     {
         Polygon* polygon = GPU3D.RenderPolygonRAM[i];
+        TextureSamplingBounds samplingBounds;
+        u32 polygonTextype = (polygon->TexParam >> 26) & 0x7;
+        if (enableTextureMaps && polygonTextype)
+        {
+            const u32 texWidth = TextureWidth(polygon->TexParam);
+            const u32 texHeight = TextureHeight(polygon->TexParam);
+            if (TextureFilter.MipmapSubrectHandling && TextureFilter.Anisotropy > 1 && TextureFilter.MipmapAlphaHandling)
+                BuildSafeTextureSamplingBounds(polygon, texWidth, texHeight, samplingBounds);
+            if (!samplingBounds.Valid && TextureScaling.EdgeExtendUnusedMargins && TextureScaling.Enabled && ScaleFactor > 1)
+            {
+                const u32 strippedTexParam = polygon->TexParam & ~0xC00F0000;
+                FindTextureFrameEdgeExtendBounds(edgeExtendCandidates, edgeExtendCandidateMap, strippedTexParam,
+                                                 polygon->TexPalette, samplingBounds);
+            }
+        }
 
         u32 nverts = polygon->NumVertices;
         u32 vtop = polygon->VTop, vbot = polygon->VBottom;
@@ -728,6 +1024,44 @@ void ComputeRenderer3D::RenderFrame()
                 && prevPolygon->TexPalette == polygon->TexPalette
                 && (prevPolygon->Attr & 0x30) == (polygon->Attr & 0x30)
                 && prevPolygon->IsShadowMask == polygon->IsShadowMask;
+            if (foundVariant && samplingBounds.Valid)
+            {
+                TextureSamplingBounds prevSamplingBounds;
+                const u32 prevTexWidth = TextureWidth(prevPolygon->TexParam);
+                const u32 prevTexHeight = TextureHeight(prevPolygon->TexParam);
+                if (TextureFilter.MipmapSubrectHandling && TextureFilter.Anisotropy > 1 && TextureFilter.MipmapAlphaHandling)
+                    BuildSafeTextureSamplingBounds(prevPolygon, prevTexWidth, prevTexHeight, prevSamplingBounds);
+                if (!prevSamplingBounds.Valid && TextureScaling.EdgeExtendUnusedMargins &&
+                    TextureScaling.Enabled && ScaleFactor > 1)
+                {
+                    const u32 prevStrippedTexParam = prevPolygon->TexParam & ~0xC00F0000;
+                    FindTextureFrameEdgeExtendBounds(edgeExtendCandidates, edgeExtendCandidateMap, prevStrippedTexParam,
+                                                     prevPolygon->TexPalette, prevSamplingBounds);
+                }
+                foundVariant = samplingBounds == prevSamplingBounds;
+            }
+            else if (foundVariant)
+            {
+                TextureSamplingBounds prevSamplingBounds;
+                bool prevHadSamplingBounds =
+                    enableTextureMaps && ((prevPolygon->TexParam >> 26) & 0x7);
+                if (prevHadSamplingBounds)
+                {
+                    const u32 prevTexWidth = TextureWidth(prevPolygon->TexParam);
+                    const u32 prevTexHeight = TextureHeight(prevPolygon->TexParam);
+                    if (TextureFilter.MipmapSubrectHandling && TextureFilter.Anisotropy > 1 && TextureFilter.MipmapAlphaHandling)
+                        BuildSafeTextureSamplingBounds(prevPolygon, prevTexWidth, prevTexHeight, prevSamplingBounds);
+                    if (!prevSamplingBounds.Valid && TextureScaling.EdgeExtendUnusedMargins &&
+                        TextureScaling.Enabled && ScaleFactor > 1)
+                    {
+                        const u32 prevStrippedTexParam = prevPolygon->TexParam & ~0xC00F0000;
+                        FindTextureFrameEdgeExtendBounds(edgeExtendCandidates, edgeExtendCandidateMap, prevStrippedTexParam,
+                                                         prevPolygon->TexPalette, prevSamplingBounds);
+                    }
+                    prevHadSamplingBounds = prevSamplingBounds.Valid;
+                }
+                foundVariant = !prevHadSamplingBounds;
+            }
         }
 
         if (!foundVariant)
@@ -736,9 +1070,12 @@ void ComputeRenderer3D::RenderFrame()
             variant.BlendMode = polygon->IsShadowMask ? 4 : ((polygon->Attr >> 4) & 0x3);
             variant.Texture = 0;
             variant.Sampler = 0;
+            variant.BinaryAlphaTexture = false;
+            variant.Width = TextureWidth(polygon->TexParam);
+            variant.Height = TextureHeight(polygon->TexParam);
             u32* textureLastVariant = nullptr;
             // we always need to look up the texture to get the layer of the array texture
-            u32 textype = (polygon->TexParam >> 26) & 0x7;
+            u32 textype = polygonTextype;
             if (enableTextureMaps && textype)
             {
                 u32 texaddr = polygon->TexParam & 0xFFFF;
@@ -783,8 +1120,14 @@ void ComputeRenderer3D::RenderFrame()
                 }
                 else
                 {
-                    Texcache.GetTexture(polygon->TexParam, polygon->TexPalette, variant.Texture, prevTexLayer, textureLastVariant);
+                    Texcache.GetTexture(polygon->TexParam, polygon->TexPalette, variant.Texture, prevTexLayer, textureLastVariant,
+                                        &variant.BinaryAlphaTexture, samplingBounds.Valid ? &samplingBounds : nullptr);
                     variant.CaptureYOffset = -1;
+                    if (TextureBoundsRemapCoordinates(samplingBounds))
+                    {
+                        variant.Width = samplingBounds.X1 - samplingBounds.X0;
+                        variant.Height = samplingBounds.Y1 - samplingBounds.Y0;
+                    }
                 }
 
                 bool wrapS = (polygon->TexParam >> 16) & 1;
@@ -814,8 +1157,6 @@ void ComputeRenderer3D::RenderFrame()
 
                 prevVariant = numVariants;
                 variants[numVariants] = variant;
-                variants[numVariants].Width = TextureWidth(polygon->TexParam);
-                variants[numVariants].Height = TextureHeight(polygon->TexParam);
                 numVariants++;
                 assert(numVariants <= MaxVariants);
             foundVariant:;
@@ -880,10 +1221,10 @@ void ComputeRenderer3D::RenderFrame()
 
             assert(numYSpans < MaxYSpanSetups);
             u32 curSpanL = numYSpans;
-            SetupYSpanDummy(&RenderPolygons[i], &YSpanSetups[numYSpans++], polygon, vtop, 0, scaledPositions);
+            SetupYSpanDummy(&RenderPolygons[i], &YSpanSetups[numYSpans++], polygon, vtop, 0, scaledPositions, samplingBounds);
             assert(numYSpans < MaxYSpanSetups);
             u32 curSpanR = numYSpans;
-            SetupYSpanDummy(&RenderPolygons[i], &YSpanSetups[numYSpans++], polygon, vbot, 1, scaledPositions);
+            SetupYSpanDummy(&RenderPolygons[i], &YSpanSetups[numYSpans++], polygon, vbot, 1, scaledPositions, samplingBounds);
 
             YSpanIndices[numSetupIndices].PolyIdx = i;
             YSpanIndices[numSetupIndices].SpanIdxL = curSpanL;
@@ -895,10 +1236,10 @@ void ComputeRenderer3D::RenderFrame()
         {
             u32 curSpanL = numYSpans;
             assert(numYSpans < MaxYSpanSetups);
-            SetupYSpan(&RenderPolygons[i], &YSpanSetups[numYSpans++], polygon, curVL, nextVL, 0, scaledPositions);
+            SetupYSpan(&RenderPolygons[i], &YSpanSetups[numYSpans++], polygon, curVL, nextVL, 0, scaledPositions, samplingBounds);
             u32 curSpanR = numYSpans;
             assert(numYSpans < MaxYSpanSetups);
-            SetupYSpan(&RenderPolygons[i], &YSpanSetups[numYSpans++], polygon, curVR, nextVR, 1, scaledPositions);
+            SetupYSpan(&RenderPolygons[i], &YSpanSetups[numYSpans++], polygon, curVR, nextVR, 1, scaledPositions, samplingBounds);
 
             for (u32 y = ytop; y < ybot; y++)
             {
@@ -924,7 +1265,7 @@ void ComputeRenderer3D::RenderFrame()
 
                     assert(numYSpans < MaxYSpanSetups);
                     curSpanL = numYSpans;
-                    SetupYSpan(&RenderPolygons[i], &YSpanSetups[numYSpans++], polygon, curVL, nextVL, 0, scaledPositions);
+                    SetupYSpan(&RenderPolygons[i], &YSpanSetups[numYSpans++], polygon, curVL, nextVL, 0, scaledPositions, samplingBounds);
                 }
                 if (y >= scaledPositions[nextVR][1] && curVR != polygon->VBottom)
                 {
@@ -947,7 +1288,7 @@ void ComputeRenderer3D::RenderFrame()
 
                     assert(numYSpans < MaxYSpanSetups);
                     curSpanR = numYSpans;
-                    SetupYSpan(&RenderPolygons[i] ,&YSpanSetups[numYSpans++], polygon, curVR, nextVR, 1, scaledPositions);
+                    SetupYSpan(&RenderPolygons[i] ,&YSpanSetups[numYSpans++], polygon, curVR, nextVR, 1, scaledPositions, samplingBounds);
                 }
 
                 YSpanIndices[numSetupIndices].PolyIdx = i;
@@ -1183,6 +1524,8 @@ void ComputeRenderer3D::RenderFrame()
                 }
                 else
                     glUniform1i(UniformIdxTexIsCapture, 0);
+                glUniform1i(UniformIdxBinaryAlphaTexture,
+                            (TextureFilter.BinaryAlphaHandling && variants[i].BinaryAlphaTexture) ? 1 : 0);
                 glBindBuffer(GL_DISPATCH_INDIRECT_BUFFER, BinResultMemory);
                 glDispatchComputeIndirect(offsetof(BinResultHeader, VariantWorkCount) + i*4*4);
             }
@@ -1204,7 +1547,7 @@ void ComputeRenderer3D::RenderFrame()
 
     glBindImageTexture(0, Framebuffer, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA8);
     u32 finalPassShader = 0;
-    if (GPU3D.RenderDispCnt & (1<<4))
+    if (MSAA || (GPU3D.RenderDispCnt & (1<<4)))
         finalPassShader |= 0x4;
     if (GPU3D.RenderDispCnt & (1<<7))
         finalPassShader |= 0x2;
@@ -1264,6 +1607,69 @@ void ComputeRenderer3D::RenderFrame()
         }
         printf("\n");
     }*/
+
+    Texcache.FinishDebugFrameTextureCapture();
+}
+
+bool ComputeRenderer3D::GetTextureScalingDebugStats(TextureScalingDebugStats& stats, std::string* status)
+{
+    Texcache.GetDebugStats(stats, true, false);
+    if (status)
+        *status = "OpenGL (Compute shader) 3D texture cache diagnostics.";
+    return true;
+}
+
+bool ComputeRenderer3D::ResetTextureScalingDebugStats(std::string* status)
+{
+    Texcache.ResetDebugStats();
+    if (status)
+        *status = "Reset OpenGL (Compute shader) 3D texture cache diagnostics.";
+    return true;
+}
+
+bool ComputeRenderer3D::GetTextureScalingDebugLastMiss(TextureScalingDebugLastMiss& miss, std::string* status)
+{
+    Texcache.GetDebugLastMiss(miss);
+    if (status)
+        *status = miss.Valid ?
+            "Last OpenGL (Compute shader) 3D texture cache miss." :
+            "No OpenGL (Compute shader) 3D texture cache miss has been captured yet.";
+    return true;
+}
+
+bool ComputeRenderer3D::SetTextureScalingDebugCaptureEnabled(bool enabled, std::string* status)
+{
+    Texcache.SetDebugLastMissImageCaptureEnabled(enabled);
+    if (status)
+        *status = enabled ?
+            "OpenGL (Compute shader) 3D texture miss capture armed." :
+            "OpenGL (Compute shader) 3D texture miss capture disabled.";
+    return true;
+}
+
+bool ComputeRenderer3D::GetTextureScalingDebugFrameTextures(TextureScalingDebugFrameTextures& frame, std::string* status)
+{
+    Texcache.GetDebugFrameTextures(frame);
+    if (status)
+    {
+        if (frame.Valid)
+            *status = "Captured OpenGL (Compute shader) frame texture list.";
+        else if (frame.CapturePending || frame.CaptureActive)
+            *status = "OpenGL (Compute shader) frame texture capture is waiting for the next rendered frame.";
+        else
+            *status = "No OpenGL (Compute shader) frame texture capture has been captured yet.";
+    }
+    return true;
+}
+
+bool ComputeRenderer3D::SetTextureScalingDebugFrameCaptureEnabled(bool enabled, std::string* status)
+{
+    Texcache.SetDebugFrameTextureCaptureEnabled(enabled);
+    if (status)
+        *status = enabled ?
+            "OpenGL (Compute shader) frame texture capture armed." :
+            "OpenGL (Compute shader) frame texture capture disabled.";
+    return true;
 }
 
 void ComputeRenderer3D::RestartFrame()

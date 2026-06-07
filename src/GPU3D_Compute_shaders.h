@@ -1062,7 +1062,11 @@ const std::string Rasterise =
 
 layout (local_size_x = TileSize, local_size_y = TileSize) in;
 
+#ifdef FILTERABLE_TEXTURE_CACHE
+layout (binding = 0) uniform sampler2DArray CurrentTexture;
+#else
 layout (binding = 0) uniform usampler2DArray CurrentTexture;
+#endif
 layout (binding = 1) uniform sampler2DArray Capture128Texture;
 layout (binding = 2) uniform sampler2DArray Capture256Texture;
 
@@ -1070,6 +1074,130 @@ layout (location = 0) uniform uint CurVariant;
 layout (location = 1) uniform vec2 InvTextureSize;
 layout (location = 2) uniform int TexIsCapture;
 layout (location = 3) uniform float CaptureYOffset;
+layout (location = 4) uniform int uBinaryAlphaTexture;
+
+#if defined(FILTERABLE_TEXTURE_CACHE) && defined(Rasterise)
+int ClampSpanX(XSpanSetup span, int x)
+{
+    return clamp(x, min(span.X0, span.X1), max(span.X0, span.X1));
+}
+
+bool SpanContainsX(XSpanSetup span, int x)
+{
+    return x >= min(span.X0, span.X1) && x <= max(span.X0, span.X1);
+}
+
+vec2 EvaluateTextureUV(XSpanSetup span, int x)
+{
+    int u, v;
+    if (span.X0 == span.X1)
+    {
+        u = span.TexcoordU0;
+        v = span.TexcoordV0;
+    }
+    else
+    {
+        int ifactor = CalcYFactorX(span, x);
+        int idiff = span.X1 - span.X0;
+        int i = x - span.X0;
+        if ((span.Flags & XSpanSetup_Linear) == 0U)
+        {
+            u = InterpolateAttrPersp(span.TexcoordU0, span.TexcoordU1, ifactor);
+            v = InterpolateAttrPersp(span.TexcoordV0, span.TexcoordV1, ifactor);
+        }
+        else
+        {
+            u = InterpolateAttrLinear(span.TexcoordU0, span.TexcoordU1, i, span.XRecip, idiff);
+            v = InterpolateAttrLinear(span.TexcoordV0, span.TexcoordV1, i, span.XRecip, idiff);
+        }
+    }
+
+    return vec2(ivec2(u, v)) * vec2(1.0 / 16.0) * InvTextureSize;
+}
+
+vec2 EvaluateTextureGradientX(XSpanSetup span, int x, vec2 baseUV)
+{
+    bool hasPrev = x > min(span.X0, span.X1);
+    bool hasNext = x < max(span.X0, span.X1);
+
+    if (hasPrev && hasNext)
+    {
+        vec2 prevUV = EvaluateTextureUV(span, x - 1);
+        vec2 nextUV = EvaluateTextureUV(span, x + 1);
+        return 0.5 * (nextUV - prevUV);
+    }
+    if (hasNext)
+        return EvaluateTextureUV(span, x + 1) - baseUV;
+    if (hasPrev)
+        return baseUV - EvaluateTextureUV(span, x - 1);
+    return vec2(0.0);
+}
+
+vec2 EvaluateTextureGradientY(Polygon polygon, ivec2 position, vec2 baseUV)
+{
+    int row = position.y - polygon.YTop;
+    bool hasNext = position.y + 1 < polygon.YBot;
+    bool hasPrev = row > 0;
+    bool nextCoversX = false;
+    bool prevCoversX = false;
+    XSpanSetup nextSpan;
+    XSpanSetup prevSpan;
+
+    if (hasNext)
+    {
+        nextSpan = XSpanSetups[polygon.FirstXSpan + row + 1];
+        nextCoversX = SpanContainsX(nextSpan, position.x);
+    }
+    if (hasPrev)
+    {
+        prevSpan = XSpanSetups[polygon.FirstXSpan + row - 1];
+        prevCoversX = SpanContainsX(prevSpan, position.x);
+    }
+
+    if (nextCoversX && prevCoversX)
+    {
+        vec2 nextUV = EvaluateTextureUV(nextSpan, position.x);
+        vec2 prevUV = EvaluateTextureUV(prevSpan, position.x);
+        return 0.5 * (nextUV - prevUV);
+    }
+    if (nextCoversX)
+    {
+        return EvaluateTextureUV(nextSpan, position.x) - baseUV;
+    }
+    if (prevCoversX)
+    {
+        return baseUV - EvaluateTextureUV(prevSpan, position.x);
+    }
+    return vec2(0.0);
+}
+
+vec4 SampleCurrentTextureAtLod(Polygon polygon, vec2 uvf, float lod)
+{
+    vec4 texel = textureLod(CurrentTexture, vec3(uvf, polygon.TextureLayer), lod);
+#ifdef READABLE_TEXTURE_CACHE
+    return texel;
+#else
+    return texel * vec4(255.0 / 63.0, 255.0 / 63.0, 255.0 / 63.0, 255.0 / 31.0);
+#endif
+}
+
+vec4 SampleCurrentTextureWithGradients(Polygon polygon, vec2 uvf, vec2 dX, vec2 dY)
+{
+    vec4 texel = textureGrad(CurrentTexture, vec3(uvf, polygon.TextureLayer), dX, dY);
+#ifdef READABLE_TEXTURE_CACHE
+    return texel;
+#else
+    return texel * vec4(255.0 / 63.0, 255.0 / 63.0, 255.0 / 63.0, 255.0 / 31.0);
+#endif
+}
+
+vec4 SampleCurrentTextureFiltered(Polygon polygon, ivec2 position, XSpanSetup xspan, vec2 uvf)
+{
+    vec2 dX = EvaluateTextureGradientX(xspan, position.x, uvf);
+    vec2 dY = EvaluateTextureGradientY(polygon, position, uvf);
+    return SampleCurrentTextureWithGradients(polygon, uvf + 0.5 * (dX + dY), dX, dY);
+}
+#endif
 
 void main()
 {
@@ -1176,20 +1304,36 @@ void main()
 
             uint r, g, b, a;
             uint polyalpha = bitfieldExtract(polygon.Attr, 16, 5);
+#ifdef FILTERABLE_TEXTURE_CACHE
+            vec4 vcolf = vec4(float(vr), float(vg), float(vb), float(polyalpha)) / vec4(63.0, 63.0, 63.0, 31.0);
+            vec4 colf = vcolf;
+#endif
 
 #ifdef Toon
             uint tooncolor = ToonTable[vr >> 1].r;
             vr = int(bitfieldExtract(tooncolor, 0, 8));
             vg = int(bitfieldExtract(tooncolor, 8, 8));
             vb = int(bitfieldExtract(tooncolor, 16, 8));
+#ifdef FILTERABLE_TEXTURE_CACHE
+            vcolf.rgb = vec3(float(vr), float(vg), float(vb)) / 63.0;
+            colf = vcolf;
+#endif
 #endif
 #ifdef Highlight
             vg = vr;
             vb = vr;
+#ifdef FILTERABLE_TEXTURE_CACHE
+            vcolf.rgb = vec3(float(vr), float(vg), float(vb)) / 63.0;
+            colf = vcolf;
+#endif
 #endif
 
 #ifdef NoTexture
+#ifdef FILTERABLE_TEXTURE_CACHE
+            colf.a = vcolf.a;
+#else
             a = int(polyalpha);
+#endif
 #endif
             r = vr;
             g = vg;
@@ -1200,19 +1344,46 @@ void main()
 
             // TODO: if they use a capture as a texture and make it repeat, or use a nonstandard height,
             // it may require custom handling of texcoord wraparound
+#ifdef FILTERABLE_TEXTURE_CACHE
+            vec4 texcolorf;
+#else
             uvec4 texcolor;
+#endif
             if (TexIsCapture != 0)
             {
                 uvf.y += CaptureYOffset;
+#ifdef FILTERABLE_TEXTURE_CACHE
+                if (TexIsCapture == 1)
+                    texcolorf = texture(Capture128Texture, vec3(uvf, polygon.TextureLayer));
+                else
+                    texcolorf = texture(Capture256Texture, vec3(uvf, polygon.TextureLayer));
+#else
                 if (TexIsCapture == 1)
                     texcolor = uvec4(texture(Capture128Texture, vec3(uvf, polygon.TextureLayer)) * vec4(63,63,63,31));
                 else
                     texcolor = uvec4(texture(Capture256Texture, vec3(uvf, polygon.TextureLayer)) * vec4(63,63,63,31));
+#endif
             }
             else
+#ifdef FILTERABLE_TEXTURE_CACHE
+            {
+                texcolorf = SampleCurrentTextureFiltered(polygon, position, xspan, uvf);
+                if (uBinaryAlphaTexture != 0)
+                {
+                    texcolorf.a = texcolorf.a >= 0.5 ? 1.0 : 0.0;
+                    if (texcolorf.a == 0.0)
+                        texcolorf.rgb = vec3(0.0);
+                }
+            }
+#else
                 texcolor = texture(CurrentTexture, vec3(uvf, polygon.TextureLayer));
+#endif
 
 #ifdef Decal
+#ifdef FILTERABLE_TEXTURE_CACHE
+            colf.rgb = (texcolorf.rgb * texcolorf.a) + (vcolf.rgb * (1.0 - texcolorf.a));
+            colf.a = vcolf.a;
+#else
             if (texcolor.a == 31)
             {
                 r = int(texcolor.r);
@@ -1227,22 +1398,50 @@ void main()
             }
             a = int(polyalpha);
 #endif
+#endif
 #if defined(Modulate) || defined(Toon) || defined(Highlight)
+#ifdef FILTERABLE_TEXTURE_CACHE
+            colf = vcolf * texcolorf;
+#else
             r = int((texcolor.r+1) * (vr+1) - 1) >> 6;
             g = int((texcolor.g+1) * (vg+1) - 1) >> 6;
             b = int((texcolor.b+1) * (vb+1) - 1) >> 6;
             a = int((texcolor.a+1) * (polyalpha+1) - 1) >> 5;
 #endif
 #endif
+#endif
 
 #ifdef Highlight
             uint tooncolor = ToonTable[vr >> 1].r;
 
+#ifdef FILTERABLE_TEXTURE_CACHE
+            colf.rgb = min(colf.rgb + (vec3(
+                float(bitfieldExtract(tooncolor, 0, 8)),
+                float(bitfieldExtract(tooncolor, 8, 8)),
+                float(bitfieldExtract(tooncolor, 16, 8))) / 63.0), vec3(1.0));
+#else
             r = min(r + int(bitfieldExtract(tooncolor, 0, 8)), 63);
             g = min(g + int(bitfieldExtract(tooncolor, 8, 8)), 63);
             b = min(b + int(bitfieldExtract(tooncolor, 16, 8)), 63);
 #endif
+#endif
 
+#ifdef FILTERABLE_TEXTURE_CACHE
+            if (polyalpha == 0)
+                colf.a = 1.0;
+
+            a = uint(round(clamp(colf.a, 0.0, 1.0) * 31.0));
+            if (a > AlphaRef)
+            {
+                r = uint(round(clamp(colf.r, 0.0, 1.0) * 63.0));
+                g = uint(round(clamp(colf.g, 0.0, 1.0) * 63.0));
+                b = uint(round(clamp(colf.b, 0.0, 1.0) * 63.0));
+                color = r | (g << 8) | (b << 16) | (a << 24);
+
+                DepthTiles[tileOffset] = z;
+                AttrTiles[tileOffset] = attr;
+            }
+#else
             if (polyalpha == 0)
                 a = 31;
 
@@ -1253,6 +1452,7 @@ void main()
                 DepthTiles[tileOffset] = z;
                 AttrTiles[tileOffset] = attr;
             }
+#endif
 #else
             color = 0xFFFFFFFF; // doesn't really matter as long as it's not 0
             DepthTiles[tileOffset] = z;

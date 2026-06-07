@@ -18,14 +18,31 @@
 
 #include "GPU_OpenGL.h"
 
+#include <algorithm>
 #include <assert.h>
+#include <chrono>
 #include <stdio.h>
 #include <string.h>
+#include <string>
+#include <unordered_map>
+#include <vector>
 #include "NDS.h"
 #include "GPU.h"
 
+#include <cmath>
+
 namespace melonDS
 {
+
+namespace
+{
+u64 ElapsedUS(std::chrono::steady_clock::time_point start)
+{
+    return static_cast<u64>(
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - start).count());
+}
+}
 
 #include "OpenGL_shaders/3DClearVS.h"
 #include "OpenGL_shaders/3DClearFS.h"
@@ -37,9 +54,267 @@ namespace melonDS
 #include "OpenGL_shaders/3DFinalPassEdgeFS.h"
 #include "OpenGL_shaders/3DFinalPassFogFS.h"
 
+static bool AddUniqueTexcoord(s16 value, s16 values[4], int& count)
+{
+    for (int i = 0; i < count; i++)
+    {
+        if (values[i] == value)
+            return true;
+    }
+    if (count >= 2)
+        return false;
+
+    values[count++] = value;
+    return true;
+}
+
+static bool BuildSafeTextureSamplingBounds(const Polygon* poly, u32 texWidth, u32 texHeight, TextureSamplingBounds& bounds)
+{
+    bounds = {};
+    if (poly->Type == 1 || poly->NumVertices != 4)
+        return false;
+    if (((poly->TexParam >> 16) & 0xF) != 0)
+        return false;
+
+    const s32 maxTexU = static_cast<s32>(texWidth << 4);
+    const s32 maxTexV = static_cast<s32>(texHeight << 4);
+    s32 minU = 0x7FFFFFFF, minV = 0x7FFFFFFF;
+    s32 maxU = -0x7FFFFFFF, maxV = -0x7FFFFFFF;
+    s16 uniqueU[4] = {};
+    s16 uniqueV[4] = {};
+    int uniqueUCount = 0;
+    int uniqueVCount = 0;
+
+    for (u32 i = 0; i < poly->NumVertices; i++)
+    {
+        const s32 u = poly->Vertices[i]->TexCoords[0];
+        const s32 v = poly->Vertices[i]->TexCoords[1];
+        if (u < 0 || v < 0 || u > maxTexU || v > maxTexV)
+            return false;
+        if (!AddUniqueTexcoord(static_cast<s16>(u), uniqueU, uniqueUCount) ||
+            !AddUniqueTexcoord(static_cast<s16>(v), uniqueV, uniqueVCount))
+            return false;
+
+        minU = std::min(minU, u);
+        minV = std::min(minV, v);
+        maxU = std::max(maxU, u);
+        maxV = std::max(maxV, v);
+    }
+
+    if (uniqueUCount != 2 || uniqueVCount != 2 || minU >= maxU || minV >= maxV)
+        return false;
+
+    u32 x0 = static_cast<u32>(minU >> 4);
+    u32 y0 = static_cast<u32>(minV >> 4);
+    u32 x1 = std::min<u32>(texWidth, static_cast<u32>((maxU + 15) >> 4));
+    u32 y1 = std::min<u32>(texHeight, static_cast<u32>((maxV + 15) >> 4));
+
+    if (x0 > 0) x0--;
+    if (y0 > 0) y0--;
+    if (x1 < texWidth) x1++;
+    if (y1 < texHeight) y1++;
+    if (x0 >= x1 || y0 >= y1)
+        return false;
+    if (x0 == 0 && y0 == 0 && x1 == texWidth && y1 == texHeight)
+        return false;
+
+    bounds.Valid = true;
+    bounds.X0 = static_cast<u16>(x0);
+    bounds.Y0 = static_cast<u16>(y0);
+    bounds.X1 = static_cast<u16>(x1);
+    bounds.Y1 = static_cast<u16>(y1);
+    return true;
+}
+
+static s32 ClampTextureCoordinate(s32 coord, s32 maxCoord)
+{
+    return std::min<s32>(std::max<s32>(coord, 0), maxCoord);
+}
+
+struct TextureFrameEdgeExtendCandidate
+{
+    u32 TexParam = 0;
+    u32 TexPalette = 0;
+    u32 Width = 0;
+    u32 Height = 0;
+    bool Valid = true;
+    bool Seen = false;
+    u32 X0 = 0;
+    u32 Y0 = 0;
+    u32 X1 = 0;
+    u32 Y1 = 0;
+};
+
+using TextureFrameEdgeExtendCandidateMap = std::unordered_map<u64, size_t>;
+
+static u64 MakeTextureFrameEdgeExtendCandidateKey(u32 texParam, u32 texPalette)
+{
+    return (static_cast<u64>(texParam) << 32) | texPalette;
+}
+
+static bool GetTextureDrawBounds(const Polygon* poly, u32 texWidth, u32 texHeight,
+                                 u32& x0, u32& y0, u32& x1, u32& y1)
+{
+    if (poly->Type == 1 || poly->NumVertices < 3 || poly->NumVertices > 10)
+        return false;
+
+    const s32 maxTexU = static_cast<s32>(texWidth << 4);
+    const s32 maxTexV = static_cast<s32>(texHeight << 4);
+    s32 minU = 0x7FFFFFFF, minV = 0x7FFFFFFF;
+    s32 maxU = -0x7FFFFFFF, maxV = -0x7FFFFFFF;
+
+    for (u32 i = 0; i < poly->NumVertices; i++)
+    {
+        const s32 u = ClampTextureCoordinate(poly->Vertices[i]->TexCoords[0], maxTexU);
+        const s32 v = ClampTextureCoordinate(poly->Vertices[i]->TexCoords[1], maxTexV);
+        minU = std::min(minU, u);
+        minV = std::min(minV, v);
+        maxU = std::max(maxU, u);
+        maxV = std::max(maxV, v);
+    }
+
+    if (minU >= maxU || minV >= maxV)
+        return false;
+
+    x0 = static_cast<u32>(std::max<s32>(0, minU >> 4));
+    y0 = static_cast<u32>(std::max<s32>(0, minV >> 4));
+    x1 = std::min<u32>(texWidth, static_cast<u32>((maxU + 15) >> 4));
+    y1 = std::min<u32>(texHeight, static_cast<u32>((maxV + 15) >> 4));
+    return x0 < x1 && y0 < y1;
+}
+
+static TextureFrameEdgeExtendCandidate& FindOrAddEdgeExtendCandidate(
+    std::vector<TextureFrameEdgeExtendCandidate>& candidates,
+    TextureFrameEdgeExtendCandidateMap& candidateMap,
+    u32 texParam, u32 texPalette, u32 width, u32 height)
+{
+    const u64 key = MakeTextureFrameEdgeExtendCandidateKey(texParam, texPalette);
+    auto it = candidateMap.find(key);
+    if (it != candidateMap.end())
+        return candidates[it->second];
+
+    candidates.push_back({});
+    candidateMap.emplace(key, candidates.size() - 1);
+    TextureFrameEdgeExtendCandidate& candidate = candidates.back();
+    candidate.TexParam = texParam;
+    candidate.TexPalette = texPalette;
+    candidate.Width = width;
+    candidate.Height = height;
+    return candidate;
+}
+
+static void AccumulateTextureFrameEdgeExtendCandidate(
+    const Polygon* poly, bool texEnable,
+    std::vector<TextureFrameEdgeExtendCandidate>& candidates,
+    TextureFrameEdgeExtendCandidateMap& candidateMap)
+{
+    const u32 texParam = poly->TexParam & ~0xC00F0000;
+    const u32 textype = (texParam >> 26) & 0x7;
+    if (!texEnable || !textype)
+        return;
+
+    const u32 texWidth = TextureWidth(texParam);
+    const u32 texHeight = TextureHeight(texParam);
+    TextureFrameEdgeExtendCandidate& candidate =
+        FindOrAddEdgeExtendCandidate(candidates, candidateMap, texParam, poly->TexPalette, texWidth, texHeight);
+
+    u32 x0, y0, x1, y1;
+    const bool eligible = ((poly->TexParam >> 16) & 0xF) == 0 &&
+        GetTextureDrawBounds(poly, texWidth, texHeight, x0, y0, x1, y1);
+    if (!eligible)
+    {
+        candidate.Valid = false;
+        return;
+    }
+
+    if (!candidate.Seen)
+    {
+        candidate.Seen = true;
+        candidate.X0 = x0;
+        candidate.Y0 = y0;
+        candidate.X1 = x1;
+        candidate.Y1 = y1;
+    }
+    else
+    {
+        candidate.X0 = std::min(candidate.X0, x0);
+        candidate.Y0 = std::min(candidate.Y0, y0);
+        candidate.X1 = std::max(candidate.X1, x1);
+        candidate.Y1 = std::max(candidate.Y1, y1);
+    }
+}
+
+static bool FindTextureFrameEdgeExtendBounds(const std::vector<TextureFrameEdgeExtendCandidate>& candidates,
+                                             const TextureFrameEdgeExtendCandidateMap& candidateMap,
+                                             u32 texParam, u32 texPalette, TextureSamplingBounds& bounds)
+{
+    const u64 key = MakeTextureFrameEdgeExtendCandidateKey(texParam, texPalette);
+    auto it = candidateMap.find(key);
+    if (it == candidateMap.end() || it->second >= candidates.size())
+        return false;
+
+    const TextureFrameEdgeExtendCandidate& candidate = candidates[it->second];
+    if (!candidate.Valid || !candidate.Seen)
+        return false;
+    if (candidate.Width == 0 || candidate.Height == 0 ||
+        candidate.X0 >= candidate.X1 || candidate.Y0 >= candidate.Y1)
+        return false;
+    if (candidate.X0 == 0 && candidate.Y0 == 0 &&
+        candidate.X1 == candidate.Width && candidate.Y1 == candidate.Height)
+        return false;
+
+    const u32 horizontalTailThreshold = std::max<u32>(16, candidate.Width / 8);
+    const u32 verticalTailThreshold = std::max<u32>(16, candidate.Height / 8);
+    const bool hasSignificantTail =
+        candidate.X0 >= horizontalTailThreshold ||
+        candidate.Width - candidate.X1 >= horizontalTailThreshold ||
+        candidate.Y0 >= verticalTailThreshold ||
+        candidate.Height - candidate.Y1 >= verticalTailThreshold;
+    if (!hasSignificantTail)
+        return false;
+
+    bounds = {};
+    bounds.Valid = true;
+    bounds.EdgeExtendMargins = true;
+    bounds.X0 = static_cast<u16>(candidate.X0);
+    bounds.Y0 = static_cast<u16>(candidate.Y0);
+    bounds.X1 = static_cast<u16>(candidate.X1);
+    bounds.Y1 = static_cast<u16>(candidate.Y1);
+    return true;
+}
+
+static bool TextureBoundsRemapCoordinates(const TextureSamplingBounds& bounds)
+{
+    return bounds.Valid && !bounds.EdgeExtendMargins;
+}
+
+static u32 PackTextureCoords(s32 u, s32 v, const TextureSamplingBounds& bounds)
+{
+    if (TextureBoundsRemapCoordinates(bounds))
+    {
+        const s32 x0 = static_cast<s32>(bounds.X0) << 4;
+        const s32 y0 = static_cast<s32>(bounds.Y0) << 4;
+        const s32 x1 = static_cast<s32>(bounds.X1) << 4;
+        const s32 y1 = static_cast<s32>(bounds.Y1) << 4;
+        u = std::min<s32>(std::max<s32>(u, x0), x1) - x0;
+        v = std::min<s32>(std::max<s32>(v, y0), y1) - y0;
+    }
+
+    return static_cast<u16>(u) | (static_cast<u32>(static_cast<u16>(v)) << 16);
+}
+
 bool GLRenderer3D::BuildRenderShader(bool wbuffer)
 {
-    std::string wbufdef = "#define WBuffer\n";
+    std::string shaderdefs;
+    if (wbuffer)
+        shaderdefs += "#define WBuffer\n";
+    if (TextureFilter.Anisotropy > 1)
+    {
+        shaderdefs += "#define FILTERABLE_TEXTURE_CACHE\n";
+        shaderdefs += "#define TEXTURE_ANISOTROPY ";
+        shaderdefs += std::to_string(TextureFilter.Anisotropy);
+        shaderdefs += "\n";
+    }
 
     char shadername[32];
     snprintf(shadername, sizeof(shadername), "RenderShader%c", wbuffer?'W':'Z');
@@ -48,14 +323,14 @@ bool GLRenderer3D::BuildRenderShader(bool wbuffer)
     if (wbuffer)
     {
         auto pos = vsbuf.find('\n') + 1;
-        vsbuf = vsbuf.substr(0, pos) + wbufdef + vsbuf.substr(pos);
+        vsbuf = vsbuf.substr(0, pos) + "#define WBuffer\n" + vsbuf.substr(pos);
     }
 
     std::string fsbuf = k3DRenderFS;
-    if (wbuffer)
+    if (!shaderdefs.empty())
     {
         auto pos = fsbuf.find('\n') + 1;
-        fsbuf = fsbuf.substr(0, pos) + wbufdef + fsbuf.substr(pos);
+        fsbuf = fsbuf.substr(0, pos) + shaderdefs + fsbuf.substr(pos);
     }
 
     GLuint prog;
@@ -78,6 +353,14 @@ bool GLRenderer3D::BuildRenderShader(bool wbuffer)
     glUniform1i(uni_id, 1);
     uni_id = glGetUniformLocation(prog, "Capture256Texture");
     glUniform1i(uni_id, 2);
+    TextureNormalizeULoc[(int)wbuffer] = glGetUniformLocation(prog, "uTextureNormalize");
+    BinaryAlphaTextureULoc[(int)wbuffer] = glGetUniformLocation(prog, "uBinaryAlphaTexture");
+    if (ReadableTextureCache)
+        glUniform4f(TextureNormalizeULoc[(int)wbuffer], 255.0f, 255.0f, 255.0f, 255.0f);
+    else
+        glUniform4f(TextureNormalizeULoc[(int)wbuffer], 63.0f, 63.0f, 63.0f, 31.0f);
+    if (BinaryAlphaTextureULoc[(int)wbuffer] >= 0)
+        glUniform1i(BinaryAlphaTextureULoc[(int)wbuffer], 0);
 
     RenderShader[(int)wbuffer] = prog;
 
@@ -111,6 +394,7 @@ GLRenderer3D::GLRenderer3D(melonDS::GPU3D& gpu3D, GLRenderer& parent) noexcept :
 
     ScaleFactor = 0;
     BetterPolygons = false;
+    TextureScaleFactor = 1;
 
     // GLRenderer3D::Init() will be used to actually initialize the renderer;
     // The various glDelete* functions silently ignore invalid IDs,
@@ -262,6 +546,7 @@ bool GLRenderer3D::Init()
     glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof(IndexBuffer), nullptr, GL_DYNAMIC_DRAW);
 
     glGenFramebuffers(1, &MainFramebuffer);
+    glGenFramebuffers(1, &MainMSAAFramebuffer);
 
     // color buffers
     glGenTextures(1, &ColorBufferTex);
@@ -277,6 +562,10 @@ bool GLRenderer3D::Init()
     // B: fog flag
     glGenTextures(1, &AttrBufferTex);
     SetupDefaultTexParams(AttrBufferTex);
+
+    glGenTextures(1, &MSAAColorBufferTex);
+    glGenTextures(1, &MSAADepthBufferTex);
+    glGenTextures(1, &MSAAAttrBufferTex);
 
     Parent.OutputTex3D = ColorBufferTex;
 
@@ -295,9 +584,13 @@ GLRenderer3D::~GLRenderer3D()
     Texcache.Reset();
 
     glDeleteFramebuffers(1, &MainFramebuffer);
+    glDeleteFramebuffers(1, &MainMSAAFramebuffer);
     glDeleteTextures(1, &ColorBufferTex);
     glDeleteTextures(1, &DepthBufferTex);
     glDeleteTextures(1, &AttrBufferTex);
+    glDeleteTextures(1, &MSAAColorBufferTex);
+    glDeleteTextures(1, &MSAADepthBufferTex);
+    glDeleteTextures(1, &MSAAAttrBufferTex);
 
     glDeleteVertexArrays(1, &VertexArrayID);
     glDeleteBuffers(1, &VertexBufferID);
@@ -324,24 +617,74 @@ void GLRenderer3D::Reset()
 
 void GLRenderer3D::SetBetterPolygons(bool betterpolygons) noexcept
 {
-    SetRenderSettings(ScaleFactor, betterpolygons);
+    SetRenderSettings(ScaleFactor, betterpolygons, ReadableTextureCache, MSAA, TextureFilter, TextureScaling);
 }
 
 void GLRenderer3D::SetScaleFactor(int scale) noexcept
 {
-    SetRenderSettings(scale, BetterPolygons);
+    SetRenderSettings(scale, BetterPolygons, ReadableTextureCache, MSAA, TextureFilter, TextureScaling);
 }
 
-
-void GLRenderer3D::SetRenderSettings(int scale, bool betterpolygons) noexcept
+void GLRenderer3D::SetReadableTextureCache(bool readableTextureCache) noexcept
 {
-    if (betterpolygons == BetterPolygons && scale == ScaleFactor)
+    SetRenderSettings(ScaleFactor, BetterPolygons, readableTextureCache, MSAA, TextureFilter, TextureScaling);
+}
+
+void GLRenderer3D::SetRenderSettings(int scale, bool betterpolygons, bool readableTextureCache, bool msaa,
+                                     const RendererSettings::TextureFilterSettings& textureFilter,
+                                     const RendererSettings::TextureScalingSettings& textureScaling) noexcept
+{
+    const int textureScaleFactor = textureScaling.Enabled ? scale : 1;
+    bool textureCacheChanged = readableTextureCache != ReadableTextureCache;
+    bool textureAnisotropyChanged = textureFilter.Anisotropy != TextureFilter.Anisotropy;
+    bool textureScaleChanged = textureScaleFactor != TextureScaleFactor;
+    bool textureFilterChanged = textureFilter != TextureFilter;
+    bool textureScalingChanged = textureScaling != TextureScaling;
+    bool msaaChanged = msaa != MSAA;
+
+    if (betterpolygons == BetterPolygons && !textureScaleChanged && !textureCacheChanged &&
+        !textureFilterChanged && !textureScalingChanged && !msaaChanged)
         return;
 
     // TODO set it for 2D renderer
     //CurGLCompositor.SetScaleFactor(scale);
     ScaleFactor = scale;
     BetterPolygons = betterpolygons;
+    ReadableTextureCache = readableTextureCache;
+    MSAA = msaa;
+    TextureScaleFactor = textureScaleFactor;
+    TextureFilter = textureFilter;
+    TextureScaling = textureScaling;
+
+    Texcache.ApplyTextureSettings(scale, textureFilter, textureScaling);
+    if (Texcache.SetPreferredOutputFormat(ReadableTextureCache ? outputFmt_RGBA8 : outputFmt_RGB6A5))
+        Texcache.Reset();
+
+    if (textureAnisotropyChanged)
+    {
+        for (GLuint& shader : RenderShader)
+        {
+            if (shader != 0)
+            {
+                glDeleteProgram(shader);
+                shader = 0;
+            }
+        }
+
+        BuildRenderShader(false);
+        BuildRenderShader(true);
+    }
+
+    for (int i = 0; i < 2; i++)
+    {
+        if (!RenderShader[i]) continue;
+        glUseProgram(RenderShader[i]);
+        if (ReadableTextureCache)
+            glUniform4f(TextureNormalizeULoc[i], 255.0f, 255.0f, 255.0f, 255.0f);
+        else
+            glUniform4f(TextureNormalizeULoc[i], 63.0f, 63.0f, 63.0f, 31.0f);
+    }
+    CurShaderID = -1;
 
     ScreenW = 256 * scale;
     ScreenH = 192 * scale;
@@ -361,6 +704,30 @@ void GLRenderer3D::SetRenderSettings(int scale, bool betterpolygons) noexcept
     glFramebufferTexture(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, DepthBufferTex, 0);
     glFramebufferTexture(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1, AttrBufferTex, 0);
     glDrawBuffers(2, fbassign);
+
+    GLint maxSamples = 0;
+    if (MSAA && glTexImage2DMultisample && glBlitFramebuffer)
+        glGetIntegerv(GL_MAX_SAMPLES, &maxSamples);
+    MSAASamples = std::min(4, maxSamples);
+    MSAAActive = MSAASamples > 1;
+
+    if (MSAAActive)
+    {
+        glBindTexture(GL_TEXTURE_2D_MULTISAMPLE, MSAAColorBufferTex);
+        glTexImage2DMultisample(GL_TEXTURE_2D_MULTISAMPLE, MSAASamples, GL_RGBA8, ScreenW, ScreenH, GL_TRUE);
+
+        glBindTexture(GL_TEXTURE_2D_MULTISAMPLE, MSAADepthBufferTex);
+        glTexImage2DMultisample(GL_TEXTURE_2D_MULTISAMPLE, MSAASamples, GL_DEPTH24_STENCIL8, ScreenW, ScreenH, GL_TRUE);
+
+        glBindTexture(GL_TEXTURE_2D_MULTISAMPLE, MSAAAttrBufferTex);
+        glTexImage2DMultisample(GL_TEXTURE_2D_MULTISAMPLE, MSAASamples, GL_RGB8, ScreenW, ScreenH, GL_TRUE);
+
+        glBindFramebuffer(GL_FRAMEBUFFER, MainMSAAFramebuffer);
+        glFramebufferTexture(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, MSAAColorBufferTex, 0);
+        glFramebufferTexture(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, MSAADepthBufferTex, 0);
+        glFramebufferTexture(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1, MSAAAttrBufferTex, 0);
+        glDrawBuffers(2, fbassign);
+    }
 
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
 
@@ -420,7 +787,8 @@ void GLRenderer3D::SetupPolygon(GLRenderer3D::RendererPolygon* rp, Polygon* poly
         rp->RenderKey |= (0x80000 | (texattr << 20));
 }
 
-u32* GLRenderer3D::SetupVertex(const Polygon* poly, int vid, const Vertex* vtx, u32 vtxattr, u32 texlayer, u32* vptr) const
+u32* GLRenderer3D::SetupVertex(const Polygon* poly, int vid, const Vertex* vtx, u32 vtxattr, u32 texlayer, u32 texwidth, u32 texheight,
+                               const TextureSamplingBounds& texBounds, u32* vptr) const
 {
     u32 z = poly->FinalZ[vid];
     u32 w = poly->FinalW[vid];
@@ -472,11 +840,11 @@ u32* GLRenderer3D::SetupVertex(const Polygon* poly, int vid, const Vertex* vtx, 
               ((vtx->FinalColor[2] >> 1) << 16) |
               (alpha << 24);
 
-    *vptr++ = (u16)vtx->TexCoords[0] | ((u16)vtx->TexCoords[1] << 16);
+    *vptr++ = PackTextureCoords(vtx->TexCoords[0], vtx->TexCoords[1], texBounds);
 
     *vptr++ = vtxattr | (zshift << 16);
     *vptr++ = texlayer;
-    *vptr++ = TextureWidth(poly->TexParam) | (TextureHeight(poly->TexParam) << 16);
+    *vptr++ = texwidth | (texheight << 16);
 
     return vptr;
 }
@@ -493,6 +861,22 @@ void GLRenderer3D::BuildPolygons(GLRenderer3D::RendererPolygon* polygons, int np
     u32 curtexpal = 0;
     GLuint curtexid = 0;
     u32 curtexlayer = (u32)-1;
+    u32 curtexwidth = 0;
+    u32 curtexheight = 0;
+    TextureSamplingBounds curSamplingBounds;
+    bool curBinaryAlphaTexture = false;
+    std::vector<TextureFrameEdgeExtendCandidate> edgeExtendCandidates;
+    TextureFrameEdgeExtendCandidateMap edgeExtendCandidateMap;
+    if (TextureScaling.EdgeExtendUnusedMargins && TextureScaleFactor > 1)
+    {
+        auto edgeExtendPhaseStart = std::chrono::steady_clock::now();
+        edgeExtendCandidates.reserve(npolys);
+        edgeExtendCandidateMap.reserve(npolys);
+        for (int i = 0; i < npolys; i++)
+            AccumulateTextureFrameEdgeExtendCandidate(polygons[i].PolyData, TexEnable,
+                                                      edgeExtendCandidates, edgeExtendCandidateMap);
+        AddRenderFrameTiming(RenderFrameTiming.EdgeExtendAccumulate, ElapsedUS(edgeExtendPhaseStart));
+    }
 
     for (int i = 0; i < npolys; i++)
     {
@@ -507,6 +891,22 @@ void GLRenderer3D::BuildPolygons(GLRenderer3D::RendererPolygon* polygons, int np
         u32 polyattr = poly->Attr;
         u32 texparam = poly->TexParam & ~0xC00F0000;
         u32 texpal = poly->TexPalette;
+        TextureSamplingBounds samplingBounds;
+        const u32 textypeForBounds = (texparam >> 26) & 0x7;
+        if (TexEnable && textypeForBounds)
+        {
+            const u32 texWidth = TextureWidth(texparam);
+            const u32 texHeight = TextureHeight(texparam);
+            if (TextureFilter.MipmapSubrectHandling && TextureFilter.Anisotropy > 1 && TextureFilter.MipmapAlphaHandling)
+                BuildSafeTextureSamplingBounds(poly, texWidth, texHeight, samplingBounds);
+            if (!samplingBounds.Valid && TextureScaling.EdgeExtendUnusedMargins && TextureScaleFactor > 1)
+            {
+                auto edgeExtendPhaseStart = std::chrono::steady_clock::now();
+                FindTextureFrameEdgeExtendBounds(edgeExtendCandidates, edgeExtendCandidateMap,
+                                                 texparam, texpal, samplingBounds);
+                AddRenderFrameTiming(RenderFrameTiming.EdgeExtendBoundsLookup, ElapsedUS(edgeExtendPhaseStart));
+            }
+        }
 
         u32 alpha = (polyattr >> 16) & 0x1F;
 
@@ -514,7 +914,7 @@ void GLRenderer3D::BuildPolygons(GLRenderer3D::RendererPolygon* polygons, int np
         if (poly->FacingView) vtxattr |= (1<<8);
         if (poly->WBuffer)    vtxattr |= (1<<9);
 
-        if ((texparam != curtexparam) || (texpal != curtexpal))
+        if ((texparam != curtexparam) || (texpal != curtexpal) || (samplingBounds != curSamplingBounds))
         {
             u32 textype = (texparam >> 26) & 0x7;
             if (TexEnable && (textype != 0))
@@ -556,12 +956,34 @@ void GLRenderer3D::BuildPolygons(GLRenderer3D::RendererPolygon* polygons, int np
                         curtexid = -2;
                         curtexlayer = (capblock >> 2) | (((texaddr >> 6) & 0xFF) << 20);
                     }
+                    curtexwidth = texwidth;
+                    curtexheight = texheight;
+                    curBinaryAlphaTexture = false;
                 }
                 else
                 {
                     u32* halp;
-                    Texcache.GetTexture(texparam, texpal, curtexid, curtexlayer, halp);
+                    const bool edgeExtendTextureLookup =
+                        samplingBounds.Valid && samplingBounds.EdgeExtendMargins;
+                    auto edgeExtendPhaseStart = std::chrono::steady_clock::now();
+                    Texcache.GetTexture(texparam, texpal, curtexid, curtexlayer, halp, &curBinaryAlphaTexture,
+                                        samplingBounds.Valid ? &samplingBounds : nullptr);
+                    if (edgeExtendTextureLookup)
+                    {
+                        AddRenderFrameTiming(RenderFrameTiming.EdgeExtendTextureLookup,
+                                             ElapsedUS(edgeExtendPhaseStart));
+                    }
                     curtexlayer |= 0xFFFF0000;
+                    if (TextureBoundsRemapCoordinates(samplingBounds))
+                    {
+                        curtexwidth = samplingBounds.X1 - samplingBounds.X0;
+                        curtexheight = samplingBounds.Y1 - samplingBounds.Y0;
+                    }
+                    else
+                    {
+                        curtexwidth = texwidth;
+                        curtexheight = texheight;
+                    }
                 }
             }
             else
@@ -569,14 +991,21 @@ void GLRenderer3D::BuildPolygons(GLRenderer3D::RendererPolygon* polygons, int np
                 // no texture
                 curtexid = 0;
                 curtexlayer = (u32)-1;
+                curtexwidth = TextureWidth(texparam);
+                curtexheight = TextureHeight(texparam);
+                curBinaryAlphaTexture = false;
             }
 
             curtexparam = texparam;
             curtexpal = texpal;
+            curSamplingBounds = samplingBounds;
         }
 
         rp->TexID = curtexid;
         rp->TexRepeat = (poly->TexParam >> 16) & 0xF;
+        rp->BinaryAlphaTexture = curBinaryAlphaTexture;
+        const TextureSamplingBounds vertexSamplingBounds =
+            TextureBoundsRemapCoordinates(samplingBounds) ? samplingBounds : TextureSamplingBounds{};
 
         // assemble vertices
         if (poly->Type == 1) // line
@@ -598,7 +1027,8 @@ void GLRenderer3D::BuildPolygons(GLRenderer3D::RendererPolygon* polygons, int np
                 lastx = vtx->FinalPosition[0];
                 lasty = vtx->FinalPosition[1];
 
-                vptr = SetupVertex(poly, j, vtx, vtxattr, curtexlayer, vptr);
+                vptr = SetupVertex(poly, j, vtx, vtxattr, curtexlayer, curtexwidth, curtexheight,
+                                   vertexSamplingBounds, vptr);
 
                 IndexBuffer[iidx++] = vidx;
                 rp->NumIndices++;
@@ -616,7 +1046,8 @@ void GLRenderer3D::BuildPolygons(GLRenderer3D::RendererPolygon* polygons, int np
             {
                 Vertex* vtx = poly->Vertices[j];
 
-                vptr = SetupVertex(poly, j, vtx, vtxattr, curtexlayer, vptr);
+                vptr = SetupVertex(poly, j, vtx, vtxattr, curtexlayer, curtexwidth, curtexheight,
+                                   vertexSamplingBounds, vptr);
                 vidx++;
             }
 
@@ -638,7 +1069,8 @@ void GLRenderer3D::BuildPolygons(GLRenderer3D::RendererPolygon* polygons, int np
                 {
                     Vertex* vtx = poly->Vertices[j];
 
-                    vptr = SetupVertex(poly, j, vtx, vtxattr, curtexlayer, vptr);
+                    vptr = SetupVertex(poly, j, vtx, vtxattr, curtexlayer, curtexwidth, curtexheight,
+                                       vertexSamplingBounds, vptr);
 
                     if (j >= 2)
                     {
@@ -719,11 +1151,11 @@ void GLRenderer3D::BuildPolygons(GLRenderer3D::RendererPolygon* polygons, int np
                           ((u32)cB << 16) |
                           (alpha << 24);
 
-                *vptr++ = (u16)cS | ((u16)cT << 16);
+                *vptr++ = PackTextureCoords(static_cast<s32>(cS), static_cast<s32>(cT), vertexSamplingBounds);
 
                 *vptr++ = vtxattr | (zshift << 16);
                 *vptr++ = curtexlayer;
-                *vptr++ = TextureWidth(texparam) | (TextureHeight(texparam) << 16);
+                *vptr++ = curtexwidth | (curtexheight << 16);
 
                 vidx++;
 
@@ -732,7 +1164,8 @@ void GLRenderer3D::BuildPolygons(GLRenderer3D::RendererPolygon* polygons, int np
                 {
                     Vertex* vtx = poly->Vertices[j];
 
-                    vptr = SetupVertex(poly, j, vtx, vtxattr, curtexlayer, vptr);
+                    vptr = SetupVertex(poly, j, vtx, vtxattr, curtexlayer, curtexwidth, curtexheight,
+                                       vertexSamplingBounds, vptr);
 
                     if (j >= 1)
                     {
@@ -805,6 +1238,10 @@ void GLRenderer3D::SetupPolygonTexture(const RendererPolygon* poly) const
 
     glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_WRAP_S, repeatS);
     glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_WRAP_T, repeatT);
+
+    if (TextureFilter.Anisotropy > 1 && BinaryAlphaTextureULoc[CurShaderID] >= 0)
+        glUniform1i(BinaryAlphaTextureULoc[CurShaderID],
+                    (TextureFilter.BinaryAlphaHandling && poly->BinaryAlphaTexture) ? 1 : 0);
 }
 
 int GLRenderer3D::RenderSinglePolygon(int i) const
@@ -834,6 +1271,7 @@ int GLRenderer3D::RenderPolygonBatch(int i) const
         if (cur_rp->RenderKey != renderkey) break;
         if (cur_rp->TexID != texid) break;
         if (cur_rp->TexRepeat != texrepeat) break;
+        if (cur_rp->BinaryAlphaTexture != rp->BinaryAlphaTexture) break;
 
         numpolys++;
         numindices += cur_rp->NumIndices;
@@ -859,6 +1297,7 @@ int GLRenderer3D::RenderPolygonEdgeBatch(int i) const
         if (cur_rp->RenderKey != renderkey) break;
         if (cur_rp->TexID != texid) break;
         if (cur_rp->TexRepeat != texrepeat) break;
+        if (cur_rp->BinaryAlphaTexture != rp->BinaryAlphaTexture) break;
 
         numpolys++;
         numindices += cur_rp->NumEdgeIndices;
@@ -867,6 +1306,30 @@ int GLRenderer3D::RenderPolygonEdgeBatch(int i) const
     SetupPolygonTexture(rp);
     glDrawElements(GL_LINES, numindices, GL_UNSIGNED_SHORT, (void*)(uintptr_t)(rp->EdgeIndicesOffset * 2));
     return numpolys;
+}
+
+void GLRenderer3D::ResolveMSAAFramebuffer()
+{
+    if (!MSAAActive)
+        return;
+
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, MainMSAAFramebuffer);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, MainFramebuffer);
+
+    glReadBuffer(GL_COLOR_ATTACHMENT0);
+    glDrawBuffer(GL_COLOR_ATTACHMENT0);
+    glBlitFramebuffer(0, 0, ScreenW, ScreenH, 0, 0, ScreenW, ScreenH, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+
+    glReadBuffer(GL_COLOR_ATTACHMENT1);
+    glDrawBuffer(GL_COLOR_ATTACHMENT1);
+    glBlitFramebuffer(0, 0, ScreenW, ScreenH, 0, 0, ScreenW, ScreenH, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+
+    glBlitFramebuffer(0, 0, ScreenW, ScreenH, 0, 0, ScreenW, ScreenH,
+                      GL_DEPTH_BUFFER_BIT | GL_STENCIL_BUFFER_BIT, GL_NEAREST);
+
+    GLenum fbassign[2] = {GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1};
+    glBindFramebuffer(GL_FRAMEBUFFER, MainFramebuffer);
+    glDrawBuffers(2, fbassign);
 }
 
 void GLRenderer3D::RenderSceneChunk(int y, int h)
@@ -1210,6 +1673,8 @@ void GLRenderer3D::RenderSceneChunk(int y, int h)
         }
     }
 
+    ResolveMSAAFramebuffer();
+
     if (GPU3D.RenderDispCnt & 0x00A0) // fog/edge enabled
     {
         glColorMaski(0, GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
@@ -1271,19 +1736,110 @@ void GLRenderer3D::RenderSceneChunk(int y, int h)
 }
 
 
+void GLRenderer3D::ResetRenderFrameTiming()
+{
+    RenderFrameTiming = {};
+}
+
+void GLRenderer3D::AddRenderFrameTiming(RenderFramePhaseTiming& phase, u64 elapsedUS)
+{
+    phase.TotalUS += elapsedUS;
+    if (elapsedUS > phase.MaxUS)
+        phase.MaxUS = elapsedUS;
+    phase.Count++;
+}
+
+void GLRenderer3D::AppendRenderFrameTimingCSVHeader(std::string& header, const char* prefix) const
+{
+    auto addPhase = [&header, prefix](const char* name)
+    {
+        if (!header.empty())
+            header += ",";
+        header += prefix;
+        header += "_";
+        header += name;
+        header += "_us";
+        header += ",";
+        header += prefix;
+        header += "_";
+        header += name;
+        header += "_max_us";
+        header += ",";
+        header += prefix;
+        header += "_";
+        header += name;
+        header += "_count";
+    };
+
+    addPhase("texcache_update");
+    addPhase("capture_info");
+    addPhase("clear_bitmap_upload");
+    addPhase("shader_config");
+    addPhase("clear_plane");
+    addPhase("polygon_build");
+    addPhase("edge_extend_accumulate");
+    addPhase("edge_extend_bounds_lookup");
+    addPhase("edge_extend_texture_lookup");
+    header += ",";
+    header += prefix;
+    header += "_edge_extend_new_variants";
+    header += ",";
+    header += prefix;
+    header += "_edge_extend_throttled_variants";
+    addPhase("buffer_upload");
+    addPhase("scene_render");
+    addPhase("msaa_resolve_only");
+}
+
+void GLRenderer3D::AppendRenderFrameTimingCSVRow(std::string& row) const
+{
+    auto addPhase = [&row](const RenderFramePhaseTiming& phase)
+    {
+        if (!row.empty())
+            row += ",";
+        row += std::to_string(phase.TotalUS);
+        row += ",";
+        row += std::to_string(phase.MaxUS);
+        row += ",";
+        row += std::to_string(phase.Count);
+    };
+
+    addPhase(RenderFrameTiming.TextureCacheUpdate);
+    addPhase(RenderFrameTiming.CaptureInfo);
+    addPhase(RenderFrameTiming.ClearBitmapUpload);
+    addPhase(RenderFrameTiming.ShaderConfig);
+    addPhase(RenderFrameTiming.ClearPlane);
+    addPhase(RenderFrameTiming.PolygonBuild);
+    addPhase(RenderFrameTiming.EdgeExtendAccumulate);
+    addPhase(RenderFrameTiming.EdgeExtendBoundsLookup);
+    addPhase(RenderFrameTiming.EdgeExtendTextureLookup);
+    row += ",";
+    row += std::to_string(Texcache.GetEdgeExtendNewVariantsThisFrame());
+    row += ",";
+    row += std::to_string(Texcache.GetEdgeExtendThrottledVariantsThisFrame());
+    addPhase(RenderFrameTiming.BufferUpload);
+    addPhase(RenderFrameTiming.SceneRender);
+    addPhase(RenderFrameTiming.MSAAResolveOnly);
+}
+
 void GLRenderer3D::RenderFrame()
 {
     u8 clrBitmapDirty;
-    if (!Texcache.Update(clrBitmapDirty) && GPU3D.RenderFrameIdentical)
-    {
+    auto phaseStart = std::chrono::steady_clock::now();
+    bool textureCacheChanged = Texcache.Update(clrBitmapDirty);
+    AddRenderFrameTiming(RenderFrameTiming.TextureCacheUpdate, ElapsedUS(phaseStart));
+
+    if (!textureCacheChanged && GPU3D.RenderFrameIdentical)
         return;
-    }
 
     // figure out which chunks of texture memory contain display captures
     int captureinfo[16];
+    phaseStart = std::chrono::steady_clock::now();
     GPU.GetCaptureInfo_Texture(captureinfo);
+    AddRenderFrameTiming(RenderFrameTiming.CaptureInfo, ElapsedUS(phaseStart));
 
     // if we're using a clear bitmap, set that up
+    phaseStart = std::chrono::steady_clock::now();
     ClearBitmapDirty |= clrBitmapDirty;
     if (GPU3D.RenderDispCnt & (1<<14))
     {
@@ -1323,13 +1879,15 @@ void GLRenderer3D::RenderFrame()
 
         ClearBitmapDirty = 0;
     }
+    AddRenderFrameTiming(RenderFrameTiming.ClearBitmapUpload, ElapsedUS(phaseStart));
 
+    phaseStart = std::chrono::steady_clock::now();
     TexEnable = !!(GPU3D.RenderDispCnt & (1<<0));
 
     CurShaderID = -1;
 
     glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
-    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, MainFramebuffer);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, MSAAActive ? MainMSAAFramebuffer : MainFramebuffer);
 
     ShaderConfig.uScreenSize[0] = ScreenW;
     ShaderConfig.uScreenSize[1] = ScreenH;
@@ -1391,7 +1949,9 @@ void GLRenderer3D::RenderFrame()
     glEnable(GL_STENCIL_TEST);
 
     glViewport(0, 0, ScreenW, ScreenH);
+    AddRenderFrameTiming(RenderFrameTiming.ShaderConfig, ElapsedUS(phaseStart));
 
+    phaseStart = std::chrono::steady_clock::now();
     glDisable(GL_BLEND);
     glColorMaski(0, GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
     glColorMaski(1, GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
@@ -1452,9 +2012,11 @@ void GLRenderer3D::RenderFrame()
     glBindBuffer(GL_ARRAY_BUFFER, ClearVertexBufferID);
     glBindVertexArray(ClearVertexArrayID);
     glDrawArrays(GL_TRIANGLES, 0, 2*3);
+    AddRenderFrameTiming(RenderFrameTiming.ClearPlane, ElapsedUS(phaseStart));
 
     if (GPU3D.RenderNumPolygons)
     {
+        phaseStart = std::chrono::steady_clock::now();
         int npolys = 0;
         int firsttrans = -1;
         for (u32 i = 0; i < GPU3D.RenderNumPolygons; i++)
@@ -1471,6 +2033,9 @@ void GLRenderer3D::RenderFrame()
         NumOpaqueFinalPolys = firsttrans;
 
         BuildPolygons(&PolygonList[0], npolys, captureinfo);
+        AddRenderFrameTiming(RenderFrameTiming.PolygonBuild, ElapsedUS(phaseStart));
+
+        phaseStart = std::chrono::steady_clock::now();
         glBindBuffer(GL_ARRAY_BUFFER, VertexBufferID);
         glBufferSubData(GL_ARRAY_BUFFER, 0, NumVertices*7*4, VertexBuffer);
 
@@ -1478,9 +2043,81 @@ void GLRenderer3D::RenderFrame()
         glBindVertexArray(VertexArrayID);
         glBufferSubData(GL_ELEMENT_ARRAY_BUFFER, 0, NumIndices * 2, IndexBuffer);
         glBufferSubData(GL_ELEMENT_ARRAY_BUFFER, EdgeIndicesOffset * 2, NumEdgeIndices * 2, IndexBuffer + EdgeIndicesOffset);
+        AddRenderFrameTiming(RenderFrameTiming.BufferUpload, ElapsedUS(phaseStart));
 
+        phaseStart = std::chrono::steady_clock::now();
         RenderSceneChunk(0, 192);
+        AddRenderFrameTiming(RenderFrameTiming.SceneRender, ElapsedUS(phaseStart));
     }
+    else
+    {
+        phaseStart = std::chrono::steady_clock::now();
+        ResolveMSAAFramebuffer();
+        AddRenderFrameTiming(RenderFrameTiming.MSAAResolveOnly, ElapsedUS(phaseStart));
+    }
+
+    Texcache.FinishDebugFrameTextureCapture();
+}
+
+bool GLRenderer3D::GetTextureScalingDebugStats(TextureScalingDebugStats& stats, std::string* status)
+{
+    Texcache.GetDebugStats(stats, false, ReadableTextureCache);
+    if (status)
+        *status = "OpenGL (Classic) 3D texture cache diagnostics.";
+    return true;
+}
+
+bool GLRenderer3D::ResetTextureScalingDebugStats(std::string* status)
+{
+    Texcache.ResetDebugStats();
+    if (status)
+        *status = "Reset OpenGL (Classic) 3D texture cache diagnostics.";
+    return true;
+}
+
+bool GLRenderer3D::GetTextureScalingDebugLastMiss(TextureScalingDebugLastMiss& miss, std::string* status)
+{
+    Texcache.GetDebugLastMiss(miss);
+    if (status)
+        *status = miss.Valid ?
+            "Last OpenGL (Classic) 3D texture cache miss." :
+            "No OpenGL (Classic) 3D texture cache miss has been captured yet.";
+    return true;
+}
+
+bool GLRenderer3D::SetTextureScalingDebugCaptureEnabled(bool enabled, std::string* status)
+{
+    Texcache.SetDebugLastMissImageCaptureEnabled(enabled);
+    if (status)
+        *status = enabled ?
+            "OpenGL (Classic) 3D texture miss capture armed." :
+            "OpenGL (Classic) 3D texture miss capture disabled.";
+    return true;
+}
+
+bool GLRenderer3D::GetTextureScalingDebugFrameTextures(TextureScalingDebugFrameTextures& frame, std::string* status)
+{
+    Texcache.GetDebugFrameTextures(frame);
+    if (status)
+    {
+        if (frame.Valid)
+            *status = "Captured OpenGL (Classic) frame texture list.";
+        else if (frame.CapturePending || frame.CaptureActive)
+            *status = "OpenGL (Classic) frame texture capture is waiting for the next rendered frame.";
+        else
+            *status = "No OpenGL (Classic) frame texture capture has been captured yet.";
+    }
+    return true;
+}
+
+bool GLRenderer3D::SetTextureScalingDebugFrameCaptureEnabled(bool enabled, std::string* status)
+{
+    Texcache.SetDebugFrameTextureCaptureEnabled(enabled);
+    if (status)
+        *status = enabled ?
+            "OpenGL (Classic) frame texture capture armed." :
+            "OpenGL (Classic) frame texture capture disabled.";
+    return true;
 }
 
 u32* GLRenderer3D::GetLine(int line)

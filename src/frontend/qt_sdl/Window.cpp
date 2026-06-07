@@ -29,6 +29,7 @@
 
 #include <QProcess>
 #include <QApplication>
+#include <QDateTime>
 #include <QMessageBox>
 #include <QMenuBar>
 #include <QMimeDatabase>
@@ -48,6 +49,8 @@
 #include "EmuSettingsDialog.h"
 #include "InputConfig/InputConfigDialog.h"
 #include "VideoSettingsDialog.h"
+#include "WholeScene2DDebugDialog.h"
+#include "TextureScalingDebugDialog.h"
 #include "CameraSettingsDialog.h"
 #include "AudioSettingsDialog.h"
 #include "FirmwareSettingsDialog.h"
@@ -221,7 +224,7 @@ MainWindow::MainWindow(int id, EmuInstance* inst, QWidget* parent) :
 
     showOSD = windowCfg.GetBool("ShowOSD");
 
-    setWindowTitle("melonDS " MELONDS_VERSION);
+    setWindowTitle("melonDS 1.1 X432R+");
     setAttribute(Qt::WA_DeleteOnClose);
     setAcceptDrops(true);
     setFocusPolicy(Qt::ClickFocus);
@@ -571,9 +574,36 @@ MainWindow::MainWindow(int id, EmuInstance* inst, QWidget* parent) :
             actScreenFiltering->setCheckable(true);
             connect(actScreenFiltering, &QAction::triggered, this, &MainWindow::onChangeScreenFiltering);
 
+            {
+                QMenu* submenu = menu->addMenu("Screen sharpening");
+                grpScreenSharpening = new QActionGroup(submenu);
+                const char* labels[] = {"Off", "Light", "Medium", "Strong", "Very Strong"};
+                for (int i = 0; i < 5; i++)
+                {
+                    actScreenSharpening[i] = submenu->addAction(labels[i]);
+                    actScreenSharpening[i]->setActionGroup(grpScreenSharpening);
+                    actScreenSharpening[i]->setData(QVariant(i));
+                    actScreenSharpening[i]->setCheckable(true);
+                }
+                connect(grpScreenSharpening, &QActionGroup::triggered,
+                        this, &MainWindow::onChangeScreenSharpening);
+            }
+
             actShowOSD = menu->addAction("Show OSD");
             actShowOSD->setCheckable(true);
             connect(actShowOSD, &QAction::triggered, this, &MainWindow::onChangeShowOSD);
+
+            menu->addSeparator();
+
+            actWholeScene2DDebugView = menu->addAction("Whole-scene 2D debug view");
+            connect(actWholeScene2DDebugView, &QAction::triggered, this, &MainWindow::onOpenWholeScene2DDebugView);
+
+            actTextureScalingDebugView = menu->addAction("3D texture scaling debug");
+            connect(actTextureScalingDebugView, &QAction::triggered, this, &MainWindow::onOpenTextureScalingDebugView);
+
+            actWholeScene2DTimingLog = menu->addAction("Log whole-scene frame times...");
+            actWholeScene2DTimingLog->setCheckable(true);
+            connect(actWholeScene2DTimingLog, &QAction::triggered, this, &MainWindow::onToggleWholeScene2DTimingLog);
         }
         {
             QMenu * menu = menubar->addMenu("Config");
@@ -728,6 +758,11 @@ MainWindow::MainWindow(int id, EmuInstance* inst, QWidget* parent) :
         }
 
         actScreenFiltering->setChecked(windowCfg.GetBool("ScreenFilter"));
+        int screenSharpenStrength = windowCfg.GetInt("ScreenSharpenStrength");
+        if (screenSharpenStrength == 0 && windowCfg.GetBool("ScreenSharpen"))
+            screenSharpenStrength = 2;
+        screenSharpenStrength = std::clamp(screenSharpenStrength, 0, 4);
+        actScreenSharpening[screenSharpenStrength]->setChecked(true);
         actShowOSD->setChecked(showOSD);
 
         actLimitFramerate->setChecked(emuInstance->doLimitFPS);
@@ -855,7 +890,14 @@ void MainWindow::createScreenPanel()
     setCentralWidget(panel);
 
     if (hasMenu)
+    {
         actScreenFiltering->setEnabled(hasOGL);
+        for (int i = 0; i < 5; i++)
+            actScreenSharpening[i]->setEnabled(hasOGL);
+        actWholeScene2DDebugView->setEnabled(hasOGL);
+        actTextureScalingDebugView->setEnabled(hasOGL);
+        actWholeScene2DTimingLog->setEnabled(hasOGL);
+    }
     panel->osdSetEnabled(showOSD);
 
     connect(emuThread, SIGNAL(windowUpdate()), panel, SLOT(repaint()));
@@ -1859,6 +1901,59 @@ void MainWindow::onOpenVideoSettings()
     connect(dlg, &VideoSettingsDialog::updateVideoSettings, this, &MainWindow::onUpdateVideoSettings);
 }
 
+void MainWindow::onOpenWholeScene2DDebugView()
+{
+    WholeScene2DDebugDialog::openDlg(this);
+}
+
+void MainWindow::onOpenTextureScalingDebugView()
+{
+    TextureScalingDebugDialog::openDlg(this);
+}
+
+void MainWindow::onToggleWholeScene2DTimingLog()
+{
+    if (!emuThread)
+    {
+        actWholeScene2DTimingLog->setChecked(false);
+        return;
+    }
+
+    if (emuThread->wholeSceneTimingLogActive())
+    {
+        const QString filename = emuThread->stopWholeSceneTimingLog();
+        actWholeScene2DTimingLog->setChecked(false);
+        if (emuInstance)
+            emuInstance->osdAddMessage(0, "Stopped whole-scene timing log: %s", filename.toUtf8().constData());
+        return;
+    }
+
+    const QString defaultName =
+        QString("whole-scene-frame-times-%1.csv")
+            .arg(QDateTime::currentDateTime().toString("yyyyMMdd-HHmmss"));
+    const QString filename = QFileDialog::getSaveFileName(this,
+                                                          "Log whole-scene frame times",
+                                                          defaultName,
+                                                          "CSV file (*.csv)");
+    if (filename.isEmpty())
+    {
+        actWholeScene2DTimingLog->setChecked(false);
+        return;
+    }
+
+    QString errorstr;
+    if (!emuThread->startWholeSceneTimingLog(filename, errorstr))
+    {
+        actWholeScene2DTimingLog->setChecked(false);
+        QMessageBox::critical(this, "melonDS", QString("Could not start timing log:\n%1").arg(errorstr));
+        return;
+    }
+
+    actWholeScene2DTimingLog->setChecked(true);
+    if (emuInstance)
+        emuInstance->osdAddMessage(0, "Started whole-scene timing log");
+}
+
 void MainWindow::onOpenCameraSettings()
 {
     emuThread->emuPause();
@@ -2103,6 +2198,15 @@ void MainWindow::onChangeScreenFiltering(bool checked)
 
     //emit screenLayoutChange();
     panel->setFilter(checked);
+}
+
+void MainWindow::onChangeScreenSharpening(QAction* act)
+{
+    int strength = std::clamp(act->data().toInt(), 0, 4);
+    windowCfg.SetInt("ScreenSharpenStrength", strength);
+    windowCfg.SetBool("ScreenSharpen", strength != 0);
+
+    panel->setSharpenStrength(strength);
 }
 
 void MainWindow::onChangeShowOSD(bool checked)

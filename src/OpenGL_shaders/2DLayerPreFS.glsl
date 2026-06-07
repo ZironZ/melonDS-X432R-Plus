@@ -24,6 +24,15 @@ uniform int uCurBG;
 smooth in vec2 fTexcoord;
 
 out vec4 oColor;
+out vec4 oMeta;
+
+vec4 EncodeSourceMeta(int sourceType, int sourceID)
+{
+    return vec4(float(sourceType & 0xFF),
+                float(sourceID & 0xFF),
+                float((sourceID >> 8) & 0xFF),
+                float((sourceID >> 16) & 0xFF)) / 255.0;
+}
 
 vec4 GetBGPalEntry(int layer, int pal, int id)
 {
@@ -49,9 +58,10 @@ int VRAMRead16(int addr)
     return lo | (hi << 8);
 }
 
-vec4 GetBGLayerPixel(int layer, ivec2 coord)
+vec4 GetBGLayerPixel(int layer, ivec2 coord, out vec4 meta)
 {
     vec4 ret;
+    meta = EncodeSourceMeta(0, 0);
 
     if (uBGConfig[layer].Type == 0)
     {
@@ -83,6 +93,7 @@ vec4 GetBGLayerPixel(int layer, ivec2 coord)
 
         int mapval = VRAMRead16(mapoffset);
         int tileoffset = (uBGConfig[layer].TileOffset << 1) + ((mapval & 0x3FF) << 6);
+        meta = EncodeSourceMeta(1, 0);
 
         if ((mapval & (1<<10)) != 0)
             tileoffset += (7 - (coord.x & 0x7));
@@ -134,6 +145,7 @@ vec4 GetBGLayerPixel(int layer, ivec2 coord)
 
         int mapval = VRAMRead16(mapoffset);
         int tileoffset = uBGConfig[layer].TileOffset + ((mapval & 0x3FF) << 6);
+        meta = EncodeSourceMeta(2, 0);
 
         if ((mapval & (1<<10)) != 0)
             tileoffset += (7 - (coord.x & 0x7));
@@ -161,6 +173,7 @@ vec4 GetBGLayerPixel(int layer, ivec2 coord)
 
         int mapval = VRAMRead8(mapoffset);
         int tileoffset = uBGConfig[layer].TileOffset + (mapval << 6);
+        meta = EncodeSourceMeta(3, 0);
 
         tileoffset += ((coord.y & 0x7) << 3);
         tileoffset += (coord.x & 0x7);
@@ -180,6 +193,7 @@ vec4 GetBGLayerPixel(int layer, ivec2 coord)
 
         int mapval = VRAMRead16(mapoffset);
         int tileoffset = uBGConfig[layer].TileOffset + ((mapval & 0x3FF) << 6);
+        meta = EncodeSourceMeta(4, 0);
 
         if ((mapval & (1<<10)) != 0)
             tileoffset += (7 - (coord.x & 0x7));
@@ -206,6 +220,7 @@ vec4 GetBGLayerPixel(int layer, ivec2 coord)
             (coord.y * uBGConfig[layer].Size.x);
 
         int col = VRAMRead8(mapoffset);
+        meta = EncodeSourceMeta(5, 0);
 
         ret = GetBGPalEntry(layer, 0, col);
         ret.a = (col == 0) ? 0 : 1;
@@ -219,6 +234,7 @@ vec4 GetBGLayerPixel(int layer, ivec2 coord)
             (coord.y * uBGConfig[layer].Size.x)) << 1);
 
         int col = VRAMRead16(mapoffset);
+        meta = EncodeSourceMeta(6, 0);
 
         ret.r = float((col << 1) & 0x3E) / 63;
         ret.g = float((col >> 4) & 0x3E) / 63;
@@ -231,5 +247,5 @@ vec4 GetBGLayerPixel(int layer, ivec2 coord)
 
 void main()
 {
-    oColor = GetBGLayerPixel(uCurBG, ivec2(fTexcoord));
+    oColor = GetBGLayerPixel(uCurBG, ivec2(fTexcoord), oMeta);
 }

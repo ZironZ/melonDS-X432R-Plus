@@ -169,7 +169,11 @@ private slots:
     void onChangeIntegerScaling(bool checked);
     void onOpenNewWindow();
     void onChangeScreenFiltering(bool checked);
+    void onChangeScreenSharpening(QAction* act);
     void onChangeShowOSD(bool checked);
+    void onOpenWholeScene2DDebugView();
+    void onOpenTextureScalingDebugView();
+    void onToggleWholeScene2DTimingLog();
     void onChangeLimitFramerate(bool checked);
     void onChangeAudioSync(bool checked);
 
@@ -291,7 +295,12 @@ public:
     QAction** actScreenAspectBot;
     QAction* actNewWindow;
     QAction* actScreenFiltering;
+    QActionGroup* grpScreenSharpening;
+    QAction* actScreenSharpening[5];
     QAction* actShowOSD;
+    QAction* actWholeScene2DDebugView;
+    QAction* actTextureScalingDebugView;
+    QAction* actWholeScene2DTimingLog;
     QAction* actLimitFramerate;
     QAction* actAudioSync;
 

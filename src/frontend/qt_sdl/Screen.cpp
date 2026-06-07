@@ -20,6 +20,8 @@
 
 #include <optional>
 #include <cmath>
+#include <atomic>
+#include <chrono>
 
 #include <QPaintEvent>
 #include <QPainter>
@@ -45,6 +47,56 @@
 #include "version.h"
 
 using namespace melonDS;
+
+namespace
+{
+std::atomic<bool> ScreenPresentationTimingEnabled{false};
+std::atomic<u64> ScreenPresentationSwapUS{0};
+std::atomic<u32> ScreenPresentationSwapCount{0};
+
+float screenSharpenAmount(int strength)
+{
+    switch (strength)
+    {
+    case 1: return 0.15f;
+    case 2: return 0.25f;
+    case 3: return 0.35f;
+    case 4: return 0.50f;
+    default: return 0.0f;
+    }
+}
+
+u64 steadyClockDeltaUS(const std::chrono::steady_clock::time_point& start,
+                       const std::chrono::steady_clock::time_point& end)
+{
+    return static_cast<u64>(
+        std::chrono::duration_cast<std::chrono::microseconds>(end - start).count());
+}
+}
+
+namespace melonDS
+{
+void SetScreenPresentationTimingEnabled(bool enabled)
+{
+    ScreenPresentationTimingEnabled.store(enabled, std::memory_order_relaxed);
+}
+
+void ResetScreenPresentationTiming()
+{
+    ScreenPresentationSwapUS.store(0, std::memory_order_relaxed);
+    ScreenPresentationSwapCount.store(0, std::memory_order_relaxed);
+}
+
+u64 GetScreenPresentationSwapUS()
+{
+    return ScreenPresentationSwapUS.load(std::memory_order_relaxed);
+}
+
+u32 GetScreenPresentationSwapCount()
+{
+    return ScreenPresentationSwapCount.load(std::memory_order_relaxed);
+}
+}
 
 #if !defined(_WIN32) && !defined(APPLE)
 #if QT_VERSION >= QT_VERSION_CHECK(6, 5, 0)
@@ -86,6 +138,10 @@ ScreenPanel::ScreenPanel(QWidget* parent) : QWidget(parent)
     
     loadConfig();
     setFilter(mainWindow->getWindowConfig().GetBool("ScreenFilter"));
+    int configuredSharpenStrength = mainWindow->getWindowConfig().GetInt("ScreenSharpenStrength");
+    if (configuredSharpenStrength == 0 && mainWindow->getWindowConfig().GetBool("ScreenSharpen"))
+        configuredSharpenStrength = 2;
+    setSharpenStrength(configuredSharpenStrength);
 
     splashLogo = QPixmap(":/melon-logo");
 
@@ -134,6 +190,13 @@ void ScreenPanel::loadConfig()
 void ScreenPanel::setFilter(bool filter)
 {
     this->filter = filter;
+}
+
+void ScreenPanel::setSharpenStrength(int strength)
+{
+    if (strength < 0) strength = 0;
+    if (strength > 4) strength = 4;
+    this->sharpenStrength = strength;
 }
 
 void ScreenPanel::setMouseHide(bool enable, int delay)
@@ -930,11 +993,13 @@ void ScreenPanelGL::initOpenGL()
                                          {{"oColor", 0}});
 
     glUseProgram(screenShaderProgram);
+    glUniform1i(glGetUniformLocation(screenShaderProgram, "ScreenTex"), 0);
     glUniform1i(glGetUniformLocation(screenShaderProgram, "TopScreenTex"), 0);
     glUniform1i(glGetUniformLocation(screenShaderProgram, "BottomScreenTex"), 1);
 
     screenShaderScreenSizeULoc = glGetUniformLocation(screenShaderProgram, "uScreenSize");
     screenShaderTransformULoc = glGetUniformLocation(screenShaderProgram, "uTransform");
+    screenShaderSharpenAmountULoc = glGetUniformLocation(screenShaderProgram, "uSharpenAmount");
 
     const float vertices[] =
     {
@@ -1158,6 +1223,7 @@ void ScreenPanelGL::drawScreen()
         GLint filter = this->filter ? GL_LINEAR : GL_NEAREST;
         glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MIN_FILTER, filter);
         glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAG_FILTER, filter);
+        glUniform1f(screenShaderSharpenAmountULoc, screenSharpenAmount(this->sharpenStrength));
 
         glBindBuffer(GL_ARRAY_BUFFER, screenVertexBuffer);
         glBindVertexArray(screenVertexArray);
@@ -1260,7 +1326,19 @@ void ScreenPanelGL::drawScreen()
         osdMutex.unlock();
     }
 
-    glContext->SwapBuffers();
+    if (ScreenPresentationTimingEnabled.load(std::memory_order_relaxed))
+    {
+        const auto swapStart = std::chrono::steady_clock::now();
+        glContext->SwapBuffers();
+        const auto swapEnd = std::chrono::steady_clock::now();
+
+        ScreenPresentationSwapUS.fetch_add(steadyClockDeltaUS(swapStart, swapEnd), std::memory_order_relaxed);
+        ScreenPresentationSwapCount.fetch_add(1, std::memory_order_relaxed);
+    }
+    else
+    {
+        glContext->SwapBuffers();
+    }
 }
 
 qreal ScreenPanelGL::devicePixelRatioFromScreen() const

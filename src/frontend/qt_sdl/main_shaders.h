@@ -48,6 +48,7 @@ void main()
 const char* kScreenFS = R"(#version 140
 
 uniform sampler2DArray ScreenTex;
+uniform float uSharpenAmount;
 
 smooth in vec3 fTexcoord;
 
@@ -56,8 +57,21 @@ out vec4 oColor;
 void main()
 {
     vec4 pixel = texture(ScreenTex, fTexcoord);
+    vec3 color = pixel.rgb;
 
-    oColor = vec4(pixel.rgb, 1.0);
+    if (uSharpenAmount > 0.0)
+    {
+        vec2 texel = 1.0 / vec2(textureSize(ScreenTex, 0).xy);
+        vec3 left = texture(ScreenTex, fTexcoord + vec3(-texel.x, 0.0, 0.0)).rgb;
+        vec3 right = texture(ScreenTex, fTexcoord + vec3(texel.x, 0.0, 0.0)).rgb;
+        vec3 up = texture(ScreenTex, fTexcoord + vec3(0.0, -texel.y, 0.0)).rgb;
+        vec3 down = texture(ScreenTex, fTexcoord + vec3(0.0, texel.y, 0.0)).rgb;
+
+        vec3 edge = color * 4.0 - left - right - up - down;
+        color = clamp(color + edge * uSharpenAmount, 0.0, 1.0);
+    }
+
+    oColor = vec4(color, 1.0);
 }
 )";
 
