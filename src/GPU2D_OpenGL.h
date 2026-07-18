@@ -27,6 +27,7 @@
 #include "GPU2D.h"
 #include "RendererDebug.h"
 #include "RendererSettings.h"
+#include "WholeSceneScalePolicy.h"
 
 namespace melonDS
 {
@@ -160,20 +161,36 @@ private:
     GLint OverlayDebugModeULoc;
     GLint OverlayDebugLegacyUnderlayULoc;
     GLint OverlayDebugCoverageAwareULoc;
+    GLuint MasterBrightnessShader;
+    GLint MasterBrightnessModeULoc;
+    GLint MasterBrightnessFactorULoc;
     GLint NativeResolveScaleULoc;
     GLint NativeResolveUseExactFinalFallbackULoc;
     GLint NativeResolveUseForegroundOverlayULoc;
     GLint NativeResolveDebugTintULoc;
     GLint NativeResolveNativeExactOutputULoc;
-    GLuint ArtCNNRGBToYUVAShader;
+    GLuint RGBAToYUVAShader;
     GLuint ArtCNNConvShaders[RendererSettings::GLArtCNNModelCount][7];
     GLuint ArtCNNDepthToSpaceShaders[RendererSettings::GLArtCNNModelCount];
-    GLuint ArtCNNSpline36Shader;
+    GLuint Spline36Shader;
     GLuint ArtCNNYUVAToRGBA2xShader;
-    GLuint NNEDI3Pass1Shader;
-    GLuint NNEDI3Pass2Shader;
+    GLuint AlphaReplaceShader;
+    GLuint NNEDI3VerticalComputeShader {};
+    GLuint NNEDI3HorizontalComputeShader {};
     GLuint XBRZPreprocessShader;
     GLuint XBRZFreescaleShader;
+    GLRenderer2D* CuNNyShaderOwner;
+    GLRenderer2D* ArtCNNShaderOwner;
+    GLRenderer2D* NNEDI3ComputeShaderOwner;
+    GLuint CuNNyInShaders[RendererSettings::GLCuNNyModelCount] {};
+    GLuint CuNNyConvShaders[RendererSettings::GLCuNNyModelCount][RendererSettings::GLCuNNyMaxConvPasses] {};
+    GLuint CuNNyOutShaders[RendererSettings::GLCuNNyModelCount] {};
+    bool CuNNyProgramsReady = false;
+    bool CuNNyProgramsFailed = false;
+    bool ArtCNNComputeProgramsReady = false;
+    bool ArtCNNComputeProgramsFailed = false;
+    bool NNEDI3ComputeProgramsReady = false;
+    bool NNEDI3ComputeProgramsFailed = false;
 
     // base index for a BG layer within the BG texture arrays
     // based on BG type and size
@@ -232,6 +249,10 @@ private:
     GLuint NativeDirect3DCompositorTex;
     GLuint NativeOverlayBlack3DTex;
     GLuint NativeOverlayWhite3DTex;
+    GLuint NativeOverlayBlackCapture128Tex;
+    GLuint NativeOverlayWhiteCapture128Tex;
+    GLuint NativeOverlayBlackCapture256Tex;
+    GLuint NativeOverlayWhiteCapture256Tex;
     GLuint NativeOverlayTrueFinalTex;
     GLuint NativeOverlayReconstructedTex;
     GLuint NativeOverlayErrorTex;
@@ -256,8 +277,18 @@ private:
     GLuint HybridFinalSourceTex;
     static constexpr int kCaptureBackedHandoffRouteSlots = 2;
     GLuint WholeSceneSourceABlitFB;
-    GLuint CaptureBackedHandoff3DFB[kCaptureBackedHandoffRouteSlots];
-    GLuint CaptureBackedHandoff3DTex[kCaptureBackedHandoffRouteSlots];
+
+    struct CaptureBackedRouteGLResources
+    {
+        GLuint Handoff3DFB = 0;
+        GLuint Handoff3DTex = 0;
+        GLuint ProductFB = 0;
+        GLuint ProductTex = 0;
+        GLuint EventProductFB = 0;
+        GLuint EventProductTex = 0;
+    };
+
+    CaptureBackedRouteGLResources CaptureBackedRouteGL[kCaptureBackedHandoffRouteSlots];
 
     GLuint ArtCNNYUVTex;
     GLuint ArtCNNYUVFB;
@@ -269,31 +300,30 @@ private:
     GLuint ArtCNNPackedFB;
     GLuint NNEDI3Vertical4xTex;
     GLuint ArtCNNLuma2xTex;
-    GLuint ArtCNNLuma2xFB;
     GLuint NNEDI3Luma4xTex;
-    GLuint NNEDI3Luma4xCorrectedTex;
-    GLuint NNEDI3YUVA4xTex;
     GLuint ArtCNNYUVA2xTex;
     GLuint ArtCNNRGBA2xTex;
-    GLuint NNEDI3RGBA4xTex;
     GLuint ArtCNNOutputFB;
     GLuint NNEDI3VerticalTex;
-    GLuint NNEDI3VerticalFB;
     GLuint XBRZInfoTex;
     GLuint XBRZInfoFB;
+    GLuint CuNNyWorkTex[2] {};
+    u32 CuNNyWorkTexWidth[2] {};
+    u32 CuNNyWorkTexHeight[2] {};
 
-    enum class WholeSceneScaleEligibility : u8
-    {
-        ScreenUnavailable,
-        EngineANotSupportedYet,
-        MainEngineVRAMDisplay,
-        MainEngineDisplayFIFO,
-        CaptureActive,
-        CaptureBackedBG,
-        CaptureBackedOBJ,
-        UnsupportedDisplayMode,
-        Eligible,
-    };
+    using WholeSceneScaleEligibility = ::melonDS::WholeSceneScaleEligibility;
+    using WholeSceneNative3DSource = ::melonDS::WholeSceneNative3DSource;
+    using WholeSceneRenderPath = ::melonDS::WholeSceneRenderPath;
+    using WholeSceneCurrentPathReason = ::melonDS::WholeSceneCurrentPathReason;
+    using WholeSceneOverlayEndpointFinalMode = ::melonDS::WholeSceneOverlayEndpointFinalMode;
+    using SourceACaptureReplacementMode = ::melonDS::SourceACaptureReplacementMode;
+    using SourceAProductChoiceReason = ::melonDS::SourceAProductChoiceReason;
+    using VisibleOBJCaptureDebug = ::melonDS::VisibleOBJCaptureDebug;
+    using WholeSceneRenderTrace = ::melonDS::WholeSceneRenderTrace;
+    using WholeSceneDebugPoisonState = ::melonDS::WholeSceneDebugPoisonState;
+    using WholeSceneUpdatePhaseTiming = ::melonDS::WholeSceneUpdatePhaseTiming;
+    using WholeSceneUpdateTimingState = ::melonDS::WholeSceneUpdateTimingState;
+    using WholeSceneUpdateDebugTrace = ::melonDS::WholeSceneUpdateDebugTrace;
 
     bool WholeSceneScaleRequested;
     bool WholeSceneScaleSourceBoundaryGuard;
@@ -320,100 +350,37 @@ private:
     std::atomic_bool WholeSceneDebugViewsActive;
     WholeSceneScaleEligibility WholeSceneScaleState;
 
-    enum class WholeSceneNative3DSource
-    {
-        None,
-        NativeRendered,
-        HighResLinearSampled,
-        HighResResolved,
-    };
-
-    enum class WholeSceneRenderPath
-    {
-        None,
-        Current,
-        LegacyNativeUpscale,
-        HighResCompositor,
-        FinalNativeUpscale,
-        OverlayOperatorUpscale,
-        ConservativeHybridUpscale,
-        CaptureBackedHandoff,
-        SourceACaptureReplacement,
-        CaptureEpochOverlay,
-        PhysicalFinalPostprocessInput,
-    };
-
-    enum class WholeSceneOverlayEndpointFinalMode
-    {
-        None,
-        MetadataResolve,
-        ExactCompositor,
-    };
-
-    enum class SourceACaptureReplacementMode
-    {
-        None,
-        FullProduct,
-        CurrentOverlay,
-        FullProductAfterOverlayFailed,
-    };
-
-    enum class SourceAProductChoiceReason
-    {
-        None,
-        UsedFullProductKeyMatch,
-        UsedFullProductNoOverlayVisible,
-        UsedBackgroundUnderlayCurrentOverlay,
-        RejectedFullProductKeyMismatch,
-        RejectedCurrentOverlayKeyMismatch,
-        RejectedMissingBackgroundProduct,
-        RejectedMissingFullProduct,
-        ReusedPreviousRouteProduct,
-        FallbackNormalHybrid,
-        FallbackFinalImage,
-        UsedFullProductRouteBridge,
-    };
-
-    struct WholeSceneRenderTrace
-    {
-        WholeSceneRenderPath Path = WholeSceneRenderPath::None;
-        WholeSceneNative3DSource Native3DSource = WholeSceneNative3DSource::None;
-        WholeSceneOverlayEndpointFinalMode OverlayEndpointFinalMode = WholeSceneOverlayEndpointFinalMode::None;
-        SourceACaptureReplacementMode SourceACaptureMode = SourceACaptureReplacementMode::None;
-        SourceAProductChoiceReason SourceAProductChoice = SourceAProductChoiceReason::None;
-        u64 SourceABackgroundEpochSerial = 0;
-        u32 SourceACapturePresentationHash = 0;
-        u32 SourceACurrentPresentationHash = 0;
-        bool SourceAFullProductKeyMatch = false;
-        int YStart = 0;
-        int YEnd = 0;
-        u64 RenderTimeUS = 0;
-        int OutputTex3D = 0;
-        int NativeStage3D = 0;
-        bool HighRes3D = false;
-        bool Linear3D = false;
-        bool Resolve3D = false;
-        bool NativeExactFinalValid = false;
-        bool PhysicalFinalNativeInputValid = false;
-        bool Native3DResolveValid = false;
-        bool Native3DSemanticsValid = false;
-        bool OverlayTrueFinalValid = false;
-        bool HybridFragmentationFallback = false;
-        bool CurrentFragmentationFallback = false;
-        u32 NativeChunkAccumulationPasses = 0;
-        u32 FullFrameFinalizerPasses = 0;
-        u32 NativeProductValidRows = 0;
-        bool NativeProductsFrameComplete = false;
-        bool NativeProductEpochValid = true;
-        bool NativeProductFinalizerPathSeen = false;
-    };
-
-    struct WholeSceneDebugPoisonState
-    {
-        bool Source3D = false;
-        bool Native3DResolve = false;
-        bool Native3DResolveAlpha = false;
-    };
+    using WholeSceneCaptureAuthority = ::melonDS::WholeSceneCaptureAuthority;
+    using WholeSceneCaptureBackedPlanRole = ::melonDS::WholeSceneCaptureBackedPlanRole;
+    using WholeSceneCaptureRequestKind = ::melonDS::WholeSceneCaptureRequestKind;
+    using WholeSceneCaptureProductKind = ::melonDS::WholeSceneCaptureProductKind;
+    using WholeSceneCaptureEffectOwner = ::melonDS::WholeSceneCaptureEffectOwner;
+    using WholeSceneCaptureEffectAction = ::melonDS::WholeSceneCaptureEffectAction;
+    using WholeSceneCaptureProofKind = ::melonDS::WholeSceneCaptureProofKind;
+    using WholeSceneCaptureRenderAction = ::melonDS::WholeSceneCaptureRenderAction;
+    using WholeSceneCaptureBackedPlanKind = ::melonDS::WholeSceneCaptureBackedPlanKind;
+    using WholeSceneCaptureBackedPlanStage = ::melonDS::WholeSceneCaptureBackedPlanStage;
+    using SourceABackgroundSource = ::melonDS::SourceABackgroundSource;
+    using CaptureBackedRouteProductLookupSource = ::melonDS::CaptureBackedRouteProductLookupSource;
+    using CaptureBackedHandoffPhase = ::melonDS::CaptureBackedHandoffPhase;
+    using CaptureBackedHandoffReuseReason = ::melonDS::CaptureBackedHandoffReuseReason;
+    using CaptureBackedRoutePresentationMode = ::melonDS::CaptureBackedRoutePresentationMode;
+    using CaptureBackedHandoffRouteKey = ::melonDS::CaptureBackedHandoffRouteKey;
+    using CaptureBackedRoutePresentationState = ::melonDS::CaptureBackedRoutePresentationState;
+    using CaptureBackedRouteProductIdentity = ::melonDS::CaptureBackedRouteProductIdentity;
+    using CaptureBackedRouteProductState = ::melonDS::CaptureBackedRouteProductState;
+    using CaptureBackedRouteEventProductState = ::melonDS::CaptureBackedRouteEventProductState;
+    using CaptureBackedRoutePendingEventState = ::melonDS::CaptureBackedRoutePendingEventState;
+    using CaptureBackedRouteProductEventQuery = ::melonDS::CaptureBackedRouteProductEventQuery;
+    using CaptureBackedRouteProductStateQuery = ::melonDS::CaptureBackedRouteProductStateQuery;
+    using SourceACaptureResolutionKind = ::melonDS::SourceACaptureResolutionKind;
+    using SourceACaptureResolutionInputs = ::melonDS::SourceACaptureResolutionInputs;
+    using WholeSceneCaptureRequest = ::melonDS::WholeSceneCaptureRequest;
+    using WholeSceneCaptureProductRef = ::melonDS::WholeSceneCaptureProductRef;
+    using WholeSceneCaptureBackedPlan = ::melonDS::WholeSceneCaptureBackedPlan;
+    using WholeSceneCapturePolicyResult = ::melonDS::WholeSceneCapturePolicyResult;
+    using SourceACaptureResolution = ::melonDS::SourceACaptureResolution;
+    using HandoffCaptureResolution = ::melonDS::HandoffCaptureResolution;
 
     struct SourceACaptureReplacementChoice
     {
@@ -421,13 +388,133 @@ private:
         GLuint FullProductTex = 0;
         GLuint BackgroundTex = 0;
         int CaptureBank = -1;
+        bool MainEngineCapturedBGOnly = false;
         bool SubEngineCapturedSourceAOnly = false;
+        bool SubEngineCapturedOBJOnly = false;
         bool CanUseCurrentOverlay = false;
         GLRenderer2D* MainRenderer = nullptr;
+        GLuint RouteProductTex = 0;
+        int RouteSlot = -1;
         u64 BackgroundEpochSerial = 0;
+        u64 BackgroundSource3DSerial = 0;
+        u32 BackgroundSource3DSceneHash = 0;
+        u64 RouteProductBackgroundEpochSerial = 0;
+        u64 RouteProductSource3DSerial = 0;
+        u32 RouteProductSource3DSceneHash = 0;
+        u64 RouteProductCapturedEventSerial = 0;
+        u32 RouteProductCapturePresentationHash = 0;
+        u32 RouteProductCurrentPresentationHash = 0;
+        u32 RouteProductStableFrames = 0;
+        WholeSceneCaptureProductPresentationClass RouteProductPresentationClass =
+            WholeSceneCaptureProductPresentationClass::None;
+        u16 RouteProductStoredMasterBrightness = 0;
+        bool RouteProductHasStoredEffectState = false;
+        bool RouteProductLookupAttempted = false;
+        bool RouteProductLookupSuccess = false;
+        u32 RouteProductLookupResultSource = 0;
+        int RouteProductLookupSlot = -1;
+        u64 RouteProductLookupEventSerial = 0;
+        u32 RouteProductLookupCaptureBank = 0xFFFFFFFFu;
+        u32 RouteProductLookupCapturePresentationHash = 0;
+        u64 RouteProductLookupSource3DSerial = 0;
+        u32 RouteProductLookupSource3DSceneHash = 0;
+        bool RouteProductLookupEventProductValid = false;
+        u64 RouteProductLookupEventProductCapturedSerial = 0;
+        u32 RouteProductLookupEventProductCaptureBank = 0xFFFFFFFFu;
+        u32 RouteProductLookupEventProductCurrentPresentationHash = 0;
+        u64 RouteProductLookupEventProductSource3DSerial = 0;
+        u32 RouteProductLookupEventProductSource3DSceneHash = 0;
+        bool RouteProductLookupProductValid = false;
+        u64 RouteProductLookupProductCapturedSerial = 0;
+        u32 RouteProductLookupProductCaptureBank = 0xFFFFFFFFu;
+        u32 RouteProductLookupProductCurrentPresentationHash = 0;
+        u64 RouteProductLookupProductSource3DSerial = 0;
+        u32 RouteProductLookupProductSource3DSceneHash = 0;
         u32 CapturePresentationHash = 0;
         u32 CurrentPresentationHash = 0;
         bool FullProductKeyMatch = true;
+        WholeSceneCaptureProductKind RouteProductKind = WholeSceneCaptureProductKind::None;
+        WholeSceneCaptureProofKind RouteProductProof = WholeSceneCaptureProofKind::None;
+        int FullProductCaptureBank = -1;
+        int FullProductTexID = 0;
+        bool FullProductEventValid = false;
+        u64 FullProductEventSerial = 0;
+        u64 FullProductEventSource3DSerial = 0;
+        u32 FullProductEventSource3DSceneHash = 0;
+        u32 FullProductEventSourcePresentationHash = 0;
+        u32 FullProductEventSourceKind = 0;
+        u32 FullProductEventProductMask = 0;
+        u32 FullProductEventRejectReason = 0;
+        int FullProductEventDstBlock = -1;
+        int FullProductEventDstOffset = -1;
+        bool FullProductEventSourceOBJ = false;
+        bool FullProductEventScreenSwap = false;
+        bool FullProductEventMainFinalBottom = false;
+        bool PreferExactFullProduct = false;
+        bool AllowExactFullProductCapturePresentation = false;
+        bool DirectFinalDisplayConsumer = false;
+        bool DirectFinalBottomConsumer = false;
+        bool ActiveDisplayCaptureSourceA2D = false;
+        bool ActiveFullDisplayCaptureSourceA = false;
+        int ActiveDisplayCaptureDstBank = -1;
+        int ActiveDisplayCaptureDstOffset = -1;
+    };
+
+    struct GLCaptureProductResolution
+    {
+        GLuint Tex = 0;
+        bool Accepted = false;
+        WholeSceneCaptureProductKind ProductKind = WholeSceneCaptureProductKind::None;
+        SourceABackgroundSource BackgroundSource = SourceABackgroundSource::None;
+        WholeSceneCaptureRenderAction RenderAction = WholeSceneCaptureRenderAction::None;
+        WholeSceneCaptureProductPresentationClass PresentationClass =
+            WholeSceneCaptureProductPresentationClass::None;
+        bool PresentationCompatible = false;
+        bool RequiresRePresentation = false;
+    };
+
+    struct GLCaptureProductSources
+    {
+        GLuint RouteProductTex = 0;
+        WholeSceneCaptureProductPresentationClass RouteProductPresentationClass =
+            WholeSceneCaptureProductPresentationClass::None;
+        u16 RouteProductStoredMasterBrightness = 0;
+        bool RouteProductHasStoredEffectState = false;
+        GLuint FullProductTex = 0;
+        GLuint BackgroundTex = 0;
+        u16 BackgroundStoredMasterBrightness = 0;
+        bool BackgroundHasStoredEffectState = false;
+        GLuint Direct3DTex = 0;
+    };
+
+    struct GLCaptureProductTraceIdentity
+    {
+        int CaptureBank = -1;
+        u64 BackgroundEpochSerial = 0;
+        u64 Source3DSerial = 0;
+        u32 Source3DSceneHash = 0;
+        u64 CaptureEventSerial = 0;
+        u32 CapturePresentationHash = 0;
+        u32 CurrentPresentationHash = 0;
+    };
+
+    struct HandoffBackgroundChoice
+    {
+        GLuint Tex = 0;
+        u64 BackgroundEpochSerial = 0;
+        u64 Source3DSerial = 0;
+        u32 Source3DSceneHash = 0;
+        u32 PresentationHash = 0;
+        u16 StoredMasterBrightness = 0;
+        bool HasStoredEffectState = false;
+        SourceABackgroundSource Source = SourceABackgroundSource::None;
+        WholeSceneCaptureAuthority Authority = WholeSceneCaptureAuthority::None;
+    };
+
+    struct HandoffBackgroundResolveResult
+    {
+        HandoffBackgroundChoice Background;
+        bool Finished = false;
     };
 
     WholeSceneRenderTrace WholeSceneTrace;
@@ -446,171 +533,66 @@ private:
     bool WholeSceneNativeProductsFrameComplete;
     bool WholeSceneNativeProductRowValid[192];
     bool WholeSceneNativeProductEpochValid;
+    u32 WholeSceneNativeProductEpochInvalidReason;
     bool WholeSceneNativeProductEligibilityInitialized;
     WholeSceneScaleEligibility WholeSceneNativeProductFrameEligibility;
+    WholeSceneScaleEligibility WholeSceneNativeProductLastEligibility;
     bool WholeSceneNativeProductPathInitialized;
     WholeSceneRenderPath WholeSceneNativeProductFramePath;
+    WholeSceneRenderPath WholeSceneNativeProductLastPath;
     bool WholeSceneNativeProductFinalizerPathSeen;
     bool WholeSceneOverlayEndpointsValid;
     GLuint WholeSceneOverlayEndpointSourceTex;
-    bool CaptureBackedHandoff3DValid[kCaptureBackedHandoffRouteSlots];
 
-    enum class CaptureBackedHandoffPhase : u8
+    struct CaptureBackedRouteProductWrite
     {
-        None = 0,
-        Live3D = 1,
-        CapturedBitmap = 2,
-        Other = 3,
-    };
-
-    enum class CaptureBackedHandoffReuseReason : u8
-    {
-        None = 0,
-        UpdatedLive3D = 1,
-        ExactKeyMatch = 2,
-        AllowedLiveToCapturePair = 3,
-        RejectedNoSnapshot = 4,
-        RejectedScreenSwapChanged = 5,
-        RejectedEngineChanged = 6,
-        RejectedPhysicalScreenChanged = 7,
-        RejectedRouteChanged = 8,
-        RejectedPhaseNotEquivalent = 9,
-        RejectedEpochChanged = 10,
-        RejectedYRangeChanged = 11,
-        RejectedUnstableLivePhase = 12,
-        UsedCaptureEventBackground = 13,
-        UsedCaptureEventFullProduct = 14,
-    };
-
-    struct CaptureBackedHandoffRouteKey
-    {
-        u8 Engine = 0;
-        bool ScreenSwap = false;
-        bool EngineFinalTop = false;
-        bool EngineFinalBottom = false;
-        u32 DisplayMode = 0;
-        u32 BGMode = 0;
-        u32 LayerEnable = 0;
-        u32 VisibleBitmapMask = 0;
-        u32 BGUploadRows = 0;
-        u32 FrameSerial = 0;
+        int RouteSlot = -1;
+        GLuint SourceTex = 0;
+        CaptureBackedRouteProductIdentity Identity;
         int YStart = 0;
         int YEnd = 192;
-        CaptureBackedHandoffPhase Phase = CaptureBackedHandoffPhase::None;
+        WholeSceneCaptureProductPresentationClass PresentationClass =
+            WholeSceneCaptureProductPresentationClass::None;
     };
 
-    CaptureBackedHandoffRouteKey CaptureBackedHandoffCurrentKey;
-    CaptureBackedHandoffRouteKey CaptureBackedHandoffLatchedKey[kCaptureBackedHandoffRouteSlots];
-    CaptureBackedHandoffReuseReason CaptureBackedHandoffReuseDecision;
-    u32 CaptureBackedHandoffFrameSerial;
-    bool CaptureBackedHandoffBackgroundUpdated;
-    bool CaptureBackedHandoffRouteHasCapturedPhase[kCaptureBackedHandoffRouteSlots];
-    u8 CaptureBackedHandoffCurrentSlot;
-
-    struct WholeSceneUpdatePhaseTiming
+    struct CaptureBackedRouteProductLookup
     {
-        u64 TotalUS = 0;
-        u64 MaxUS = 0;
-        u32 Count = 0;
+        GLuint Tex = 0;
+        bool Valid = false;
+        CaptureBackedRouteProductLookupSource Source = CaptureBackedRouteProductLookupSource::None;
+        CaptureBackedRouteProductIdentity Identity;
+        u64 CapturedEventSerial = 0;
+        u32 StableFrames = 0;
+        WholeSceneCaptureProductPresentationClass PresentationClass =
+            WholeSceneCaptureProductPresentationClass::None;
+        u16 StoredMasterBrightness = 0;
+        bool HasStoredEffectState = false;
     };
 
-    struct WholeSceneUpdateTimingState
+    struct CaptureBackedRouteState
     {
-        WholeSceneUpdatePhaseTiming StateDiff;
-        WholeSceneUpdatePhaseTiming VRAMFlatten;
-        WholeSceneUpdatePhaseTiming LayerDirty;
-        WholeSceneUpdatePhaseTiming Classify;
-        WholeSceneUpdatePhaseTiming SpriteRender;
-        WholeSceneUpdatePhaseTiming PartialComposite;
-        WholeSceneUpdatePhaseTiming RegisterCache;
-        WholeSceneUpdatePhaseTiming BGUpload;
-        WholeSceneUpdatePhaseTiming BGPaletteUpload;
-        WholeSceneUpdatePhaseTiming LayerPrerender;
-        WholeSceneUpdatePhaseTiming OBJPrerender;
-        WholeSceneUpdatePhaseTiming VBlankSpriteRender;
-        WholeSceneUpdatePhaseTiming VBlankComposite;
-        WholeSceneUpdatePhaseTiming NativePrepass;
-        WholeSceneUpdatePhaseTiming NativeExactFinal;
-        WholeSceneUpdatePhaseTiming OverlayBlackExactFinal;
-        WholeSceneUpdatePhaseTiming OverlayWhiteExactFinal;
-        WholeSceneUpdatePhaseTiming OverlayTrueExactFinal;
-        WholeSceneUpdatePhaseTiming OverlayEndpoint;
-        WholeSceneUpdatePhaseTiming Hybrid2DBaseCandidate;
-        WholeSceneUpdatePhaseTiming HybridLegacyCandidate;
-        WholeSceneUpdatePhaseTiming HybridForegroundCandidate;
-        WholeSceneUpdatePhaseTiming FinalizerUpscale;
-        WholeSceneUpdatePhaseTiming FinalizerComposite;
-    } WholeSceneUpdateTiming;
-
-    static constexpr int kWholeSceneDebugRangeRecordLimit = 16;
-
-    struct WholeSceneUpdateDebugTrace
-    {
-        u32 LayerDirtyEvents = 0;
-        u32 LayerDirtyMask = 0;
-        u32 LayerDirtyOverflow = 0;
-        int LayerDirtyLine[kWholeSceneDebugRangeRecordLimit] = {};
-        u8 LayerDirtyEventMask[kWholeSceneDebugRangeRecordLimit] = {};
-        u32 RegisterLayerDirtyMask = 0;
-        u32 VRAMLayerDirtyMask = 0;
-        u32 PaletteLayerDirtyMask = 0;
-        u32 DeferredLayerDirtyMask = 0;
-        u32 InactiveDeferredLayerDirtyMask = 0;
-        u32 CoveredBitmapMask = 0;
-        u32 ContributingLayerMask = 0;
-
-        u32 StateDirtyEvents = 0;
-        u32 StateDirtyReasonMask = 0;
-        u32 StateDirtyDispCntDiff = 0;
-        u32 StateDirtyLayerEnableDiff = 0;
-        u16 StateDirtyBGCntDiff[4] = {};
-        u32 StateDirtyMiscDiffMask = 0;
-
-        u32 FullFrameUnsafeEvents = 0;
-        u32 FullFrameUnsafeReasonMask = 0;
-        int FullFrameUnsafeFirstLine = -1;
-        int FullFrameUnsafeLastLine = -1;
-        u32 FullFrameUnsafeLayerMask = 0;
-        u32 FullFrameUnsafeDispCntDiff = 0;
-        u32 FullFrameUnsafeLayerEnableDiff = 0;
-        u16 FullFrameUnsafeBGCntDiff[4] = {};
-        u32 FullFrameUnsafeMiscDiffMask = 0;
-
-        u32 BGUploadCalls = 0;
-        u32 BGUploadRangeCount = 0;
-        u32 BGUploadRangeOverflow = 0;
-        u32 BGUploadRows = 0;
-        int BGUploadFirstRow = -1;
-        int BGUploadLastRow = -1;
-        int BGUploadLine[kWholeSceneDebugRangeRecordLimit] = {};
-        int BGUploadStartRow[kWholeSceneDebugRangeRecordLimit] = {};
-        int BGUploadEndRow[kWholeSceneDebugRangeRecordLimit] = {};
-
-        u32 LayerPrerenderCalls = 0;
-        u32 LayerPrerenderMask = 0;
-        u32 LayerPrerenderBitmapMask = 0;
-        u32 LayerPrerenderOverflow = 0;
-        int LayerPrerenderLine[kWholeSceneDebugRangeRecordLimit] = {};
-        u8 LayerPrerenderEventMask[kWholeSceneDebugRangeRecordLimit] = {};
-        u32 VisibleBitmapDirtyMask = 0;
-        u32 VisibleBitmapVRAMDirtyMask = 0;
-        u32 VisibleBitmapDirtyBeforeLineMask = 0;
-        u32 VisibleBitmapDirtyAfterLineMask = 0;
-        u32 VisibleBitmapDirtyCrossesLineMask = 0;
-        u32 VisibleBitmapRowLimitedPrerenderMask = 0;
-        u32 VisibleBitmapCoveredDirtyDeferredMask = 0;
-        int VisibleBitmapDirtyFirstRow = -1;
-        int VisibleBitmapDirtyLastRow = -1;
-        int VisibleBitmapLayerFirstRow[4] = {-1, -1, -1, -1};
-        int VisibleBitmapLayerLastRow[4] = {-1, -1, -1, -1};
-        int VisibleBitmapRowLimitedFirstRow[4] = {-1, -1, -1, -1};
-        int VisibleBitmapRowLimitedLastRow[4] = {-1, -1, -1, -1};
-
-        u32 PartialCompositeRangeCount = 0;
-        u32 PartialCompositeRangeOverflow = 0;
-        int PartialCompositeStart[kWholeSceneDebugRangeRecordLimit] = {};
-        int PartialCompositeEnd[kWholeSceneDebugRangeRecordLimit] = {};
+        bool Handoff3DValid = false;
+        bool HasCapturedPhase = false;
+        CaptureBackedHandoffRouteKey HandoffLatchedKey;
+        CaptureBackedRoutePresentationState Presentation;
+        CaptureBackedRouteProductState Product;
+        CaptureBackedRouteEventProductState EventProduct;
+        CaptureBackedRoutePendingEventState PendingEvent;
     };
+
+    struct CaptureBackedHandoffFrameState
+    {
+        CaptureBackedHandoffRouteKey CurrentKey;
+        CaptureBackedHandoffReuseReason ReuseDecision = CaptureBackedHandoffReuseReason::None;
+        u32 FrameSerial = 0;
+        bool BackgroundUpdated = false;
+        u8 CurrentSlot = 0;
+    };
+
+    CaptureBackedHandoffFrameState CaptureBackedHandoff;
+    CaptureBackedRouteState CaptureBackedRoute[kCaptureBackedHandoffRouteSlots];
+
+    WholeSceneUpdateTimingState WholeSceneUpdateTiming;
 
     WholeSceneUpdateDebugTrace WholeSceneCurrentUpdateDebugTrace;
     WholeSceneUpdateDebugTrace WholeScenePreviousUpdateDebugTrace;
@@ -727,18 +709,71 @@ private:
     void AppendWholeSceneUpdateTimingCSVRow(std::string& row) const;
     bool IsWholeSceneHybridFragmentationGuardActive() const;
     bool IsWholeSceneCurrentFragmentationGuardActive() const;
+    bool IsWholeSceneHybridPresentationGuardActive(int ystart, int yend) const;
+    bool CanBypassWholeSceneHybridPresentationGuardForDirect2D(int ystart, int yend) const;
+    bool ShouldUseWholeSceneHybridOverlayForSuppressedDirect3DAlphaBlend() const;
     bool IsWholeSceneCaptureBackedHandoffGuardActive() const;
     bool IsWholeSceneCaptureBackedHandoffCandidate() const;
     bool ShouldUseWholeSceneCaptureBackedHandoffForRange(int ystart, int yend) const;
     void UpdateWholeSceneCaptureBackedHandoffGuard();
     CaptureBackedHandoffPhase CurrentCaptureBackedHandoffPhase() const;
     CaptureBackedHandoffRouteKey BuildCaptureBackedHandoffRouteKey(int ystart, int yend) const;
+    int BeginCaptureBackedHandoffRoute(int ystart, int yend);
     int CaptureBackedHandoffRouteSlot(const CaptureBackedHandoffRouteKey& key) const;
     bool IsStableCaptureBackedHandoffLiveUpdate(const CaptureBackedHandoffRouteKey& key) const;
     bool CanReuseCaptureBackedHandoffSnapshot(const CaptureBackedHandoffRouteKey& key,
                                               int slot,
                                               CaptureBackedHandoffReuseReason& reason) const;
+    void ClearCaptureBackedRouteProductState(int slot);
+    void ClearCaptureBackedRouteState(int slot);
+    void LatchCaptureBackedHandoffSnapshot(int slot, const CaptureBackedHandoffRouteKey& key);
+    void MarkCaptureBackedRouteCapturedPhase(int slot);
     void InvalidateCaptureBackedHandoffSnapshot(int slot = -1);
+    void UpdateCaptureBackedRoutePresentation(int slot,
+                                              CaptureBackedRoutePresentationMode mode,
+                                              u64 serial,
+                                              u32 captureBank,
+                                              u32 source3DSceneHash,
+                                              u32 sourcePresentationHash,
+                                              u32 currentOverlayPresentationHash = 0);
+    void InvalidateCaptureBackedRouteProduct(int slot = -1);
+    bool StoreCaptureBackedRouteProduct(const CaptureBackedRouteProductWrite& write);
+    bool StoreRawCaptureBackedRouteProduct(int routeSlot,
+                                           GLuint sourceTex,
+                                           u64 backgroundEpochSerial,
+                                           u64 source3DSerial,
+                                           u32 source3DSceneHash,
+                                           u32 captureBank,
+                                           u32 capturePresentationHash,
+                                           u32 currentOverlayPresentationHash,
+                                           int ystart,
+                                           int yend);
+    bool StoreCurrentOverlayCaptureBackedRouteProduct(int routeSlot,
+                                                      GLuint sourceTex,
+                                                      u64 backgroundEpochSerial,
+                                                      u64 source3DSerial,
+                                                      u32 source3DSceneHash,
+                                                      u32 captureBank,
+                                                      u32 capturePresentationHash,
+                                                      u32 currentOverlayPresentationHash,
+                                                      int ystart,
+                                                      int yend);
+    void NoteCaptureBackedRouteProductCaptured(int slot,
+                                               u64 captureEventSerial,
+                                               u32 captureBank,
+                                               u32 capturePresentationHash,
+                                               u64 source3DSerial,
+                                               u32 source3DSceneHash);
+    CaptureBackedRouteProductLookup FindCaptureBackedRouteProductForEvent(
+        const CaptureBackedRouteProductEventQuery& query) const;
+    CaptureBackedRouteProductLookup FindCaptureBackedRouteProductForSource3DScene(
+        const CaptureBackedRouteProductEventQuery& query) const;
+    CaptureBackedRouteProductLookup FindCaptureBackedRouteProductForState(
+        const CaptureBackedRouteProductStateQuery& query) const;
+    bool TryStoreCaptureBackedRouteEventProduct(int slot);
+    VisibleOBJCaptureDebug BuildVisibleOBJCaptureDebug() const;
+    int VisibleSingleDisplayCaptureBank() const;
+    int VisibleSingleDisplayCaptureOBJBank() const;
     int VisibleSingleHighResCaptureBank() const;
     GLuint VisibleHighResCaptureBackgroundTex() const;
     GLuint VisibleHighResCaptureFullTex() const;
@@ -746,7 +781,8 @@ private:
     u32 VisibleSourceAOnlyFullDisplayCaptureBGLayerMask() const;
     u32 VisibleFullDisplayCaptureFromSourceABGLayerMask() const;
     bool HasOnlyFullDisplayCaptureFromSourceABGLayers() const;
-    bool CanUseWholeSceneCaptureOnlyHighResPath() const;
+    bool HasWholeSceneHighResCaptureBackedOBJReplacement(int ystart, int yend) const;
+    bool CanUseWholeSceneCaptureOnlyHighResPath(int ystart, int yend) const;
     bool IsWholeSceneStreamingBitmapFragmentationCandidate() const;
     bool IsBitmapLikeBGLayer(int layer) const;
     bool IsFullScreenBitmapBGLayer(int layer) const;
@@ -768,6 +804,7 @@ private:
                                                          u32 bgvrammask) const;
     void MarkLayerPrerenderDeferred(int layer, int firstRow = -1, int lastRow = -1);
     void ClearLayerPrerenderDeferred(u8 layerMask);
+    void SyncPendingDisplayCapturesForFlatVRAMBGs();
     void RecordWholeSceneVisibleBitmapDirtyRows(int layer, int line, int firstRow, int lastRow);
     void UpdateCachedRegistersAndLayerConfig(u8 layerPreDirty);
     void UploadBGVRAM(NonStupidBitField<1024>& bgDirty, int line);
@@ -782,7 +819,8 @@ private:
     void CountWholeScenePartialComposite(int ystart, int yend);
     void ResetWholeSceneNativeProductTracking();
     void UpdateWholeSceneTraceFrameSplitState();
-    bool WholeSceneRenderPathUsesFullFrameFinalizer(WholeSceneRenderPath path) const;
+    bool IsBenignMainVRAMDisplayNativeProductEligibilityTransition(
+        WholeSceneScaleEligibility eligibility) const;
     void RecordWholeSceneNativeProductEligibility(WholeSceneScaleEligibility eligibility);
     void RecordWholeSceneNativeProductRenderPath(WholeSceneRenderPath path, int ystart, int yend);
     bool CanFinalizeWholeSceneNativeProducts() const;
@@ -799,12 +837,203 @@ private:
                                      GLuint nativeStage3DTex = 0,
                                      bool hybridFragmentationFallback = false,
                                      bool currentFragmentationFallback = false);
+    void RecordOutputPresentationMasterBrightness(WholeSceneCaptureEffectOwner owner,
+                                                  u16 masterBrightness);
+    HybridSourceDecision ChooseHybridSourceDecision() const;
+    void RecordWholeSceneCaptureSemantics(WholeSceneCaptureBackedPlanRole role,
+                                          WholeSceneCaptureRequestKind request,
+                                          WholeSceneCaptureProductKind product,
+                                          WholeSceneCaptureProofKind proof,
+                                          WholeSceneCaptureRenderAction action);
+    static WholeSceneCaptureRequest MakeSourceAConsumerCaptureRequest(
+        const SourceACaptureReplacementChoice& choice,
+        WholeSceneCaptureRequestKind kind,
+        int ystart,
+        int yend,
+        u64 captureEventSerial = 0);
+    static SourceACaptureResolution MakeSourceARouteProductResolution(
+        const SourceACaptureReplacementChoice& choice,
+        int ystart,
+        int yend);
+    static SourceACaptureResolution MakeSourceABackgroundOverlayResolution(
+        const SourceACaptureReplacementChoice& choice,
+        int ystart,
+        int yend);
+    static SourceACaptureResolution MakeSourceARejectedResolution(
+        const SourceACaptureReplacementChoice& choice,
+        int ystart,
+        int yend);
+    static SourceACaptureResolution MakeSourceAFullProductResolution(
+        const SourceACaptureReplacementChoice& choice,
+        int ystart,
+        int yend);
+    static HandoffCaptureResolution MakeHandoffRouteProductResolution(
+        const WholeSceneCaptureRequest& baseRequest,
+        const CaptureBackedRouteProductLookup& routeProduct,
+        u32 captureBank,
+        u64 captureEventSerial,
+        u64 backgroundEpochSerial,
+        u32 capturePresentationHash,
+        u32 currentPresentationHash);
+    static HandoffCaptureResolution MakeHandoffFullProductResolution(
+        const WholeSceneCaptureRequest& baseRequest,
+        u32 captureBank,
+        u64 captureEventSerial,
+        u64 backgroundEpochSerial,
+        u32 capturePresentationHash,
+        u32 currentPresentationHash);
+    static HandoffCaptureResolution MakeHandoffBackgroundOverlayResolution(
+        const WholeSceneCaptureRequest& baseRequest,
+        SourceABackgroundSource backgroundSource,
+        WholeSceneCaptureAuthority authority,
+        u64 backgroundEpochSerial,
+        u32 capturePresentationHash,
+        u32 currentPresentationHash);
+    static HandoffCaptureResolution MakeHandoffHybridResolution(
+        const WholeSceneCaptureRequest& baseRequest,
+        SourceABackgroundSource backgroundSource,
+        WholeSceneCaptureAuthority authority,
+        u64 backgroundEpochSerial,
+        u32 capturePresentationHash,
+        bool hasHighResBackground);
+    void RecordWholeSceneCaptureResolution(const WholeSceneCaptureRequest& request,
+                                           WholeSceneCapturePolicyResult result);
+    void RecordSourceACaptureResolution(const SourceACaptureResolution& resolution);
+    void RecordHandoffCaptureResolution(const HandoffCaptureResolution& resolution);
+    void RecordSourceACaptureChoiceDebug(const SourceACaptureReplacementChoice& choice);
+    void RecordSourceABackgroundTrace(u64 requestBackgroundEpochSerial,
+                                      SourceABackgroundSource effectiveBackgroundSource,
+                                      u64 effectiveBackgroundEpochSerial,
+                                      u32 capturePresentationHash);
+    void RecordSourceACaptureProductTrace(SourceACaptureReplacementMode mode,
+                                          u64 requestBackgroundEpochSerial,
+                                          SourceABackgroundSource effectiveBackgroundSource,
+                                          u64 effectiveBackgroundEpochSerial,
+                                          u32 capturePresentationHash,
+                                          u32 currentPresentationHash,
+                                          SourceAProductChoiceReason productChoice,
+                                          bool fullProductKeyMatch = false);
+    void RecordSourceARouteProductTrace(const CaptureBackedRouteProductIdentity& identity,
+                                        u64 capturedEventSerial,
+                                        u32 stableFrames,
+                                        WholeSceneCaptureProductPresentationClass presentationClass =
+                                            WholeSceneCaptureProductPresentationClass::RawContent);
+    void RecordSourceARouteProductTrace(const CaptureBackedRouteProductState& product);
+    void RecordSourceARouteProductTrace(const SourceACaptureReplacementChoice& choice);
+    static GLCaptureProductSources SourceACaptureProductSources(
+        const SourceACaptureReplacementChoice& choice);
+    static GLCaptureProductSources RouteCaptureProductSources(
+        GLuint routeProductTex,
+        WholeSceneCaptureProductPresentationClass presentationClass,
+        u16 storedMasterBrightness,
+        bool hasStoredEffectState);
+    static GLCaptureProductSources FullCaptureProductSources(GLuint fullProductTex);
+    static GLCaptureProductSources BackgroundCaptureProductSources(
+        GLuint backgroundTex,
+        u16 storedMasterBrightness = 0,
+        bool hasStoredEffectState = false);
+    GLCaptureProductResolution ResolveCaptureProduct(
+        const WholeSceneCapturePolicyResult& result,
+        const WholeSceneCaptureRequest& request,
+        const GLCaptureProductSources& sources);
+    void RecordChosenCaptureProductTrace(const GLCaptureProductResolution& product,
+                                         const GLCaptureProductTraceIdentity& identity);
+    static HandoffBackgroundChoice MakeHandoffSnapshotBackgroundChoice(GLuint texture);
+    static HandoffBackgroundChoice MakeCaptureEventBackgroundChoice(
+        GLuint texture,
+        SourceABackgroundSource source,
+        u64 backgroundEpochSerial = 0,
+        u64 source3DSerial = 0,
+        u32 source3DSceneHash = 0,
+        u32 presentationHash = 0);
+    HandoffBackgroundChoice UseActiveEpochHandoffBackground(
+        int handoffSlot,
+        u64 backgroundEpochSerial,
+        u32 captureBank,
+        u64 source3DSerial,
+        u32 source3DSceneHash,
+        u32 presentationHash);
+    GLCaptureProductResolution RecordSourceARouteProductChoiceTrace(
+        const SourceACaptureReplacementChoice& choice,
+        int ystart,
+        int yend);
+    GLCaptureProductResolution RecordSourceABackgroundOverlayChoiceTrace(
+        const SourceACaptureReplacementChoice& choice,
+        int ystart,
+        int yend);
+    GLCaptureProductResolution RecordSourceAFullProductChoiceTrace(
+        const SourceACaptureReplacementChoice& choice,
+        int ystart,
+        int yend);
+    void RecordSourceARejectedChoiceTrace(const SourceACaptureReplacementChoice& choice,
+                                          int ystart,
+                                          int yend);
+    GLCaptureProductResolution RecordHandoffRouteProductTrace(
+        const WholeSceneCaptureRequest& baseRequest,
+        const CaptureBackedRouteProductLookup& routeProduct,
+        GLuint routeProductTex,
+        u32 captureBank,
+        u64 captureEventSerial,
+        u64 backgroundEpochSerial,
+        u32 capturePresentationHash,
+        u32 currentPresentationHash,
+        int ystart,
+        int yend);
+    GLCaptureProductResolution RecordHandoffFullProductTrace(
+        const WholeSceneCaptureRequest& baseRequest,
+        GLuint fullProductTex,
+        u32 captureBank,
+        u64 captureEventSerial,
+        u64 backgroundEpochSerial,
+        u32 capturePresentationHash,
+        u32 currentPresentationHash,
+        int ystart,
+        int yend);
+    GLCaptureProductResolution RecordHandoffBackgroundOverlayTrace(
+        const WholeSceneCaptureRequest& baseRequest,
+        SourceABackgroundSource backgroundSource,
+        WholeSceneCaptureAuthority authority,
+        GLuint backgroundTex,
+        u64 backgroundEpochSerial,
+        u32 capturePresentationHash,
+        u32 currentPresentationHash,
+        u16 storedMasterBrightness,
+        bool hasStoredEffectState,
+        int ystart,
+        int yend);
+    void RecordHandoffHybridTrace(const WholeSceneCaptureRequest& baseRequest,
+                                  SourceABackgroundSource backgroundSource,
+                                  WholeSceneCaptureAuthority authority,
+                                  GLuint direct3DTex,
+                                  bool highRes3D,
+                                  u64 backgroundEpochSerial,
+                                  u32 capturePresentationHash,
+                                  bool hasHighResBackground,
+                                  int ystart,
+                                  int yend);
+    GLCaptureProductResolution RecordCaptureEpochOverlayTrace(
+        int routeSlot,
+        u32 captureBank,
+        SourceABackgroundSource backgroundSource,
+        GLuint backgroundTex,
+        u64 requestBackgroundEpochSerial,
+        u64 routeProductBackgroundSerial,
+        u32 routeProductPresentationHash,
+        u32 currentPresentationHash,
+        u16 storedMasterBrightness,
+        bool hasStoredEffectState,
+        int ystart,
+        int yend);
     void RenderScreenWholeSceneFinalizeFinalUpscaleFullFrame();
     void RenderScreenWholeSceneFinalizeOverlayOperatorFullFrame(bool conservativeHybrid,
                                                                int ystart = 0,
                                                                int yend = 192);
     WholeSceneScaleEligibility ClassifyWholeSceneScalePath() const;
     bool CanScaleMainEngineVRAMDisplayCaptureSourceA(u32 dispmode) const;
+    bool CanUseWholeSceneMixedSourceACaptureBGPath() const;
+    bool CanUseWholeSceneMixedCaptureBackedOBJOverlayPath() const;
+    bool CanUseSourceABackgroundCurrentOverlayPath() const;
+    bool CanUseSourceAExactFullProductBridgePath(int ystart, int yend) const;
     bool HasOnlyCaptureBackedOBJPresentation() const;
     bool HasFullScreenSourceACaptureBackedOBJ() const;
     bool CanUseWholeSceneScalePath() const;
@@ -820,6 +1049,7 @@ private:
     bool CanUseWholeSceneArtCNNPath() const;
     bool CanUseWholeSceneNNEDI3Path() const;
     bool CanUseWholeSceneXBRZPath() const;
+    bool CanUseWholeSceneCuNNyPath() const;
     int WholeSceneHighResLayerFilterMode() const;
     bool WholeSceneHighResLayerFilterNoWrap() const;
     int WholeSceneHighResSpriteFilterMode() const;
@@ -851,16 +1081,17 @@ private:
                               GLuint direct3DTex = 0,
                               GLuint direct3DCoverageTex = 0,
                               bool forceOBJDisabled = false,
-                              bool preserveCompositorConfig = false);
+                              bool preserveCompositorConfig = false,
+                              GLuint capture128Tex = 0,
+                              GLuint capture256Tex = 0);
     void RenderNativePrepass(int ystart, int yend);
     void RenderScreenPhysicalFinalPostprocessNativeInput(int ystart, int yend);
     void PrepareFinalUpscaleNative3DInput(GLuint& direct3DTex,
                                           GLuint& direct3DCoverageTex,
-                                          bool& highRes3D,
-                                          bool& linear3D);
+                                          bool& highRes3D);
     void RenderNativeLayerDebugView(int debugLayer) const;
     void RenderNativeExactFinal(int ystart, int yend, bool debugTint = false, GLuint direct3DTex = 0, GLuint direct3DCoverageTex = 0);
-    void RenderNativeExactFinalToTexture(GLuint targetTex, int ystart, int yend, bool debugTint = false, GLuint direct3DTex = 0, GLuint direct3DCoverageTex = 0, bool preserveCompositorConfig = false);
+    void RenderNativeExactFinalToTexture(GLuint targetTex, int ystart, int yend, bool debugTint = false, GLuint direct3DTex = 0, GLuint direct3DCoverageTex = 0, bool preserveCompositorConfig = false, GLuint capture128Tex = 0, GLuint capture256Tex = 0, bool forceOBJDisabled = false);
     void RenderNativeResolvedExactFinalToTexture(GLuint targetTex, GLuint direct3DTex);
     void RenderNativeUpscale(int ystart, int yend);
     void RenderNativeFinalUpscale(GLuint sourceTex);
@@ -874,7 +1105,23 @@ private:
     bool RenderCurrentOverlayOverHighResBackgroundToTexture(GLuint targetTex,
                                                             GLuint highResBackgroundTex,
                                                             int ystart,
-                                                            int yend);
+                                                            int yend,
+                                                            bool applyMasterBrightness = false,
+                                                            GLuint* rawCompositeTex = nullptr,
+                                                            bool* outputMasterBrightnessApplied = nullptr);
+    bool ApplyMasterBrightnessToTexture(GLuint targetTex,
+                                        GLuint sourceTex,
+                                        int width,
+                                        int height,
+                                        int ystart,
+                                        int yend,
+                                        u16 masterBrightness);
+    bool RenderCurrentLayersOverHighResCaptureBGToTexture(GLuint targetTex,
+                                                          int ystart,
+                                                          int yend);
+    bool RenderCurrentBGOverlayOverHighResCaptureOBJToTexture(GLuint targetTex,
+                                                              int ystart,
+                                                              int yend);
     void RenderNativeResolveToTexture(GLuint targetTex,
                                       int ystart,
                                       int yend,
@@ -911,23 +1158,99 @@ private:
                                    GLuint nativeFinalTex,
                                    int debugMode);
     void RenderNativeMetaCoverage(int ystart, int yend);
-    void RenderArtCNNPassToTexture(GLuint shader, GLuint targetTex, int width, int height, GLuint source0, GLuint source1);
-    void RenderArtCNNPass(GLuint shader, GLuint outputFB, int width, int height, GLuint source0, GLuint source1);
-    void RenderArtCNN2x(int modelIndex, GLuint sourceTex, GLuint targetTex);
-    void RenderArtCNN2xGuarded(int modelIndex, GLuint sourceTex, GLuint targetTex, bool secondLayer);
-    void RenderArtCNNSpline36(GLuint sourceTex, GLuint targetTex, int width, int height, float sourceShiftX = 0.0f, float sourceShiftY = 0.0f);
-    void RenderNNEDI32x(GLuint sourceTex, GLuint targetTex);
-    void RenderNNEDI32xGuarded(GLuint sourceTex, GLuint targetTex, bool secondLayer);
+    void RenderFullscreenPassToTexture(GLuint shader, GLuint targetTex, int width, int height, GLuint source0, GLuint source1);
+    void RenderFullscreenPass(GLuint shader, GLuint outputFB, int width, int height, GLuint source0, GLuint source1);
+    void RenderArtCNNComputePass(GLuint shader, GLuint targetTex, int pass);
+    bool RenderArtCNN2x(int modelIndex, GLuint sourceTex, GLuint targetTex);
+    bool RenderArtCNN2xGuarded(int modelIndex, GLuint sourceTex, GLuint targetTex, bool secondLayer);
+    void RenderSpline36(GLuint sourceTex, GLuint targetTex, int width, int height, float sourceShiftX = 0.0f, float sourceShiftY = 0.0f);
+    bool RenderNNEDI32x(GLuint sourceTex, GLuint targetTex);
+    bool RenderNNEDI32xGuarded(GLuint sourceTex, GLuint targetTex, bool secondLayer);
     void RenderXBRZ(GLuint sourceTex, GLuint targetTex);
     void RenderXBRZGuarded(GLuint sourceTex, GLuint targetTex, bool secondLayer);
+    bool EnsureCuNNyPrograms();
+    bool EnsureArtCNNComputePrograms();
+    bool EnsureNNEDI3ComputePrograms();
+    bool EnsureCuNNyWorkTexture(int index, int width, int height);
+    void CopyCuNNyProgramsFrom(const GLRenderer2D& other);
+    void CopyArtCNNProgramsFrom(const GLRenderer2D& other);
+    void CopyNNEDI3ComputeProgramsFrom(const GLRenderer2D& other);
+    void RenderNNEDI3ComputePass(GLuint shader, GLuint sourceTex, GLuint targetTex,
+                                 int sourceWidth, int sourceHeight);
+    void RenderCuNNyComputePass(GLuint shader, GLuint sourceTex, GLuint baseTex, GLuint targetTex,
+                                int sourceWidth, int sourceHeight,
+                                int nativeWidth, int nativeHeight);
+    bool RenderCuNNy2x(int modelIndex, GLuint sourceTex, GLuint targetTex);
+    bool RenderCuNNy2xGuarded(int modelIndex, GLuint sourceTex, GLuint targetTex, bool secondLayer);
     void RenderNativeBoundaryGuard(GLuint scaledTex, GLuint nativeTex, GLuint targetTex, bool secondLayer);
     void RenderNativeResolve(int ystart, int yend);
-    void RenderScreenCurrent(int ystart, int yend, bool currentFragmentationFallback = false);
+    void RenderScreenCurrent(int ystart, int yend,
+                             bool currentFragmentationFallback = false,
+                             WholeSceneCurrentPathReason reason = WholeSceneCurrentPathReason::DirectCurrent);
     void RenderScreenWholeSceneLegacy(int ystart, int yend, bool cleanHybridCandidate = false);
     void RenderScreenWholeSceneHighRes(int ystart, int yend);
+    WholeSceneScaleDecision ChooseWholeSceneScaleDecision(int ystart, int yend) const;
+    WholeScenePathDecision ChooseWholeScenePathDecision(int ystart, int yend) const;
+    WholeSceneCaptureBackedPlan ChooseWholeSceneCaptureBackedPlan(int ystart, int yend) const;
+    void RenderScreenWholeSceneCaptureBackedPlan(const WholeSceneCaptureBackedPlan& plan, int ystart, int yend);
+    void RenderScreenWholeSceneCaptureBackedHybridFallback(int ystart, int yend);
     void RenderScreenWholeSceneSourceACaptureReplacement(int ystart, int yend);
+    bool TryRenderHandoffBackgroundOverlayProduct(const WholeSceneCaptureRequest& request,
+                                                  int handoffSlot,
+                                                  const HandoffBackgroundChoice& background,
+                                                  int ystart,
+                                                  int yend);
+    bool TryPrepareStableHandoffLiveBackground(int handoffSlot,
+                                               HandoffBackgroundChoice& background,
+                                               int ystart,
+                                               int yend);
+    HandoffBackgroundResolveResult ResolveCapturedHandoffBackgroundChoice(
+        const WholeSceneCaptureRequest& request,
+        int handoffSlot,
+        int ystart,
+        int yend);
+    void RenderHandoffHybridComposite(const WholeSceneCaptureRequest& request,
+                                      const HandoffBackgroundChoice& background,
+                                      int ystart,
+                                      int yend);
     SourceACaptureReplacementChoice ChooseSourceACaptureReplacement(int ystart, int yend);
-    void BlitWholeSceneSourceAReplacement(GLuint sourceTex, int ystart, int yend);
+    void ResolveSourceARouteProductChoice(SourceACaptureReplacementChoice& choice,
+                                          u64 captureEventSerial,
+                                          u64 source3DSerial,
+                                          u32 source3DSceneHash,
+                                          int ystart,
+                                          int yend) const;
+    void ApplyRouteProductLookupToSourceAChoice(SourceACaptureReplacementChoice& choice,
+                                                const CaptureBackedRouteProductLookup& lookup) const;
+    CaptureBackedRouteProductLookup ResolveHandoffExactRouteProduct(int routeSlot,
+                                                                    u64 captureEventSerial,
+                                                                    u64 eventSource3DSerial,
+                                                                    u32 eventSource3DSceneHash,
+                                                                    u32 captureBank,
+                                                                    u64 backgroundEpochSerial,
+                                                                    u64 backgroundSource3DSerial,
+                                                                    u32 backgroundSource3DSceneHash,
+                                                                    u32 capturePresentationHash,
+                                                                    u32 currentPresentationHash,
+                                                                    int ystart,
+                                                                    int yend) const;
+    void BlitWholeSceneCaptureProduct(GLuint sourceTex,
+                                      int ystart,
+                                      int yend,
+                                      u16 presentationMasterBrightness,
+                                      bool applyPresentationMasterBrightness = false,
+                                      WholeSceneCaptureEffectOwner presentationEffectOwner =
+                                          WholeSceneCaptureEffectOwner::None);
+    void BlitWholeSceneHandoffProduct(const GLCaptureProductResolution& product,
+                                      int ystart,
+                                      int yend);
+    void BlitWholeSceneSourceAProduct(const GLCaptureProductResolution& product,
+                                      int ystart,
+                                      int yend);
+    void BlitWholeSceneSourceAReplacement(GLuint sourceTex,
+                                           int ystart,
+                                           int yend,
+                                           bool applySourceAMasterBrightness = false);
     void RenderScreenWholeSceneCaptureEpochOverlay(int ystart, int yend);
     void RenderScreenWholeSceneFinalUpscale(int ystart, int yend, bool hybridFragmentationFallback = false);
     void RenderScreenWholeSceneOverlayOperator(int ystart, int yend);

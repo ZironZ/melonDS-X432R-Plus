@@ -108,6 +108,18 @@ vec3 Direct3DUnderlayColor(vec4 direct3D)
     return Direct3DCompositorEndpoint(direct3D);
 }
 
+bool PresentationEndpointLooksPassThrough(vec3 overlayBlack, vec3 underWeight)
+{
+    float overlay = max(max(overlayBlack.r, overlayBlack.g), overlayBlack.b);
+    float minUnder = min(min(underWeight.r, underWeight.g), underWeight.b);
+    float channelSpread = max(max(abs(underWeight.r - underWeight.g),
+                                  abs(underWeight.r - underWeight.b)),
+                              abs(underWeight.g - underWeight.b));
+    return overlay <= (4.0 / 255.0) &&
+           minUnder >= 0.95 &&
+           channelSpread <= (4.0 / 255.0);
+}
+
 void main()
 {
     ivec2 size = textureSize(OverlayBlackTex, 0);
@@ -120,6 +132,8 @@ void main()
     vec4 direct3D = FetchDirect3D(coord);
     vec3 directColor = Direct3DUnderlayColor(direct3D);
     vec3 finalColor = clamp(overlayBlack + (underWeight * directColor), 0.0, 1.0);
+    if (uDirect3DPresentationSpace && PresentationEndpointLooksPassThrough(overlayBlack, underWeight))
+        finalColor = directColor;
 
     if (uDebugTintBySource)
     {

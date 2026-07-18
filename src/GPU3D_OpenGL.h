@@ -49,6 +49,7 @@ public:
     void SetReadableTextureCache(bool readableTextureCache) noexcept;
     [[nodiscard]] bool GetBetterPolygons() const noexcept { return BetterPolygons; }
     [[nodiscard]] int GetScaleFactor() const noexcept { return ScaleFactor; }
+    [[nodiscard]] bool WasLastRenderFrameSkipped() const noexcept { return LastRenderFrameSkipped; }
 
     void RenderFrame() override;
     u32* GetLine(int line) override;
@@ -64,6 +65,7 @@ public:
 
 private:
     GLRenderer& Parent;
+    bool LastRenderFrameSkipped = false;
 
     // GL version requirements
     // * texelFetch: 3.0 (GLSL 1.30)     (3.2/1.50 for MS)
@@ -85,6 +87,7 @@ private:
         GLuint TexID;
         u32 TexRepeat;
         bool BinaryAlphaTexture;
+        bool DisableMSAA;
     };
 
     //GLCompositor CurGLCompositor;
@@ -111,6 +114,9 @@ private:
         RenderFramePhaseTiming EdgeExtendAccumulate;
         RenderFramePhaseTiming EdgeExtendBoundsLookup;
         RenderFramePhaseTiming EdgeExtendTextureLookup;
+        RenderFramePhaseTiming EdgeExtendTextureLookupHit;
+        RenderFramePhaseTiming EdgeExtendTextureLookupMiss;
+        RenderFramePhaseTiming MipmapFlush;
         RenderFramePhaseTiming BufferUpload;
         RenderFramePhaseTiming SceneRender;
         RenderFramePhaseTiming MSAAResolveOnly;
@@ -122,7 +128,9 @@ private:
     void UseRenderShader(bool wbuffer);
     void SetupPolygon(RendererPolygon* rp, Polygon* polygon) const;
     u32* SetupVertex(const Polygon* poly, int vid, const Vertex* vtx, u32 vtxattr, u32 texlayer, u32 texwidth, u32 texheight,
-                     const TextureSamplingBounds& texBounds, u32* vptr) const;
+                     bool forceNearestTexture, const TextureSamplingBounds& texBounds,
+                     const TextureSpriteUVInsetBounds& spriteUVInsetBounds,
+                     u32* vptr) const;
     void BuildPolygons(RendererPolygon* polygons, int npolys, int captureinfo[16]);
     void SetupPolygonTexture(const RendererPolygon* poly) const;
     int RenderSinglePolygon(int i) const;
@@ -182,6 +190,7 @@ private:
     // * RGBA: 4x8bit
     // * ST: 2x16bit
     // * polygon data: 3x32bit (polygon/texture attributes)
+    // * sprite UV inset bounds: 4x16bit
     //
     // polygon attributes:
     // * bit4-7, 11, 14-15, 24-29: POLYGON_ATTR
@@ -190,7 +199,7 @@ private:
     // * bit9: W-buffering (?)
 
     GLuint VertexBufferID {};
-    u32 VertexBuffer[10240 * 7] {};
+    u32 VertexBuffer[10240 * 9] {};
     u32 NumVertices {};
 
     GLuint VertexArrayID {};

@@ -15,7 +15,7 @@ use the official melonDS builds.
 
 - Anisotropic filtering.
 - 3D texture scaling using the GPU (Spline36, xBRZ, ArtCNN, ArtCNN DN, 
-  and NNEDI3 luma paths).
+  NNEDI3, and CuNNy).
 - Whole-scene 2D scaling modes for UI, sprites, title screens, text, menus, and
   mixed 2D/3D scenes.
 - `Hybrid Upscale`, the main 2D scaling mode, which tries to combine sharp 3D
@@ -28,7 +28,7 @@ use the official melonDS builds.
 - A screen sharpening filter for blurry output.
 - Debug tools for whole-scene 2D, texture-scaling inspection, timings, 
   and renderer comparison (useless for most people, but fun to look at).
-- FMV fixes. Some bitmap FMVs were broken in the beta build I forked.
+- FMV fixes. Some FMVs were broken in the beta build I forked.
 
 All the work in this fork targets the OpenGL renderers. The software
 renderer wasn't touched (besides the FMV fixes that apply to it too).
@@ -42,9 +42,9 @@ of the features and things will look better.
 
 <p align="center">
   <b>Mario Kart</b><br>
-  No Upscale vs. Hybrid Upscale<br>
+  No Upscale vs. X432R+ Upscale<br>
   Hybrid Upscale + Anisotropic Filtering + Texture Scaling + 3D MSAA, ArtCNN DN<br>
-  <img src="hybrid-comparison.webp" alt="No upscale vs Hybrid upscale comparison">
+  <img src="hybrid-comparison.webp" alt="No upscale vs X432R+ upscale comparison">
 </p>
 
 ## Recommended Setup
@@ -53,10 +53,14 @@ For normal use:
 
 1. Open Config -> Video settings.
 2. Use `OpenGL (Compute shader)`.
-3. Set 3D resolution to the internal resolution you normally want, such as 4x.
+3. Set `Resolution scale` to the value you normally want, such as 4x.
 4. Enable `Whole-scene 2D scaling`.
 5. Set the mode to `Hybrid Upscale`.
 6. Click `Recommended Settings`.
+
+The compute shader renderer needs OpenGL 4.3. The neural scalers (ArtCNN,
+NNEDI3, and CuNNy) are also much heavier than Spline36, so older GPUs may
+struggle with them at higher resolution scales.
 
 `Recommended Settings` does not force every feature on. The button mainly 
 resets the advanced settings to what worked best in my testing.
@@ -89,18 +93,25 @@ in the dialog, then click a setting to see what it does.
   - Use it for: Upscaling textures. In some games where the textures are right
     up in your face this can make them look far better.
   - Tradeoff: Higher risk. It can stutter or produce texture-edge artifacts.
+- `Reduce 2D texture artifacts`
+  - Use it for: Cleaning up thin lines, blocky textures, or stray pixels on UI
+    and sprites after enabling anisotropic filtering or texture scaling.
+  - Tradeoff: Can be a performance hit, and it will not fix every game.
 
 `3D texture scaling` and `Anisotropic filtering` are worth testing in most
 games, but both might cause texture-edge artifacts (weird lines all over the
 place). Anisotropic filtering is less of a performance hit than texture
 scaling. You will likely want to have either `Frequent-change protection` or
 `Deferred scaling` on if you are using texture scaling to prevent framerate drops.
+If cutout edges look blocky with texture scaling on, try
+`Cleaner transparent edges`.
 
-Algorithm-wise, ArtCNN DN usually looks the best in my opinion.<br> 
-ArtCNN is sharper if you like that look. <br> 
-NNEDI3 is an alternative when ArtCNN DN doesn't work with a game's art style. <br> 
-XBRZ will hide texture scaling artifacts the best.<br> 
-Spline36 will be the fastest and least likely to kill your GPU.<br> 
+Algorithm-wise, `ArtCNN DN` usually looks the best in my opinion.<br>
+`NNEDI3` is an alternative when `ArtCNN DN` doesn't work with a game's art style.<br>
+`ArtCNN` is sharper if you like that look.<br>
+`CuNNy` is similar to `ArtCNN`, but a bit less sharp.<br>
+`XBRZ` will hide texture scaling artifacts the best.<br> 
+`Spline36` will be the fastest and least likely to kill your GPU.<br> 
 
 Advanced modes such as `Presentation Overlay Upscale`, `Native Stack Upscale`
 and `High-resolution Compositor` are mostly for comparison and debugging.
@@ -110,8 +121,9 @@ or `Native Stack Upscale` than they do in `Hybrid Upscale`.
 If you get slowdowns when using 2D scaling, try either changing your
 scaling algorithm, or changing the fragmented-frame fallback setting.
 
-By default, `Postprocessing Upscale` mode downsamples high-res 3D. To reduce
-shimmering it can be helpful to enable either 3D texture scaling or
+By default, `Postprocessing Upscale` mode renders 3D at high resolution and
+then downsamples it, unless `Render 3D at native resolution` is checked.
+To reduce shimmering it can be helpful to enable either 3D texture scaling or
 anisotropic filtering. Also, sometimes the game will look better (less blurry)
 in `Postprocessing Upscale` mode when you toggle `Render 3D at native resolution`
 and turn `3D MSAA` on. `OpenGL (Classic)` can also sometimes look better than
@@ -127,17 +139,15 @@ If the output looks too blurry, turn on `Screen sharpening`.
 - Blending, windows, display capture, copied final-screen buffers, brightness
   effects, and OBJ-only presentation tricks are all high-risk cases.
 - Scrolling/Affine scenes are often scaled poorly.
-- Some capture-backed UI cases are handled, but not every capture-backed frame
+- Most capture-backed cases are handled, but not every capture-backed frame
   is safe to enhance.
-- Dragon Quest V-style final VRAM-display capture routes are currently kept
-  conservative because stable native/current output is better than flickery
-  scaled output.
 - Text may look darker after scaling with most algorithms except xBRZ. This is
   mostly unavoidable with how the scaling is done.
 - 3D texture scaling is optional and performance-sensitive. Deferred scaling and
   frequent-change protection help, but you still might get hitches.
 - You will see the edges of textures and get weird-looking UI at times with 
-  anisotropic filtering and texture scaling. This is not easily fixed.
+  anisotropic filtering and texture scaling. This is not easily fixed, but
+  `Reduce 2D texture artifacts` helps in some games.
 - 3D MSAA will sometimes cause sporadic black lines to appear.
 
 ## BIOS, Firmware, And Games
@@ -170,6 +180,15 @@ enhancement features disabled.
 
 ## Credits
 
+Scaler algorithms used by this fork:
+
+- Artoriuz for the ArtCNN models: https://github.com/Artoriuz/ArtCNN
+- funnyplanter for CuNNy: https://github.com/funnyplanter/CuNNy
+- tritical for NNEDI3, and bjin for the mpv NNEDI3 prescaler shaders:
+  https://github.com/bjin/mpv-prescalers
+- Zenju for xBRZ, with Hyllian's xBR shader code and hunterk's RetroArch
+  xbrz-freescale port: https://github.com/libretro/glsl-shaders
+
 Upstream melonDS credits:
 
 - Martin for GBAtek.
@@ -190,3 +209,7 @@ External assets:
 
 - Images used in the input config dialog: see
   [src/frontend/qt_sdl/InputConfig/resources/LICENSE.md](./src/frontend/qt_sdl/InputConfig/resources/LICENSE.md).
+- The CuNNy compute shaders keep funnyplanter's upstream license notices: see
+  [src/OpenGL_shaders](./src/OpenGL_shaders).
+- The NNEDI3 compute shaders are based on the LGPL mpv prescaler shaders,
+  and the original NNEDI3 algorithm and weights are tritical's (GPL).

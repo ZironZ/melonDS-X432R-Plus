@@ -54,6 +54,7 @@ public:
 
     void RenderFrame() override;
     void RestartFrame() override;
+    [[nodiscard]] bool WasLastRenderFrameSkipped() const noexcept { return LastRenderFrameSkipped; }
     u32* GetLine(int line) override;
     bool GetTextureScalingDebugStats(TextureScalingDebugStats& stats, std::string* status = nullptr);
     bool ResetTextureScalingDebugStats(std::string* status = nullptr);
@@ -67,6 +68,7 @@ public:
 
 private:
     GLRenderer& Parent;
+    bool LastRenderFrameSkipped = false;
 
     GLuint ShaderInterpXSpans[2];
     GLuint ShaderBinCombined;
@@ -163,6 +165,10 @@ private:
         u32 Attr;
 
         float TextureLayer;
+        float TextureInsetU0;
+        float TextureInsetV0;
+        float TextureInsetU1;
+        float TextureInsetV1;
     };
 
     int TileSize;
@@ -219,7 +225,7 @@ private:
     };
     GLuint MetaUniformMemory;
 
-    GLuint Samplers[9];
+    GLuint Samplers[18];
 
     GLuint ClearBitmapTex[2];
     u32* ClearBitmap[2];

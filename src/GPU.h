@@ -151,6 +151,9 @@ public:
     }
 
     int GetCaptureBlock_LCDC(u32 offset);
+    bool HasUnsyncedVRAMCaptureBlock(u32 block) const;
+    void SyncVRAMCaptureBlockForRead(u32 block);
+    void NotifyVRAMWrite(u32 bank, u32 offset, u32 bytes, bool changed) noexcept;
 
     void GetCaptureInfo_ABG(int* info);
     void GetCaptureInfo_AOBJ(int* info);
@@ -285,8 +288,12 @@ public:
 
         if (VRAMMap_LCDC & (1<<bank))
         {
-            *(T*)&VRAM[bank][addr] = val;
+            T& dst = *(T*)&VRAM[bank][addr];
+            const bool changed = dst != val;
+            dst = val;
             VRAMDirty[bank][addr / VRAMDirtyGranularity] = true;
+            if (bank < 4)
+                NotifyVRAMWrite(bank, addr, sizeof(T), changed);
         }
     }
 
@@ -318,23 +325,39 @@ public:
 
         if (mask & (1<<0))
         {
-            VRAMDirty[0][(addr & 0x1FFFF) / VRAMDirtyGranularity] = true;
-            *(T*)&VRAM_A[addr & 0x1FFFF] = val;
+            const u32 offset = addr & 0x1FFFF;
+            T& dst = *(T*)&VRAM_A[offset];
+            const bool changed = dst != val;
+            VRAMDirty[0][offset / VRAMDirtyGranularity] = true;
+            dst = val;
+            NotifyVRAMWrite(0, offset, sizeof(T), changed);
         }
         if (mask & (1<<1))
         {
-            VRAMDirty[1][(addr & 0x1FFFF) / VRAMDirtyGranularity] = true;
-            *(T*)&VRAM_B[addr & 0x1FFFF] = val;
+            const u32 offset = addr & 0x1FFFF;
+            T& dst = *(T*)&VRAM_B[offset];
+            const bool changed = dst != val;
+            VRAMDirty[1][offset / VRAMDirtyGranularity] = true;
+            dst = val;
+            NotifyVRAMWrite(1, offset, sizeof(T), changed);
         }
         if (mask & (1<<2))
         {
-            VRAMDirty[2][(addr & 0x1FFFF) / VRAMDirtyGranularity] = true;
-            *(T*)&VRAM_C[addr & 0x1FFFF] = val;
+            const u32 offset = addr & 0x1FFFF;
+            T& dst = *(T*)&VRAM_C[offset];
+            const bool changed = dst != val;
+            VRAMDirty[2][offset / VRAMDirtyGranularity] = true;
+            dst = val;
+            NotifyVRAMWrite(2, offset, sizeof(T), changed);
         }
         if (mask & (1<<3))
         {
-            VRAMDirty[3][(addr & 0x1FFFF) / VRAMDirtyGranularity] = true;
-            *(T*)&VRAM_D[addr & 0x1FFFF] = val;
+            const u32 offset = addr & 0x1FFFF;
+            T& dst = *(T*)&VRAM_D[offset];
+            const bool changed = dst != val;
+            VRAMDirty[3][offset / VRAMDirtyGranularity] = true;
+            dst = val;
+            NotifyVRAMWrite(3, offset, sizeof(T), changed);
         }
         if (mask & (1<<4))
         {
@@ -379,13 +402,21 @@ public:
 
         if (mask & (1<<0))
         {
-            VRAMDirty[0][(addr & 0x1FFFF) / VRAMDirtyGranularity] = true;
-            *(T*)&VRAM_A[addr & 0x1FFFF] = val;
+            const u32 offset = addr & 0x1FFFF;
+            T& dst = *(T*)&VRAM_A[offset];
+            const bool changed = dst != val;
+            VRAMDirty[0][offset / VRAMDirtyGranularity] = true;
+            dst = val;
+            NotifyVRAMWrite(0, offset, sizeof(T), changed);
         }
         if (mask & (1<<1))
         {
-            VRAMDirty[1][(addr & 0x1FFFF) / VRAMDirtyGranularity] = true;
-            *(T*)&VRAM_B[addr & 0x1FFFF] = val;
+            const u32 offset = addr & 0x1FFFF;
+            T& dst = *(T*)&VRAM_B[offset];
+            const bool changed = dst != val;
+            VRAMDirty[1][offset / VRAMDirtyGranularity] = true;
+            dst = val;
+            NotifyVRAMWrite(1, offset, sizeof(T), changed);
         }
         if (mask & (1<<4))
         {
@@ -428,8 +459,12 @@ public:
 
         if (mask & (1<<2))
         {
-            VRAMDirty[2][(addr & 0x1FFFF) / VRAMDirtyGranularity] = true;
-            *(T*)&VRAM_C[addr & 0x1FFFF] = val;
+            const u32 offset = addr & 0x1FFFF;
+            T& dst = *(T*)&VRAM_C[offset];
+            const bool changed = dst != val;
+            VRAMDirty[2][offset / VRAMDirtyGranularity] = true;
+            dst = val;
+            NotifyVRAMWrite(2, offset, sizeof(T), changed);
         }
         if (mask & (1<<7))
         {
@@ -466,8 +501,12 @@ public:
 
         if (mask & (1<<3))
         {
-            VRAMDirty[3][(addr & 0x1FFFF) / VRAMDirtyGranularity] = true;
-            *(T*)&VRAM_D[addr & 0x1FFFF] = val;
+            const u32 offset = addr & 0x1FFFF;
+            T& dst = *(T*)&VRAM_D[offset];
+            const bool changed = dst != val;
+            VRAMDirty[3][offset / VRAMDirtyGranularity] = true;
+            dst = val;
+            NotifyVRAMWrite(3, offset, sizeof(T), changed);
         }
         if (mask & (1<<8))
         {
@@ -493,8 +532,22 @@ public:
     {
         u32 mask = VRAMMap_ARM7[(addr >> 17) & 0x1];
 
-        if (mask & (1<<2)) *(T*)&VRAM_C[addr & 0x1FFFF] = val;
-        if (mask & (1<<3)) *(T*)&VRAM_D[addr & 0x1FFFF] = val;
+        if (mask & (1<<2))
+        {
+            const u32 offset = addr & 0x1FFFF;
+            T& dst = *(T*)&VRAM_C[offset];
+            const bool changed = dst != val;
+            dst = val;
+            NotifyVRAMWrite(2, offset, sizeof(T), changed);
+        }
+        if (mask & (1<<3))
+        {
+            const u32 offset = addr & 0x1FFFF;
+            T& dst = *(T*)&VRAM_D[offset];
+            const bool changed = dst != val;
+            dst = val;
+            NotifyVRAMWrite(3, offset, sizeof(T), changed);
+        }
     }
 
 
@@ -845,7 +898,9 @@ public:
     virtual void VBlankEnd() = 0;
 
     virtual void AllocCapture(u32 bank, u32 start, u32 len) = 0;
-    virtual void SyncVRAMCapture(u32 bank, u32 start, u32 len, bool complete) = 0;
+    virtual void SetVRAMCaptureSyncReason(u32 reason) {}
+    virtual void NotifyVRAMWrite(u32 bank, u32 offset, u32 bytes, bool changed) {}
+    virtual void SyncVRAMCapture(u32 bank, u32 start, u32 len, bool complete, bool invalidate) = 0;
 
     // a renderer may render to RAM buffers, or to something else (ie. OpenGL)
     // if the renderer uses RAM buffers, they should be 32-bit BGRA, 256x192 for each screen
@@ -884,6 +939,35 @@ public:
     {
         header.clear();
         row.clear();
+        return false;
+    }
+    virtual void SetWholeScene2DTimingFrame(u64 frame, bool valid)
+    {
+        (void)frame;
+        (void)valid;
+    }
+    virtual bool SetWholeScene2DRollingDebugCapture(bool enabled,
+                                                    int frameCount,
+                                                    std::string* status = nullptr)
+    {
+        if (status)
+            *status = "Whole-scene 2D rolling debug capture is unavailable for this renderer.";
+        return false;
+    }
+    virtual bool ReadWholeScene2DCurrentFinalDebugFrame(WholeScene2DFinalDebugFrame& frame,
+                                                        std::string* status = nullptr)
+    {
+        frame = {};
+        if (status)
+            *status = "Whole-scene 2D final-frame debug capture is unavailable for this renderer.";
+        return false;
+    }
+    virtual bool ReadWholeScene2DRollingDebugFrames(std::vector<WholeScene2DFinalDebugFrame>& frames,
+                                                    std::string* status = nullptr)
+    {
+        frames.clear();
+        if (status)
+            *status = "Whole-scene 2D rolling debug capture is unavailable for this renderer.";
         return false;
     }
     virtual bool ReadTextureScalingDebugStats(TextureScalingDebugStats& stats,

@@ -63,6 +63,15 @@ struct TextureSamplingBounds
     u16 Y1 = 0;
 };
 
+struct TextureSpriteUVInsetBounds
+{
+    bool Valid = false;
+    u16 U0 = 0;
+    u16 V0 = 0;
+    u16 U1 = 0;
+    u16 V1 = 0;
+};
+
 inline bool operator==(const TextureSamplingBounds& lhs, const TextureSamplingBounds& rhs)
 {
     return lhs.Valid == rhs.Valid &&

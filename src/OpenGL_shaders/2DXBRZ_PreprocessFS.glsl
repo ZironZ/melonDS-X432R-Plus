@@ -1,3 +1,9 @@
+// xBRZ freescale - based on the RetroArch xbrz-freescale shader by hunterk:
+// https://github.com/libretro/glsl-shaders/blob/master/xbrz/shaders/xbrz-freescale.glsl
+// Uses Hyllian's xBR vertex/texel mapping code (MIT, Copyright 2011/2016 Hyllian)
+// and xBRZ code/concepts by Zenju from the DeSmuME source (GPLv3, via HqMAME).
+// Adapted to a two-pass GLSL path for melonDS X432R+.
+
 #version 140
 
 uniform sampler2D Source;

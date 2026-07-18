@@ -62,6 +62,17 @@ public:
         currentDlg = nullptr;
     }
 
+    static bool dumpCurrentFrame(MainWindow* parent,
+                                 const QString& timingCsvPath,
+                                 qulonglong timingFrame,
+                                 QString* exportPath,
+                                 QString* errorText);
+    static bool dumpRollingFrames(MainWindow* parent,
+                                  const QString& timingCsvPath,
+                                  qulonglong timingFrame,
+                                  QString* exportPath,
+                                  QString* errorText);
+
 protected:
     void closeEvent(QCloseEvent* event) override;
     void resizeEvent(QResizeEvent* event) override;

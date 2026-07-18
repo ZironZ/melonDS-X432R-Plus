@@ -17,7 +17,8 @@ inline bool TextureScaleUsesGPUAlgorithm(RendererSettings::GLScaleAlgorithm algo
     return algorithm == RendererSettings::GLScaleAlgorithm::Spline36 ||
         algorithm == RendererSettings::GLScaleAlgorithm::XBRZ ||
         RendererSettings::IsGLArtCNNAlgorithm(algorithm) ||
-        RendererSettings::IsGLNNEDI3Algorithm(algorithm);
+        RendererSettings::IsGLNNEDI3Algorithm(algorithm) ||
+        RendererSettings::IsGLCuNNyAlgorithm(algorithm);
 }
 
 inline void TextureScaleDecodeSourceRGBA8(u32 fmt,

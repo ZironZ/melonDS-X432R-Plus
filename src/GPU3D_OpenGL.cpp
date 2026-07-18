@@ -68,6 +68,79 @@ static bool AddUniqueTexcoord(s16 value, s16 values[4], int& count)
     return true;
 }
 
+static bool AddUniquePositionCoord(s32 value, s32 values[4], int& count)
+{
+    for (int i = 0; i < count; i++)
+    {
+        if (values[i] == value)
+            return true;
+    }
+    if (count >= 2)
+        return false;
+
+    values[count++] = value;
+    return true;
+}
+
+static bool BuildSpriteUVInsetBounds(const Polygon* poly, u32 texWidth, u32 texHeight,
+                                     TextureSpriteUVInsetBounds& bounds)
+{
+    bounds = {};
+    if (poly->Type == 1 || poly->NumVertices != 4)
+        return false;
+    if (((poly->TexParam >> 16) & 0xF) != 0)
+        return false;
+    if (((poly->TexParam >> 30) & 0x3) != 0)
+        return false;
+
+    s32 uniqueX[4] = {};
+    s32 uniqueY[4] = {};
+    int uniqueXCount = 0;
+    int uniqueYCount = 0;
+    s16 uniqueU[4] = {};
+    s16 uniqueV[4] = {};
+    int uniqueUCount = 0;
+    int uniqueVCount = 0;
+    const s32 maxTexU = static_cast<s32>(texWidth << 4);
+    const s32 maxTexV = static_cast<s32>(texHeight << 4);
+    s32 minU = 0x7FFFFFFF, minV = 0x7FFFFFFF;
+    s32 maxU = -0x7FFFFFFF, maxV = -0x7FFFFFFF;
+
+    for (u32 i = 0; i < poly->NumVertices; i++)
+    {
+        const Vertex* vtx = poly->Vertices[i];
+        if (!AddUniquePositionCoord(vtx->FinalPosition[0], uniqueX, uniqueXCount) ||
+            !AddUniquePositionCoord(vtx->FinalPosition[1], uniqueY, uniqueYCount))
+            return false;
+
+        const s32 u = vtx->TexCoords[0];
+        const s32 v = vtx->TexCoords[1];
+        if (u < 0 || v < 0 || u > maxTexU || v > maxTexV)
+            return false;
+        if (!AddUniqueTexcoord(static_cast<s16>(u), uniqueU, uniqueUCount) ||
+            !AddUniqueTexcoord(static_cast<s16>(v), uniqueV, uniqueVCount))
+            return false;
+
+        minU = std::min(minU, u);
+        minV = std::min(minV, v);
+        maxU = std::max(maxU, u);
+        maxV = std::max(maxV, v);
+    }
+
+    if (uniqueXCount != 2 || uniqueYCount != 2 ||
+        uniqueUCount != 2 || uniqueVCount != 2)
+        return false;
+    if (maxU - minU < 32 || maxV - minV < 32)
+        return false;
+
+    bounds.Valid = true;
+    bounds.U0 = static_cast<u16>(minU);
+    bounds.V0 = static_cast<u16>(minV);
+    bounds.U1 = static_cast<u16>(maxU);
+    bounds.V1 = static_cast<u16>(maxV);
+    return true;
+}
+
 static bool BuildSafeTextureSamplingBounds(const Polygon* poly, u32 texWidth, u32 texHeight, TextureSamplingBounds& bounds)
 {
     bounds = {};
@@ -124,6 +197,35 @@ static bool BuildSafeTextureSamplingBounds(const Polygon* poly, u32 texWidth, u3
     bounds.X1 = static_cast<u16>(x1);
     bounds.Y1 = static_cast<u16>(y1);
     return true;
+}
+
+static bool IsLargeTranslucentTextureDraw(const Polygon* poly)
+{
+    if (poly->Type == 1 || poly->NumVertices < 3)
+        return false;
+    if (!poly->Translucent && (((poly->Attr >> 16) & 0x1F) == 31))
+        return false;
+
+    s32 minX = 0x7FFFFFFF, minY = 0x7FFFFFFF;
+    s32 maxX = -0x7FFFFFFF, maxY = -0x7FFFFFFF;
+    for (u32 i = 0; i < poly->NumVertices; i++)
+    {
+        const Vertex* vtx = poly->Vertices[i];
+        const s32 x = static_cast<s32>(vtx->FinalPosition[0]);
+        const s32 y = static_cast<s32>(vtx->FinalPosition[1]);
+        minX = std::min(minX, x);
+        minY = std::min(minY, y);
+        maxX = std::max(maxX, x);
+        maxY = std::max(maxY, y);
+    }
+
+    const s32 width = maxX - minX;
+    const s32 height = maxY - minY;
+    const s64 area = static_cast<s64>(width) * static_cast<s64>(height);
+    return (width >= 80 && height >= 40) ||
+           (width >= 160 && height >= 24) ||
+           (width >= 40 && height >= 80) ||
+           (area >= 4096 && (width >= 64 || height >= 64));
 }
 
 static s32 ClampTextureCoordinate(s32 coord, s32 maxCoord)
@@ -303,6 +405,14 @@ static u32 PackTextureCoords(s32 u, s32 v, const TextureSamplingBounds& bounds)
     return static_cast<u16>(u) | (static_cast<u32>(static_cast<u16>(v)) << 16);
 }
 
+static u32 PackTextureSizeRepeatAndForceNearest(u32 width, u32 height, u32 texRepeat, bool forceNearestTexture)
+{
+    return (width & 0x7FF) |
+           ((texRepeat & 0xF) << 11) |
+           (forceNearestTexture ? 0x8000 : 0) |
+           (height << 16);
+}
+
 bool GLRenderer3D::BuildRenderShader(bool wbuffer)
 {
     std::string shaderdefs;
@@ -337,7 +447,7 @@ bool GLRenderer3D::BuildRenderShader(bool wbuffer)
     bool ret = OpenGL::CompileVertexFragmentProgram(prog,
         vsbuf, fsbuf,
         shadername,
-        {{"vPosition", 0}, {"vColor", 1}, {"vTexcoord", 2}, {"vPolygonAttr", 3}},
+        {{"vPosition", 0}, {"vColor", 1}, {"vTexcoord", 2}, {"vPolygonAttr", 3}, {"vTexcoordInsetBounds", 4}},
         {{"oColor", 0}, {"oAttr", 1}});
 
     if (!ret) return false;
@@ -533,13 +643,15 @@ bool GLRenderer3D::Init()
     glGenVertexArrays(1, &VertexArrayID);
     glBindVertexArray(VertexArrayID);
     glEnableVertexAttribArray(0); // position
-    glVertexAttribIPointer(0, 4, GL_UNSIGNED_SHORT, 7*4, (void*)(0));
+    glVertexAttribIPointer(0, 4, GL_UNSIGNED_SHORT, 9*4, (void*)(0));
     glEnableVertexAttribArray(1); // color
-    glVertexAttribIPointer(1, 4, GL_UNSIGNED_BYTE, 7*4, (void*)(2*4));
+    glVertexAttribIPointer(1, 4, GL_UNSIGNED_BYTE, 9*4, (void*)(2*4));
     glEnableVertexAttribArray(2); // texcoords
-    glVertexAttribIPointer(2, 2, GL_SHORT, 7*4, (void*)(3*4));
+    glVertexAttribIPointer(2, 2, GL_SHORT, 9*4, (void*)(3*4));
     glEnableVertexAttribArray(3); // attrib
-    glVertexAttribIPointer(3, 3, GL_UNSIGNED_INT, 7*4, (void*)(4*4));
+    glVertexAttribIPointer(3, 3, GL_UNSIGNED_INT, 9*4, (void*)(4*4));
+    glEnableVertexAttribArray(4); // sprite UV inset bounds
+    glVertexAttribIPointer(4, 4, GL_UNSIGNED_SHORT, 9*4, (void*)(7*4));
 
     glGenBuffers(1, &IndexBufferID);
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, IndexBufferID);
@@ -613,6 +725,7 @@ void GLRenderer3D::Reset()
 {
     Texcache.Reset();
     ClearBitmapDirty = 0x3;
+    LastRenderFrameSkipped = false;
 }
 
 void GLRenderer3D::SetBetterPolygons(bool betterpolygons) noexcept
@@ -635,6 +748,7 @@ void GLRenderer3D::SetRenderSettings(int scale, bool betterpolygons, bool readab
                                      const RendererSettings::TextureScalingSettings& textureScaling) noexcept
 {
     const int textureScaleFactor = textureScaling.Enabled ? scale : 1;
+    const bool scaleChanged = scale != ScaleFactor;
     bool textureCacheChanged = readableTextureCache != ReadableTextureCache;
     bool textureAnisotropyChanged = textureFilter.Anisotropy != TextureFilter.Anisotropy;
     bool textureScaleChanged = textureScaleFactor != TextureScaleFactor;
@@ -642,7 +756,7 @@ void GLRenderer3D::SetRenderSettings(int scale, bool betterpolygons, bool readab
     bool textureScalingChanged = textureScaling != TextureScaling;
     bool msaaChanged = msaa != MSAA;
 
-    if (betterpolygons == BetterPolygons && !textureScaleChanged && !textureCacheChanged &&
+    if (!scaleChanged && betterpolygons == BetterPolygons && !textureScaleChanged && !textureCacheChanged &&
         !textureFilterChanged && !textureScalingChanged && !msaaChanged)
         return;
 
@@ -788,7 +902,8 @@ void GLRenderer3D::SetupPolygon(GLRenderer3D::RendererPolygon* rp, Polygon* poly
 }
 
 u32* GLRenderer3D::SetupVertex(const Polygon* poly, int vid, const Vertex* vtx, u32 vtxattr, u32 texlayer, u32 texwidth, u32 texheight,
-                               const TextureSamplingBounds& texBounds, u32* vptr) const
+                               bool forceNearestTexture, const TextureSamplingBounds& texBounds,
+                               const TextureSpriteUVInsetBounds& spriteUVInsetBounds, u32* vptr) const
 {
     u32 z = poly->FinalZ[vid];
     u32 w = poly->FinalW[vid];
@@ -844,7 +959,17 @@ u32* GLRenderer3D::SetupVertex(const Polygon* poly, int vid, const Vertex* vtx, 
 
     *vptr++ = vtxattr | (zshift << 16);
     *vptr++ = texlayer;
-    *vptr++ = texwidth | (texheight << 16);
+    *vptr++ = PackTextureSizeRepeatAndForceNearest(texwidth, texheight, (poly->TexParam >> 16) & 0xF, forceNearestTexture);
+    if (spriteUVInsetBounds.Valid)
+    {
+        *vptr++ = spriteUVInsetBounds.U0 | (static_cast<u32>(spriteUVInsetBounds.V0) << 16);
+        *vptr++ = spriteUVInsetBounds.U1 | (static_cast<u32>(spriteUVInsetBounds.V1) << 16);
+    }
+    else
+    {
+        *vptr++ = 0;
+        *vptr++ = 0;
+    }
 
     return vptr;
 }
@@ -966,12 +1091,17 @@ void GLRenderer3D::BuildPolygons(GLRenderer3D::RendererPolygon* polygons, int np
                     const bool edgeExtendTextureLookup =
                         samplingBounds.Valid && samplingBounds.EdgeExtendMargins;
                     auto edgeExtendPhaseStart = std::chrono::steady_clock::now();
+                    bool textureCacheHit = false;
                     Texcache.GetTexture(texparam, texpal, curtexid, curtexlayer, halp, &curBinaryAlphaTexture,
-                                        samplingBounds.Valid ? &samplingBounds : nullptr);
+                                        samplingBounds.Valid ? &samplingBounds : nullptr, &textureCacheHit);
                     if (edgeExtendTextureLookup)
                     {
-                        AddRenderFrameTiming(RenderFrameTiming.EdgeExtendTextureLookup,
-                                             ElapsedUS(edgeExtendPhaseStart));
+                        const u64 elapsedUS = ElapsedUS(edgeExtendPhaseStart);
+                        AddRenderFrameTiming(RenderFrameTiming.EdgeExtendTextureLookup, elapsedUS);
+                        AddRenderFrameTiming(textureCacheHit
+                                             ? RenderFrameTiming.EdgeExtendTextureLookupHit
+                                             : RenderFrameTiming.EdgeExtendTextureLookupMiss,
+                                             elapsedUS);
                     }
                     curtexlayer |= 0xFFFF0000;
                     if (TextureBoundsRemapCoordinates(samplingBounds))
@@ -1006,6 +1136,28 @@ void GLRenderer3D::BuildPolygons(GLRenderer3D::RendererPolygon* polygons, int np
         rp->BinaryAlphaTexture = curBinaryAlphaTexture;
         const TextureSamplingBounds vertexSamplingBounds =
             TextureBoundsRemapCoordinates(samplingBounds) ? samplingBounds : TextureSamplingBounds{};
+        TextureSpriteUVInsetBounds spriteUVInsetBounds;
+        const bool canClassifySpriteTexture =
+            TexEnable && textypeForBounds &&
+            !TextureBoundsRemapCoordinates(samplingBounds) &&
+            curtexid != static_cast<GLuint>(-1) && curtexid != static_cast<GLuint>(-2);
+        const bool spriteTexture =
+            canClassifySpriteTexture &&
+            BuildSpriteUVInsetBounds(poly, TextureWidth(texparam), TextureHeight(texparam), spriteUVInsetBounds);
+        const bool translucentTextureGuard =
+            TextureFilter.TranslucentTextureFilteringGuard &&
+            TextureFilter.Anisotropy > 1 &&
+            textypeForBounds == 6 &&
+            IsLargeTranslucentTextureDraw(poly);
+        const bool forceNearestTexture =
+            canClassifySpriteTexture &&
+            ((TextureFilter.Smart2DFiltering && spriteTexture) ||
+             translucentTextureGuard);
+        rp->DisableMSAA = canClassifySpriteTexture && translucentTextureGuard;
+        if (!TextureFilter.SpriteUVInset)
+        {
+            spriteUVInsetBounds = {};
+        }
 
         // assemble vertices
         if (poly->Type == 1) // line
@@ -1027,8 +1179,8 @@ void GLRenderer3D::BuildPolygons(GLRenderer3D::RendererPolygon* polygons, int np
                 lastx = vtx->FinalPosition[0];
                 lasty = vtx->FinalPosition[1];
 
-                vptr = SetupVertex(poly, j, vtx, vtxattr, curtexlayer, curtexwidth, curtexheight,
-                                   vertexSamplingBounds, vptr);
+                vptr = SetupVertex(poly, j, vtx, vtxattr, curtexlayer, curtexwidth, curtexheight, forceNearestTexture,
+                                   vertexSamplingBounds, spriteUVInsetBounds, vptr);
 
                 IndexBuffer[iidx++] = vidx;
                 rp->NumIndices++;
@@ -1046,8 +1198,8 @@ void GLRenderer3D::BuildPolygons(GLRenderer3D::RendererPolygon* polygons, int np
             {
                 Vertex* vtx = poly->Vertices[j];
 
-                vptr = SetupVertex(poly, j, vtx, vtxattr, curtexlayer, curtexwidth, curtexheight,
-                                   vertexSamplingBounds, vptr);
+                vptr = SetupVertex(poly, j, vtx, vtxattr, curtexlayer, curtexwidth, curtexheight, forceNearestTexture,
+                                   vertexSamplingBounds, spriteUVInsetBounds, vptr);
                 vidx++;
             }
 
@@ -1069,8 +1221,8 @@ void GLRenderer3D::BuildPolygons(GLRenderer3D::RendererPolygon* polygons, int np
                 {
                     Vertex* vtx = poly->Vertices[j];
 
-                    vptr = SetupVertex(poly, j, vtx, vtxattr, curtexlayer, curtexwidth, curtexheight,
-                                       vertexSamplingBounds, vptr);
+                    vptr = SetupVertex(poly, j, vtx, vtxattr, curtexlayer, curtexwidth, curtexheight, forceNearestTexture,
+                                       vertexSamplingBounds, spriteUVInsetBounds, vptr);
 
                     if (j >= 2)
                     {
@@ -1155,7 +1307,17 @@ void GLRenderer3D::BuildPolygons(GLRenderer3D::RendererPolygon* polygons, int np
 
                 *vptr++ = vtxattr | (zshift << 16);
                 *vptr++ = curtexlayer;
-                *vptr++ = curtexwidth | (curtexheight << 16);
+                *vptr++ = PackTextureSizeRepeatAndForceNearest(curtexwidth, curtexheight, (poly->TexParam >> 16) & 0xF, forceNearestTexture);
+                if (spriteUVInsetBounds.Valid)
+                {
+                    *vptr++ = spriteUVInsetBounds.U0 | (static_cast<u32>(spriteUVInsetBounds.V0) << 16);
+                    *vptr++ = spriteUVInsetBounds.U1 | (static_cast<u32>(spriteUVInsetBounds.V1) << 16);
+                }
+                else
+                {
+                    *vptr++ = 0;
+                    *vptr++ = 0;
+                }
 
                 vidx++;
 
@@ -1164,8 +1326,8 @@ void GLRenderer3D::BuildPolygons(GLRenderer3D::RendererPolygon* polygons, int np
                 {
                     Vertex* vtx = poly->Vertices[j];
 
-                    vptr = SetupVertex(poly, j, vtx, vtxattr, curtexlayer, curtexwidth, curtexheight,
-                                       vertexSamplingBounds, vptr);
+                    vptr = SetupVertex(poly, j, vtx, vtxattr, curtexlayer, curtexwidth, curtexheight, forceNearestTexture,
+                                       vertexSamplingBounds, spriteUVInsetBounds, vptr);
 
                     if (j >= 1)
                     {
@@ -1249,7 +1411,11 @@ int GLRenderer3D::RenderSinglePolygon(int i) const
     const RendererPolygon* rp = &PolygonList[i];
 
     SetupPolygonTexture(rp);
+    if (MSAAActive && rp->DisableMSAA)
+        glDisable(GL_MULTISAMPLE);
     glDrawElements(rp->PrimType, rp->NumIndices, GL_UNSIGNED_SHORT, (void*)(uintptr_t)(rp->IndicesOffset * 2));
+    if (MSAAActive && rp->DisableMSAA)
+        glEnable(GL_MULTISAMPLE);
 
     return 1;
 }
@@ -1272,13 +1438,18 @@ int GLRenderer3D::RenderPolygonBatch(int i) const
         if (cur_rp->TexID != texid) break;
         if (cur_rp->TexRepeat != texrepeat) break;
         if (cur_rp->BinaryAlphaTexture != rp->BinaryAlphaTexture) break;
+        if (cur_rp->DisableMSAA != rp->DisableMSAA) break;
 
         numpolys++;
         numindices += cur_rp->NumIndices;
     }
 
     SetupPolygonTexture(rp);
+    if (MSAAActive && rp->DisableMSAA)
+        glDisable(GL_MULTISAMPLE);
     glDrawElements(primtype, numindices, GL_UNSIGNED_SHORT, (void*)(uintptr_t)(rp->IndicesOffset * 2));
+    if (MSAAActive && rp->DisableMSAA)
+        glEnable(GL_MULTISAMPLE);
     return numpolys;
 }
 
@@ -1298,13 +1469,18 @@ int GLRenderer3D::RenderPolygonEdgeBatch(int i) const
         if (cur_rp->TexID != texid) break;
         if (cur_rp->TexRepeat != texrepeat) break;
         if (cur_rp->BinaryAlphaTexture != rp->BinaryAlphaTexture) break;
+        if (cur_rp->DisableMSAA != rp->DisableMSAA) break;
 
         numpolys++;
         numindices += cur_rp->NumEdgeIndices;
     }
 
     SetupPolygonTexture(rp);
+    if (MSAAActive && rp->DisableMSAA)
+        glDisable(GL_MULTISAMPLE);
     glDrawElements(GL_LINES, numindices, GL_UNSIGNED_SHORT, (void*)(uintptr_t)(rp->EdgeIndicesOffset * 2));
+    if (MSAAActive && rp->DisableMSAA)
+        glEnable(GL_MULTISAMPLE);
     return numpolys;
 }
 
@@ -1770,6 +1946,14 @@ void GLRenderer3D::AppendRenderFrameTimingCSVHeader(std::string& header, const c
         header += name;
         header += "_count";
     };
+    auto addCounter = [&header, prefix](const char* name)
+    {
+        if (!header.empty())
+            header += ",";
+        header += prefix;
+        header += "_";
+        header += name;
+    };
 
     addPhase("texcache_update");
     addPhase("capture_info");
@@ -1780,12 +1964,34 @@ void GLRenderer3D::AppendRenderFrameTimingCSVHeader(std::string& header, const c
     addPhase("edge_extend_accumulate");
     addPhase("edge_extend_bounds_lookup");
     addPhase("edge_extend_texture_lookup");
-    header += ",";
-    header += prefix;
-    header += "_edge_extend_new_variants";
-    header += ",";
-    header += prefix;
-    header += "_edge_extend_throttled_variants";
+    addPhase("edge_extend_texture_lookup_hit");
+    addPhase("edge_extend_texture_lookup_miss");
+    addPhase("mipmap_flush");
+    addCounter("edge_extend_new_variants");
+    addCounter("edge_extend_throttled_variants");
+    addCounter("edge_extend_suppressed_variants");
+    addCounter("edge_extend_secondary_restore_hit");
+    addCounter("edge_extend_secondary_restore_miss_no_entry");
+    addCounter("edge_extend_secondary_restore_miss_mismatch");
+    addCounter("edge_extend_secondary_restore_skipped");
+    addCounter("edge_extend_secondary_store");
+    addCounter("edge_extend_secondary_eviction");
+    addPhase("texcache_pal_hash");
+    addPhase("texcache_miss_total");
+    addPhase("texcache_decode");
+    addPhase("texcache_bounds_process");
+    addPhase("texcache_texture_hash");
+    addPhase("texcache_secondary_restore");
+    addPhase("texcache_storage_alloc");
+    addPhase("texcache_scale_source_decode");
+    addPhase("texcache_scale_alpha_prep");
+    addPhase("texcache_gpu_scale");
+    addPhase("texcache_cpu_scale");
+    addPhase("texcache_mip_prep");
+    addPhase("texcache_binary_alpha_scan");
+    addPhase("texcache_preview_capture");
+    addPhase("texcache_upload");
+    addPhase("texcache_cache_insert");
     addPhase("buffer_upload");
     addPhase("scene_render");
     addPhase("msaa_resolve_only");
@@ -1793,7 +1999,7 @@ void GLRenderer3D::AppendRenderFrameTimingCSVHeader(std::string& header, const c
 
 void GLRenderer3D::AppendRenderFrameTimingCSVRow(std::string& row) const
 {
-    auto addPhase = [&row](const RenderFramePhaseTiming& phase)
+    auto addPhase = [&row](const auto& phase)
     {
         if (!row.empty())
             row += ",";
@@ -1802,6 +2008,12 @@ void GLRenderer3D::AppendRenderFrameTimingCSVRow(std::string& row) const
         row += std::to_string(phase.MaxUS);
         row += ",";
         row += std::to_string(phase.Count);
+    };
+    auto addCounter = [&row](u32 value)
+    {
+        if (!row.empty())
+            row += ",";
+        row += std::to_string(value);
     };
 
     addPhase(RenderFrameTiming.TextureCacheUpdate);
@@ -1813,10 +2025,35 @@ void GLRenderer3D::AppendRenderFrameTimingCSVRow(std::string& row) const
     addPhase(RenderFrameTiming.EdgeExtendAccumulate);
     addPhase(RenderFrameTiming.EdgeExtendBoundsLookup);
     addPhase(RenderFrameTiming.EdgeExtendTextureLookup);
-    row += ",";
-    row += std::to_string(Texcache.GetEdgeExtendNewVariantsThisFrame());
-    row += ",";
-    row += std::to_string(Texcache.GetEdgeExtendThrottledVariantsThisFrame());
+    addPhase(RenderFrameTiming.EdgeExtendTextureLookupHit);
+    addPhase(RenderFrameTiming.EdgeExtendTextureLookupMiss);
+    addPhase(RenderFrameTiming.MipmapFlush);
+    addCounter(Texcache.GetEdgeExtendNewVariantsThisFrame());
+    addCounter(Texcache.GetEdgeExtendThrottledVariantsThisFrame());
+    addCounter(Texcache.GetEdgeExtendSuppressedVariantsThisFrame());
+    addCounter(Texcache.GetEdgeExtendSecondaryRestoreHitThisFrame());
+    addCounter(Texcache.GetEdgeExtendSecondaryRestoreMissNoEntryThisFrame());
+    addCounter(Texcache.GetEdgeExtendSecondaryRestoreMissMismatchThisFrame());
+    addCounter(Texcache.GetEdgeExtendSecondaryRestoreSkippedThisFrame());
+    addCounter(Texcache.GetEdgeExtendSecondaryStoreThisFrame());
+    addCounter(Texcache.GetEdgeExtendSecondaryEvictionThisFrame());
+    const auto& textureTiming = Texcache.GetTextureCacheFrameTiming();
+    addPhase(textureTiming.PaletteHash);
+    addPhase(textureTiming.MissTotal);
+    addPhase(textureTiming.Decode);
+    addPhase(textureTiming.BoundsProcess);
+    addPhase(textureTiming.TextureHash);
+    addPhase(textureTiming.SecondaryRestore);
+    addPhase(textureTiming.StorageAlloc);
+    addPhase(textureTiming.ScaleSourceDecode);
+    addPhase(textureTiming.ScaleAlphaPrep);
+    addPhase(textureTiming.GPUScale);
+    addPhase(textureTiming.CPUScale);
+    addPhase(textureTiming.MipPrep);
+    addPhase(textureTiming.BinaryAlphaScan);
+    addPhase(textureTiming.PreviewCapture);
+    addPhase(textureTiming.Upload);
+    addPhase(textureTiming.CacheInsert);
     addPhase(RenderFrameTiming.BufferUpload);
     addPhase(RenderFrameTiming.SceneRender);
     addPhase(RenderFrameTiming.MSAAResolveOnly);
@@ -1824,13 +2061,18 @@ void GLRenderer3D::AppendRenderFrameTimingCSVRow(std::string& row) const
 
 void GLRenderer3D::RenderFrame()
 {
+    LastRenderFrameSkipped = false;
+
     u8 clrBitmapDirty;
     auto phaseStart = std::chrono::steady_clock::now();
     bool textureCacheChanged = Texcache.Update(clrBitmapDirty);
     AddRenderFrameTiming(RenderFrameTiming.TextureCacheUpdate, ElapsedUS(phaseStart));
 
     if (!textureCacheChanged && GPU3D.RenderFrameIdentical)
+    {
+        LastRenderFrameSkipped = true;
         return;
+    }
 
     // figure out which chunks of texture memory contain display captures
     int captureinfo[16];
@@ -2036,8 +2278,12 @@ void GLRenderer3D::RenderFrame()
         AddRenderFrameTiming(RenderFrameTiming.PolygonBuild, ElapsedUS(phaseStart));
 
         phaseStart = std::chrono::steady_clock::now();
+        Texcache.FlushPendingMipmaps();
+        AddRenderFrameTiming(RenderFrameTiming.MipmapFlush, ElapsedUS(phaseStart));
+
+        phaseStart = std::chrono::steady_clock::now();
         glBindBuffer(GL_ARRAY_BUFFER, VertexBufferID);
-        glBufferSubData(GL_ARRAY_BUFFER, 0, NumVertices*7*4, VertexBuffer);
+        glBufferSubData(GL_ARRAY_BUFFER, 0, NumVertices*9*4, VertexBuffer);
 
         // bind to access the index buffer
         glBindVertexArray(VertexArrayID);

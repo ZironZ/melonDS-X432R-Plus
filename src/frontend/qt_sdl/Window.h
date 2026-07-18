@@ -174,6 +174,9 @@ private slots:
     void onOpenWholeScene2DDebugView();
     void onOpenTextureScalingDebugView();
     void onToggleWholeScene2DTimingLog();
+    void onDumpWholeScene2DDebugFrame();
+    void onDumpWholeScene2DRollingDebugFrames();
+    void onToggleWholeScene2DRollingDebugCapture(bool checked);
     void onChangeLimitFramerate(bool checked);
     void onChangeAudioSync(bool checked);
 
@@ -301,6 +304,9 @@ public:
     QAction* actWholeScene2DDebugView;
     QAction* actTextureScalingDebugView;
     QAction* actWholeScene2DTimingLog;
+    QAction* actWholeScene2DDebugDump;
+    QAction* actWholeScene2DRollingDebugDump;
+    QAction* actWholeScene2DRollingDebugCapture;
     QAction* actLimitFramerate;
     QAction* actAudioSync;
 

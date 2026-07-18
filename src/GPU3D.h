@@ -107,6 +107,7 @@ public:
 
     void SetRenderXPos(u16 xpos, u16 mask) noexcept;
     [[nodiscard]] u16 GetRenderXPos() const noexcept { return RenderXPos; }
+    [[nodiscard]] u32 GetRenderSceneHash() const noexcept { return RenderSceneHash; }
 
     void WriteToGXFIFO(u32 val) noexcept;
 
@@ -260,6 +261,7 @@ public:
     u32 RenderClearAttr2 = 0;
 
     bool RenderFrameIdentical = false; // not part of the hardware state, don't serialize
+    u32 RenderSceneHash = 0; // not part of the hardware state, don't serialize
 
     u16 RenderXPos = 0;
 

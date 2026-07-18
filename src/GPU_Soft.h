@@ -47,7 +47,7 @@ public:
     void VBlankEnd() override {};
 
     void AllocCapture(u32 bank, u32 start, u32 len) override {};
-    void SyncVRAMCapture(u32 bank, u32 start, u32 len, bool complete) override {};
+    void SyncVRAMCapture(u32 bank, u32 start, u32 len, bool complete, bool invalidate) override {};
 
     bool GetFramebuffers(void** top, void** bottom) override;
 

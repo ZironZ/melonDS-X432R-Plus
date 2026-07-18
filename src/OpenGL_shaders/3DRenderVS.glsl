@@ -16,10 +16,14 @@ in uvec4 vPosition;
 in uvec4 vColor;
 in ivec2 vTexcoord;
 in ivec3 vPolygonAttr;
+in uvec4 vTexcoordInsetBounds;
 
 smooth out vec4 fColor;
 smooth out vec2 fTexcoord;
+flat out vec4 fTexcoordInsetBounds;
 flat out ivec3 fPolygonAttr;
+flat out int fTexRepeat;
+flat out int fForceNearestTexture;
 
 #ifdef WBuffer
 smooth out float fZ;
@@ -41,8 +45,10 @@ void main()
     fpos.w = float(vPosition.w) / 65536.0f;
     fpos.xyz *= fpos.w;
 
-    int texwidth = vPolygonAttr.z & 0xFFFF;
+    int texwidth = vPolygonAttr.z & 0x7FF;
     int texheight = (vPolygonAttr.z >> 16) & 0xFFFF;
+    fTexRepeat = (vPolygonAttr.z >> 11) & 0xF;
+    fForceNearestTexture = (vPolygonAttr.z >> 15) & 0x1;
     vec2 texfactor = 1.0 / (16 * vec2(texwidth, texheight));
 
     vec2 texcoord = vec2(vTexcoord);
@@ -59,6 +65,10 @@ void main()
 
     fColor = vec4(vColor) / vec4(255.0,255.0,255.0,31.0);
     fTexcoord = texcoord * texfactor;
+    vec2 texsize = vec2(texwidth, texheight);
+    fTexcoordInsetBounds = vec4(
+        (vec2(vTexcoordInsetBounds.xy) * (1.0 / 16.0) + vec2(0.5)) / texsize,
+        (vec2(vTexcoordInsetBounds.zw) * (1.0 / 16.0) - vec2(0.5)) / texsize);
     fPolygonAttr = ivec3(vPolygonAttr.x, vPolygonAttr.y & 0xFFFF, attrz);
 
     gl_Position = fpos;

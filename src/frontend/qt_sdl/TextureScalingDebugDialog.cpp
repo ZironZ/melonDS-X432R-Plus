@@ -142,10 +142,11 @@ QString AlgorithmLabel(int algorithmIndex)
     switch (melonDS::RendererSettings::GetGLScaleAlgorithm(algorithmIndex))
     {
     case ScaleAlgorithm::Spline36: return "Spline36 (GPU)";
-    case ScaleAlgorithm::ArtCNN: return "ArtCNN DN (GPU)";
+    case ScaleAlgorithm::ArtCNNDN: return "ArtCNN DN (GPU)";
     case ScaleAlgorithm::XBRZ: return "xBRZ (GPU)";
-    case ScaleAlgorithm::ArtCNNNonDN: return "ArtCNN (GPU)";
-    case ScaleAlgorithm::NNEDI3: return "NNEDI3 nns16 8x4 Luma (GPU)";
+    case ScaleAlgorithm::ArtCNN: return "ArtCNN (GPU)";
+    case ScaleAlgorithm::NNEDI3: return "NNEDI3 nns16 8x4 RGB (GPU compute)";
+    case ScaleAlgorithm::CuNNy4x32: return "CuNNy 4x32 NVL RGB (GPU compute)";
     }
 
     return "Unknown";
@@ -205,7 +206,9 @@ QString FormatStats(const melonDS::TextureScalingDebugStats& stats)
     const QString deferredScaling = stats.DeferredScalingEnabled ? "on" : "off";
     const QString legacyAlpha = stats.LegacyAlphaHandling ? "on" : "off";
     const QString qualityAlpha = stats.QualityAlphaHandling ? "on" : "off";
+    const QString cleanerTransparentEdges = stats.AlphaXBRZ ? "on" : "off";
     const QString readableCache = stats.ReadableTextureCache ? "on" : "off";
+    const QString spline36Alpha = stats.Spline36Alpha ? "on" : "off";
 
     return QStringLiteral(
                "Renderer: %1\n"
@@ -216,20 +219,22 @@ QString FormatStats(const melonDS::TextureScalingDebugStats& stats)
                "Deferred scaling: %6\n"
                "Classic GPU alpha handling: %7\n"
                "Quality alpha handling: %8\n"
-               "Readable texture cache: %9\n"
+               "Cleaner transparent edges: %9\n"
+               "Readable texture cache: %10\n"
+               "Spline36 alpha: %11\n"
                "\n"
-               "Cache entries: %10\n"
-               "Secondary cache entries: %11 / %12\n"
-               "Secondary cache texels: %13 / %14\n"
-               "Secondary cache approx bytes: %15 / %16\n"
-               "Free layers: %17\n"
-               "Total layers: %18\n"
-               "Array textures: %19\n"
-               "Frames observed: %20\n"
+               "Cache entries: %12\n"
+               "Secondary cache entries: %13 / %14\n"
+               "Secondary cache texels: %15 / %16\n"
+               "Secondary cache approx bytes: %17 / %18\n"
+               "Free layers: %19\n"
+               "Total layers: %20\n"
+               "Array textures: %21\n"
+               "Frames observed: %22\n"
                "\n"
-               "Last frame:\n%21\n"
+               "Last frame:\n%23\n"
                "\n"
-               "Totals since reset:\n%22")
+               "Totals since reset:\n%24")
         .arg(renderer)
         .arg(scaling)
         .arg(stats.ScaleFactor)
@@ -238,7 +243,9 @@ QString FormatStats(const melonDS::TextureScalingDebugStats& stats)
         .arg(deferredScaling)
         .arg(legacyAlpha)
         .arg(qualityAlpha)
+        .arg(cleanerTransparentEdges)
         .arg(readableCache)
+        .arg(spline36Alpha)
         .arg(stats.CacheEntries)
         .arg(stats.SecondaryCacheEntries)
         .arg(stats.SecondaryCacheMaxEntries)

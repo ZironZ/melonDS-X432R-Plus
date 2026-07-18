@@ -141,6 +141,7 @@ public:
     bool startWholeSceneTimingLog(const QString& filename, QString& errorstr);
     QString stopWholeSceneTimingLog();
     bool wholeSceneTimingLogActive() const { return wholeSceneTimingLogEnabled.load(); }
+    bool flushWholeSceneTimingLog(QString& filename, melonDS::u64& nextFrame, QString& errorstr);
 
     QWaitCondition glBorrowCond;
     QMutex glBorrowMutex;
@@ -222,8 +223,11 @@ private:
     mutable QMutex wholeSceneTimingLogMutex;
     QFile wholeSceneTimingLogFile;
     QString wholeSceneTimingLogBuffer;
+    QFile wholeSceneRendererLogFile;
+    QString wholeSceneRendererLogBuffer;
     melonDS::u64 wholeSceneTimingLogFrame;
     bool wholeSceneTimingLogHeaderWritten;
+    bool wholeSceneRendererLogHeaderWritten;
     bool wholeSceneTimingLastTouching;
 };
 

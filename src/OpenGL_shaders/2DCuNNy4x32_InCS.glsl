@@ -1,0 +1,222 @@
+// CuNNy 4x32 - https://github.com/funnyplanter/CuNNy
+// Copyright (c) 2024 funnyplanter
+
+// This program is free software; you can redistribute it and/or
+// modify it under the terms of the GNU Lesser General Public
+// License as published by the Free Software Foundation; either
+// version 3.0 of the License, or (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+// Lesser General Public License for more details.
+//
+// You should have received a copy of the GNU Lesser General Public
+// License along with this program.  If not, see <https://www.gnu.org/licenses/>.
+/* ------------------------------------------------------------------- */
+
+// Generated from CuNNy-4x32-NVL.glsl, pass: CuNNy-4x32 : in (3x32).
+#version 430 core
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#ifdef GL_EXT_shader_explicit_arithmetic_types_float16
+#	define V4 f16vec4
+#	define M4 f16mat4
+#	define F float16_t
+#	define M3x4 f16mat3x4
+#	define V3 f16vec3
+#else
+#	define V4 vec4
+#	define M4 mat4
+#	define F float
+#	define M3x4 mat3x4
+#	define V3 vec3
+#endif
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+layout(rgba16f, binding = 0) writeonly uniform image2D out_image;
+
+uniform sampler2D LUMA_raw;
+uniform sampler2D MAIN_raw;
+uniform sampler2D in_raw;
+uniform sampler2D conv1_raw;
+uniform sampler2D conv2_raw;
+uniform sampler2D conv3_raw;
+uniform sampler2D conv4_raw;
+uniform sampler2D conv5_raw;
+uniform sampler2D conv6_raw;
+uniform sampler2D conv7_raw;
+uniform sampler2D conv8_raw;
+
+uniform vec4 LUMA_mul;
+uniform vec4 MAIN_mul;
+uniform vec4 in_mul;
+uniform vec4 conv1_mul;
+uniform vec4 conv2_mul;
+uniform vec4 conv3_mul;
+uniform vec4 conv4_mul;
+uniform vec4 conv5_mul;
+uniform vec4 conv6_mul;
+uniform vec4 conv7_mul;
+uniform vec4 conv8_mul;
+
+uniform vec2 LUMA_size;
+uniform vec2 MAIN_size;
+uniform vec2 LUMA_pt;
+uniform vec2 MAIN_pt;
+uniform vec2 in_pt;
+uniform vec2 conv1_pt;
+uniform vec2 conv2_pt;
+uniform vec2 conv3_pt;
+uniform vec2 conv4_pt;
+uniform vec2 conv5_pt;
+uniform vec2 conv6_pt;
+uniform vec2 conv7_pt;
+uniform vec2 conv8_pt;
+
+#define LUMA_tex(pos) texture(LUMA_raw, pos)
+#define MAIN_tex(pos) texture(MAIN_raw, pos)
+#define in_tex(pos) texture(in_raw, pos)
+#define conv1_tex(pos) texture(conv1_raw, pos)
+#define conv2_tex(pos) texture(conv2_raw, pos)
+#define conv3_tex(pos) texture(conv3_raw, pos)
+#define conv4_tex(pos) texture(conv4_raw, pos)
+#define conv5_tex(pos) texture(conv5_raw, pos)
+#define conv6_tex(pos) texture(conv6_raw, pos)
+#define conv7_tex(pos) texture(conv7_raw, pos)
+#define conv8_tex(pos) texture(conv8_raw, pos)
+
+vec4 LUMA_gather(vec2 pos, int component) { switch (component) { case 1: return textureGather(LUMA_raw, pos, 1); case 2: return textureGather(LUMA_raw, pos, 2); case 3: return textureGather(LUMA_raw, pos, 3); default: return textureGather(LUMA_raw, pos, 0); } }
+vec4 MAIN_gather(vec2 pos, int component) { switch (component) { case 1: return textureGather(MAIN_raw, pos, 1); case 2: return textureGather(MAIN_raw, pos, 2); case 3: return textureGather(MAIN_raw, pos, 3); default: return textureGather(MAIN_raw, pos, 0); } }
+vec4 in_gather(vec2 pos, int component) { switch (component) { case 1: return textureGather(in_raw, pos, 1); case 2: return textureGather(in_raw, pos, 2); case 3: return textureGather(in_raw, pos, 3); default: return textureGather(in_raw, pos, 0); } }
+vec4 conv1_gather(vec2 pos, int component) { switch (component) { case 1: return textureGather(conv1_raw, pos, 1); case 2: return textureGather(conv1_raw, pos, 2); case 3: return textureGather(conv1_raw, pos, 3); default: return textureGather(conv1_raw, pos, 0); } }
+vec4 conv2_gather(vec2 pos, int component) { switch (component) { case 1: return textureGather(conv2_raw, pos, 1); case 2: return textureGather(conv2_raw, pos, 2); case 3: return textureGather(conv2_raw, pos, 3); default: return textureGather(conv2_raw, pos, 0); } }
+vec4 conv3_gather(vec2 pos, int component) { switch (component) { case 1: return textureGather(conv3_raw, pos, 1); case 2: return textureGather(conv3_raw, pos, 2); case 3: return textureGather(conv3_raw, pos, 3); default: return textureGather(conv3_raw, pos, 0); } }
+vec4 conv4_gather(vec2 pos, int component) { switch (component) { case 1: return textureGather(conv4_raw, pos, 1); case 2: return textureGather(conv4_raw, pos, 2); case 3: return textureGather(conv4_raw, pos, 3); default: return textureGather(conv4_raw, pos, 0); } }
+vec4 conv5_gather(vec2 pos, int component) { switch (component) { case 1: return textureGather(conv5_raw, pos, 1); case 2: return textureGather(conv5_raw, pos, 2); case 3: return textureGather(conv5_raw, pos, 3); default: return textureGather(conv5_raw, pos, 0); } }
+vec4 conv6_gather(vec2 pos, int component) { switch (component) { case 1: return textureGather(conv6_raw, pos, 1); case 2: return textureGather(conv6_raw, pos, 2); case 3: return textureGather(conv6_raw, pos, 3); default: return textureGather(conv6_raw, pos, 0); } }
+vec4 conv7_gather(vec2 pos, int component) { switch (component) { case 1: return textureGather(conv7_raw, pos, 1); case 2: return textureGather(conv7_raw, pos, 2); case 3: return textureGather(conv7_raw, pos, 3); default: return textureGather(conv7_raw, pos, 0); } }
+vec4 conv8_gather(vec2 pos, int component) { switch (component) { case 1: return textureGather(conv8_raw, pos, 1); case 2: return textureGather(conv8_raw, pos, 2); case 3: return textureGather(conv8_raw, pos, 3); default: return textureGather(conv8_raw, pos, 0); } }
+#define l0(x, y) V3((MAIN_mul * texelFetch(MAIN_raw, clamp(pos + ivec2(x, y), ivec2(0), sz) * ivec2(1, 1) + ivec2(0, 0), 0)).rgb)
+shared V3 G[1][10][10];
+void main() {
+	ivec2 xy = ivec2(gl_LocalInvocationID.xy);
+	ivec2 pos = ivec2(gl_WorkGroupID.xy) * ivec2(8, 8) + xy;
+	bool inside = pos.x < int(MAIN_size.x) && pos.y < int(MAIN_size.y);
+	ivec2 opos = pos * ivec2(4, 2);
+	ivec2 sz = ivec2(MAIN_size) - ivec2(1);
+	for (int y = 0; y < 10; y += 8) {
+		int ay = xy.y + y;
+		if (ay >= 10) break;
+		for (int x = 0; x < 10; x += 8) {
+			int ax = xy.x + x;
+			if (ax >= 10) break;
+			G[0][ay][ax] = l0(x - 1, y - 1);
+		}
+	}
+	barrier();
+	if (!inside) return;
+	V3 s0_0_0, s0_0_1, s0_0_2, s0_1_0, s0_1_1, s0_1_2, s0_2_0, s0_2_1, s0_2_2;
+	V4 r0, r1, r2, r3, r4, r5, r6, r7;
+	r0 = V4(0.0); r1 = V4(0.0); r2 = V4(0.0); r3 = V4(0.0); r4 = V4(0.0); r5 = V4(0.0); r6 = V4(0.0); r7 = V4(0.0);
+	s0_0_0 = G[0][xy.y+0][xy.x+0]; s0_0_1 = G[0][xy.y+0][xy.x+1];
+	s0_0_2 = G[0][xy.y+0][xy.x+2]; s0_1_0 = G[0][xy.y+1][xy.x+0];
+	s0_1_1 = G[0][xy.y+1][xy.x+1]; s0_1_2 = G[0][xy.y+1][xy.x+2];
+	s0_2_0 = G[0][xy.y+2][xy.x+0]; s0_2_1 = G[0][xy.y+2][xy.x+1];
+	s0_2_2 = G[0][xy.y+2][xy.x+2];
+	r0 += M3x4(-2.974e-02, 5.816e-03, 1.618e-02, 3.382e-02, 9.644e-02, -9.010e-03, -2.379e-02, 3.527e-02, 3.407e-02, -1.045e-03, 1.148e-02, -7.593e-02) * s0_0_0;
+	r1 += M3x4(4.640e-02, -1.481e-02, 1.616e-01, 2.042e-02, 4.950e-03, 1.882e-02, -9.444e-02, -5.408e-02, -5.337e-02, -3.505e-02, -7.092e-02, 6.107e-02) * s0_0_0;
+	r2 += M3x4(5.308e-03, 5.217e-03, 3.756e-01, 2.588e-01, 9.713e-03, -1.880e-02, 6.035e-01, 3.975e-01, 1.831e-03, 6.644e-03, 2.204e-01, 1.685e-01) * s0_0_0;
+	r3 += M3x4(-1.182e-02, -2.707e-03, -3.426e-03, -7.050e-03, -2.419e-03, 7.397e-02, 2.912e-02, 1.071e-02, -8.691e-03, -3.814e-02, -6.166e-03, -9.052e-04) * s0_0_0;
+	r4 += M3x4(1.651e-03, -5.984e-02, -1.453e-02, -1.946e-02, -2.091e-04, 1.042e-01, -6.092e-02, 1.352e-02, -2.027e-03, -7.498e-02, 7.012e-02, 2.039e-02) * s0_0_0;
+	r5 += M3x4(1.025e-02, 9.142e-03, 2.869e-02, -2.501e-02, 2.327e-02, 1.543e-02, 8.012e-02, -4.183e-02, -7.327e-03, 1.158e-02, -9.207e-03, 1.114e-02) * s0_0_0;
+	r6 += M3x4(-2.692e-02, 1.631e-03, 9.116e-03, -1.701e-02, 1.388e-02, -4.140e-02, -5.622e-02, -9.081e-02, 2.071e-02, -9.839e-04, -4.965e-03, 2.063e-02) * s0_0_0;
+	r7 += M3x4(3.159e-03, -6.668e-03, 1.287e-02, -1.012e-02, -3.699e-03, -1.325e-02, -1.212e-02, 6.670e-02, 1.071e-02, 6.166e-03, 1.703e-03, 3.842e-02) * s0_0_0;
+	r0 += M3x4(4.013e-02, 6.392e-02, 9.907e-02, -7.971e-02, -6.831e-02, -3.685e-02, -1.071e-01, -1.179e-01, -5.681e-03, -1.668e-03, 3.574e-03, 1.931e-01) * s0_0_1;
+	r1 += M3x4(-8.809e-01, 1.279e-02, 3.296e-01, -9.046e-02, 6.035e-01, 3.962e-02, -1.959e-01, -1.122e-01, 2.829e-01, 2.692e-02, -1.270e-01, 2.337e-01) * s0_0_1;
+	r2 += M3x4(-2.513e-01, 1.201e-02, -3.701e-01, -2.761e-01, -6.543e-01, -3.144e-02, -5.781e-01, -3.980e-01, -1.677e-01, -2.192e-02, -2.417e-01, -1.276e-01) * s0_0_1;
+	r3 += M3x4(6.821e-03, -5.042e-02, 7.085e-02, -5.099e-02, -3.885e-03, 7.607e-02, 2.892e-01, 7.935e-02, 1.280e-02, 1.068e-01, 2.558e-02, -3.382e-02) * s0_0_1;
+	r4 += M3x4(-6.924e-03, 3.048e-01, 5.834e-02, 2.509e-02, 2.815e-02, -5.683e-01, 7.086e-02, -6.539e-02, -1.133e-02, 3.802e-01, -1.294e-01, -1.139e-02) * s0_0_1;
+	r5 += M3x4(-1.772e-02, -3.772e-02, -3.101e-02, -1.136e-02, -1.112e-02, -6.066e-02, -1.422e-01, -8.169e-02, 2.210e-02, -1.679e-02, -1.131e-02, 1.782e-02) * s0_0_1;
+	r6 += M3x4(2.775e-02, -2.686e-01, -1.470e-01, -3.872e-02, 4.933e-03, -5.840e-01, -2.862e-01, 5.019e-02, -4.279e-02, -1.213e-01, -5.109e-02, 2.553e-02) * s0_0_1;
+	r7 += M3x4(-5.018e-03, -2.909e-02, -8.553e-03, 6.865e-02, 1.038e-03, 7.512e-02, -1.556e-02, 5.507e-02, -3.588e-03, -1.001e-02, -4.390e-03, 9.003e-03) * s0_0_1;
+	r0 += M3x4(-2.786e-01, 2.376e-02, 8.464e-03, 1.256e-03, -1.942e-01, -3.481e-02, -1.483e-03, -2.191e-02, -1.837e-01, -8.821e-03, -1.043e-02, 3.314e-02) * s0_0_2;
+	r1 += M3x4(2.874e-02, 2.668e-02, -8.518e-02, -5.774e-02, -1.816e-02, 1.094e-02, 5.336e-02, -8.093e-02, -8.299e-03, -7.100e-04, 3.105e-02, 1.373e-01) * s0_0_2;
+	r2 += M3x4(-7.133e-04, 2.438e-03, 7.956e-03, 3.987e-03, 1.405e-02, -1.561e-02, -1.694e-02, -1.035e-02, 8.688e-03, 6.049e-03, 1.090e-02, -4.012e-03) * s0_0_2;
+	r3 += M3x4(5.491e-04, 2.735e-02, -2.576e-03, -4.157e-02, 1.689e-02, 6.888e-02, 3.825e-02, 4.337e-02, -2.787e-03, -6.740e-02, -9.787e-03, 8.524e-04) * s0_0_2;
+	r4 += M3x4(6.789e-03, 9.914e-02, -1.473e-02, 7.000e-03, -2.617e-02, -2.503e-01, -4.754e-02, -7.263e-02, 1.881e-02, 2.085e-01, 6.859e-02, -4.031e-03) * s0_0_2;
+	r5 += M3x4(-4.548e-03, 9.697e-03, -2.360e-02, 1.308e-02, -1.849e-02, 1.376e-02, -2.747e-02, -2.223e-03, 5.747e-03, 4.717e-03, 9.484e-03, -1.193e-02) * s0_0_2;
+	r6 += M3x4(-5.756e-03, -2.702e-03, -7.104e-03, -7.561e-03, 3.482e-02, -1.967e-02, -3.430e-02, -4.216e-02, -2.392e-02, -9.384e-03, -1.385e-02, 1.861e-02) * s0_0_2;
+	r7 += M3x4(-2.037e-03, -5.674e-02, -5.006e-04, 2.433e-02, -6.703e-03, 1.797e-02, -3.056e-03, 9.920e-02, -4.592e-03, 1.854e-04, 1.079e-02, 4.204e-02) * s0_0_2;
+	r0 += M3x4(1.154e-01, 6.955e-02, 3.039e-02, -1.118e-02, -5.234e-02, -1.929e-02, -5.624e-02, -4.201e-02, -2.577e-04, 1.130e-02, 2.423e-02, 5.754e-02) * s0_1_0;
+	r1 += M3x4(8.108e-01, 1.653e-01, 5.332e-01, -2.392e-02, -5.455e-01, 3.291e-01, -3.594e-01, -5.884e-02, -2.666e-01, 1.101e-01, -1.620e-01, 9.006e-02) * s0_1_0;
+	r2 += M3x4(3.361e-03, -9.792e-03, -1.170e-02, -3.784e-03, -2.378e-02, -2.363e-02, 1.244e-02, -3.606e-02, -1.837e-02, -3.535e-03, 8.215e-03, -3.662e-03) * s0_1_0;
+	r3 += M3x4(1.820e-02, 3.547e-02, 1.893e-02, -1.008e-01, -2.792e-02, 5.436e-02, -2.211e-02, 1.477e-01, -3.675e-05, 3.427e-02, -1.072e-02, -5.274e-02) * s0_1_0;
+	r4 += M3x4(-1.562e-02, -5.786e-02, -8.226e-02, 2.199e-02, 9.642e-03, 1.017e-01, -8.032e-02, -1.630e-02, 8.885e-03, -6.238e-02, 1.724e-01, 1.337e-02) * s0_1_0;
+	r5 += M3x4(1.517e-01, -2.804e-02, 1.184e-01, 4.834e-01, 3.966e-01, -5.289e-02, 3.738e-01, 5.642e-01, 7.935e-02, 2.730e-03, -9.612e-03, 9.057e-02) * s0_1_0;
+	r6 += M3x4(9.201e-02, -9.386e-04, 7.166e-04, 9.941e-02, 4.050e-02, 9.533e-03, 8.119e-02, 2.989e-01, -1.230e-01, -5.387e-03, 2.641e-02, 9.315e-02) * s0_1_0;
+	r7 += M3x4(-3.968e-03, -2.343e-02, -7.453e-03, 9.765e-03, 1.447e-02, 7.544e-02, 2.285e-02, 3.655e-02, -1.947e-02, 3.453e-03, 1.794e-02, 9.733e-03) * s0_1_0;
+	r0 += M3x4(-1.162e-01, -3.873e-01, -8.535e-01, -2.406e-01, -3.556e-01, 7.559e-02, 9.277e-01, -6.895e-01, -1.003e-01, 2.540e-02, -7.041e-02, 9.536e-01) * s0_1_1;
+	r1 += M3x4(-1.047e-02, -8.227e-02, -3.139e-01, 4.423e-01, -5.888e-02, -1.734e-01, 2.272e-01, 6.309e-01, 6.554e-02, -5.874e-02, 7.944e-02, -1.402e+00) * s0_1_1;
+	r2 += M3x4(2.528e-01, 2.806e-02, 3.535e-03, 1.976e-02, 6.964e-01, 5.801e-01, -3.071e-02, 3.228e-02, 1.599e-01, 1.442e-02, 1.059e-02, -1.691e-02) * s0_1_1;
+	r3 += M3x4(-2.937e-01, -1.422e-01, 1.057e-01, 6.701e-01, -5.137e-01, -2.321e+00, 2.510e-01, -7.832e-01, -1.728e-01, -5.838e-02, 7.674e-02, 1.223e-01) * s0_1_1;
+	r4 += M3x4(2.773e-01, -3.752e-01, 1.291e-02, 7.874e-02, 6.004e-01, 7.194e-01, -2.561e-02, 3.290e-01, 9.685e-02, -5.096e-01, 9.131e-03, 8.575e-02) * s0_1_1;
+	r5 += M3x4(-3.229e-02, 2.411e-01, -1.305e-01, 8.027e-03, -2.552e-02, 5.605e-01, -3.394e-01, -2.812e-02, -6.392e-02, 1.480e-01, 1.593e-02, -1.913e-02) * s0_1_1;
+	r6 += M3x4(1.659e-01, 2.609e-01, 1.539e-01, 3.099e-02, -6.286e-02, 6.061e-01, 2.731e-01, -1.089e-03, -1.111e-01, 1.253e-01, 4.804e-02, -3.789e-02) * s0_1_1;
+	r7 += M3x4(-2.857e-01, 2.027e-01, -9.917e-02, -3.807e-01, -5.424e-01, -2.783e-01, -2.607e-01, -5.719e-01, -2.607e-01, 1.752e-02, -2.326e-02, -2.088e-01) * s0_1_1;
+	r0 += M3x4(2.992e-01, 6.188e-02, 1.467e-01, 1.929e-01, 2.755e-01, -2.912e-02, -1.778e-01, 4.248e-01, 1.694e-01, 2.515e-02, 3.748e-02, -6.465e-01) * s0_1_2;
+	r1 += M3x4(-4.846e-02, -4.078e-02, -1.754e-01, -4.465e-02, 4.235e-02, -4.111e-02, 1.093e-01, -5.948e-02, 5.157e-03, -5.675e-03, 6.421e-02, 1.654e-01) * s0_1_2;
+	r2 += M3x4(9.371e-04, -6.637e-03, -7.473e-03, 8.429e-03, -3.601e-02, -5.250e-02, 1.062e-02, 2.825e-02, 7.978e-03, 9.060e-04, -6.242e-03, -1.946e-02) * s0_1_2;
+	r3 += M3x4(2.806e-01, 1.342e-02, -5.917e-03, 3.797e-02, 5.444e-01, 1.434e-01, -5.160e-02, -1.156e-02, 1.677e-01, 4.440e-02, 2.877e-02, -2.518e-02) * s0_1_2;
+	r4 += M3x4(-1.823e-01, 1.403e-01, 5.511e-01, -1.519e-01, -3.842e-01, -2.733e-01, 4.991e-01, -3.688e-01, -8.660e-02, 1.857e-01, -1.059e+00, -2.105e-01) * s0_1_2;
+	r5 += M3x4(-1.165e-01, -4.846e-03, 2.947e-02, -1.785e-02, -3.580e-01, -2.166e-02, 6.857e-02, -7.823e-03, -2.510e-02, -8.992e-03, -1.184e-03, 6.437e-03) * s0_1_2;
+	r6 += M3x4(7.675e-02, 2.448e-03, 6.094e-03, 2.385e-02, -2.050e-02, 1.446e-02, 3.038e-02, 2.126e-02, -4.954e-02, -3.151e-03, -1.058e-02, -1.091e-03) * s0_1_2;
+	r7 += M3x4(5.213e-03, -8.132e-02, -1.636e-01, 5.064e-02, -7.122e-03, 9.369e-02, -3.479e-01, 6.530e-02, 3.542e-02, -2.044e-03, -1.121e-01, 2.410e-02) * s0_1_2;
+	r0 += M3x4(-9.983e-02, -4.675e-02, -2.534e-02, -2.102e-02, 6.453e-02, 8.322e-03, 3.975e-02, -3.234e-02, 6.633e-03, -2.519e-03, -1.367e-02, 5.286e-02) * s0_2_0;
+	r1 += M3x4(-2.895e-03, 3.213e-02, -1.489e-01, -3.007e-02, -9.333e-04, 3.581e-02, 8.668e-02, 4.170e-02, 3.057e-03, -3.347e-02, 5.589e-02, -2.327e-02) * s0_2_0;
+	r2 += M3x4(-1.181e-03, 2.548e-03, 3.606e-04, 1.148e-02, 2.003e-02, 5.356e-03, -3.127e-03, 6.422e-04, 5.320e-03, -3.323e-03, -1.061e-03, 9.240e-03) * s0_2_0;
+	r3 += M3x4(-9.287e-03, -3.224e-03, -1.642e-02, -1.464e-04, 2.088e-02, 1.163e-02, 7.460e-03, -1.846e-02, -3.267e-03, 2.985e-03, 5.602e-03, 1.749e-02) * s0_2_0;
+	r4 += M3x4(6.650e-03, 3.717e-02, -2.544e-02, -1.652e-02, -1.030e-02, -4.597e-02, -2.459e-03, 1.664e-03, -3.642e-04, 2.319e-02, 1.815e-02, 5.092e-03) * s0_2_0;
+	r5 += M3x4(1.200e-02, -3.481e-03, 5.111e-02, -1.482e-02, 2.986e-03, -2.758e-02, 1.125e-01, -4.129e-02, -1.900e-02, -4.779e-03, -8.956e-03, -3.545e-02) * s0_2_0;
+	r6 += M3x4(1.603e-01, 8.987e-03, -4.033e-03, -1.199e-01, -7.282e-02, 2.104e-02, -5.612e-02, -3.962e-01, -9.936e-02, 6.237e-03, -5.678e-03, -1.392e-01) * s0_2_0;
+	r7 += M3x4(7.790e-03, 9.057e-03, -3.414e-03, 8.960e-04, -6.221e-03, -5.236e-02, -2.045e-02, 3.299e-02, -5.824e-03, -1.954e-03, -1.520e-02, 1.910e-02) * s0_2_0;
+	r0 += M3x4(-8.192e-04, 5.935e-02, 7.635e-02, 6.151e-02, 8.053e-02, 1.571e-02, -9.752e-02, 2.660e-01, -2.877e-02, -2.130e-02, 2.057e-02, -3.419e-01) * s0_2_1;
+	r1 += M3x4(4.228e-02, -1.599e-01, -2.783e-01, -4.471e-02, -2.214e-02, -2.604e-01, 1.624e-01, 1.155e-02, -1.658e-02, -2.132e-02, 1.165e-01, 4.685e-02) * s0_2_1;
+	r2 += M3x4(-4.829e-03, -8.034e-03, 5.772e-03, -9.828e-03, -3.307e-02, -3.447e-02, 3.344e-03, -1.911e-02, 1.051e-02, -1.013e-02, -3.069e-03, 6.913e-04) * s0_2_1;
+	r3 += M3x4(1.633e-02, 2.627e-02, -1.804e-01, -6.278e-02, -6.140e-02, 8.853e-02, -5.493e-01, 9.182e-02, 3.182e-02, 3.426e-02, -9.057e-02, -2.620e-02) * s0_2_1;
+	r4 += M3x4(-4.620e-02, -2.618e-02, -2.281e-01, 2.857e-02, -9.801e-02, 3.951e-02, -2.213e-01, -5.846e-02, -1.325e-02, -2.225e-02, 4.564e-01, -8.528e-03) * s0_2_1;
+	r5 += M3x4(-5.448e-03, -1.901e-01, -4.684e-02, -5.376e-03, -1.655e-03, -4.365e-01, -8.901e-02, -8.764e-02, 1.972e-02, -1.202e-01, 1.030e-02, 2.001e-02) * s0_2_1;
+	r6 += M3x4(-8.379e-01, -1.514e-02, 7.678e-03, -1.234e-01, -8.298e-02, -9.021e-03, 7.444e-02, 7.155e-02, 9.313e-01, 2.107e-04, 5.015e-04, -9.238e-02) * s0_2_1;
+	r7 += M3x4(1.642e-03, -4.732e-02, 9.484e-02, 9.748e-02, -7.009e-03, 9.681e-02, 2.707e-01, 7.775e-02, 8.419e-03, -1.346e-02, 5.090e-02, 3.100e-02) * s0_2_1;
+	r0 += M3x4(2.282e-03, -3.105e-02, 7.746e-03, 6.181e-02, 4.306e-02, 1.289e-03, -1.287e-02, 1.692e-01, 9.517e-04, -4.027e-04, 1.332e-03, -2.216e-01) * s0_2_2;
+	r1 += M3x4(1.107e-02, 2.260e-02, -1.314e-02, -5.768e-02, -1.989e-03, 1.494e-02, 9.908e-03, -9.546e-02, -1.155e-02, 1.023e-03, 4.755e-03, 1.565e-01) * s0_2_2;
+	r2 += M3x4(-6.987e-04, 8.820e-04, -2.900e-03, -6.661e-03, 1.082e-02, -1.426e-02, -2.039e-03, 8.653e-03, -8.675e-03, 6.521e-03, 1.336e-03, 4.041e-04) * s0_2_2;
+	r3 += M3x4(-7.801e-03, 6.607e-03, 1.564e-02, -1.087e-02, 3.054e-02, 7.879e-02, 7.496e-03, 1.701e-02, -2.353e-02, -3.627e-02, -1.873e-02, -6.498e-03) * s0_2_2;
+	r4 += M3x4(-3.625e-02, -6.322e-02, -2.519e-01, -2.036e-02, -1.223e-01, 1.734e-01, -1.283e-01, 1.493e-01, -7.572e-03, -1.323e-01, 3.818e-01, 3.682e-02) * s0_2_2;
+	r5 += M3x4(4.019e-03, 5.256e-03, -6.879e-03, -1.024e-02, -1.006e-02, 1.280e-02, -2.565e-02, -8.366e-03, -1.167e-02, -1.303e-02, 5.854e-03, -5.277e-04) * s0_2_2;
+	r6 += M3x4(6.775e-02, 1.294e-02, -3.371e-03, 3.430e-02, -4.094e-02, -1.050e-03, -1.162e-02, -8.909e-02, -3.599e-02, -2.983e-03, 2.349e-02, 1.662e-04) * s0_2_2;
+	r7 += M3x4(2.783e-01, -3.269e-02, 1.755e-01, 4.552e-02, 5.603e-01, 1.678e-02, 3.672e-01, 1.147e-01, 2.385e-01, 4.311e-04, 7.414e-02, 1.702e-02) * s0_2_2;
+	r0 += V4(-3.044e-02, 2.204e-01, 3.578e-03, -1.818e-05);
+	r0 = clamp(r0, V4(0.0), V4(1.0));
+	imageStore(out_image, opos + ivec2(0, 0), vec4(r0));
+	r1 += V4(-1.833e-04, -9.983e-03, 5.587e-04, 2.900e-03);
+	r1 = clamp(r1, V4(0.0), V4(1.0));
+	imageStore(out_image, opos + ivec2(1, 0), vec4(r1));
+	r2 += V4(2.285e-03, -5.204e-03, -5.944e-05, 1.765e-02);
+	r2 = clamp(r2, V4(0.0), V4(1.0));
+	imageStore(out_image, opos + ivec2(0, 1), vec4(r2));
+	r3 += V4(1.785e-03, 2.391e-02, 1.660e-03, -1.521e-03);
+	r3 = clamp(r3, V4(0.0), V4(1.0));
+	imageStore(out_image, opos + ivec2(1, 1), vec4(r3));
+	r4 += V4(3.657e-03, 1.430e-04, -9.372e-05, -3.161e-02);
+	r4 = clamp(r4, V4(0.0), V4(1.0));
+	imageStore(out_image, opos + ivec2(2, 0), vec4(r4));
+	r5 += V4(1.693e-03, 1.077e-02, 1.514e-02, -6.223e-01);
+	r5 = clamp(r5, V4(0.0), V4(1.0));
+	imageStore(out_image, opos + ivec2(3, 0), vec4(r5));
+	r6 += V4(-4.067e-03, -1.788e-02, 1.321e-02, -2.569e-02);
+	r6 = clamp(r6, V4(0.0), V4(1.0));
+	imageStore(out_image, opos + ivec2(2, 1), vec4(r6));
+	r7 += V4(-5.985e-04, 9.972e-02, 1.096e-02, 6.194e-03);
+	r7 = clamp(r7, V4(0.0), V4(1.0));
+	imageStore(out_image, opos + ivec2(3, 1), vec4(r7));
+}
+

@@ -27,6 +27,32 @@
 #include "GPU2D_OpenGL.h"
 #include "GPU.h"
 #include "GPU3D.h"
+#include "OpenGL_shaders/2DNNEDI3_VerticalCS.h"
+#include "OpenGL_shaders/2DNNEDI3_HorizontalCS.h"
+
+extern const char* k2DCuNNy4x32_InCS;
+extern const char* k2DCuNNy4x32_Conv1CS;
+extern const char* k2DCuNNy4x32_Conv2CS;
+extern const char* k2DCuNNy4x32_Conv3CS;
+extern const char* k2DCuNNy4x32_Conv4CS;
+extern const char* k2DCuNNy4x32_OutShuffleCS;
+
+extern const char* k2DArtCNN_C4F16_Conv0CS;
+extern const char* k2DArtCNN_C4F16_Conv1CS;
+extern const char* k2DArtCNN_C4F16_Conv2CS;
+extern const char* k2DArtCNN_C4F16_Conv3CS;
+extern const char* k2DArtCNN_C4F16_Conv4CS;
+extern const char* k2DArtCNN_C4F16_Conv5CS;
+extern const char* k2DArtCNN_C4F16_Conv6CS;
+extern const char* k2DArtCNN_C4F16_DepthToSpaceCS;
+extern const char* k2DArtCNN_C4F16DN_Conv0CS;
+extern const char* k2DArtCNN_C4F16DN_Conv1CS;
+extern const char* k2DArtCNN_C4F16DN_Conv2CS;
+extern const char* k2DArtCNN_C4F16DN_Conv3CS;
+extern const char* k2DArtCNN_C4F16DN_Conv4CS;
+extern const char* k2DArtCNN_C4F16DN_Conv5CS;
+extern const char* k2DArtCNN_C4F16DN_Conv6CS;
+extern const char* k2DArtCNN_C4F16DN_DepthToSpaceCS;
 
 namespace melonDS
 {
@@ -50,28 +76,12 @@ using Platform::LogLevel;
 #include "OpenGL_shaders/2DOverlayBaselineCompositeFS.h"
 #include "OpenGL_shaders/2DOverlayCompositeFS.h"
 #include "OpenGL_shaders/2DOverlayDebugFS.h"
-#include "OpenGL_shaders/2DArtCNNPassVS.h"
-#include "OpenGL_shaders/2DArtCNN_RGBToYUVAFS.h"
-#include "OpenGL_shaders/2DArtCNN_Spline36FS.h"
+#include "OpenGL_shaders/2DMasterBrightnessFS.h"
+#include "OpenGL_shaders/2DFullscreenPassVS.h"
+#include "OpenGL_shaders/2DRGBAToYUVAFS.h"
+#include "OpenGL_shaders/2DSpline36FS.h"
 #include "OpenGL_shaders/2DArtCNN_YUVAToRGBA2xFS.h"
-#include "OpenGL_shaders/2DArtCNN_C4F16_Conv0FS.h"
-#include "OpenGL_shaders/2DArtCNN_C4F16_Conv1FS.h"
-#include "OpenGL_shaders/2DArtCNN_C4F16_Conv2FS.h"
-#include "OpenGL_shaders/2DArtCNN_C4F16_Conv3FS.h"
-#include "OpenGL_shaders/2DArtCNN_C4F16_Conv4FS.h"
-#include "OpenGL_shaders/2DArtCNN_C4F16_Conv5FS.h"
-#include "OpenGL_shaders/2DArtCNN_C4F16_Conv6FS.h"
-#include "OpenGL_shaders/2DArtCNN_C4F16_DepthToSpaceFS.h"
-#include "OpenGL_shaders/2DArtCNN_C4F16DN_Conv0FS.h"
-#include "OpenGL_shaders/2DArtCNN_C4F16DN_Conv1FS.h"
-#include "OpenGL_shaders/2DArtCNN_C4F16DN_Conv2FS.h"
-#include "OpenGL_shaders/2DArtCNN_C4F16DN_Conv3FS.h"
-#include "OpenGL_shaders/2DArtCNN_C4F16DN_Conv4FS.h"
-#include "OpenGL_shaders/2DArtCNN_C4F16DN_Conv5FS.h"
-#include "OpenGL_shaders/2DArtCNN_C4F16DN_Conv6FS.h"
-#include "OpenGL_shaders/2DArtCNN_C4F16DN_DepthToSpaceFS.h"
-#include "OpenGL_shaders/2DNNEDI3_CommonFS.h"
-#include "OpenGL_shaders/2DNNEDI3_NNS16Win8x4KernelFS.h"
+#include "OpenGL_shaders/2DAlphaReplaceFS.h"
 #include "OpenGL_shaders/2DXBRZ_PreprocessFS.h"
 #include "OpenGL_shaders/2DXBRZ_FreescaleFS.h"
 
@@ -95,11 +105,152 @@ constexpr u32 kWholeSceneMiscEVB = 1u << 4;
 constexpr u32 kWholeSceneMiscEVY = 1u << 5;
 constexpr u32 kWholeSceneMiscParentPartial = 1u << 6;
 
+enum class CaptureRepresentationEffectOwner : u8
+{
+    None = 0,
+    CurrentEngine = 1,
+    SourceA = 2,
+    FinalDisplay = 3,
+    Unknown = 4,
+};
+
+enum class CaptureRepresentationEffectCompatibility : u8
+{
+    IncompatibleOrNoProduct = 0,
+    Compatible = 1,
+    UnknownNeedsProof = 2,
+};
+
+enum class CaptureRepresentationFallbackClass : u8
+{
+    None = 0,
+    NativeCurrent = 1,
+    PostprocessFinal = 2,
+    Overlay = 3,
+    ExactFullCapture = 4,
+    MissingProduct = 5,
+    NormalHybrid = 6,
+};
+
+bool CaptureRepresentationHasContentProof(const WholeSceneRenderTrace& trace)
+{
+    if (trace.CaptureProductKind == WholeSceneCaptureProductKind::None ||
+        trace.CaptureRenderAction == WholeSceneCaptureRenderAction::None ||
+        trace.CaptureRenderAction == WholeSceneCaptureRenderAction::RenderNormalHybridFallback)
+    {
+        return false;
+    }
+
+    if (trace.CaptureProofKind != WholeSceneCaptureProofKind::None)
+        return true;
+
+    return trace.CaptureProductKind == WholeSceneCaptureProductKind::FullCaptureProduct &&
+           trace.SourceAFullProductEventValid;
+}
+
+bool CaptureRepresentationHasRouteProof(const WholeSceneRenderTrace& trace)
+{
+    switch (trace.CaptureProofKind)
+    {
+    case WholeSceneCaptureProofKind::ExactCaptureEvent:
+    case WholeSceneCaptureProofKind::RouteStateIdentity:
+    case WholeSceneCaptureProofKind::ActiveBackgroundEpoch:
+    case WholeSceneCaptureProofKind::HandoffRouteKey:
+    case WholeSceneCaptureProofKind::DirectFinalPresentationMatch:
+    case WholeSceneCaptureProofKind::CurrentOverlayEligibility:
+    case WholeSceneCaptureProofKind::Source3DSceneIdentity:
+        return true;
+    case WholeSceneCaptureProofKind::None:
+    default:
+        return false;
+    }
+}
+
+CaptureRepresentationEffectOwner CaptureRepresentationEffectOwnerForTrace(
+    const WholeSceneRenderTrace& trace)
+{
+    switch (trace.CaptureRequestKind)
+    {
+    case WholeSceneCaptureRequestKind::CapturedLayerConsumer:
+        return CaptureRepresentationEffectOwner::SourceA;
+    case WholeSceneCaptureRequestKind::DirectFinalConsumer:
+    case WholeSceneCaptureRequestKind::MainVRAMDisplayConsumer:
+        return CaptureRepresentationEffectOwner::FinalDisplay;
+    case WholeSceneCaptureRequestKind::LiveOverlayProducer:
+    case WholeSceneCaptureRequestKind::HandoffConsumer:
+        return CaptureRepresentationEffectOwner::CurrentEngine;
+    case WholeSceneCaptureRequestKind::None:
+    default:
+        break;
+    }
+
+    if (trace.Path == WholeSceneRenderPath::SourceACaptureReplacement)
+        return CaptureRepresentationEffectOwner::SourceA;
+    if (trace.Path == WholeSceneRenderPath::PhysicalFinalPostprocessInput)
+        return CaptureRepresentationEffectOwner::FinalDisplay;
+    if (trace.Path == WholeSceneRenderPath::CaptureBackedHandoff ||
+        trace.Path == WholeSceneRenderPath::CaptureEpochOverlay)
+        return CaptureRepresentationEffectOwner::CurrentEngine;
+
+    return CaptureRepresentationEffectOwner::None;
+}
+
+CaptureRepresentationFallbackClass CaptureRepresentationFallbackForTrace(
+    const WholeSceneRenderTrace& trace)
+{
+    if (trace.Path == WholeSceneRenderPath::Current)
+        return CaptureRepresentationFallbackClass::NativeCurrent;
+    if (trace.Path == WholeSceneRenderPath::PhysicalFinalPostprocessInput ||
+        trace.SourceAProductChoice == SourceAProductChoiceReason::FallbackFinalImage)
+        return CaptureRepresentationFallbackClass::PostprocessFinal;
+    if (trace.Path == WholeSceneRenderPath::OverlayOperatorUpscale)
+        return CaptureRepresentationFallbackClass::Overlay;
+    if (trace.CaptureProductKind == WholeSceneCaptureProductKind::FullCaptureProduct)
+        return CaptureRepresentationFallbackClass::ExactFullCapture;
+    if (trace.CaptureRenderAction == WholeSceneCaptureRenderAction::RenderNormalHybridFallback ||
+        trace.SourceAProductChoice == SourceAProductChoiceReason::FallbackNormalHybrid)
+        return CaptureRepresentationFallbackClass::NormalHybrid;
+    if (trace.CaptureProductKind == WholeSceneCaptureProductKind::None &&
+        (trace.Path == WholeSceneRenderPath::SourceACaptureReplacement ||
+         trace.Path == WholeSceneRenderPath::CaptureBackedHandoff ||
+         trace.Path == WholeSceneRenderPath::CaptureEpochOverlay))
+        return CaptureRepresentationFallbackClass::MissingProduct;
+
+    return CaptureRepresentationFallbackClass::None;
+}
+
+WholeSceneCaptureProductPresentationClass CaptureRepresentationProductClassForTrace(
+    const WholeSceneRenderTrace& trace)
+{
+    const auto chosenProductClass =
+        static_cast<WholeSceneCaptureProductPresentationClass>(
+            trace.SourceAChosenProductPresentationClass);
+    if (chosenProductClass != WholeSceneCaptureProductPresentationClass::None)
+        return chosenProductClass;
+
+    return CaptureProductPresentationClassForProduct(trace.CaptureProductKind,
+                                                     trace.CaptureRenderAction);
+}
+
 u32 HashPresentationValue(u32 hash, u32 value)
 {
     hash ^= value;
     hash *= 16777619u;
     return hash;
+}
+
+u32 PackedMasterBrightnessTraceState(u16 masterBrightness)
+{
+    const u32 mode = (masterBrightness >> 14) & 0x3u;
+    const u32 factor = std::min<u32>(masterBrightness & 0x1Fu, 16u);
+    return (mode << 8) | factor;
+}
+
+bool IsMasterBrightnessActive(u16 masterBrightness)
+{
+    const u32 mode = (masterBrightness >> 14) & 0x3u;
+    const u32 factor = std::min<u32>(masterBrightness & 0x1Fu, 16u);
+    return (mode == 1 || mode == 2) && factor > 0;
 }
 
 const char* kArtCNNModelLabels[RendererSettings::GLArtCNNModelCount] = {
@@ -109,40 +260,213 @@ const char* kArtCNNModelLabels[RendererSettings::GLArtCNNModelCount] = {
 
 const char* kArtCNNConvShaderSources[RendererSettings::GLArtCNNModelCount][7] = {
     {
-        k2DArtCNN_C4F16DN_Conv0FS,
-        k2DArtCNN_C4F16DN_Conv1FS,
-        k2DArtCNN_C4F16DN_Conv2FS,
-        k2DArtCNN_C4F16DN_Conv3FS,
-        k2DArtCNN_C4F16DN_Conv4FS,
-        k2DArtCNN_C4F16DN_Conv5FS,
-        k2DArtCNN_C4F16DN_Conv6FS,
+        ::k2DArtCNN_C4F16DN_Conv0CS,
+        ::k2DArtCNN_C4F16DN_Conv1CS,
+        ::k2DArtCNN_C4F16DN_Conv2CS,
+        ::k2DArtCNN_C4F16DN_Conv3CS,
+        ::k2DArtCNN_C4F16DN_Conv4CS,
+        ::k2DArtCNN_C4F16DN_Conv5CS,
+        ::k2DArtCNN_C4F16DN_Conv6CS,
     },
     {
-        k2DArtCNN_C4F16_Conv0FS,
-        k2DArtCNN_C4F16_Conv1FS,
-        k2DArtCNN_C4F16_Conv2FS,
-        k2DArtCNN_C4F16_Conv3FS,
-        k2DArtCNN_C4F16_Conv4FS,
-        k2DArtCNN_C4F16_Conv5FS,
-        k2DArtCNN_C4F16_Conv6FS,
+        ::k2DArtCNN_C4F16_Conv0CS,
+        ::k2DArtCNN_C4F16_Conv1CS,
+        ::k2DArtCNN_C4F16_Conv2CS,
+        ::k2DArtCNN_C4F16_Conv3CS,
+        ::k2DArtCNN_C4F16_Conv4CS,
+        ::k2DArtCNN_C4F16_Conv5CS,
+        ::k2DArtCNN_C4F16_Conv6CS,
     },
 };
 
 const char* kArtCNNDepthToSpaceSources[RendererSettings::GLArtCNNModelCount] = {
-    k2DArtCNN_C4F16DN_DepthToSpaceFS,
-    k2DArtCNN_C4F16_DepthToSpaceFS,
+    ::k2DArtCNN_C4F16DN_DepthToSpaceCS,
+    ::k2DArtCNN_C4F16_DepthToSpaceCS,
 };
 
-std::string BuildNNEDI3PassSource(bool vertical)
+const char* kCuNNyModelLabels[RendererSettings::GLCuNNyModelCount] = {
+    "4x32",
+};
+
+struct CuNNyModelInfo
 {
-    std::string source = "#version 140\n";
-    source += "#extension GL_ARB_shader_bit_encoding : require\n";
-    source += vertical ? "#define NNEDI3_VERTICAL 1\n" : "#define NNEDI3_VERTICAL 0\n";
-    source += k2DNNEDI3_CommonFS;
-    source += "\n";
-    source += k2DNNEDI3_NNS16Win8x4KernelFS;
-    source += "\nvoid main()\n{\n    oColor = vec4(nnedi3_scalar(0), 1.0, 1.0, 1.0);\n}\n";
-    return source;
+    const char* InShader;
+    const char* ConvShaders[RendererSettings::GLCuNNyMaxConvPasses];
+    const char* OutShader;
+    int ConvPasses;
+    int WorkScaleX;
+    int WorkScaleY;
+    int FinalWorkScaleX;
+    int FinalWorkScaleY;
+    bool RGB;
+};
+
+const CuNNyModelInfo kCuNNyModels[RendererSettings::GLCuNNyModelCount] = {
+    {
+        ::k2DCuNNy4x32_InCS,
+        {
+            ::k2DCuNNy4x32_Conv1CS,
+            ::k2DCuNNy4x32_Conv2CS,
+            ::k2DCuNNy4x32_Conv3CS,
+            ::k2DCuNNy4x32_Conv4CS,
+        },
+        ::k2DCuNNy4x32_OutShuffleCS,
+        4,
+        4, 2,
+        4, 2,
+        true,
+    },
+};
+
+void SetUniform1iIfPresent(GLuint shader, const char* name, GLint value)
+{
+    const GLint loc = glGetUniformLocation(shader, name);
+    if (loc >= 0)
+        glUniform1i(loc, value);
+}
+
+void SetUniform2iIfPresent(GLuint shader, const char* name, GLint x, GLint y)
+{
+    const GLint loc = glGetUniformLocation(shader, name);
+    if (loc >= 0)
+        glUniform2i(loc, x, y);
+}
+
+void SetUniform1fIfPresent(GLuint shader, const char* name, GLfloat value)
+{
+    const GLint loc = glGetUniformLocation(shader, name);
+    if (loc >= 0)
+        glUniform1f(loc, value);
+}
+
+void SetUniform2fIfPresent(GLuint shader, const char* name, GLfloat x, GLfloat y)
+{
+    const GLint loc = glGetUniformLocation(shader, name);
+    if (loc >= 0)
+        glUniform2f(loc, x, y);
+}
+
+void SetUniform4fIfPresent(GLuint shader, const char* name, GLfloat x, GLfloat y, GLfloat z, GLfloat w)
+{
+    const GLint loc = glGetUniformLocation(shader, name);
+    if (loc >= 0)
+        glUniform4f(loc, x, y, z, w);
+}
+
+constexpr const char* kCuNNyWorkSamplerUniforms[] = {
+    "in_raw",
+    "conv1_raw",
+    "conv2_raw",
+    "conv3_raw",
+    "conv4_raw",
+    "conv5_raw",
+    "conv6_raw",
+    "conv7_raw",
+    "conv8_raw",
+};
+
+constexpr const char* kCuNNyMulUniforms[] = {
+    "LUMA_mul",
+    "MAIN_mul",
+    "in_mul",
+    "conv1_mul",
+    "conv2_mul",
+    "conv3_mul",
+    "conv4_mul",
+    "conv5_mul",
+    "conv6_mul",
+    "conv7_mul",
+    "conv8_mul",
+};
+
+constexpr const char* kCuNNyWorkPointUniforms[] = {
+    "in_pt",
+    "conv1_pt",
+    "conv2_pt",
+    "conv3_pt",
+    "conv4_pt",
+    "conv5_pt",
+    "conv6_pt",
+    "conv7_pt",
+    "conv8_pt",
+};
+
+void SetCuNNyProgramDefaults(GLuint shader)
+{
+    glUseProgram(shader);
+    SetUniform1iIfPresent(shader, "LUMA_raw", 1);
+    SetUniform1iIfPresent(shader, "MAIN_raw", 1);
+    for (const char* name : kCuNNyWorkSamplerUniforms)
+        SetUniform1iIfPresent(shader, name, 0);
+    for (const char* name : kCuNNyMulUniforms)
+        SetUniform4fIfPresent(shader, name, 1.0f, 1.0f, 1.0f, 1.0f);
+}
+
+constexpr const char* kArtCNNSamplerUniforms[] = {
+    "LUMA_raw",
+    "conv2d_raw",
+    "conv2d_1_raw",
+    "conv2d_2_raw",
+    "conv2d_3_raw",
+    "conv2d_4_raw",
+    "conv2d_5_raw",
+    "conv2d_6_raw",
+};
+constexpr int kArtCNNSamplerUniformCount = sizeof(kArtCNNSamplerUniforms) / sizeof(kArtCNNSamplerUniforms[0]);
+
+constexpr const char* kArtCNNMulUniforms[] = {
+    "LUMA_mul",
+    "conv2d_mul",
+    "conv2d_1_mul",
+    "conv2d_2_mul",
+    "conv2d_3_mul",
+    "conv2d_4_mul",
+    "conv2d_5_mul",
+    "conv2d_6_mul",
+};
+
+void SetArtCNNComputeProgramDefaults(GLuint shader)
+{
+    glUseProgram(shader);
+    for (int i = 0; i < (int)kArtCNNSamplerUniformCount; i++)
+        SetUniform1iIfPresent(shader, kArtCNNSamplerUniforms[i], i);
+    for (const char* name : kArtCNNMulUniforms)
+        SetUniform1fIfPresent(shader, name, 1.0f);
+}
+
+void SetNNEDI3ComputeProgramDefaults(GLuint shader)
+{
+    glUseProgram(shader);
+    SetUniform1iIfPresent(shader, "Source", 0);
+}
+
+void SetArtCNNSizeUniform(GLuint shader, const char* sizeName, const char* pointName, GLfloat width, GLfloat height)
+{
+    SetUniform2fIfPresent(shader, sizeName, width, height);
+    SetUniform2fIfPresent(shader, pointName, 1.0f / width, 1.0f / height);
+}
+
+void SetArtCNNComputeSizeUniforms(GLuint shader, int nativeWidth, int nativeHeight)
+{
+    const GLfloat width = (GLfloat)nativeWidth;
+    const GLfloat height = (GLfloat)nativeHeight;
+    const GLfloat width2x = width * 2.0f;
+    const GLfloat height2x = height * 2.0f;
+
+    SetArtCNNSizeUniform(shader, "LUMA_size", "LUMA_pt", width, height);
+    SetArtCNNSizeUniform(shader, "conv2d_size", "conv2d_pt", width2x, height2x);
+    SetArtCNNSizeUniform(shader, "conv2d_1_size", "conv2d_1_pt", width2x, height2x);
+    SetArtCNNSizeUniform(shader, "conv2d_2_size", "conv2d_2_pt", width2x, height2x);
+    SetArtCNNSizeUniform(shader, "conv2d_3_size", "conv2d_3_pt", width2x, height2x);
+    SetArtCNNSizeUniform(shader, "conv2d_4_size", "conv2d_4_pt", width2x, height2x);
+    SetArtCNNSizeUniform(shader, "conv2d_5_size", "conv2d_5_pt", width2x, height2x);
+    SetArtCNNSizeUniform(shader, "conv2d_6_size", "conv2d_6_pt", width, height);
+}
+
+void BindTextureUnit(int unit, GLuint texture)
+{
+    glActiveTexture(GL_TEXTURE0 + unit);
+    glBindTexture(GL_TEXTURE_2D, texture);
 }
 
 std::string FormatHex(u32 value, int digits)
@@ -260,6 +584,9 @@ GLRenderer2D::GLRenderer2D(melonDS::GPU2D& gpu2D, GLRenderer& parent)
     WholeSceneScaleHybridNativeEffectGuard = true;
     WholeSceneScaleHybridForeground2DBase = false;
     WholeSceneScaleHybridCleanLegacyCandidate = false;
+    CuNNyShaderOwner = this;
+    ArtCNNShaderOwner = this;
+    NNEDI3ComputeShaderOwner = this;
     WholeSceneDebugViewsActive.store(false, std::memory_order_relaxed);
     WholeSceneScaleState = WholeSceneScaleEligibility::ScreenUnavailable;
     WholeSceneTrace = {};
@@ -281,27 +608,27 @@ GLRenderer2D::GLRenderer2D(melonDS::GPU2D& gpu2D, GLRenderer& parent)
     WholeSceneNativeProductsFrameComplete = false;
     memset(WholeSceneNativeProductRowValid, 0, sizeof(WholeSceneNativeProductRowValid));
     WholeSceneNativeProductEpochValid = true;
+    WholeSceneNativeProductEpochInvalidReason = 0;
     WholeSceneNativeProductEligibilityInitialized = false;
     WholeSceneNativeProductFrameEligibility = WholeSceneScaleEligibility::ScreenUnavailable;
+    WholeSceneNativeProductLastEligibility = WholeSceneScaleEligibility::ScreenUnavailable;
     WholeSceneNativeProductPathInitialized = false;
     WholeSceneNativeProductFramePath = WholeSceneRenderPath::None;
+    WholeSceneNativeProductLastPath = WholeSceneRenderPath::None;
     WholeSceneNativeProductFinalizerPathSeen = false;
     WholeSceneOverlayEndpointsValid = false;
     WholeSceneOverlayEndpointSourceTex = 0;
     WholeSceneSourceABlitFB = 0;
     for (int i = 0; i < kCaptureBackedHandoffRouteSlots; i++)
     {
-        CaptureBackedHandoff3DFB[i] = 0;
-        CaptureBackedHandoff3DTex[i] = 0;
-        CaptureBackedHandoff3DValid[i] = false;
-        CaptureBackedHandoffLatchedKey[i] = {};
-        CaptureBackedHandoffRouteHasCapturedPhase[i] = false;
+        CaptureBackedRouteGL[i] = {};
+        CaptureBackedRoute[i] = {};
     }
-    CaptureBackedHandoffCurrentKey = {};
-    CaptureBackedHandoffReuseDecision = CaptureBackedHandoffReuseReason::None;
-    CaptureBackedHandoffFrameSerial = 0;
-    CaptureBackedHandoffBackgroundUpdated = false;
-    CaptureBackedHandoffCurrentSlot = 0;
+    CaptureBackedHandoff.CurrentKey = {};
+    CaptureBackedHandoff.ReuseDecision = CaptureBackedHandoffReuseReason::None;
+    CaptureBackedHandoff.FrameSerial = 0;
+    CaptureBackedHandoff.BackgroundUpdated = false;
+    CaptureBackedHandoff.CurrentSlot = 0;
     DeferredLayerPrerenderDirty = 0;
     for (int layer = 0; layer < 4; layer++)
     {
@@ -387,101 +714,77 @@ bool GLRenderer2D::InitShaders()
         return false;
 
     if (!OpenGL::CompileVertexFragmentProgram(OverlayEndpointShader,
-                                              k2DArtCNNPassVS, k2DOverlayEndpointFS,
+                                              k2DFullscreenPassVS, k2DOverlayEndpointFS,
                                               "2DOverlayEndpointShader",
                                               {{"vPosition", 0}},
                                               {{"oColor", 0}}))
         return false;
 
     if (!OpenGL::CompileVertexFragmentProgram(OverlayCompositeShader,
-                                              k2DArtCNNPassVS, k2DOverlayBaselineCompositeFS,
+                                              k2DFullscreenPassVS, k2DOverlayBaselineCompositeFS,
                                               "2DOverlayCompositeShader",
                                               {{"vPosition", 0}},
                                               {{"oColor", 0}}))
         return false;
 
     if (!OpenGL::CompileVertexFragmentProgram(OverlayHybridCompositeShader,
-                                              k2DArtCNNPassVS, k2DOverlayCompositeFS,
+                                              k2DFullscreenPassVS, k2DOverlayCompositeFS,
                                               "2DOverlayHybridCompositeShader",
                                               {{"vPosition", 0}},
                                               {{"oColor", 0}}))
         return false;
 
     if (!OpenGL::CompileVertexFragmentProgram(OverlayDebugShader,
-                                              k2DArtCNNPassVS, k2DOverlayDebugFS,
+                                              k2DFullscreenPassVS, k2DOverlayDebugFS,
                                               "2DOverlayDebugShader",
                                               {{"vPosition", 0}},
                                               {{"oColor", 0}}))
         return false;
 
-    if (!OpenGL::CompileVertexFragmentProgram(ArtCNNRGBToYUVAShader,
-                                              k2DArtCNNPassVS, k2DArtCNN_RGBToYUVAFS,
-                                              "2DArtCNNRGBToYUVAShader",
+    if (!OpenGL::CompileVertexFragmentProgram(MasterBrightnessShader,
+                                              k2DFullscreenPassVS, k2DMasterBrightnessFS,
+                                              "2DMasterBrightnessShader",
                                               {{"vPosition", 0}},
                                               {{"oColor", 0}}))
         return false;
 
-    for (int model = 0; model < RendererSettings::GLArtCNNModelCount; model++)
-    {
-        for (int pass = 0; pass < 7; pass++)
-        {
-            std::string shaderName = "2DArtCNN_" + std::string(kArtCNNModelLabels[model]) +
-                                     "_Conv" + std::to_string(pass) + "Shader";
-            if (!OpenGL::CompileVertexFragmentProgram(ArtCNNConvShaders[model][pass],
-                                                      k2DArtCNNPassVS, kArtCNNConvShaderSources[model][pass],
-                                                      shaderName.c_str(),
-                                                      {{"vPosition", 0}},
-                                                      {{"oColor", 0}}))
-                return false;
-        }
+    if (!OpenGL::CompileVertexFragmentProgram(RGBAToYUVAShader,
+                                              k2DFullscreenPassVS, k2DRGBAToYUVAFS,
+                                              "2DRGBAToYUVAShader",
+                                              {{"vPosition", 0}},
+                                              {{"oColor", 0}}))
+        return false;
 
-        std::string depthShaderName = "2DArtCNN_" + std::string(kArtCNNModelLabels[model]) +
-                                      "_DepthToSpaceShader";
-        if (!OpenGL::CompileVertexFragmentProgram(ArtCNNDepthToSpaceShaders[model],
-                                                  k2DArtCNNPassVS, kArtCNNDepthToSpaceSources[model],
-                                                  depthShaderName.c_str(),
-                                                  {{"vPosition", 0}},
-                                                  {{"oColor", 0}}))
-            return false;
-    }
-
-    if (!OpenGL::CompileVertexFragmentProgram(ArtCNNSpline36Shader,
-                                              k2DArtCNNPassVS, k2DArtCNN_Spline36FS,
-                                              "2DArtCNNSpline36Shader",
+    if (!OpenGL::CompileVertexFragmentProgram(Spline36Shader,
+                                              k2DFullscreenPassVS, k2DSpline36FS,
+                                              "2DSpline36Shader",
                                               {{"vPosition", 0}},
                                               {{"oColor", 0}}))
         return false;
 
     if (!OpenGL::CompileVertexFragmentProgram(ArtCNNYUVAToRGBA2xShader,
-                                              k2DArtCNNPassVS, k2DArtCNN_YUVAToRGBA2xFS,
+                                              k2DFullscreenPassVS, k2DArtCNN_YUVAToRGBA2xFS,
                                               "2DArtCNNYUVAToRGBA2xShader",
                                               {{"vPosition", 0}},
                                               {{"oColor", 0}}))
         return false;
 
-    if (!OpenGL::CompileVertexFragmentProgram(NNEDI3Pass1Shader,
-                                              k2DArtCNNPassVS, BuildNNEDI3PassSource(true),
-                                              "2DNNEDI3Pass1Shader",
-                                              {{"vPosition", 0}},
-                                              {{"oColor", 0}}))
-        return false;
-
-    if (!OpenGL::CompileVertexFragmentProgram(NNEDI3Pass2Shader,
-                                              k2DArtCNNPassVS, BuildNNEDI3PassSource(false),
-                                              "2DNNEDI3Pass2Shader",
+    if (!OpenGL::CompileVertexFragmentProgram(AlphaReplaceShader,
+                                              k2DFullscreenPassVS, k2DAlphaReplaceFS,
+                                              "2DAlphaReplaceShader",
                                               {{"vPosition", 0}},
                                               {{"oColor", 0}}))
         return false;
 
     if (!OpenGL::CompileVertexFragmentProgram(XBRZPreprocessShader,
-                                              k2DArtCNNPassVS, k2DXBRZ_PreprocessFS,
+                                              k2DFullscreenPassVS, k2DXBRZ_PreprocessFS,
                                               "2DXBRZPreprocessShader",
                                               {{"vPosition", 0}},
                                               {{"oColor", 0}}))
         return false;
 
     if (!OpenGL::CompileVertexFragmentProgram(XBRZFreescaleShader,
-                                              k2DArtCNNPassVS, k2DXBRZ_FreescaleFS,
+                                              k2DFullscreenPassVS, k2DXBRZ_FreescaleFS,
                                               "2DXBRZFreescaleShader",
                                               {{"vPosition", 0}},
                                               {{"oColor", 0}}))
@@ -747,49 +1050,18 @@ bool GLRenderer2D::InitShaders()
     OverlayDebugLegacyUnderlayULoc = glGetUniformLocation(OverlayDebugShader, "uLegacyUnderlayEndpoint");
     OverlayDebugCoverageAwareULoc = glGetUniformLocation(OverlayDebugShader, "uCoverageAwareUnderlay");
 
-    glUseProgram(ArtCNNRGBToYUVAShader);
-    uniloc = glGetUniformLocation(ArtCNNRGBToYUVAShader, "Source");
+    glUseProgram(MasterBrightnessShader);
+    uniloc = glGetUniformLocation(MasterBrightnessShader, "SourceTex");
+    glUniform1i(uniloc, 0);
+    MasterBrightnessModeULoc = glGetUniformLocation(MasterBrightnessShader, "uBrightMode");
+    MasterBrightnessFactorULoc = glGetUniformLocation(MasterBrightnessShader, "uBrightFactor");
+
+    glUseProgram(RGBAToYUVAShader);
+    uniloc = glGetUniformLocation(RGBAToYUVAShader, "Source");
     glUniform1i(uniloc, 0);
 
-    for (int model = 0; model < RendererSettings::GLArtCNNModelCount; model++)
-    {
-        glUseProgram(ArtCNNConvShaders[model][0]);
-        uniloc = glGetUniformLocation(ArtCNNConvShaders[model][0], "artcnn_yuv");
-        glUniform1i(uniloc, 0);
-
-        glUseProgram(ArtCNNConvShaders[model][1]);
-        uniloc = glGetUniformLocation(ArtCNNConvShaders[model][1], "conv2d");
-        glUniform1i(uniloc, 0);
-
-        glUseProgram(ArtCNNConvShaders[model][2]);
-        uniloc = glGetUniformLocation(ArtCNNConvShaders[model][2], "conv2d_1");
-        glUniform1i(uniloc, 0);
-
-        glUseProgram(ArtCNNConvShaders[model][3]);
-        uniloc = glGetUniformLocation(ArtCNNConvShaders[model][3], "conv2d_2");
-        glUniform1i(uniloc, 0);
-
-        glUseProgram(ArtCNNConvShaders[model][4]);
-        uniloc = glGetUniformLocation(ArtCNNConvShaders[model][4], "conv2d_3");
-        glUniform1i(uniloc, 0);
-
-        glUseProgram(ArtCNNConvShaders[model][5]);
-        uniloc = glGetUniformLocation(ArtCNNConvShaders[model][5], "conv2d_4");
-        glUniform1i(uniloc, 0);
-
-        glUseProgram(ArtCNNConvShaders[model][6]);
-        uniloc = glGetUniformLocation(ArtCNNConvShaders[model][6], "conv2d");
-        glUniform1i(uniloc, 0);
-        uniloc = glGetUniformLocation(ArtCNNConvShaders[model][6], "conv2d_5");
-        glUniform1i(uniloc, 1);
-
-        glUseProgram(ArtCNNDepthToSpaceShaders[model]);
-        uniloc = glGetUniformLocation(ArtCNNDepthToSpaceShaders[model], "conv2d_6");
-        glUniform1i(uniloc, 0);
-    }
-
-    glUseProgram(ArtCNNSpline36Shader);
-    uniloc = glGetUniformLocation(ArtCNNSpline36Shader, "Source");
+    glUseProgram(Spline36Shader);
+    uniloc = glGetUniformLocation(Spline36Shader, "Source");
     glUniform1i(uniloc, 0);
 
     glUseProgram(ArtCNNYUVAToRGBA2xShader);
@@ -797,14 +1069,16 @@ bool GLRenderer2D::InitShaders()
     glUniform1i(uniloc, 0);
     uniloc = glGetUniformLocation(ArtCNNYUVAToRGBA2xShader, "artcnn_luma");
     glUniform1i(uniloc, 1);
-
-    glUseProgram(NNEDI3Pass1Shader);
-    uniloc = glGetUniformLocation(NNEDI3Pass1Shader, "Source");
+    uniloc = glGetUniformLocation(ArtCNNYUVAToRGBA2xShader, "AlphaSource");
+    glUniform1i(uniloc, 2);
+    uniloc = glGetUniformLocation(ArtCNNYUVAToRGBA2xShader, "uUseAlphaSource");
     glUniform1i(uniloc, 0);
 
-    glUseProgram(NNEDI3Pass2Shader);
-    uniloc = glGetUniformLocation(NNEDI3Pass2Shader, "Source");
+    glUseProgram(AlphaReplaceShader);
+    uniloc = glGetUniformLocation(AlphaReplaceShader, "Source");
     glUniform1i(uniloc, 0);
+    uniloc = glGetUniformLocation(AlphaReplaceShader, "AlphaSource");
+    glUniform1i(uniloc, 1);
 
     glUseProgram(XBRZPreprocessShader);
     uniloc = glGetUniformLocation(XBRZPreprocessShader, "Source");
@@ -857,19 +1131,19 @@ bool GLRenderer2D::InitShaders(GLRenderer2D& other)
     OverlayCompositeShader = other.OverlayCompositeShader;
     OverlayHybridCompositeShader = other.OverlayHybridCompositeShader;
     OverlayDebugShader = other.OverlayDebugShader;
-    ArtCNNRGBToYUVAShader = other.ArtCNNRGBToYUVAShader;
-    for (int model = 0; model < RendererSettings::GLArtCNNModelCount; model++)
-    {
-        for (int i = 0; i < 7; i++)
-            ArtCNNConvShaders[model][i] = other.ArtCNNConvShaders[model][i];
-        ArtCNNDepthToSpaceShaders[model] = other.ArtCNNDepthToSpaceShaders[model];
-    }
-    ArtCNNSpline36Shader = other.ArtCNNSpline36Shader;
+    MasterBrightnessShader = other.MasterBrightnessShader;
+    RGBAToYUVAShader = other.RGBAToYUVAShader;
+    ArtCNNShaderOwner = &other;
+    CopyArtCNNProgramsFrom(other);
+    Spline36Shader = other.Spline36Shader;
     ArtCNNYUVAToRGBA2xShader = other.ArtCNNYUVAToRGBA2xShader;
-    NNEDI3Pass1Shader = other.NNEDI3Pass1Shader;
-    NNEDI3Pass2Shader = other.NNEDI3Pass2Shader;
+    AlphaReplaceShader = other.AlphaReplaceShader;
+    NNEDI3ComputeShaderOwner = &other;
+    CopyNNEDI3ComputeProgramsFrom(other);
     XBRZPreprocessShader = other.XBRZPreprocessShader;
     XBRZFreescaleShader = other.XBRZFreescaleShader;
+    CuNNyShaderOwner = &other;
+    CopyCuNNyProgramsFrom(other);
 
     LayerPreCurBGULoc = other.LayerPreCurBGULoc;
     SpriteRenderTransULoc = other.SpriteRenderTransULoc;
@@ -916,6 +1190,8 @@ bool GLRenderer2D::InitShaders(GLRenderer2D& other)
     OverlayDebugModeULoc = other.OverlayDebugModeULoc;
     OverlayDebugLegacyUnderlayULoc = other.OverlayDebugLegacyUnderlayULoc;
     OverlayDebugCoverageAwareULoc = other.OverlayDebugCoverageAwareULoc;
+    MasterBrightnessModeULoc = other.MasterBrightnessModeULoc;
+    MasterBrightnessFactorULoc = other.MasterBrightnessFactorULoc;
 
     MosaicTex = other.MosaicTex;
 
@@ -1156,6 +1432,20 @@ bool GLRenderer2D::Init()
     glDefaultTexParams(GL_TEXTURE_2D);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 256, 192, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
 
+    auto initCaptureEndpointTex = [](GLuint& tex, int size, int layers, u32 color)
+    {
+        std::vector<u32> pixels(static_cast<size_t>(size) * size * layers, color);
+        glGenTextures(1, &tex);
+        glBindTexture(GL_TEXTURE_2D_ARRAY, tex);
+        glDefaultTexParams(GL_TEXTURE_2D_ARRAY);
+        glTexImage3D(GL_TEXTURE_2D_ARRAY, 0, GL_RGBA, size, size, layers, 0,
+                     GL_RGBA, GL_UNSIGNED_BYTE, pixels.data());
+    };
+    initCaptureEndpointTex(NativeOverlayBlackCapture128Tex, 128, 16, 0xFF000000u);
+    initCaptureEndpointTex(NativeOverlayWhiteCapture128Tex, 128, 16, 0xFFFFFFFFu);
+    initCaptureEndpointTex(NativeOverlayBlackCapture256Tex, 256, 4, 0xFF000000u);
+    initCaptureEndpointTex(NativeOverlayWhiteCapture256Tex, 256, 4, 0xFFFFFFFFu);
+
     glGenTextures(1, &NativeOverlayTrueFinalTex);
     glBindTexture(GL_TEXTURE_2D, NativeOverlayTrueFinalTex);
     glDefaultTexParams(GL_TEXTURE_2D);
@@ -1283,16 +1573,37 @@ bool GLRenderer2D::Init()
 
     glGenFramebuffers(1, &WholeSceneSourceABlitFB);
 
-    glGenTextures(kCaptureBackedHandoffRouteSlots, CaptureBackedHandoff3DTex);
-    glGenFramebuffers(kCaptureBackedHandoffRouteSlots, CaptureBackedHandoff3DFB);
     for (int i = 0; i < kCaptureBackedHandoffRouteSlots; i++)
     {
-        glBindTexture(GL_TEXTURE_2D, CaptureBackedHandoff3DTex[i]);
+        glGenTextures(1, &CaptureBackedRouteGL[i].Handoff3DTex);
+        glGenFramebuffers(1, &CaptureBackedRouteGL[i].Handoff3DFB);
+        glGenTextures(1, &CaptureBackedRouteGL[i].ProductTex);
+        glGenFramebuffers(1, &CaptureBackedRouteGL[i].ProductFB);
+        glGenTextures(1, &CaptureBackedRouteGL[i].EventProductTex);
+        glGenFramebuffers(1, &CaptureBackedRouteGL[i].EventProductFB);
+
+        glBindTexture(GL_TEXTURE_2D, CaptureBackedRouteGL[i].Handoff3DTex);
         glDefaultTexParams(GL_TEXTURE_2D);
         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, ScreenW, ScreenH, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
 
-        glBindFramebuffer(GL_FRAMEBUFFER, CaptureBackedHandoff3DFB[i]);
-        glFramebufferTexture(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, CaptureBackedHandoff3DTex[i], 0);
+        glBindFramebuffer(GL_FRAMEBUFFER, CaptureBackedRouteGL[i].Handoff3DFB);
+        glFramebufferTexture(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, CaptureBackedRouteGL[i].Handoff3DTex, 0);
+        glDrawBuffer(GL_COLOR_ATTACHMENT0);
+
+        glBindTexture(GL_TEXTURE_2D, CaptureBackedRouteGL[i].ProductTex);
+        glDefaultTexParams(GL_TEXTURE_2D);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, ScreenW, ScreenH, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+
+        glBindFramebuffer(GL_FRAMEBUFFER, CaptureBackedRouteGL[i].ProductFB);
+        glFramebufferTexture(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, CaptureBackedRouteGL[i].ProductTex, 0);
+        glDrawBuffer(GL_COLOR_ATTACHMENT0);
+
+        glBindTexture(GL_TEXTURE_2D, CaptureBackedRouteGL[i].EventProductTex);
+        glDefaultTexParams(GL_TEXTURE_2D);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, ScreenW, ScreenH, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+
+        glBindFramebuffer(GL_FRAMEBUFFER, CaptureBackedRouteGL[i].EventProductFB);
+        glFramebufferTexture(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, CaptureBackedRouteGL[i].EventProductTex, 0);
         glDrawBuffer(GL_COLOR_ATTACHMENT0);
     }
 
@@ -1356,11 +1667,6 @@ bool GLRenderer2D::Init()
     glDefaultTexParams(GL_TEXTURE_2D);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, 256, 384, 0, GL_RGBA, GL_HALF_FLOAT, nullptr);
 
-    glGenFramebuffers(1, &NNEDI3VerticalFB);
-    glBindFramebuffer(GL_FRAMEBUFFER, NNEDI3VerticalFB);
-    glFramebufferTexture(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, NNEDI3VerticalTex, 0);
-    glDrawBuffer(GL_COLOR_ATTACHMENT0);
-
     glGenTextures(1, &NNEDI3Vertical4xTex);
     glBindTexture(GL_TEXTURE_2D, NNEDI3Vertical4xTex);
     glDefaultTexParams(GL_TEXTURE_2D);
@@ -1371,18 +1677,8 @@ bool GLRenderer2D::Init()
     glDefaultTexParams(GL_TEXTURE_2D);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, 512, 384, 0, GL_RGBA, GL_HALF_FLOAT, nullptr);
 
-    glGenFramebuffers(1, &ArtCNNLuma2xFB);
-    glBindFramebuffer(GL_FRAMEBUFFER, ArtCNNLuma2xFB);
-    glFramebufferTexture(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, ArtCNNLuma2xTex, 0);
-    glDrawBuffer(GL_COLOR_ATTACHMENT0);
-
     glGenTextures(1, &NNEDI3Luma4xTex);
     glBindTexture(GL_TEXTURE_2D, NNEDI3Luma4xTex);
-    glDefaultTexParams(GL_TEXTURE_2D);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, 1024, 768, 0, GL_RGBA, GL_HALF_FLOAT, nullptr);
-
-    glGenTextures(1, &NNEDI3Luma4xCorrectedTex);
-    glBindTexture(GL_TEXTURE_2D, NNEDI3Luma4xCorrectedTex);
     glDefaultTexParams(GL_TEXTURE_2D);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, 1024, 768, 0, GL_RGBA, GL_HALF_FLOAT, nullptr);
 
@@ -1391,22 +1687,22 @@ bool GLRenderer2D::Init()
     glDefaultTexParams(GL_TEXTURE_2D);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, 512, 384, 0, GL_RGBA, GL_HALF_FLOAT, nullptr);
 
-    glGenTextures(1, &NNEDI3YUVA4xTex);
-    glBindTexture(GL_TEXTURE_2D, NNEDI3YUVA4xTex);
-    glDefaultTexParams(GL_TEXTURE_2D);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, 1024, 768, 0, GL_RGBA, GL_HALF_FLOAT, nullptr);
-
     glGenTextures(1, &ArtCNNRGBA2xTex);
     glBindTexture(GL_TEXTURE_2D, ArtCNNRGBA2xTex);
     glDefaultTexParams(GL_TEXTURE_2D);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, 512, 384, 0, GL_RGBA, GL_HALF_FLOAT, nullptr);
 
-    glGenTextures(1, &NNEDI3RGBA4xTex);
-    glBindTexture(GL_TEXTURE_2D, NNEDI3RGBA4xTex);
-    glDefaultTexParams(GL_TEXTURE_2D);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, 1024, 768, 0, GL_RGBA, GL_HALF_FLOAT, nullptr);
-
     glGenFramebuffers(1, &ArtCNNOutputFB);
+
+    glGenTextures(2, CuNNyWorkTex);
+    for (int i = 0; i < 2; i++)
+    {
+        glBindTexture(GL_TEXTURE_2D, CuNNyWorkTex[i]);
+        glDefaultTexParams(GL_TEXTURE_2D);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, 1, 1, 0, GL_RGBA, GL_HALF_FLOAT, nullptr);
+        CuNNyWorkTexWidth[i] = 1;
+        CuNNyWorkTexHeight[i] = 1;
+    }
 
     glGenTextures(1, &XBRZInfoTex);
     glBindTexture(GL_TEXTURE_2D, XBRZInfoTex);
@@ -1463,19 +1759,33 @@ void GLRenderer2D::DeleteShaders()
     glDeleteProgram(OverlayCompositeShader);
     glDeleteProgram(OverlayHybridCompositeShader);
     glDeleteProgram(OverlayDebugShader);
-    glDeleteProgram(ArtCNNRGBToYUVAShader);
+    glDeleteProgram(RGBAToYUVAShader);
     for (int model = 0; model < RendererSettings::GLArtCNNModelCount; model++)
     {
         for (int i = 0; i < 7; i++)
             glDeleteProgram(ArtCNNConvShaders[model][i]);
         glDeleteProgram(ArtCNNDepthToSpaceShaders[model]);
     }
-    glDeleteProgram(ArtCNNSpline36Shader);
+    glDeleteProgram(Spline36Shader);
     glDeleteProgram(ArtCNNYUVAToRGBA2xShader);
-    glDeleteProgram(NNEDI3Pass1Shader);
-    glDeleteProgram(NNEDI3Pass2Shader);
+    glDeleteProgram(AlphaReplaceShader);
+    glDeleteProgram(NNEDI3VerticalComputeShader);
+    glDeleteProgram(NNEDI3HorizontalComputeShader);
     glDeleteProgram(XBRZPreprocessShader);
     glDeleteProgram(XBRZFreescaleShader);
+    for (int model = 0; model < RendererSettings::GLCuNNyModelCount; model++)
+    {
+        glDeleteProgram(CuNNyInShaders[model]);
+        for (int pass = 0; pass < RendererSettings::GLCuNNyMaxConvPasses; pass++)
+            glDeleteProgram(CuNNyConvShaders[model][pass]);
+        glDeleteProgram(CuNNyOutShaders[model]);
+    }
+    CuNNyProgramsReady = false;
+    CuNNyProgramsFailed = false;
+    ArtCNNComputeProgramsReady = false;
+    ArtCNNComputeProgramsFailed = false;
+    NNEDI3ComputeProgramsReady = false;
+    NNEDI3ComputeProgramsFailed = false;
 
     glDeleteTextures(1, &MosaicTex);
 }
@@ -1526,6 +1836,10 @@ GLRenderer2D::~GLRenderer2D()
     glDeleteTextures(1, &NativeDirect3DCompositorTex);
     glDeleteTextures(1, &NativeOverlayBlack3DTex);
     glDeleteTextures(1, &NativeOverlayWhite3DTex);
+    glDeleteTextures(1, &NativeOverlayBlackCapture128Tex);
+    glDeleteTextures(1, &NativeOverlayWhiteCapture128Tex);
+    glDeleteTextures(1, &NativeOverlayBlackCapture256Tex);
+    glDeleteTextures(1, &NativeOverlayWhiteCapture256Tex);
     glDeleteTextures(1, &NativeOverlayTrueFinalTex);
     glDeleteTextures(1, &NativeOverlayReconstructedTex);
     glDeleteTextures(1, &NativeOverlayErrorTex);
@@ -1552,8 +1866,15 @@ GLRenderer2D::~GLRenderer2D()
     glDeleteTextures(1, &HybridForegroundAlphaTex);
     glDeleteTextures(1, &HybridFinalSourceTex);
     glDeleteFramebuffers(1, &WholeSceneSourceABlitFB);
-    glDeleteTextures(kCaptureBackedHandoffRouteSlots, CaptureBackedHandoff3DTex);
-    glDeleteFramebuffers(kCaptureBackedHandoffRouteSlots, CaptureBackedHandoff3DFB);
+    for (int i = 0; i < kCaptureBackedHandoffRouteSlots; i++)
+    {
+        glDeleteTextures(1, &CaptureBackedRouteGL[i].Handoff3DTex);
+        glDeleteFramebuffers(1, &CaptureBackedRouteGL[i].Handoff3DFB);
+        glDeleteTextures(1, &CaptureBackedRouteGL[i].ProductTex);
+        glDeleteFramebuffers(1, &CaptureBackedRouteGL[i].ProductFB);
+        glDeleteTextures(1, &CaptureBackedRouteGL[i].EventProductTex);
+        glDeleteFramebuffers(1, &CaptureBackedRouteGL[i].EventProductFB);
+    }
     glDeleteFramebuffers(1, &UpscaledStateFB);
 
     glDeleteTextures(1, &ArtCNNYUVTex);
@@ -1565,17 +1886,13 @@ GLRenderer2D::~GLRenderer2D()
     glDeleteTextures(1, &ArtCNNPackedTex);
     glDeleteFramebuffers(1, &ArtCNNPackedFB);
     glDeleteTextures(1, &NNEDI3VerticalTex);
-    glDeleteFramebuffers(1, &NNEDI3VerticalFB);
     glDeleteTextures(1, &NNEDI3Vertical4xTex);
     glDeleteTextures(1, &ArtCNNLuma2xTex);
-    glDeleteFramebuffers(1, &ArtCNNLuma2xFB);
     glDeleteTextures(1, &NNEDI3Luma4xTex);
-    glDeleteTextures(1, &NNEDI3Luma4xCorrectedTex);
-    glDeleteTextures(1, &NNEDI3YUVA4xTex);
     glDeleteTextures(1, &ArtCNNYUVA2xTex);
     glDeleteTextures(1, &ArtCNNRGBA2xTex);
-    glDeleteTextures(1, &NNEDI3RGBA4xTex);
     glDeleteFramebuffers(1, &ArtCNNOutputFB);
+    glDeleteTextures(2, CuNNyWorkTex);
     glDeleteTextures(1, &XBRZInfoTex);
     glDeleteFramebuffers(1, &XBRZInfoFB);
 
@@ -1743,10 +2060,22 @@ void GLRenderer2D::SetScaleFactor(int scale)
 
     for (int i = 0; i < kCaptureBackedHandoffRouteSlots; i++)
     {
-        glBindTexture(GL_TEXTURE_2D, CaptureBackedHandoff3DTex[i]);
+        glBindTexture(GL_TEXTURE_2D, CaptureBackedRouteGL[i].Handoff3DTex);
         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, ScreenW, ScreenH, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
-        glBindFramebuffer(GL_FRAMEBUFFER, CaptureBackedHandoff3DFB[i]);
-        glFramebufferTexture(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, CaptureBackedHandoff3DTex[i], 0);
+        glBindFramebuffer(GL_FRAMEBUFFER, CaptureBackedRouteGL[i].Handoff3DFB);
+        glFramebufferTexture(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, CaptureBackedRouteGL[i].Handoff3DTex, 0);
+        glDrawBuffer(GL_COLOR_ATTACHMENT0);
+
+        glBindTexture(GL_TEXTURE_2D, CaptureBackedRouteGL[i].ProductTex);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, ScreenW, ScreenH, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+        glBindFramebuffer(GL_FRAMEBUFFER, CaptureBackedRouteGL[i].ProductFB);
+        glFramebufferTexture(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, CaptureBackedRouteGL[i].ProductTex, 0);
+        glDrawBuffer(GL_COLOR_ATTACHMENT0);
+
+        glBindTexture(GL_TEXTURE_2D, CaptureBackedRouteGL[i].EventProductTex);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, ScreenW, ScreenH, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+        glBindFramebuffer(GL_FRAMEBUFFER, CaptureBackedRouteGL[i].EventProductFB);
+        glFramebufferTexture(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, CaptureBackedRouteGL[i].EventProductTex, 0);
         glDrawBuffer(GL_COLOR_ATTACHMENT0);
     }
     InvalidateCaptureBackedHandoffSnapshot();
@@ -2369,10 +2698,13 @@ void GLRenderer2D::ResetWholeSceneNativeProductTracking()
     WholeSceneNativeProductsFrameComplete = false;
     memset(WholeSceneNativeProductRowValid, 0, sizeof(WholeSceneNativeProductRowValid));
     WholeSceneNativeProductEpochValid = true;
+    WholeSceneNativeProductEpochInvalidReason = 0;
     WholeSceneNativeProductEligibilityInitialized = false;
     WholeSceneNativeProductFrameEligibility = WholeSceneScaleEligibility::ScreenUnavailable;
+    WholeSceneNativeProductLastEligibility = WholeSceneScaleEligibility::ScreenUnavailable;
     WholeSceneNativeProductPathInitialized = false;
     WholeSceneNativeProductFramePath = WholeSceneRenderPath::None;
+    WholeSceneNativeProductLastPath = WholeSceneRenderPath::None;
     WholeSceneNativeProductFinalizerPathSeen = false;
     WholeSceneOverlayEndpointsValid = false;
     WholeSceneOverlayEndpointSourceTex = 0;
@@ -2386,14 +2718,34 @@ void GLRenderer2D::UpdateWholeSceneTraceFrameSplitState()
     WholeSceneTrace.NativeProductValidRows = WholeSceneNativeProductValidRows;
     WholeSceneTrace.NativeProductsFrameComplete = WholeSceneNativeProductsFrameComplete;
     WholeSceneTrace.NativeProductEpochValid = WholeSceneNativeProductEpochValid;
+    WholeSceneTrace.NativeProductEpochInvalidReason = WholeSceneNativeProductEpochInvalidReason;
+    WholeSceneTrace.NativeProductFrameEligibility = WholeSceneNativeProductFrameEligibility;
+    WholeSceneTrace.NativeProductLastEligibility = WholeSceneNativeProductLastEligibility;
+    WholeSceneTrace.NativeProductFramePath = WholeSceneNativeProductFramePath;
+    WholeSceneTrace.NativeProductLastPath = WholeSceneNativeProductLastPath;
     WholeSceneTrace.NativeProductFinalizerPathSeen = WholeSceneNativeProductFinalizerPathSeen;
 }
 
-bool GLRenderer2D::WholeSceneRenderPathUsesFullFrameFinalizer(WholeSceneRenderPath path) const
+bool GLRenderer2D::IsBenignMainVRAMDisplayNativeProductEligibilityTransition(
+    WholeSceneScaleEligibility eligibility) const
 {
-    return path == WholeSceneRenderPath::FinalNativeUpscale ||
-           path == WholeSceneRenderPath::OverlayOperatorUpscale ||
-           path == WholeSceneRenderPath::ConservativeHybridUpscale;
+    if (GPU2D.Num ||
+        WholeSceneScaleMode != RendererSettings::WholeScene2DScaleMode::ConservativeHybridUpscale ||
+        !WholeSceneScaleCaptureBacked ||
+        WholeSceneFullFrameFinalizerUnsafeFrame ||
+        WholeSceneCurrentFramePartialComposites != 0 ||
+        WholeSceneNativeProductFrameEligibility != WholeSceneScaleEligibility::MainEngineVRAMDisplay ||
+        eligibility != WholeSceneScaleEligibility::Eligible)
+    {
+        return false;
+    }
+
+    const u32 dispmode = (DispCnt >> 16) & 0x3u;
+    if (dispmode != 2)
+        return false;
+
+    const u32 displayBank = (DispCnt >> 18) & 0x3u;
+    return Parent.CanUseMainVRAMDisplayHighResCaptureReplacement(displayBank);
 }
 
 void GLRenderer2D::RecordWholeSceneNativeProductEligibility(WholeSceneScaleEligibility eligibility)
@@ -2403,10 +2755,14 @@ void GLRenderer2D::RecordWholeSceneNativeProductEligibility(WholeSceneScaleEligi
         WholeSceneNativeProductEligibilityInitialized = true;
         WholeSceneNativeProductFrameEligibility = eligibility;
     }
-    else if (WholeSceneNativeProductFrameEligibility != eligibility)
+    else if (WholeSceneNativeProductFrameEligibility != eligibility &&
+             !IsBenignMainVRAMDisplayNativeProductEligibilityTransition(eligibility))
     {
         WholeSceneNativeProductEpochValid = false;
+        if (WholeSceneNativeProductEpochInvalidReason == 0)
+            WholeSceneNativeProductEpochInvalidReason = 1;
     }
+    WholeSceneNativeProductLastEligibility = eligibility;
 
     UpdateWholeSceneTraceFrameSplitState();
 }
@@ -2424,7 +2780,10 @@ void GLRenderer2D::RecordWholeSceneNativeProductRenderPath(WholeSceneRenderPath 
     else if (WholeSceneNativeProductFramePath != path)
     {
         WholeSceneNativeProductEpochValid = false;
+        if (WholeSceneNativeProductEpochInvalidReason == 0)
+            WholeSceneNativeProductEpochInvalidReason = 2;
     }
+    WholeSceneNativeProductLastPath = path;
 
     if (WholeSceneRenderPathUsesFullFrameFinalizer(path))
         WholeSceneNativeProductFinalizerPathSeen = true;
@@ -2513,8 +2872,67 @@ void GLRenderer2D::RecordWholeSceneRenderTrace(WholeSceneRenderPath path,
     WholeSceneTrace.Resolve3D = resolve3D;
     WholeSceneTrace.HybridFragmentationFallback = hybridFragmentationFallback;
     WholeSceneTrace.CurrentFragmentationFallback = currentFragmentationFallback;
+    WholeSceneTrace.VisibleOBJCapture = BuildVisibleOBJCaptureDebug();
+    const u32 dispmode = (DispCnt >> 16) & (GPU2D.Num ? 0x1u : 0x3u);
+    WholeSceneTrace.DirectFinalDisplayConsumer = dispmode == 1;
+    WholeSceneTrace.DirectFinalBottomConsumer =
+        WholeSceneTrace.DirectFinalDisplayConsumer &&
+        Parent.IsEngineRoutedToFinalBottom(GPU2D.Num, ystart, yend);
+    const u32 activeCapCnt = GPU.CaptureCnt;
+    WholeSceneTrace.ActiveDisplayCaptureDstBank =
+        GPU.CaptureEnable ? static_cast<int>((activeCapCnt >> 16) & 0x3u) : -1;
+    WholeSceneTrace.ActiveDisplayCaptureDstOffset =
+        GPU.CaptureEnable ? static_cast<int>((activeCapCnt >> 18) & 0x3u) : -1;
+    WholeSceneTrace.ActiveDisplayCaptureSourceA2D =
+        !GPU2D.Num &&
+        GPU.CaptureEnable &&
+        (((activeCapCnt >> 24) & 0x1u) == 0);
+    WholeSceneTrace.ActiveFullDisplayCaptureSourceA =
+        WholeSceneTrace.ActiveDisplayCaptureSourceA2D &&
+        Parent.IsFullDisplayCaptureFromSourceAOnly(activeCapCnt);
     RecordWholeSceneNativeProductRenderPath(path, ystart, yend);
     UpdateWholeSceneTraceFrameSplitState();
+}
+
+void GLRenderer2D::RecordOutputPresentationMasterBrightness(WholeSceneCaptureEffectOwner owner,
+                                                            u16 masterBrightness)
+{
+    if (!IsMasterBrightnessActive(masterBrightness))
+        return;
+
+    WholeSceneTrace.OutputPresentationMasterBrightnessApplied = true;
+    WholeSceneTrace.OutputPresentationEffectOwner = static_cast<u32>(owner);
+    WholeSceneTrace.OutputPresentationEffectState =
+        PackedMasterBrightnessTraceState(masterBrightness);
+    WholeSceneTrace.OutputPresentationTex = static_cast<int>(OutputTex);
+}
+
+HybridSourceDecision GLRenderer2D::ChooseHybridSourceDecision() const
+{
+    HybridSourceDecisionInputs inputs = {};
+    inputs.ConservativeHybridRequested =
+        WholeSceneScaleMode == RendererSettings::WholeScene2DScaleMode::ConservativeHybridUpscale;
+    inputs.OverlaySuppressedDirect3D =
+        inputs.ConservativeHybridRequested &&
+        ShouldUseWholeSceneHybridOverlayForSuppressedDirect3DAlphaBlend();
+    inputs.ActiveDirect3D =
+        !GPU2D.Num && (DispCnt & (1 << 3)) && (LayerEnable & (1 << 0));
+    inputs.Foreground2DBaseEnabled = WholeSceneScaleHybridForeground2DBase;
+
+    return ::melonDS::ChooseHybridSourceDecision(inputs);
+}
+
+void GLRenderer2D::RecordWholeSceneCaptureSemantics(WholeSceneCaptureBackedPlanRole role,
+                                                    WholeSceneCaptureRequestKind request,
+                                                    WholeSceneCaptureProductKind product,
+                                                    WholeSceneCaptureProofKind proof,
+                                                    WholeSceneCaptureRenderAction action)
+{
+    WholeSceneTrace.CaptureRole = role;
+    WholeSceneTrace.CaptureRequestKind = request;
+    WholeSceneTrace.CaptureProductKind = product;
+    WholeSceneTrace.CaptureProofKind = proof;
+    WholeSceneTrace.CaptureRenderAction = action;
 }
 
 void GLRenderer2D::AppendWholeSceneModeStatus(std::string& status) const
@@ -2544,8 +2962,10 @@ void GLRenderer2D::AppendWholeSceneModeStatus(std::string& status) const
                     status += "\nHybrid foreground boundary 2D base is enabled for safe Direct3D-absent fallback halos.";
                 if (WholeSceneScaleHybridCleanLegacyCandidate)
                     status += "\nHybrid clean native-stack candidate is enabled for simple Direct3D plus 2D frames.";
+                if (ShouldUseWholeSceneHybridOverlayForSuppressedDirect3DAlphaBlend())
+                    status += "\nHybrid is using presentation overlay because Direct3D is a zero-weight native alpha-blend target.";
                 if (IsWholeSceneHybridFragmentationGuardActive())
-                    status += "\nHybrid scanline fragmentation guard is active; fragmented chunks use final image upscale.";
+                    status += "\nHybrid scanline fragmentation guard is active; fragmented chunks use postprocessing upscale.";
                 if (IsWholeSceneCurrentFragmentationGuardActive())
                     status += "\nSevere scanline fragmentation guard is active; fragmented chunks use the current renderer.";
                 if (IsWholeSceneCaptureBackedHandoffGuardActive())
@@ -2555,7 +2975,7 @@ void GLRenderer2D::AppendWholeSceneModeStatus(std::string& status) const
                 status += "\nRaw overlay underlay endpoint is enabled.";
         }
         else
-            status += "\nMode: final image upscale.";
+            status += "\nMode: postprocessing upscale.";
 
         if (WholeSceneScaleFinalUpscaleRender3DNative)
             status += "\n3D renders at native resolution.";
@@ -2577,24 +2997,9 @@ void GLRenderer2D::AppendWholeSceneModeStatus(std::string& status) const
         }
 
         status += "\nNative-stage 3D input: ";
-        switch (WholeSceneTrace.Native3DSource)
-        {
-        case WholeSceneNative3DSource::NativeRendered:
-            status += "native-rendered Direct3D texture.";
-            break;
-        case WholeSceneNative3DSource::HighResLinearSampled:
-            status += "high-resolution Direct3D sampled directly by the native compositor.";
-            break;
-        case WholeSceneNative3DSource::HighResResolved:
-            status += WholeSceneScaleFinalUpscale3DSplitSemantics
-                ? "high-resolution Direct3D visual RGB with separate visual coverage and native material alpha/presence."
-                : "high-resolution Direct3D visual RGB with a single native compositor alpha.";
-            break;
-        case WholeSceneNative3DSource::None:
-        default:
-            status += "not generated this frame.";
-            break;
-        }
+        status += WholeSceneNative3DSourceDescription(
+            WholeSceneTrace.Native3DSource,
+            WholeSceneScaleFinalUpscale3DSplitSemantics);
     }
     else
         status += "\nMode: native stack upscale.";
@@ -2641,63 +3046,6 @@ void GLRenderer2D::AppendWholeSceneModeStatus(std::string& status) const
 void GLRenderer2D::AppendWholeSceneRenderTrace(std::string& status) const
 {
     auto yesNo = [](bool value) { return value ? "yes" : "no"; };
-    auto pathName = [this]()
-    {
-        switch (WholeSceneTrace.Path)
-        {
-        case WholeSceneRenderPath::Current:
-            return "current native/high-res renderer";
-        case WholeSceneRenderPath::LegacyNativeUpscale:
-            return "native stack upscale";
-        case WholeSceneRenderPath::HighResCompositor:
-            return "high-resolution compositor";
-        case WholeSceneRenderPath::FinalNativeUpscale:
-            return "final image upscale";
-        case WholeSceneRenderPath::OverlayOperatorUpscale:
-            return "presentation overlay upscale";
-        case WholeSceneRenderPath::ConservativeHybridUpscale:
-            return "conservative hybrid overlay upscale";
-        case WholeSceneRenderPath::CaptureBackedHandoff:
-            return "capture-backed 3D plus UI handoff";
-        case WholeSceneRenderPath::SourceACaptureReplacement:
-            return "source-A capture high-resolution replacement";
-        case WholeSceneRenderPath::CaptureEpochOverlay:
-            return "capture-epoch background plus current overlay";
-        case WholeSceneRenderPath::PhysicalFinalPostprocessInput:
-            return "physical final postprocess input";
-        case WholeSceneRenderPath::None:
-        default:
-            return "none";
-        }
-    };
-    auto overlayEndpointFinalModeName = [this]()
-    {
-        switch (WholeSceneTrace.OverlayEndpointFinalMode)
-        {
-        case WholeSceneOverlayEndpointFinalMode::MetadataResolve:
-            return "metadata resolve";
-        case WholeSceneOverlayEndpointFinalMode::ExactCompositor:
-            return "exact compositor";
-        case WholeSceneOverlayEndpointFinalMode::None:
-        default:
-            return "none";
-        }
-    };
-    auto sourceACaptureReplacementModeName = [this]()
-    {
-        switch (WholeSceneTrace.SourceACaptureMode)
-        {
-        case SourceACaptureReplacementMode::FullProduct:
-            return "full captured product";
-        case SourceACaptureReplacementMode::CurrentOverlay:
-            return "captured 3D background plus current overlay";
-        case SourceACaptureReplacementMode::FullProductAfterOverlayFailed:
-            return "full captured product after current overlay unavailable/failed";
-        case SourceACaptureReplacementMode::None:
-        default:
-            return "none";
-        }
-    };
 
     status += "\n\nLast render trace:";
     status += "\n  engine: ";
@@ -2707,12 +3055,12 @@ void GLRenderer2D::AppendWholeSceneRenderTrace(std::string& status) const
     status += "-";
     status += std::to_string(WholeSceneTrace.YEnd);
     status += "\n  actual path: ";
-    status += pathName();
+    status += WholeSceneRenderPathName(WholeSceneTrace.Path);
     if (WholeSceneTrace.Path == WholeSceneRenderPath::SourceACaptureReplacement ||
         WholeSceneTrace.Path == WholeSceneRenderPath::CaptureEpochOverlay)
     {
         status += "; replacement mode: ";
-        status += sourceACaptureReplacementModeName();
+        status += SourceACaptureReplacementModeName(WholeSceneTrace.SourceACaptureMode);
         status += "; background epoch ";
         status += std::to_string(WholeSceneTrace.SourceABackgroundEpochSerial);
         status += "; product choice ";
@@ -2745,28 +3093,28 @@ void GLRenderer2D::AppendWholeSceneRenderTrace(std::string& status) const
     status += std::to_string(WholeSceneCurrentFragmentationGuardFrames);
     status += "\n  capture-backed handoff guard frames: ";
     status += std::to_string(WholeSceneCaptureBackedHandoffGuardFrames);
-    const int handoffSlot = std::min<int>(CaptureBackedHandoffCurrentSlot, kCaptureBackedHandoffRouteSlots - 1);
-    const auto& handoffLatch = CaptureBackedHandoffLatchedKey[handoffSlot];
+    const int handoffSlot = std::min<int>(CaptureBackedHandoff.CurrentSlot, kCaptureBackedHandoffRouteSlots - 1);
+    const auto& handoffLatch = CaptureBackedRoute[handoffSlot].HandoffLatchedKey;
     status += "\n  capture-backed handoff snapshot valid: ";
-    status += yesNo(CaptureBackedHandoff3DValid[handoffSlot]);
+    status += yesNo(CaptureBackedRoute[handoffSlot].Handoff3DValid);
     status += "; route slot ";
     status += std::to_string(handoffSlot);
     status += "; route has captured phase ";
-    status += yesNo(CaptureBackedHandoffRouteHasCapturedPhase[handoffSlot]);
+    status += yesNo(CaptureBackedRoute[handoffSlot].HasCapturedPhase);
     status += "; updated this frame ";
-    status += yesNo(CaptureBackedHandoffBackgroundUpdated);
+    status += yesNo(CaptureBackedHandoff.BackgroundUpdated);
     status += "; reuse reason ";
-    status += std::to_string(static_cast<int>(CaptureBackedHandoffReuseDecision));
+    status += std::to_string(static_cast<int>(CaptureBackedHandoff.ReuseDecision));
     status += "\n  capture-backed handoff current phase/key: phase ";
-    status += std::to_string(static_cast<int>(CaptureBackedHandoffCurrentKey.Phase));
+    status += std::to_string(static_cast<int>(CaptureBackedHandoff.CurrentKey.Phase));
     status += " bgmode ";
-    status += std::to_string(CaptureBackedHandoffCurrentKey.BGMode);
+    status += std::to_string(CaptureBackedHandoff.CurrentKey.BGMode);
     status += " layers ";
-    status += LayerEnableSummary(CaptureBackedHandoffCurrentKey.LayerEnable);
+    status += LayerEnableSummary(CaptureBackedHandoff.CurrentKey.LayerEnable);
     status += " bitmap mask ";
-    status += FormatHex(CaptureBackedHandoffCurrentKey.VisibleBitmapMask, 1);
+    status += FormatHex(CaptureBackedHandoff.CurrentKey.VisibleBitmapMask, 1);
     status += " final bottom ";
-    status += yesNo(CaptureBackedHandoffCurrentKey.EngineFinalBottom);
+    status += yesNo(CaptureBackedHandoff.CurrentKey.EngineFinalBottom);
     status += "\n  capture-backed handoff latched phase/key: phase ";
     status += std::to_string(static_cast<int>(handoffLatch.Phase));
     status += " bgmode ";
@@ -2822,7 +3170,7 @@ void GLRenderer2D::AppendWholeSceneRenderTrace(std::string& status) const
     status += "\n  OverlayTrueNativeFinal valid: ";
     status += yesNo(WholeSceneTrace.OverlayTrueFinalValid);
     status += "\n  overlay endpoint final path: ";
-    status += overlayEndpointFinalModeName();
+    status += WholeSceneOverlayEndpointFinalModeName(WholeSceneTrace.OverlayEndpointFinalMode);
 }
 
 void GLRenderer2D::AppendWholeSceneTimingCSVHeader(std::string& header, const char* prefix) const
@@ -2863,6 +3211,7 @@ void GLRenderer2D::AppendWholeSceneTimingCSVHeader(std::string& header, const ch
 
     add("eligibility");
     add("path");
+    add("current_path_reason");
     add("mode");
     add("frag_policy");
     add("hybrid_frag_guard");
@@ -2871,27 +3220,27 @@ void GLRenderer2D::AppendWholeSceneTimingCSVHeader(std::string& header, const ch
     add("current_frag_guard");
     add("current_frag_fallback");
     add("current_frag_guard_frames");
-    add("capture_handoff_guard");
-    add("capture_handoff_guard_frames");
-    add("capture_handoff_route_slot");
-    add("capture_handoff_route_has_captured_phase");
-    add("capture_handoff_3d_snapshot");
-    add("capture_handoff_bg_updated");
-    add("capture_handoff_phase");
-    add("capture_handoff_latch_phase");
-    add("capture_handoff_reuse_reason");
-    add("capture_handoff_current_screen_swap");
-    add("capture_handoff_latch_screen_swap");
-    add("capture_handoff_current_final_bottom");
-    add("capture_handoff_latch_final_bottom");
-    add("capture_handoff_current_bg_mode");
-    add("capture_handoff_latch_bg_mode");
-    add("capture_handoff_current_layer_enable");
-    add("capture_handoff_latch_layer_enable");
-    add("capture_handoff_current_bitmap_mask");
-    add("capture_handoff_latch_bitmap_mask");
-    add("capture_handoff_current_bg_upload_rows");
-    add("capture_handoff_frame_age");
+    add("route_guard_active");
+    add("route_guard_frames");
+    add("route_slot");
+    add("route_has_captured_phase");
+    add("route_handoff_snapshot_valid");
+    add("route_handoff_snapshot_updated");
+    add("route_current_source_phase");
+    add("route_latched_source_phase");
+    add("route_reuse_reason");
+    add("route_current_screen_swap");
+    add("route_latched_screen_swap");
+    add("route_current_final_bottom");
+    add("route_latched_final_bottom");
+    add("route_current_bg_mode");
+    add("route_latched_bg_mode");
+    add("route_current_layer_enable");
+    add("route_latched_layer_enable");
+    add("route_current_bitmap_mask");
+    add("route_latched_bitmap_mask");
+    add("route_current_bg_upload_rows");
+    add("route_latched_frame_age");
     add("frame_partial_count");
     add("prev_frame_partial_count");
     add("native_chunk_accum_passes");
@@ -2899,13 +3248,135 @@ void GLRenderer2D::AppendWholeSceneTimingCSVHeader(std::string& header, const ch
     add("native_product_valid_rows");
     add("native_products_complete");
     add("native_product_epoch_valid");
+    add("native_product_epoch_invalid_reason");
+    add("native_product_frame_eligibility");
+    add("native_product_last_eligibility");
+    add("native_product_frame_path");
+    add("native_product_last_path");
     add("native_product_finalizer_path_seen");
-    add("source_a_replacement_mode");
-    add("source_a_background_epoch_serial");
+    add("source_a_resolution_mode");
+    add("source_a_request_background_epoch_serial");
+    add("source_a_resolved_background_source");
+    add("source_a_resolved_background_epoch_serial");
+    add("source_a_route_product_ref_background_epoch_serial");
+    add("source_a_route_product_ref_source_3d_serial");
+    add("source_a_route_product_ref_source_3d_scene_hash");
+    add("source_a_route_product_ref_capture_event_serial");
+    add("source_a_route_product_ref_capture_presentation_hash");
+    add("source_a_route_product_ref_current_presentation_hash");
+    add("source_a_route_product_ref_stable_frames");
+    add("source_a_route_product_ref_class");
+    add("route_product_lookup_attempted");
+    add("route_product_lookup_success");
+    add("route_product_lookup_result_source");
+    add("route_product_lookup_slot");
+    add("route_product_lookup_event_serial");
+    add("route_product_lookup_capture_bank");
+    add("route_product_lookup_capture_presentation_hash");
+    add("route_product_lookup_source_3d_serial");
+    add("route_product_lookup_source_3d_scene_hash");
+    add("route_product_lookup_event_product_valid");
+    add("route_product_lookup_event_product_captured_serial");
+    add("route_product_lookup_event_product_capture_bank");
+    add("route_product_lookup_event_product_current_presentation_hash");
+    add("route_product_lookup_event_product_source_3d_serial");
+    add("route_product_lookup_event_product_source_3d_scene_hash");
+    add("route_product_lookup_product_valid");
+    add("route_product_lookup_product_captured_serial");
+    add("route_product_lookup_product_capture_bank");
+    add("route_product_lookup_product_current_presentation_hash");
+    add("route_product_lookup_product_source_3d_serial");
+    add("route_product_lookup_product_source_3d_scene_hash");
+    add("route_event_publish_attempted");
+    add("route_event_publish_success");
+    add("route_event_publish_reject_reason");
+    add("route_event_publish_slot");
+    add("route_event_publish_pending_event_serial");
+    add("route_event_publish_pending_capture_bank");
+    add("route_event_publish_pending_presentation_hash");
+    add("route_event_publish_pending_source_3d_serial");
+    add("route_event_publish_pending_source_3d_scene_hash");
+    add("route_event_publish_product_valid");
+    add("route_event_publish_product_tex_valid");
+    add("route_event_publish_event_product_tex_valid");
+    add("route_event_publish_event_product_fb_valid");
+    add("route_event_publish_product_background_epoch_serial");
+    add("route_event_publish_product_source_3d_serial");
+    add("route_event_publish_product_source_3d_scene_hash");
+    add("route_event_publish_product_captured_event_serial");
+    add("route_event_publish_product_capture_bank");
+    add("route_event_publish_product_capture_presentation_hash");
+    add("route_event_publish_product_current_presentation_hash");
+    add("route_event_publish_product_class");
     add("source_a_product_choice_reason");
-    add("source_a_capture_presentation_hash");
-    add("source_a_current_presentation_hash");
-    add("source_a_full_product_key_match");
+    add("capture_policy_authority");
+    add("capture_policy_role");
+    add("capture_policy_request_kind");
+    add("capture_policy_product_kind");
+    add("capture_policy_proof_kind");
+    add("capture_policy_render_action");
+    add("capture_repr_request_role");
+    add("capture_repr_physical_screen");
+    add("capture_repr_source_engine");
+    add("capture_repr_product_class");
+    add("capture_repr_selected_product_kind");
+    add("capture_repr_selected_event_serial");
+    add("capture_repr_content_proof_match");
+    add("capture_repr_route_proof_match");
+    add("capture_repr_effect_owner");
+    add("capture_repr_effect_state");
+    add("capture_repr_effect_compatible");
+    add("capture_repr_product_use_accepted");
+    add("capture_repr_presentation_hash_match");
+    add("capture_repr_stored_effect_owner");
+    add("capture_repr_stored_effect_state");
+    add("capture_repr_consume_effect_owner");
+    add("capture_repr_consume_effect_state");
+    add("capture_repr_effect_action");
+    add("capture_repr_effect_phase_incompatible");
+    add("capture_repr_final_pass_effect_owner");
+    add("capture_repr_apply_effect_on_blit");
+    add("capture_repr_output_brightness_applied");
+    add("capture_repr_output_effect_owner");
+    add("capture_repr_output_effect_state");
+    add("capture_repr_output_tex");
+    add("capture_repr_would_represent_raw_product");
+    add("capture_repr_fallback_class");
+    add("source_a_request_capture_presentation_hash");
+    add("source_a_request_current_presentation_hash");
+    add("source_a_chosen_product_tex");
+    add("source_a_chosen_product_capture_bank");
+    add("source_a_chosen_product_background_epoch_serial");
+    add("source_a_chosen_product_source_3d_serial");
+    add("source_a_chosen_product_source_3d_scene_hash");
+    add("source_a_chosen_product_capture_event_serial");
+    add("source_a_chosen_product_capture_presentation_hash");
+    add("source_a_chosen_product_current_presentation_hash");
+    add("source_a_chosen_product_kind");
+    add("source_a_chosen_product_render_action");
+    add("source_a_chosen_product_class");
+    add("source_a_full_product_candidate_presentation_match");
+    add("source_a_full_product_candidate_capture_bank");
+    add("source_a_full_product_candidate_tex");
+    add("source_a_full_product_candidate_event_valid");
+    add("source_a_full_product_candidate_event_serial");
+    add("source_a_full_product_candidate_event_source_3d_serial");
+    add("source_a_full_product_candidate_event_source_3d_scene_hash");
+    add("source_a_full_product_candidate_event_source_presentation_hash");
+    add("source_a_full_product_candidate_event_source_kind");
+    add("source_a_full_product_candidate_event_product_mask");
+    add("source_a_full_product_candidate_event_reject_reason");
+    add("source_a_full_product_candidate_event_dst_block");
+    add("source_a_full_product_candidate_event_dst_offset");
+    add("source_a_full_product_candidate_event_source_obj");
+    add("source_a_full_product_candidate_event_screen_swap");
+    add("source_a_full_product_candidate_event_main_final_bottom");
+    add("direct_final_display_consumer");
+    add("direct_final_bottom_consumer");
+    add("active_display_capture_source_a_2d");
+    add("active_full_display_capture_source_a");
+    add("active_display_capture_dst_bank");
+    add("active_display_capture_dst_offset");
     add("algorithm");
     add("scale");
     add("width");
@@ -2926,6 +3397,10 @@ void GLRenderer2D::AppendWholeSceneTimingCSVHeader(std::string& header, const ch
     add("layer_enable");
     add("obj_enable");
     add("blendcnt");
+    add("bldalpha_eva");
+    add("bldalpha_evb");
+    add("bldy_evy");
+    add("palette_hash");
     add("visible_bitmap_bg_mask");
     add("source_a_only_capture_bg_mask");
     add("full_source_a_capture_bg_mask");
@@ -2934,6 +3409,29 @@ void GLRenderer2D::AppendWholeSceneTimingCSVHeader(std::string& header, const ch
     add("visible_capture_event_source_kind");
     add("visible_capture_event_product_mask");
     add("visible_capture_event_reject_reason");
+    add("visible_obj_capture_found");
+    add("visible_obj_capture_bank");
+    add("visible_obj_capture_mixed_bank");
+    add("visible_obj_capture_current_source_a_only");
+    add("visible_obj_capture_current_full_source_a");
+    add("visible_obj_capture_fullscreen");
+    add("visible_obj_capture_full_width_strip");
+    add("visible_obj_capture_product_available");
+    add("visible_obj_capture_event_valid");
+    add("visible_obj_capture_event_source_obj");
+    add("visible_obj_capture_event_product_mask");
+    add("visible_obj_capture_event_reject_reason");
+    add("visible_obj_capture_event_serial");
+    add("visible_obj_capture_type3_count");
+    add("visible_obj_capture_type4_count");
+    add("visible_obj_capture_sprite_count");
+    add("visible_obj_capture_non_capture_sprite_count");
+    add("visible_obj_capture_coverage_area");
+    add("visible_obj_capture_min_x");
+    add("visible_obj_capture_min_y");
+    add("visible_obj_capture_max_x");
+    add("visible_obj_capture_max_y");
+    add("visible_obj_capture_reject_reason");
     add("bg0_type");
     add("bg1_type");
     add("bg2_type");
@@ -2957,6 +3455,7 @@ void GLRenderer2D::AppendWholeSceneTimingCSVHeader(std::string& header, const ch
     add("frame_palette_layer_dirty_mask");
     add("frame_deferred_layer_dirty_mask");
     add("frame_inactive_deferred_layer_dirty_mask");
+    add("frame_flat_vram_capture_sync_layer_mask");
     add("frame_covered_bitmap_mask");
     add("frame_contributing_layer_mask");
     add("frame_visible_bitmap_dirty_mask");
@@ -2998,6 +3497,7 @@ void GLRenderer2D::AppendWholeSceneTimingCSVHeader(std::string& header, const ch
     add("prev_palette_layer_dirty_mask");
     add("prev_deferred_layer_dirty_mask");
     add("prev_inactive_deferred_layer_dirty_mask");
+    add("prev_flat_vram_capture_sync_layer_mask");
     add("prev_covered_bitmap_mask");
     add("prev_contributing_layer_mask");
     add("prev_visible_bitmap_dirty_mask");
@@ -3045,6 +3545,7 @@ void GLRenderer2D::AppendWholeSceneTimingCSVRow(std::string& row) const
 
     addInt(WholeSceneScaleState);
     addInt(WholeSceneTrace.Path);
+    addInt(WholeSceneTrace.CurrentReason);
     addInt(WholeSceneScaleMode);
     addInt(WholeSceneScaleFragmentationFallback);
     addInt(IsWholeSceneHybridFragmentationGuardActive());
@@ -3055,28 +3556,28 @@ void GLRenderer2D::AppendWholeSceneTimingCSVRow(std::string& row) const
     addInt(WholeSceneCurrentFragmentationGuardFrames);
     addInt(IsWholeSceneCaptureBackedHandoffGuardActive());
     addInt(WholeSceneCaptureBackedHandoffGuardFrames);
-    const int handoffSlot = std::min<int>(CaptureBackedHandoffCurrentSlot, kCaptureBackedHandoffRouteSlots - 1);
-    const auto& handoffLatch = CaptureBackedHandoffLatchedKey[handoffSlot];
+    const int handoffSlot = std::min<int>(CaptureBackedHandoff.CurrentSlot, kCaptureBackedHandoffRouteSlots - 1);
+    const auto& handoffLatch = CaptureBackedRoute[handoffSlot].HandoffLatchedKey;
     addInt(handoffSlot);
-    addInt(CaptureBackedHandoffRouteHasCapturedPhase[handoffSlot]);
-    addInt(CaptureBackedHandoff3DValid[handoffSlot]);
-    addInt(CaptureBackedHandoffBackgroundUpdated);
-    addInt(CaptureBackedHandoffCurrentKey.Phase);
+    addInt(CaptureBackedRoute[handoffSlot].HasCapturedPhase);
+    addInt(CaptureBackedRoute[handoffSlot].Handoff3DValid);
+    addInt(CaptureBackedHandoff.BackgroundUpdated);
+    addInt(CaptureBackedHandoff.CurrentKey.Phase);
     addInt(handoffLatch.Phase);
-    addInt(CaptureBackedHandoffReuseDecision);
-    addInt(CaptureBackedHandoffCurrentKey.ScreenSwap);
+    addInt(CaptureBackedHandoff.ReuseDecision);
+    addInt(CaptureBackedHandoff.CurrentKey.ScreenSwap);
     addInt(handoffLatch.ScreenSwap);
-    addInt(CaptureBackedHandoffCurrentKey.EngineFinalBottom);
+    addInt(CaptureBackedHandoff.CurrentKey.EngineFinalBottom);
     addInt(handoffLatch.EngineFinalBottom);
-    addInt(CaptureBackedHandoffCurrentKey.BGMode);
+    addInt(CaptureBackedHandoff.CurrentKey.BGMode);
     addInt(handoffLatch.BGMode);
-    addInt(CaptureBackedHandoffCurrentKey.LayerEnable);
+    addInt(CaptureBackedHandoff.CurrentKey.LayerEnable);
     addInt(handoffLatch.LayerEnable);
-    addInt(CaptureBackedHandoffCurrentKey.VisibleBitmapMask);
+    addInt(CaptureBackedHandoff.CurrentKey.VisibleBitmapMask);
     addInt(handoffLatch.VisibleBitmapMask);
-    addInt(CaptureBackedHandoffCurrentKey.BGUploadRows);
-    addInt(CaptureBackedHandoff3DValid[handoffSlot]
-        ? CaptureBackedHandoffCurrentKey.FrameSerial - handoffLatch.FrameSerial
+    addInt(CaptureBackedHandoff.CurrentKey.BGUploadRows);
+    addInt(CaptureBackedRoute[handoffSlot].Handoff3DValid
+        ? CaptureBackedHandoff.CurrentKey.FrameSerial - handoffLatch.FrameSerial
         : 0);
     addInt(WholeSceneCurrentFramePartialComposites);
     addInt(WholeScenePreviousFramePartialComposites);
@@ -3085,13 +3586,180 @@ void GLRenderer2D::AppendWholeSceneTimingCSVRow(std::string& row) const
     addInt(WholeSceneTrace.NativeProductValidRows);
     addInt(WholeSceneTrace.NativeProductsFrameComplete);
     addInt(WholeSceneTrace.NativeProductEpochValid);
+    addInt(WholeSceneTrace.NativeProductEpochInvalidReason);
+    addInt(WholeSceneTrace.NativeProductFrameEligibility);
+    addInt(WholeSceneTrace.NativeProductLastEligibility);
+    addInt(WholeSceneTrace.NativeProductFramePath);
+    addInt(WholeSceneTrace.NativeProductLastPath);
     addInt(WholeSceneTrace.NativeProductFinalizerPathSeen);
     addInt(WholeSceneTrace.SourceACaptureMode);
     addU64(WholeSceneTrace.SourceABackgroundEpochSerial);
+    addInt(WholeSceneTrace.EffectiveSourceABackgroundSource);
+    addU64(WholeSceneTrace.EffectiveSourceABackgroundEpochSerial);
+    addU64(WholeSceneTrace.SourceARouteProductBackgroundEpochSerial);
+    addU64(WholeSceneTrace.SourceARouteProductSource3DSerial);
+    addU64(WholeSceneTrace.SourceARouteProductSource3DSceneHash);
+    addU64(WholeSceneTrace.SourceARouteProductCapturedEventSerial);
+    addU64(WholeSceneTrace.SourceARouteProductCapturePresentationHash);
+    addU64(WholeSceneTrace.SourceARouteProductCurrentPresentationHash);
+    addU64(WholeSceneTrace.SourceARouteProductStableFrames);
+    addInt(WholeSceneTrace.SourceARouteProductPresentationClass);
+    addInt(WholeSceneTrace.RouteProductLookupAttempted);
+    addInt(WholeSceneTrace.RouteProductLookupSuccess);
+    addInt(WholeSceneTrace.RouteProductLookupResultSource);
+    addInt(WholeSceneTrace.RouteProductLookupSlot);
+    addU64(WholeSceneTrace.RouteProductLookupEventSerial);
+    addU64(WholeSceneTrace.RouteProductLookupCaptureBank);
+    addU64(WholeSceneTrace.RouteProductLookupCapturePresentationHash);
+    addU64(WholeSceneTrace.RouteProductLookupSource3DSerial);
+    addU64(WholeSceneTrace.RouteProductLookupSource3DSceneHash);
+    addInt(WholeSceneTrace.RouteProductLookupEventProductValid);
+    addU64(WholeSceneTrace.RouteProductLookupEventProductCapturedSerial);
+    addU64(WholeSceneTrace.RouteProductLookupEventProductCaptureBank);
+    addU64(WholeSceneTrace.RouteProductLookupEventProductCurrentPresentationHash);
+    addU64(WholeSceneTrace.RouteProductLookupEventProductSource3DSerial);
+    addU64(WholeSceneTrace.RouteProductLookupEventProductSource3DSceneHash);
+    addInt(WholeSceneTrace.RouteProductLookupProductValid);
+    addU64(WholeSceneTrace.RouteProductLookupProductCapturedSerial);
+    addU64(WholeSceneTrace.RouteProductLookupProductCaptureBank);
+    addU64(WholeSceneTrace.RouteProductLookupProductCurrentPresentationHash);
+    addU64(WholeSceneTrace.RouteProductLookupProductSource3DSerial);
+    addU64(WholeSceneTrace.RouteProductLookupProductSource3DSceneHash);
+    addInt(WholeSceneTrace.RouteEventPublishAttempted);
+    addInt(WholeSceneTrace.RouteEventPublishSuccess);
+    addInt(WholeSceneTrace.RouteEventPublishRejectReason);
+    addInt(WholeSceneTrace.RouteEventPublishSlot);
+    addU64(WholeSceneTrace.RouteEventPublishPendingEventSerial);
+    addU64(WholeSceneTrace.RouteEventPublishPendingCaptureBank);
+    addU64(WholeSceneTrace.RouteEventPublishPendingPresentationHash);
+    addU64(WholeSceneTrace.RouteEventPublishPendingSource3DSerial);
+    addU64(WholeSceneTrace.RouteEventPublishPendingSource3DSceneHash);
+    addInt(WholeSceneTrace.RouteEventPublishProductValid);
+    addInt(WholeSceneTrace.RouteEventPublishProductTexValid);
+    addInt(WholeSceneTrace.RouteEventPublishEventProductTexValid);
+    addInt(WholeSceneTrace.RouteEventPublishEventProductFBValid);
+    addU64(WholeSceneTrace.RouteEventPublishProductBackgroundEpochSerial);
+    addU64(WholeSceneTrace.RouteEventPublishProductSource3DSerial);
+    addU64(WholeSceneTrace.RouteEventPublishProductSource3DSceneHash);
+    addU64(WholeSceneTrace.RouteEventPublishProductCapturedEventSerial);
+    addU64(WholeSceneTrace.RouteEventPublishProductCaptureBank);
+    addU64(WholeSceneTrace.RouteEventPublishProductCapturePresentationHash);
+    addU64(WholeSceneTrace.RouteEventPublishProductCurrentPresentationHash);
+    addInt(WholeSceneTrace.RouteEventPublishProductPresentationClass);
     addInt(WholeSceneTrace.SourceAProductChoice);
+    addInt(WholeSceneTrace.CaptureAuthority);
+    addInt(WholeSceneTrace.CaptureRole);
+    addInt(WholeSceneTrace.CaptureRequestKind);
+    addInt(WholeSceneTrace.CaptureProductKind);
+    addInt(WholeSceneTrace.CaptureProofKind);
+    addInt(WholeSceneTrace.CaptureRenderAction);
+    bool finalScreenSwap = GPU.ScreenSwap;
+    const bool finalScreenSwapKnown =
+        Parent.GetFinalPassScreenSwapForRange(WholeSceneTrace.YStart,
+                                              WholeSceneTrace.YEnd,
+                                              finalScreenSwap);
+    const int physicalScreen =
+        !finalScreenSwapKnown ? 0 :
+        GPU2D.Num == 0 ? (finalScreenSwap ? 1 : 2) :
+                         (finalScreenSwap ? 2 : 1);
+    const u16 routeMasterBrightness = GPU2D.Num ? GPU.MasterBrightnessB : GPU.MasterBrightnessA;
+    const int routeBrightMode = (routeMasterBrightness >> 14) & 0x3;
+    const int routeBrightFactor = std::min<int>(routeMasterBrightness & 0x1F, 16);
+    const int routeEffectState = (routeBrightMode << 8) | routeBrightFactor;
+    const bool routeEffectActive =
+        (routeBrightMode == 1 || routeBrightMode == 2) &&
+        routeBrightFactor > 0;
+    const auto representationProductClass =
+        CaptureRepresentationProductClassForTrace(WholeSceneTrace);
+    const bool representationContentProof =
+        CaptureRepresentationHasContentProof(WholeSceneTrace);
+    const bool representationRouteProof =
+        CaptureRepresentationHasRouteProof(WholeSceneTrace);
+    const auto representationEffectOwner =
+        CaptureRepresentationEffectOwnerForTrace(WholeSceneTrace);
+    const bool selectedProductPresentationCompatible =
+        CanUseCaptureProductAsPresented(
+            representationProductClass,
+            WholeSceneTrace.SourceAChosenProductCapturePresentationHash,
+            WholeSceneTrace.SourceAChosenProductCurrentPresentationHash);
+    const auto representationEffectCompatible =
+        representationProductClass == WholeSceneCaptureProductPresentationClass::RawContent
+            ? CaptureRepresentationEffectCompatibility::Compatible
+            : representationProductClass == WholeSceneCaptureProductPresentationClass::AlreadyPresented
+                ? (selectedProductPresentationCompatible
+                    ? CaptureRepresentationEffectCompatibility::Compatible
+                    : CaptureRepresentationEffectCompatibility::UnknownNeedsProof)
+                : CaptureRepresentationEffectCompatibility::IncompatibleOrNoProduct;
+    const bool wouldRepresentRawProduct =
+        representationProductClass == WholeSceneCaptureProductPresentationClass::RawContent &&
+        representationContentProof &&
+        routeEffectActive;
+    const u64 selectedProductEventSerial =
+        WholeSceneTrace.SourceAChosenProductCaptureEventSerial != 0
+            ? WholeSceneTrace.SourceAChosenProductCaptureEventSerial
+            : WholeSceneTrace.SourceAFullProductEventSerial;
+    addInt(WholeSceneTrace.CaptureRole);
+    addInt(physicalScreen);
+    addInt(GPU2D.Num ? 1 : 0);
+    addInt(representationProductClass);
+    addInt(WholeSceneTrace.CaptureProductKind);
+    addU64(selectedProductEventSerial);
+    addInt(representationContentProof);
+    addInt(representationRouteProof);
+    addInt(representationEffectOwner);
+    addInt(routeEffectState);
+    addInt(representationEffectCompatible);
+    addInt(WholeSceneTrace.CaptureProductUseAccepted);
+    addInt(WholeSceneTrace.CaptureProductPresentationHashMatch);
+    addInt(WholeSceneTrace.CaptureProductStoredEffectOwner);
+    addInt(WholeSceneTrace.CaptureProductStoredEffectState);
+    addInt(WholeSceneTrace.CaptureProductConsumeEffectOwner);
+    addInt(WholeSceneTrace.CaptureProductConsumeEffectState);
+    addInt(WholeSceneTrace.CaptureProductEffectAction);
+    addInt(WholeSceneTrace.CaptureProductEffectPhaseIncompatible);
+    addInt(WholeSceneTrace.CaptureProductFinalPassEffectOwner);
+    addInt(WholeSceneTrace.CaptureProductApplyEffectOnBlit);
+    addInt(WholeSceneTrace.OutputPresentationMasterBrightnessApplied);
+    addInt(WholeSceneTrace.OutputPresentationEffectOwner);
+    addInt(WholeSceneTrace.OutputPresentationEffectState);
+    addInt(WholeSceneTrace.OutputPresentationTex);
+    addInt(wouldRepresentRawProduct);
+    addInt(CaptureRepresentationFallbackForTrace(WholeSceneTrace));
     addU64(WholeSceneTrace.SourceACapturePresentationHash);
     addU64(WholeSceneTrace.SourceACurrentPresentationHash);
+    addInt(WholeSceneTrace.SourceAChosenProductTex);
+    addInt(WholeSceneTrace.SourceAChosenProductCaptureBank);
+    addU64(WholeSceneTrace.SourceAChosenProductBackgroundEpochSerial);
+    addU64(WholeSceneTrace.SourceAChosenProductSource3DSerial);
+    addU64(WholeSceneTrace.SourceAChosenProductSource3DSceneHash);
+    addU64(WholeSceneTrace.SourceAChosenProductCaptureEventSerial);
+    addU64(WholeSceneTrace.SourceAChosenProductCapturePresentationHash);
+    addU64(WholeSceneTrace.SourceAChosenProductCurrentPresentationHash);
+    addInt(WholeSceneTrace.SourceAChosenProductKind);
+    addInt(WholeSceneTrace.SourceAChosenProductRenderAction);
+    addInt(WholeSceneTrace.SourceAChosenProductPresentationClass);
     addInt(WholeSceneTrace.SourceAFullProductKeyMatch);
+    addInt(WholeSceneTrace.SourceAFullProductCaptureBank);
+    addInt(WholeSceneTrace.SourceAFullProductTex);
+    addInt(WholeSceneTrace.SourceAFullProductEventValid);
+    addU64(WholeSceneTrace.SourceAFullProductEventSerial);
+    addU64(WholeSceneTrace.SourceAFullProductEventSource3DSerial);
+    addU64(WholeSceneTrace.SourceAFullProductEventSource3DSceneHash);
+    addU64(WholeSceneTrace.SourceAFullProductEventSourcePresentationHash);
+    addInt(WholeSceneTrace.SourceAFullProductEventSourceKind);
+    addInt(WholeSceneTrace.SourceAFullProductEventProductMask);
+    addInt(WholeSceneTrace.SourceAFullProductEventRejectReason);
+    addInt(WholeSceneTrace.SourceAFullProductEventDstBlock);
+    addInt(WholeSceneTrace.SourceAFullProductEventDstOffset);
+    addInt(WholeSceneTrace.SourceAFullProductEventSourceOBJ);
+    addInt(WholeSceneTrace.SourceAFullProductEventScreenSwap);
+    addInt(WholeSceneTrace.SourceAFullProductEventMainFinalBottom);
+    addInt(WholeSceneTrace.DirectFinalDisplayConsumer);
+    addInt(WholeSceneTrace.DirectFinalBottomConsumer);
+    addInt(WholeSceneTrace.ActiveDisplayCaptureSourceA2D);
+    addInt(WholeSceneTrace.ActiveFullDisplayCaptureSourceA);
+    addInt(WholeSceneTrace.ActiveDisplayCaptureDstBank);
+    addInt(WholeSceneTrace.ActiveDisplayCaptureDstOffset);
     addInt(WholeSceneScaleAlgorithm);
     addInt(ScaleFactor);
     addInt(ScreenW);
@@ -3112,6 +3780,18 @@ void GLRenderer2D::AppendWholeSceneTimingCSVRow(std::string& row) const
     addInt(LayerEnable);
     addInt(OBJEnable);
     addInt(BlendCnt);
+    addInt(GPU2D.EVA);
+    addInt(GPU2D.EVB);
+    addInt(GPU2D.EVY);
+    {
+        // Palette-side fades change no traced register or presentation hash;
+        // this hash is the only trace that can see them.
+        u32 paletteHash = 2166136261u;
+        const u8* palette = &GPU.Palette[GPU2D.Num ? 0x400 : 0];
+        for (int i = 0; i < 0x400; i++)
+            paletteHash = (paletteHash ^ palette[i]) * 16777619u;
+        addU64(paletteHash);
+    }
     addInt(VisibleBitmapBGLayerMask());
     addInt(VisibleSourceAOnlyFullDisplayCaptureBGLayerMask());
     addInt(VisibleFullDisplayCaptureFromSourceABGLayerMask());
@@ -3152,6 +3832,30 @@ void GLRenderer2D::AppendWholeSceneTimingCSVRow(std::string& row) const
     addInt(visibleCaptureEventSourceKind);
     addInt(visibleCaptureEventProductMask);
     addInt(visibleCaptureEventRejectReason);
+    const auto& visibleOBJCapture = WholeSceneTrace.VisibleOBJCapture;
+    addInt(visibleOBJCapture.Found);
+    addInt(visibleOBJCapture.Bank);
+    addInt(visibleOBJCapture.MixedBank);
+    addInt(visibleOBJCapture.CurrentSourceAOnly);
+    addInt(visibleOBJCapture.CurrentFullSourceA);
+    addInt(visibleOBJCapture.FullScreen);
+    addInt(visibleOBJCapture.FullWidthTopStrip);
+    addInt(visibleOBJCapture.ProductAvailable);
+    addInt(visibleOBJCapture.EventValid);
+    addInt(visibleOBJCapture.EventSourceOBJ);
+    addInt(visibleOBJCapture.EventProductMask);
+    addInt(visibleOBJCapture.EventRejectReason);
+    addU64(visibleOBJCapture.EventSerial);
+    addInt(visibleOBJCapture.Type3Count);
+    addInt(visibleOBJCapture.Type4Count);
+    addInt(visibleOBJCapture.CaptureSpriteCount);
+    addInt(visibleOBJCapture.NonCaptureSpriteCount);
+    addInt(visibleOBJCapture.CoverageArea);
+    addInt(visibleOBJCapture.MinX);
+    addInt(visibleOBJCapture.MinY);
+    addInt(visibleOBJCapture.MaxX);
+    addInt(visibleOBJCapture.MaxY);
+    addInt(visibleOBJCapture.RejectReason);
     for (int layer = 0; layer < 4; layer++)
         addInt(LayerConfig.uBGConfig[layer].Type);
     for (int layer = 0; layer < 4; layer++)
@@ -3194,6 +3898,7 @@ void GLRenderer2D::AppendWholeSceneTimingCSVRow(std::string& row) const
         addInt(trace.PaletteLayerDirtyMask);
         addInt(trace.DeferredLayerDirtyMask);
         addInt(trace.InactiveDeferredLayerDirtyMask);
+        addInt(trace.FlatVRAMCaptureSyncLayerMask);
         addInt(trace.CoveredBitmapMask);
         addInt(trace.ContributingLayerMask);
         addInt(trace.VisibleBitmapDirtyMask);
@@ -3232,10 +3937,10 @@ void GLRenderer2D::AppendWholeSceneTimingCSVRow(std::string& row) const
 
 void GLRenderer2D::ResetWholeSceneUpdateTiming()
 {
-    CaptureBackedHandoffFrameSerial++;
-    CaptureBackedHandoffBackgroundUpdated = false;
-    CaptureBackedHandoffReuseDecision = CaptureBackedHandoffReuseReason::None;
-    CaptureBackedHandoffCurrentKey = {};
+    CaptureBackedHandoff.FrameSerial++;
+    CaptureBackedHandoff.BackgroundUpdated = false;
+    CaptureBackedHandoff.ReuseDecision = CaptureBackedHandoffReuseReason::None;
+    CaptureBackedHandoff.CurrentKey = {};
 
     WholeScenePreviousUpdateDebugTrace = WholeSceneCurrentUpdateDebugTrace;
     WholeScenePreviousFramePartialComposites = WholeSceneUpdateTiming.PartialComposite.Count;
@@ -3310,6 +4015,105 @@ bool GLRenderer2D::IsWholeSceneCurrentFragmentationGuardActive() const
     return WholeSceneScaleFragmentationFallback == RendererSettings::WholeScene2DFragmentationFallback::CurrentForSevere;
 }
 
+bool GLRenderer2D::IsWholeSceneHybridPresentationGuardActive(int ystart, int yend) const
+{
+    if (WholeSceneScaleMode != RendererSettings::WholeScene2DScaleMode::ConservativeHybridUpscale ||
+        !CanUseWholeSceneScalePath())
+    {
+        return false;
+    }
+
+    const u32 dispmode = (DispCnt >> 16) & (GPU2D.Num ? 0x1u : 0x3u);
+    if (!GPU2D.Num &&
+        dispmode == 2 &&
+        CanScaleMainEngineVRAMDisplayCaptureSourceA(dispmode))
+    {
+        return false;
+    }
+
+    if (!Parent.IsFinalPresentationTransitionGuardActiveForRange(ystart, yend))
+        return false;
+
+    return !CanBypassWholeSceneHybridPresentationGuardForDirect2D(ystart, yend);
+}
+
+bool GLRenderer2D::CanBypassWholeSceneHybridPresentationGuardForDirect2D(int ystart, int yend) const
+{
+    bool screenSwap = false;
+    if (!Parent.GetFinalPassScreenSwapForRange(ystart, yend, screenSwap))
+        return false;
+    (void)screenSwap;
+
+    if (Parent.IsFinalPresentationScreenSwapExcursionActiveForRange(ystart, yend))
+        return false;
+
+    // Master brightness is applied by the final pass, so it does not change
+    // which direct-2D renderer owns the physical screen.
+    if (GPU.CaptureEnable ||
+        Parent.HasMainVRAMDisplayCaptureFinalRoute())
+    {
+        return false;
+    }
+
+    const auto* mainRenderer = dynamic_cast<const GLRenderer2D*>(Parent.Rend2D_A.get());
+    const auto* subRenderer = dynamic_cast<const GLRenderer2D*>(Parent.Rend2D_B.get());
+    if (!mainRenderer || !subRenderer)
+        return false;
+
+    const u32 mainDispMode = (mainRenderer->DispCnt >> 16) & 0x3u;
+    const u32 subDispMode = (subRenderer->DispCnt >> 16) & 0x1u;
+    if (mainDispMode != 1 || subDispMode != 1)
+        return false;
+
+    return mainRenderer->WholeSceneScaleMode ==
+               RendererSettings::WholeScene2DScaleMode::ConservativeHybridUpscale &&
+           subRenderer->WholeSceneScaleMode ==
+               RendererSettings::WholeScene2DScaleMode::ConservativeHybridUpscale &&
+           mainRenderer->CanUseWholeSceneScalePath() &&
+           subRenderer->CanUseWholeSceneScalePath();
+}
+
+bool GLRenderer2D::ShouldUseWholeSceneHybridOverlayForSuppressedDirect3DAlphaBlend() const
+{
+    if (WholeSceneScaleMode != RendererSettings::WholeScene2DScaleMode::ConservativeHybridUpscale ||
+        !CanUseWholeSceneScalePath() ||
+        GPU2D.Num)
+        return false;
+
+    const u32 dispmode = (DispCnt >> 16) & 0x3u;
+    if (dispmode != 1)
+        return false;
+
+    const u32 direct3DMask = 1u << 0;
+    const u32 bg2DLayerMask = (1u << 1) | (1u << 2) | (1u << 3);
+    const u32 objMask = 1u << 4;
+    const u32 backdropMask = 1u << 5;
+
+    if (!(DispCnt & (1 << 3)) || !(LayerEnable & direct3DMask))
+        return false;
+
+    const u32 blendEffect = (BlendCnt >> 6) & 0x3u;
+    if (blendEffect != 1 || EVA != 0)
+        return false;
+
+    const u32 blendTarget1 = BlendCnt & 0x3Fu;
+    const u32 blendTarget2 = (BlendCnt >> 8) & 0x3Fu;
+    u32 visibleNativeLayers = LayerEnable & bg2DLayerMask;
+    if ((LayerEnable & objMask) && OBJEnable && NumSprites > 0)
+        visibleNativeLayers |= objMask;
+
+    const bool direct3DTarget1 = (blendTarget1 & direct3DMask) != 0;
+    const bool visibleNativeTarget1 = (blendTarget1 & visibleNativeLayers) != 0;
+    if (!direct3DTarget1 || visibleNativeTarget1 || (blendTarget2 & direct3DMask))
+        return false;
+
+    u32 visibleNativeTarget2 = visibleNativeLayers;
+    if (blendTarget2 & backdropMask)
+        visibleNativeTarget2 |= backdropMask;
+
+    return (blendTarget2 & visibleNativeTarget2) != 0;
+}
+
 bool GLRenderer2D::IsWholeSceneCaptureBackedHandoffGuardActive() const
 {
     return WholeSceneCaptureBackedHandoffGuardFrames > 0 &&
@@ -3337,16 +4141,29 @@ bool GLRenderer2D::IsWholeSceneCaptureBackedHandoffCandidate() const
 
     const u32 captureLayerMask = (1 << 2) | (1 << 3);
     const bool visibleDirect3DLayer = (DispCnt & (1 << 3)) && (LayerEnable & (1 << 0));
+    const u32 visibleBGLayers = LayerEnable & 0x0Fu;
+    const bool direct3DOnlyLiveBackground =
+        visibleDirect3DLayer && visibleBGLayers == (1u << 0);
     const bool visibleFullDisplaySourceACaptureBG =
         (VisibleFullDisplayCaptureFromSourceABGLayerMask() & captureLayerMask) != 0;
     const bool fullScreenBitmapUpload =
         WholeSceneCurrentUpdateDebugTrace.BGUploadRows >= 192 &&
         (WholeSceneCurrentUpdateDebugTrace.LayerDirtyMask & captureLayerMask);
     const bool maintainingKnownCaptureRoute =
-        CaptureBackedHandoffRouteHasCapturedPhase[0] ||
-        CaptureBackedHandoffRouteHasCapturedPhase[1];
+        CaptureBackedRoute[0].HasCapturedPhase ||
+        CaptureBackedRoute[1].HasCapturedPhase;
+    const int currentRouteSlot = Parent.IsEngineRoutedToFinalBottom(GPU2D.Num, 0, 192) ? 1 : 0;
+    const bool hasProvenRouteProduct =
+        CaptureBackedRoute[currentRouteSlot].Product.Valid &&
+        CaptureBackedRoute[currentRouteSlot].Product.CapturedEventSerial;
+    const bool stableKnownLiveRoute =
+        direct3DOnlyLiveBackground &&
+        hasProvenRouteProduct &&
+        WholeSceneCurrentUpdateDebugTrace.BGUploadRows == 0 &&
+        WholeSceneNativeProductEpochValid;
 
     return visibleFullDisplaySourceACaptureBG ||
+           stableKnownLiveRoute ||
            (visibleDirect3DLayer && fullScreenBitmapUpload && maintainingKnownCaptureRoute);
 }
 
@@ -3362,10 +4179,11 @@ bool GLRenderer2D::ShouldUseWholeSceneCaptureBackedHandoffForRange(int ystart, i
 
     if (key.Phase == CaptureBackedHandoffPhase::CapturedBitmap)
         return HasOnlyFullDisplayCaptureFromSourceABGLayers() ||
-               CaptureBackedHandoffRouteHasCapturedPhase[slot];
+               CaptureBackedRoute[slot].HasCapturedPhase;
 
     if (key.Phase == CaptureBackedHandoffPhase::Live3D)
-        return CaptureBackedHandoffRouteHasCapturedPhase[slot];
+        return CaptureBackedRoute[slot].HasCapturedPhase ||
+               IsStableCaptureBackedHandoffLiveUpdate(key);
 
     return false;
 }
@@ -3407,11 +4225,21 @@ GLRenderer2D::CaptureBackedHandoffRouteKey GLRenderer2D::BuildCaptureBackedHando
     key.LayerEnable = LayerEnable;
     key.VisibleBitmapMask = VisibleBitmapBGLayerMask();
     key.BGUploadRows = WholeSceneCurrentUpdateDebugTrace.BGUploadRows;
-    key.FrameSerial = CaptureBackedHandoffFrameSerial;
+    key.FrameSerial = CaptureBackedHandoff.FrameSerial;
     key.YStart = ystart;
     key.YEnd = yend;
     key.Phase = CurrentCaptureBackedHandoffPhase();
     return key;
+}
+
+int GLRenderer2D::BeginCaptureBackedHandoffRoute(int ystart, int yend)
+{
+    CaptureBackedHandoff.CurrentKey = BuildCaptureBackedHandoffRouteKey(ystart, yend);
+    const int handoffSlot = CaptureBackedHandoffRouteSlot(CaptureBackedHandoff.CurrentKey);
+    CaptureBackedHandoff.CurrentSlot = static_cast<u8>(handoffSlot);
+    CaptureBackedHandoff.BackgroundUpdated = false;
+    CaptureBackedHandoff.ReuseDecision = CaptureBackedHandoffReuseReason::None;
+    return handoffSlot;
 }
 
 int GLRenderer2D::CaptureBackedHandoffRouteSlot(const CaptureBackedHandoffRouteKey& key) const
@@ -3436,13 +4264,13 @@ bool GLRenderer2D::CanReuseCaptureBackedHandoffSnapshot(const CaptureBackedHando
         return false;
     }
 
-    if (!CaptureBackedHandoff3DValid[slot])
+    if (!CaptureBackedRoute[slot].Handoff3DValid)
     {
         reason = CaptureBackedHandoffReuseReason::RejectedNoSnapshot;
         return false;
     }
 
-    const auto& latched = CaptureBackedHandoffLatchedKey[slot];
+    const auto& latched = CaptureBackedRoute[slot].HandoffLatchedKey;
 
     if (key.Engine != latched.Engine)
     {
@@ -3504,25 +4332,99 @@ bool GLRenderer2D::CanReuseCaptureBackedHandoffSnapshot(const CaptureBackedHando
     return true;
 }
 
+void GLRenderer2D::ClearCaptureBackedRouteProductState(int slot)
+{
+    if (slot < 0 || slot >= kCaptureBackedHandoffRouteSlots)
+        return;
+
+    CaptureBackedRoute[slot].Product = {};
+    CaptureBackedRoute[slot].EventProduct = {};
+    CaptureBackedRoute[slot].PendingEvent = {};
+}
+
+void GLRenderer2D::ClearCaptureBackedRouteState(int slot)
+{
+    if (slot < 0 || slot >= kCaptureBackedHandoffRouteSlots)
+        return;
+
+    CaptureBackedRoute[slot].Handoff3DValid = false;
+    CaptureBackedRoute[slot].HandoffLatchedKey = {};
+    CaptureBackedRoute[slot].Presentation = {};
+    ClearCaptureBackedRouteProductState(slot);
+    CaptureBackedRoute[slot].HasCapturedPhase = false;
+}
+
+void GLRenderer2D::LatchCaptureBackedHandoffSnapshot(int slot, const CaptureBackedHandoffRouteKey& key)
+{
+    if (slot < 0 || slot >= kCaptureBackedHandoffRouteSlots)
+        return;
+
+    CaptureBackedRoute[slot].Handoff3DValid = true;
+    CaptureBackedRoute[slot].HandoffLatchedKey = key;
+}
+
+void GLRenderer2D::MarkCaptureBackedRouteCapturedPhase(int slot)
+{
+    if (slot < 0 || slot >= kCaptureBackedHandoffRouteSlots)
+        return;
+
+    CaptureBackedRoute[slot].HasCapturedPhase = true;
+}
+
 void GLRenderer2D::InvalidateCaptureBackedHandoffSnapshot(int slot)
 {
     if (slot >= 0 && slot < kCaptureBackedHandoffRouteSlots)
     {
-        CaptureBackedHandoff3DValid[slot] = false;
-        CaptureBackedHandoffLatchedKey[slot] = {};
-        CaptureBackedHandoffRouteHasCapturedPhase[slot] = false;
+        ClearCaptureBackedRouteState(slot);
         return;
     }
 
     for (int i = 0; i < kCaptureBackedHandoffRouteSlots; i++)
-    {
-        CaptureBackedHandoff3DValid[i] = false;
-        CaptureBackedHandoffLatchedKey[i] = {};
-        CaptureBackedHandoffRouteHasCapturedPhase[i] = false;
-    }
+        ClearCaptureBackedRouteState(i);
 }
 
-int GLRenderer2D::VisibleSingleHighResCaptureBank() const
+void GLRenderer2D::UpdateCaptureBackedRoutePresentation(int slot,
+                                                        CaptureBackedRoutePresentationMode mode,
+                                                        u64 serial,
+                                                        u32 captureBank,
+                                                        u32 source3DSceneHash,
+                                                        u32 sourcePresentationHash,
+                                                        u32 currentOverlayPresentationHash)
+{
+    if (slot < 0 || slot >= kCaptureBackedHandoffRouteSlots)
+        return;
+
+    auto& state = CaptureBackedRoute[slot].Presentation;
+    const bool sameSource =
+        state.Valid &&
+        state.CaptureBank == captureBank &&
+        state.Source3DSceneHash == source3DSceneHash &&
+        state.SourcePresentationHash == sourcePresentationHash;
+    const u32 stableFrames = sameSource ? std::min<u32>(state.StableFrames + 1, 0xFFFFu) : 0;
+
+    state.Valid = true;
+    state.Mode = mode;
+    state.Serial = serial;
+    state.CaptureBank = captureBank;
+    state.Source3DSceneHash = source3DSceneHash;
+    state.SourcePresentationHash = sourcePresentationHash;
+    state.CurrentOverlayPresentationHash = currentOverlayPresentationHash;
+    state.StableFrames = stableFrames;
+}
+
+void GLRenderer2D::InvalidateCaptureBackedRouteProduct(int slot)
+{
+    if (slot >= 0 && slot < kCaptureBackedHandoffRouteSlots)
+    {
+        ClearCaptureBackedRouteProductState(slot);
+        return;
+    }
+
+    for (int i = 0; i < kCaptureBackedHandoffRouteSlots; i++)
+        ClearCaptureBackedRouteProductState(i);
+}
+
+int GLRenderer2D::VisibleSingleDisplayCaptureBank() const
 {
     const u32 visibleBGMask = LayerEnable & 0x0Fu;
     if (visibleBGMask == 0)
@@ -3542,12 +4444,61 @@ int GLRenderer2D::VisibleSingleHighResCaptureBank() const
         if (visibleBank >= 0 && visibleBank != captureBank)
             return -1;
 
+        visibleBank = captureBank;
+    }
+
+    return visibleBank;
+}
+
+int GLRenderer2D::VisibleSingleDisplayCaptureOBJBank() const
+{
+    if ((LayerEnable & (1 << 4)) == 0 || !OBJEnable || NumSprites <= 0)
+        return -1;
+    if ((LayerEnable & 0x0Fu) != 0)
+        return -1;
+
+    int visibleBank = -1;
+    bool found = false;
+    for (int i = 0; i < NumSprites; i++)
+    {
+        const auto& sprite = SpriteConfig.uOAM[i];
+        int captureBank = -1;
+        if (sprite.Type == 3)
+            captureBank = static_cast<int>((sprite.TileStride >> 2) & 0x3);
+        else if (sprite.Type == 4)
+            captureBank = static_cast<int>(sprite.TileStride & 0x3);
+        else
+            continue;
+
         const auto& event = Parent.HighResDisplayCapture256Event[captureBank];
-        if (!Parent.IsFullDisplayHighResCaptureEventRecord(event, captureBank))
+        if (!Parent.IsFullDisplayHighResCaptureEventRecord(event, static_cast<u32>(captureBank)) ||
+            !(event.ProductMask & GLRenderer::HighResCaptureProductFullEquivalent) ||
+            !Parent.HighResDisplayCaptureFullTex[captureBank])
+        {
+            return -1;
+        }
+
+        if (visibleBank >= 0 && visibleBank != captureBank)
             return -1;
 
         visibleBank = captureBank;
+        found = true;
     }
+
+    return found ? visibleBank : -1;
+}
+
+int GLRenderer2D::VisibleSingleHighResCaptureBank() const
+{
+    int visibleBank = VisibleSingleDisplayCaptureBank();
+    if (visibleBank < 0)
+        visibleBank = VisibleSingleDisplayCaptureOBJBank();
+    if (visibleBank < 0)
+        return -1;
+
+    const auto& event = Parent.HighResDisplayCapture256Event[visibleBank];
+    if (!Parent.IsFullDisplayHighResCaptureEventRecord(event, static_cast<u32>(visibleBank)))
+        return -1;
 
     return visibleBank;
 }
@@ -3590,7 +4541,12 @@ GLuint GLRenderer2D::VisibleHighResCaptureFullTex() const
 {
     const u32 visibleBGMask = LayerEnable & 0x0Fu;
     if (visibleBGMask == 0)
-        return 0;
+    {
+        const int objBank = VisibleSingleDisplayCaptureOBJBank();
+        if (objBank < 0)
+            return 0;
+        return Parent.HighResDisplayCaptureFullTex[objBank];
+    }
 
     GLuint fullTex = 0;
     for (int layer = 0; layer < 4; layer++)
@@ -3660,7 +4616,32 @@ bool GLRenderer2D::HasOnlyFullDisplayCaptureFromSourceABGLayers() const
     return captureMask != 0 && (visibleBGMask & ~captureMask) == 0;
 }
 
-bool GLRenderer2D::CanUseWholeSceneCaptureOnlyHighResPath() const
+bool GLRenderer2D::HasWholeSceneHighResCaptureBackedOBJReplacement(int ystart, int yend) const
+{
+    const VisibleOBJCaptureDebug debug = BuildVisibleOBJCaptureDebug();
+    const bool fullFrameRange = ystart == 0 && yend == 192;
+    const bool trackedVRAMDisplayRoute =
+        fullFrameRange &&
+        Parent.IsMainVRAMDisplayFinalRouteForRange(ystart, yend);
+    const bool fullWidthSourceAProduct =
+        debug.FullWidthTopStrip &&
+        debug.CurrentFullSourceA &&
+        debug.EventRejectReason == 0 &&
+        debug.ProductAvailable &&
+        trackedVRAMDisplayRoute;
+
+    const bool exactOBJReplacement =
+        debug.NonCaptureSpriteCount == 0 &&
+        (debug.FullScreen || fullWidthSourceAProduct);
+
+    return debug.Found &&
+           !debug.MixedBank &&
+           debug.CurrentSourceAOnly &&
+           exactOBJReplacement &&
+           debug.ProductAvailable;
+}
+
+bool GLRenderer2D::CanUseWholeSceneCaptureOnlyHighResPath(int ystart, int yend) const
 {
     if (WholeSceneScaleMode != RendererSettings::WholeScene2DScaleMode::ConservativeHybridUpscale ||
         !WholeSceneScaleCaptureBacked)
@@ -3671,12 +4652,18 @@ bool GLRenderer2D::CanUseWholeSceneCaptureOnlyHighResPath() const
         return false;
 
     if (GPU2D.Num && Parent.HasMainVRAMDisplayCaptureFinalRoute())
+    {
+        bool screenSwap = false;
+        if (!Parent.GetFinalPassScreenSwapForRange(ystart, yend, screenSwap))
+            return false;
+    }
+
+    const bool objVisible = (LayerEnable & (1 << 4)) && OBJEnable && NumSprites > 0;
+    if (objVisible && !HasWholeSceneHighResCaptureBackedOBJReplacement(ystart, yend))
         return false;
 
-    if ((LayerEnable & (1 << 4)) && OBJEnable && NumSprites > 0)
-        return false;
-
-    return VisibleHighResCaptureFullTex() != 0;
+    return VisibleHighResCaptureFullTex() != 0 ||
+           CanUseSourceABackgroundCurrentOverlayPath();
 }
 
 bool GLRenderer2D::IsWholeSceneStreamingBitmapFragmentationCandidate() const
@@ -4067,6 +5054,58 @@ void GLRenderer2D::ClearLayerPrerenderDeferred(u8 layerMask)
         DeferredLayerPrerenderFirstRow[layer] = -1;
         DeferredLayerPrerenderLastRow[layer] = -1;
     }
+}
+
+void GLRenderer2D::SyncPendingDisplayCapturesForFlatVRAMBGs()
+{
+    // Display captures stay GPU-side until something reads the VRAM they
+    // landed in. Only direct-color bitmap BGs get capture-classified (layer
+    // types 7/8) and sample the GPU-side capture texture; every other BG
+    // shape is composited from the flat VRAM mirror, which still holds
+    // pre-capture content until a sync runs. Read-sync capture blocks that
+    // overlap such a layer so the flatten below picks up the real captured
+    // data. A read sync keeps the GPU-side capture products valid, and
+    // already-synced blocks return immediately.
+    const u8 enabledLayers = (LayerEnable | GPU2D.LayerEnable) & 0xF;
+    if (!enabledLayers)
+        return;
+
+    const int capturemask = GPU2D.Num ? 0x7 : 0x1F;
+    int captureinfo[32];
+    GPU2D.GetCaptureInfo_BG(captureinfo);
+
+    u32 syncedLayerMask = 0;
+    for (int layer = 0; layer < 4; layer++)
+    {
+        if ((enabledLayers & (1 << layer)) == 0)
+            continue;
+
+        const auto& cfg = LayerConfig.uBGConfig[layer];
+        if (cfg.Type == 6 || cfg.Type == 7 || cfg.Type == 8)
+            continue;
+
+        const u32* rangeinfo = BGVRAMRange[layer];
+        for (int r = 0; r < 4; r += 2)
+        {
+            if (rangeinfo[r] == 0xFFFFFFFF)
+                continue;
+
+            const u32 start = rangeinfo[r] >> 14;
+            const u32 end = (rangeinfo[r] + rangeinfo[r + 1] + 0x3FFF) >> 14;
+            for (u32 b = start; b < end; b++)
+            {
+                const int blk = captureinfo[b & capturemask];
+                if (blk < 0 || !GPU.HasUnsyncedVRAMCaptureBlock(blk))
+                    continue;
+
+                GPU.SyncVRAMCaptureBlockForRead(blk);
+                syncedLayerMask |= 1u << layer;
+            }
+        }
+    }
+
+    if (syncedLayerMask)
+        WholeSceneCurrentUpdateDebugTrace.FlatVRAMCaptureSyncLayerMask |= syncedLayerMask;
 }
 
 void GLRenderer2D::RecordWholeSceneVisibleBitmapDirtyRows(int layer, int line, int firstRow, int lastRow)
@@ -5002,7 +6041,6 @@ bool GLRenderer2D::ReadWholeSceneDebugView(WholeScene2DDebugView view,
         switch (WholeSceneTrace.Native3DSource)
         {
         case WholeSceneNative3DSource::NativeRendered:
-        case WholeSceneNative3DSource::HighResLinearSampled:
             texture = Parent.OutputTex3D;
             useTextureLevelSize = true;
             break;
@@ -5293,8 +6331,9 @@ bool GLRenderer2D::ReadWholeSceneDebugView(WholeScene2DDebugView view,
         break;
     case WholeScene2DDebugView::FinalTop:
     case WholeScene2DDebugView::FinalBottom:
+    case WholeScene2DDebugView::MainVRAMDisplayRaw:
         if (status)
-            *status = "Final physical screen views are read after the GL final pass.";
+            *status = "Final physical and main VRAM display views are read after the GL final pass.";
         return false;
     }
 
@@ -6208,7 +7247,7 @@ bool GLRenderer2D::ReadWholeSceneDebugView(WholeScene2DDebugView view,
         {
             *status = (WholeSceneScaleMode == RendererSettings::WholeScene2DScaleMode::OverlayOperatorUpscale)
                 ? "Native exact final texture. In presentation overlay upscale mode this is the black-underlay endpoint used as overlay contribution."
-                : "Native exact final texture used as the source for final image upscale.";
+                : "Native exact final texture used as the source for postprocessing upscale.";
             *status += "\n";
             *status += DescribeWholeSceneScaleState();
         }
@@ -6446,14 +7485,18 @@ GLRenderer2D::WholeSceneScaleEligibility GLRenderer2D::ClassifyWholeSceneScalePa
             const bool liveLayerVisible = (GPU2D.LayerEnable & (1 << layer)) != 0;
             if (!WholeSceneScaleCaptureBacked ||
                 (cachedLayerVisible && !liveLayerVisible) ||
-                Parent.IsCurrentSourceAOnlyFullDisplayCaptureBG(cfg.Type, cfg.TileOffset))
+                (Parent.IsCurrentSourceAOnlyFullDisplayCaptureBG(cfg.Type, cfg.TileOffset) &&
+                 !CanUseWholeSceneMixedSourceACaptureBGPath()))
                 return WholeSceneScaleEligibility::CaptureBackedBG;
         }
     }
 
+    const bool mixedCaptureBackedOBJOverlayPath =
+        CanUseWholeSceneMixedCaptureBackedOBJOverlayPath();
     for (int i = 0; i < NumSprites; i++)
     {
         if ((SpriteConfig.uOAM[i].Type >= 3) &&
+            !mixedCaptureBackedOBJOverlayPath &&
             (!WholeSceneScaleCaptureBacked ||
              !Parent.IsEngineRoutedToFinalBottom(GPU2D.Num) ||
              HasOnlyCaptureBackedOBJPresentation() ||
@@ -6535,17 +7578,211 @@ bool GLRenderer2D::HasFullScreenSourceACaptureBackedOBJ() const
 
 bool GLRenderer2D::CanScaleMainEngineVRAMDisplayCaptureSourceA(u32 dispmode) const
 {
-    if (GPU2D.Num || dispmode != 2)
-        return false;
-    if (!WholeSceneScaleCaptureBacked)
-        return false;
-    if (!GPU.CaptureEnable)
+    MainVRAMDisplayCaptureScaleInputs inputs = {};
+    inputs.MainEngine = !GPU2D.Num;
+    inputs.DisplayMode = dispmode;
+    inputs.ConservativeHybridMode =
+        WholeSceneScaleMode == RendererSettings::WholeScene2DScaleMode::ConservativeHybridUpscale;
+    inputs.CaptureBackedScalingEnabled = WholeSceneScaleCaptureBacked;
+    inputs.CaptureEnabled = GPU.CaptureEnable;
+    inputs.CaptureCnt = GPU.CaptureCnt;
+
+    if (inputs.MainEngine &&
+        inputs.DisplayMode == 2 &&
+        inputs.ConservativeHybridMode &&
+        inputs.CaptureBackedScalingEnabled)
+    {
+        inputs.DisplayBank = (DispCnt >> 18) & 0x3;
+        inputs.HasAcceptedDisplayReplacement =
+            Parent.CanUseMainVRAMDisplayHighResCaptureReplacement(inputs.DisplayBank);
+    }
+
+    return ::melonDS::CanScaleMainVRAMDisplayCaptureSourceA(inputs);
+}
+
+bool GLRenderer2D::CanUseWholeSceneMixedSourceACaptureBGPath() const
+{
+    if (!WholeSceneScaleCaptureBacked || GPU.CaptureEnable)
         return false;
 
-    // Main-engine VRAM display consumes a captured framebuffer at final-pass
-    // level. Keep that presentation native for now; BG/OBJ capture-backed
-    // layer consumers remain handled by the normal capture-backed paths.
-    return false;
+    const u32 dispmode = (DispCnt >> 16) & (GPU2D.Num ? 0x1u : 0x3u);
+    if (dispmode != 1)
+        return false;
+
+    if (!GPU2D.Num && (DispCnt & (1 << 3)) && (LayerEnable & (1 << 0)))
+        return false;
+
+    const u32 visibleBGMask = LayerEnable & 0x0Fu;
+    const u32 captureBGMask = VisibleSourceAOnlyFullDisplayCaptureBGLayerMask();
+    if (captureBGMask == 0 || (visibleBGMask & ~captureBGMask) == 0)
+        return false;
+
+    for (int layer = 0; layer < 4; layer++)
+    {
+        if ((visibleBGMask & (1u << layer)) == 0)
+            continue;
+
+        const auto& cfg = LayerConfig.uBGConfig[layer];
+        if (cfg.Type < 7)
+            continue;
+
+        if ((captureBGMask & (1u << layer)) == 0)
+            return false;
+
+        u64 serial = 0;
+        u32 sourceKind = 0;
+        u32 productMask = 0;
+        u32 rejectReason = 0;
+        const GLuint fullProductTex =
+            Parent.GetHighResDisplayCaptureFullTexForBG(cfg.Type,
+                                                         cfg.TileOffset,
+                                                         serial,
+                                                         sourceKind,
+                                                         productMask,
+                                                         rejectReason);
+        if (!fullProductTex ||
+            rejectReason != static_cast<u32>(GLRenderer::HighResCaptureRejectReason::None) ||
+            sourceKind != static_cast<u32>(GLRenderer::HighResCaptureSourceKind::CleanEngineA2DOutput) ||
+            (productMask & GLRenderer::HighResCaptureProductFullEquivalent) == 0)
+        {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+bool GLRenderer2D::CanUseWholeSceneMixedCaptureBackedOBJOverlayPath() const
+{
+    if (!WholeSceneScaleRequested ||
+        WholeSceneScaleMode != RendererSettings::WholeScene2DScaleMode::ConservativeHybridUpscale ||
+        !WholeSceneScaleCaptureBacked ||
+        GPU.CaptureEnable)
+    {
+        return false;
+    }
+
+    const u32 dispmode = (DispCnt >> 16) & (GPU2D.Num ? 0x1u : 0x3u);
+    if (dispmode != 1)
+        return false;
+
+    if (!GPU2D.Num && (DispCnt & (1 << 3)) && (LayerEnable & (1 << 0)))
+        return false;
+
+    const u32 visibleBGMask = LayerEnable & 0x0Fu;
+    if (visibleBGMask == 0 || VisibleBitmapBGLayerMask() != 0)
+        return false;
+
+    for (int layer = 0; layer < 4; layer++)
+    {
+        if ((visibleBGMask & (1u << layer)) == 0)
+            continue;
+
+        if (LayerConfig.uBGConfig[layer].Type >= 7)
+            return false;
+    }
+
+    const VisibleOBJCaptureDebug debug = BuildVisibleOBJCaptureDebug();
+    if (!debug.Found ||
+        debug.RejectReason != 2 ||
+        debug.Bank < 0 ||
+        debug.Bank >= 4 ||
+        debug.MixedBank ||
+        debug.NonCaptureSpriteCount != 0 ||
+        debug.CaptureSpriteCount == 0 ||
+        (!debug.FullScreen && !debug.FullWidthTopStrip) ||
+        !debug.CurrentFullSourceA ||
+        !debug.EventValid ||
+        debug.EventSourceOBJ ||
+        debug.EventRejectReason != static_cast<u32>(GLRenderer::HighResCaptureRejectReason::None) ||
+        (debug.EventProductMask & GLRenderer::HighResCaptureProductFullEquivalent) == 0 ||
+        !debug.ProductAvailable)
+    {
+        return false;
+    }
+
+    const auto& event = Parent.HighResDisplayCapture256Event[debug.Bank];
+    return event.SourceKind == GLRenderer::HighResCaptureSourceKind::CleanEngineA2DOutput &&
+           Parent.HighResDisplayCaptureFullTex[debug.Bank] != 0;
+}
+
+bool GLRenderer2D::CanUseSourceABackgroundCurrentOverlayPath() const
+{
+    if (WholeSceneScaleMode != RendererSettings::WholeScene2DScaleMode::ConservativeHybridUpscale ||
+        !WholeSceneScaleCaptureBacked ||
+        GPU.CaptureEnable)
+    {
+        return false;
+    }
+
+    const u32 dispmode = (DispCnt >> 16) & (GPU2D.Num ? 0x1u : 0x3u);
+    if (dispmode != 1)
+        return false;
+
+    const u32 visibleBGMask = LayerEnable & 0x0Fu;
+    const u32 captureBGMask = VisibleFullDisplayCaptureFromSourceABGLayerMask();
+    if (visibleBGMask == 0 || (visibleBGMask & ~captureBGMask) != 0)
+        return false;
+
+    const int captureBank = VisibleSingleHighResCaptureBank();
+    if (captureBank < 0 || captureBank >= 4)
+        return false;
+
+    const auto& event = Parent.HighResDisplayCapture256Event[captureBank];
+    if (event.RejectReason != GLRenderer::HighResCaptureRejectReason::None ||
+        event.SourceKind != GLRenderer::HighResCaptureSourceKind::CleanEngineA2DOutput ||
+        (event.ProductMask & GLRenderer::HighResCaptureProductBackground3DUnderlay) == 0 ||
+        !VisibleHighResCaptureBackgroundTex())
+    {
+        return false;
+    }
+
+    const GLRenderer2D* mainRenderer = dynamic_cast<GLRenderer2D*>(Parent.Rend2D_A.get());
+    return mainRenderer &&
+           mainRenderer->CanRenderCurrentOverlayForCaptureSource(event.SourceLayerEnable,
+                                                                 event.SourceBGMode,
+                                                                 event.SourceVisibleBitmapMask,
+                                                                 event.SourceDirect3DVisible);
+}
+
+bool GLRenderer2D::CanUseSourceAExactFullProductBridgePath(int ystart, int yend) const
+{
+    if (WholeSceneScaleMode != RendererSettings::WholeScene2DScaleMode::ConservativeHybridUpscale ||
+        !WholeSceneScaleCaptureBacked ||
+        GPU.CaptureEnable)
+    {
+        return false;
+    }
+
+    const u32 dispmode = (DispCnt >> 16) & (GPU2D.Num ? 0x1u : 0x3u);
+    if (dispmode != 1 ||
+        !Parent.IsEngineRoutedToFinalBottom(GPU2D.Num, ystart, yend))
+    {
+        return false;
+    }
+
+    const bool objVisible = (LayerEnable & (1 << 4)) && OBJEnable && NumSprites > 0;
+    if (objVisible)
+        return false;
+
+    const u32 visibleBGMask = LayerEnable & 0x0Fu;
+    const u32 captureBGMask = VisibleFullDisplayCaptureFromSourceABGLayerMask();
+    if (visibleBGMask == 0 || (visibleBGMask & ~captureBGMask) != 0)
+        return false;
+
+    const int captureBank = VisibleSingleHighResCaptureBank();
+    if (captureBank < 0 || captureBank >= 4 || !VisibleHighResCaptureFullTex())
+        return false;
+
+    const auto& event = Parent.HighResDisplayCapture256Event[captureBank];
+    if (event.RejectReason != GLRenderer::HighResCaptureRejectReason::None ||
+        event.SourceKind != GLRenderer::HighResCaptureSourceKind::CleanEngineA2DOutput ||
+        (event.ProductMask & GLRenderer::HighResCaptureProductFullEquivalent) == 0)
+    {
+        return false;
+    }
+
+    return true;
 }
 
 bool GLRenderer2D::CanUseWholeSceneScalePath() const
@@ -6785,6 +8022,15 @@ bool GLRenderer2D::CanUseWholeSceneXBRZPath() const
            (ScaleFactor > 1);
 }
 
+bool GLRenderer2D::CanUseWholeSceneCuNNyPath() const
+{
+    return (CanUseWholeSceneLegacyPath() ||
+            CanUseWholeSceneHybridCleanLegacyCandidatePath() ||
+            CanUseWholeSceneSplitLegacyFallbackPath()) &&
+           RendererSettings::IsGLCuNNyAlgorithm(WholeSceneScaleAlgorithm) &&
+           (ScaleFactor >= 2);
+}
+
 int GLRenderer2D::WholeSceneHighResLayerFilterMode() const
 {
     if (!CanUseWholeSceneHighResPath())
@@ -6933,6 +8179,8 @@ void GLRenderer2D::UpdateAndRender(int line)
 
     if (screenon)
     {
+        SyncPendingDisplayCapturesForFlatVRAMBGs();
+
         if (GPU2D.Num == 0)
         {
             bgDirty = GPU.VRAMDirty_ABG.DeriveState(GPU.VRAMMap_ABG, GPU);
@@ -7141,6 +8389,8 @@ void GLRenderer2D::UpdateAndRender(int line)
     {
         WholeSceneFullFrameFinalizerUnsafeFrame = true;
         WholeSceneNativeProductEpochValid = false;
+        if (WholeSceneNativeProductEpochInvalidReason == 0)
+            WholeSceneNativeProductEpochInvalidReason = 3;
         auto& unsafeTrace = WholeSceneCurrentUpdateDebugTrace;
         unsafeTrace.FullFrameUnsafeEvents++;
         unsafeTrace.FullFrameUnsafeReasonMask |= state_dirty_reason_mask;
@@ -8347,7 +9597,9 @@ void GLRenderer2D::RenderCompositorPass(GLuint outputFB, GLuint objLayerTex,
                                         GLuint direct3DTex,
                                         GLuint direct3DCoverageTex,
                                         bool forceOBJDisabled,
-                                        bool preserveCompositorConfig)
+                                        bool preserveCompositorConfig,
+                                        GLuint capture128Tex,
+                                        GLuint capture256Tex)
 {
     glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, outputFB);
@@ -8430,10 +9682,10 @@ void GLRenderer2D::RenderCompositorPass(GLuint outputFB, GLuint objLayerTex,
     glBindTexture(GL_TEXTURE_2D_ARRAY, objLayerTex);
 
     glActiveTexture(GL_TEXTURE5);
-    glBindTexture(GL_TEXTURE_2D_ARRAY, Parent.CaptureOutput128Tex);
+    glBindTexture(GL_TEXTURE_2D_ARRAY, capture128Tex ? capture128Tex : Parent.CaptureOutput128Tex);
 
     glActiveTexture(GL_TEXTURE6);
-    glBindTexture(GL_TEXTURE_2D_ARRAY, Parent.CaptureOutput256Tex);
+    glBindTexture(GL_TEXTURE_2D_ARRAY, capture256Tex ? capture256Tex : Parent.CaptureOutput256Tex);
 
     glActiveTexture(GL_TEXTURE7);
     glBindTexture(GL_TEXTURE_2D, MosaicTex);
@@ -8629,13 +9881,16 @@ void GLRenderer2D::RenderNativeExactFinal(int ystart, int yend, bool debugTint, 
     RenderNativeExactFinalToTexture(NativeExactFinalTex, ystart, yend, debugTint, direct3DTex, direct3DCoverageTex);
 }
 
-void GLRenderer2D::RenderNativeExactFinalToTexture(GLuint targetTex, int ystart, int yend, bool debugTint, GLuint direct3DTex, GLuint direct3DCoverageTex, bool preserveCompositorConfig)
+void GLRenderer2D::RenderNativeExactFinalToTexture(GLuint targetTex, int ystart, int yend, bool debugTint, GLuint direct3DTex, GLuint direct3DCoverageTex, bool preserveCompositorConfig, GLuint capture128Tex, GLuint capture256Tex, bool forceOBJDisabled)
 {
     glBindFramebuffer(GL_FRAMEBUFFER, NativeExactFinalFB);
     glFramebufferTexture(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, targetTex, 0);
     glDrawBuffer(GL_COLOR_ATTACHMENT0);
 
-    RenderCompositorPass(NativeExactFinalFB, NativeOBJLayerTex, 256, 192, ystart, yend, 1, 0, false, false, debugTint, direct3DTex, direct3DCoverageTex, false, preserveCompositorConfig);
+    RenderCompositorPass(NativeExactFinalFB, NativeOBJLayerTex, 256, 192, ystart, yend,
+                         1, 0, false, false, debugTint, direct3DTex,
+                         direct3DCoverageTex, forceOBJDisabled, preserveCompositorConfig,
+                         capture128Tex, capture256Tex);
 
     glBindFramebuffer(GL_FRAMEBUFFER, NativeExactFinalFB);
     glFramebufferTexture(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, NativeExactFinalTex, 0);
@@ -8712,30 +9967,55 @@ void GLRenderer2D::RenderNativeUpscale(int ystart, int yend)
         const int modelIndex = WholeSceneArtCNNModelIndex();
         if (WholeSceneScaleSourceBoundaryGuard)
             RenderNativeMetaCoverage(0, 192);
-        RenderArtCNN2xGuarded(modelIndex, NativeTopColorTex, UpscaledTopColorTex, false);
-        RenderArtCNN2xGuarded(modelIndex, NativeSecondColorTex, UpscaledSecondColorTex, true);
-        if (useForegroundOverlay)
-            RenderArtCNN2x(modelIndex, NativeOutputTex, UpscaledExactFinalTex);
-        else if (WholeSceneScaleExactFinalFallback)
-            RenderArtCNN2x(modelIndex, NativeExactFinalTex, UpscaledExactFinalTex);
-        if (!WholeSceneScaleSourceBoundaryGuard)
-            RenderNativeMetaCoverage(0, 192);
-        return;
+        bool rendered = RenderArtCNN2xGuarded(modelIndex, NativeTopColorTex, UpscaledTopColorTex, false) &&
+                        RenderArtCNN2xGuarded(modelIndex, NativeSecondColorTex, UpscaledSecondColorTex, true);
+        if (rendered && useForegroundOverlay)
+            rendered = RenderArtCNN2x(modelIndex, NativeOutputTex, UpscaledExactFinalTex);
+        else if (rendered && WholeSceneScaleExactFinalFallback)
+            rendered = RenderArtCNN2x(modelIndex, NativeExactFinalTex, UpscaledExactFinalTex);
+        if (rendered)
+        {
+            if (!WholeSceneScaleSourceBoundaryGuard)
+                RenderNativeMetaCoverage(0, 192);
+            return;
+        }
     }
 
     if (CanUseWholeSceneNNEDI3Path())
     {
         if (WholeSceneScaleSourceBoundaryGuard)
             RenderNativeMetaCoverage(0, 192);
-        RenderNNEDI32xGuarded(NativeTopColorTex, UpscaledTopColorTex, false);
-        RenderNNEDI32xGuarded(NativeSecondColorTex, UpscaledSecondColorTex, true);
-        if (useForegroundOverlay)
-            RenderNNEDI32x(NativeOutputTex, UpscaledExactFinalTex);
-        else if (WholeSceneScaleExactFinalFallback)
-            RenderNNEDI32x(NativeExactFinalTex, UpscaledExactFinalTex);
-        if (!WholeSceneScaleSourceBoundaryGuard)
+        bool rendered = RenderNNEDI32xGuarded(NativeTopColorTex, UpscaledTopColorTex, false) &&
+                        RenderNNEDI32xGuarded(NativeSecondColorTex, UpscaledSecondColorTex, true);
+        if (rendered && useForegroundOverlay)
+            rendered = RenderNNEDI32x(NativeOutputTex, UpscaledExactFinalTex);
+        else if (rendered && WholeSceneScaleExactFinalFallback)
+            rendered = RenderNNEDI32x(NativeExactFinalTex, UpscaledExactFinalTex);
+        if (rendered)
+        {
+            if (!WholeSceneScaleSourceBoundaryGuard)
+                RenderNativeMetaCoverage(0, 192);
+            return;
+        }
+    }
+
+    if (CanUseWholeSceneCuNNyPath())
+    {
+        const int modelIndex = RendererSettings::GetGLCuNNyModelIndex(WholeSceneScaleAlgorithm);
+        if (WholeSceneScaleSourceBoundaryGuard)
             RenderNativeMetaCoverage(0, 192);
-        return;
+        bool rendered = RenderCuNNy2xGuarded(modelIndex, NativeTopColorTex, UpscaledTopColorTex, false) &&
+                        RenderCuNNy2xGuarded(modelIndex, NativeSecondColorTex, UpscaledSecondColorTex, true);
+        if (rendered && useForegroundOverlay)
+            rendered = RenderCuNNy2x(modelIndex, NativeOutputTex, UpscaledExactFinalTex);
+        else if (rendered && WholeSceneScaleExactFinalFallback)
+            rendered = RenderCuNNy2x(modelIndex, NativeExactFinalTex, UpscaledExactFinalTex);
+        if (rendered)
+        {
+            if (!WholeSceneScaleSourceBoundaryGuard)
+                RenderNativeMetaCoverage(0, 192);
+            return;
+        }
     }
 
     if (CanUseWholeSceneXBRZPath())
@@ -8788,9 +10068,9 @@ void GLRenderer2D::RenderNativeUpscale(int ystart, int yend)
     glDrawArrays(GL_TRIANGLES, 0, 2*3);
 
     if (useForegroundOverlay)
-        RenderArtCNNSpline36(NativeOutputTex, UpscaledExactFinalTex, ScreenW, ScreenH);
+        RenderSpline36(NativeOutputTex, UpscaledExactFinalTex, ScreenW, ScreenH);
     else if (WholeSceneScaleExactFinalFallback)
-        RenderArtCNNSpline36(NativeExactFinalTex, UpscaledExactFinalTex, ScreenW, ScreenH);
+        RenderSpline36(NativeExactFinalTex, UpscaledExactFinalTex, ScreenW, ScreenH);
 
     glDisable(GL_SCISSOR_TEST);
 }
@@ -8804,20 +10084,26 @@ void GLRenderer2D::RenderNativeFinalUpscaleToTexture(GLuint sourceTex, GLuint ta
 {
     if (ScaleFactor <= 1)
     {
-        RenderArtCNNSpline36(sourceTex, targetTex, ScreenW, ScreenH);
+        RenderSpline36(sourceTex, targetTex, ScreenW, ScreenH);
         return;
     }
 
     if (RendererSettings::IsGLArtCNNAlgorithm(WholeSceneScaleAlgorithm))
     {
-        RenderArtCNN2x(WholeSceneArtCNNModelIndex(), sourceTex, targetTex);
-        return;
+        if (RenderArtCNN2x(WholeSceneArtCNNModelIndex(), sourceTex, targetTex))
+            return;
     }
 
     if (RendererSettings::IsGLNNEDI3Algorithm(WholeSceneScaleAlgorithm))
     {
-        RenderNNEDI32x(sourceTex, targetTex);
-        return;
+        if (RenderNNEDI32x(sourceTex, targetTex))
+            return;
+    }
+
+    if (RendererSettings::IsGLCuNNyAlgorithm(WholeSceneScaleAlgorithm))
+    {
+        if (RenderCuNNy2x(RendererSettings::GetGLCuNNyModelIndex(WholeSceneScaleAlgorithm), sourceTex, targetTex))
+            return;
     }
 
     if (WholeSceneScaleAlgorithm == RendererSettings::GLScaleAlgorithm::XBRZ)
@@ -8826,7 +10112,7 @@ void GLRenderer2D::RenderNativeFinalUpscaleToTexture(GLuint sourceTex, GLuint ta
         return;
     }
 
-    RenderArtCNNSpline36(sourceTex, targetTex, ScreenW, ScreenH);
+    RenderSpline36(sourceTex, targetTex, ScreenW, ScreenH);
 }
 
 u32 GLRenderer2D::CapturePresentationHash() const
@@ -8930,11 +10216,25 @@ bool GLRenderer2D::CanUseCaptureEpochBackgroundForLiveOverlay(int ystart, int ye
     const auto& epoch = Parent.ActiveCaptureBackgroundEpoch[routeSlot];
     if (!epoch.Valid ||
         epoch.ConsumerRouteSlot != static_cast<u32>(routeSlot) ||
+        epoch.CaptureBank >= 4 ||
         !Parent.ActiveCaptureBackgroundEpochTex[routeSlot] ||
         !(epoch.ProductMask & GLRenderer::HighResCaptureProductBackground3DUnderlay) ||
         epoch.SourceKind != GLRenderer::HighResCaptureSourceKind::CleanEngineA2DOutput)
     {
         return false;
+    }
+
+    if (!IsWholeSceneCaptureBackedHandoffGuardActive())
+    {
+        const auto& event = Parent.HighResDisplayCapture256Event[epoch.CaptureBank];
+        if (!event.Valid ||
+            event.Serial < epoch.Serial ||
+            event.Serial - epoch.Serial > 2 ||
+            event.RejectReason != GLRenderer::HighResCaptureRejectReason::None ||
+            !(event.ProductMask & GLRenderer::HighResCaptureProductBackground3DUnderlay))
+        {
+            return false;
+        }
     }
 
     const u32 epochVisibleBGLayers = epoch.SourceLayerEnable & 0x0Fu;
@@ -8947,8 +10247,14 @@ bool GLRenderer2D::CanUseCaptureEpochBackgroundForLiveOverlay(int ystart, int ye
 bool GLRenderer2D::RenderCurrentOverlayOverHighResBackgroundToTexture(GLuint targetTex,
                                                                       GLuint highResBackgroundTex,
                                                                       int ystart,
-                                                                      int yend)
+                                                                      int yend,
+                                                                      bool applyMasterBrightness,
+                                                                      GLuint* rawCompositeTex,
+                                                                      bool* outputMasterBrightnessApplied)
 {
+    if (outputMasterBrightnessApplied)
+        *outputMasterBrightnessApplied = false;
+
     if (!targetTex || !highResBackgroundTex || ystart != 0 || yend != 192)
         return false;
 
@@ -8984,6 +10290,15 @@ bool GLRenderer2D::RenderCurrentOverlayOverHighResBackgroundToTexture(GLuint tar
     RenderNativeFinalUpscaleToTexture(NativeExactFinalTex, UpscaledExactFinalTex);
     RenderNativeFinalUpscaleToTexture(NativeOutputTex, UpscaledCoverageTex);
 
+    const u16 masterBrightness = GPU2D.Num ? GPU.MasterBrightnessB : GPU.MasterBrightnessA;
+    const int brightMode = (masterBrightness >> 14) & 0x3;
+    const int brightFactor = std::min<int>(masterBrightness & 0x1F, 16);
+    const bool bakeMasterBrightness =
+        applyMasterBrightness && (brightMode == 1 || brightMode == 2) && brightFactor > 0;
+    const GLuint compositeTargetTex = bakeMasterBrightness ? HybridFinalSourceTex : targetTex;
+    if (rawCompositeTex)
+        *rawCompositeTex = compositeTargetTex;
+
     RenderOverlayComposite(UpscaledExactFinalTex,
                            UpscaledCoverageTex,
                            highResBackgroundTex,
@@ -8994,12 +10309,26 @@ bool GLRenderer2D::RenderCurrentOverlayOverHighResBackgroundToTexture(GLuint tar
                            0,
                            false,
                            0,
-                           targetTex,
+                           compositeTargetTex,
                            false,
                            0,
                            ystart,
                            yend,
                            true);
+
+    bool masterBrightnessAppliedToOutput = false;
+    const bool masterBrightnessApplied =
+        !bakeMasterBrightness ||
+        (masterBrightnessAppliedToOutput =
+             ApplyMasterBrightnessToTexture(targetTex,
+                                            compositeTargetTex,
+                                            ScreenW,
+                                            ScreenH,
+                                            ystart,
+                                            yend,
+                                            masterBrightness));
+    if (outputMasterBrightnessApplied)
+        *outputMasterBrightnessApplied = masterBrightnessAppliedToOutput;
 
     CompositorConfig = savedCompositorConfig;
     glBindBuffer(GL_UNIFORM_BUFFER, CompositorConfigUBO);
@@ -9007,6 +10336,306 @@ bool GLRenderer2D::RenderCurrentOverlayOverHighResBackgroundToTexture(GLuint tar
 
     WholeSceneOverlayEndpointsValid = false;
     WholeSceneOverlayEndpointSourceTex = 0;
+    return masterBrightnessApplied;
+}
+
+bool GLRenderer2D::ApplyMasterBrightnessToTexture(GLuint targetTex,
+                                                  GLuint sourceTex,
+                                                  int width,
+                                                  int height,
+                                                  int ystart,
+                                                  int yend,
+                                                  u16 masterBrightness)
+{
+    const int brightMode = (masterBrightness >> 14) & 0x3;
+    const int brightFactor = std::min<int>(masterBrightness & 0x1F, 16);
+    if (!targetTex || !sourceTex || targetTex == sourceTex ||
+        brightFactor <= 0 || (brightMode != 1 && brightMode != 2))
+    {
+        return false;
+    }
+
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+    glBindFramebuffer(GL_FRAMEBUFFER, ArtCNNOutputFB);
+    glFramebufferTexture(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, targetTex, 0);
+    glDrawBuffer(GL_COLOR_ATTACHMENT0);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, ArtCNNOutputFB);
+
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_STENCIL_TEST);
+    glDisable(GL_BLEND);
+    glColorMaski(0, GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glDepthMask(GL_FALSE);
+
+    glViewport(0, 0, width, height);
+    glEnable(GL_SCISSOR_TEST);
+    glScissor(0, (ystart * height) / 192, width, ((yend - ystart) * height) / 192);
+
+    glUseProgram(MasterBrightnessShader);
+    glUniform1i(MasterBrightnessModeULoc, brightMode);
+    glUniform1i(MasterBrightnessFactorULoc, brightFactor);
+
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, sourceTex);
+
+    glBindBuffer(GL_ARRAY_BUFFER, Parent.RectVtxBuffer);
+    glBindVertexArray(Parent.RectVtxArray);
+    glDrawArrays(GL_TRIANGLES, 0, 2*3);
+
+    return true;
+}
+
+bool GLRenderer2D::RenderCurrentLayersOverHighResCaptureBGToTexture(GLuint targetTex,
+                                                                    int ystart,
+                                                                    int yend)
+{
+    if (!targetTex || ystart != 0 || yend != 192 ||
+        !CanUseWholeSceneMixedSourceACaptureBGPath())
+    {
+        return false;
+    }
+
+    const u32 captureBGMask = VisibleSourceAOnlyFullDisplayCaptureBGLayerMask();
+    GLuint highResUnderlayTex = 0;
+    for (int layer = 0; layer < 4; layer++)
+    {
+        if ((captureBGMask & (1u << layer)) == 0)
+            continue;
+
+        const auto& cfg = LayerConfig.uBGConfig[layer];
+        u64 serial = 0;
+        u32 sourceKind = 0;
+        u32 productMask = 0;
+        u32 rejectReason = 0;
+        const GLuint layerTex = Parent.GetHighResDisplayCaptureFullTexForBG(cfg.Type,
+                                                                            cfg.TileOffset,
+                                                                            serial,
+                                                                            sourceKind,
+                                                                            productMask,
+                                                                            rejectReason);
+        if (!layerTex)
+            return false;
+        if (highResUnderlayTex && highResUnderlayTex != layerTex)
+            return false;
+
+        highResUnderlayTex = layerTex;
+    }
+
+    if (!highResUnderlayTex)
+        return false;
+
+    ResetWholeSceneRenderTrace();
+    RecordWholeSceneRenderTrace(WholeSceneRenderPath::SourceACaptureReplacement,
+                                ystart, yend,
+                                ScaleFactor > 1,
+                                false,
+                                false,
+                                highResUnderlayTex);
+    WholeSceneTrace.SourceACaptureMode = SourceACaptureReplacementMode::CurrentOverlay;
+    WholeSceneTrace.SourceAProductChoice =
+        SourceAProductChoiceReason::UsedBackgroundUnderlayCurrentOverlay;
+    WholeSceneTrace.EffectiveSourceABackgroundSource =
+        SourceABackgroundSource::FullCaptureProduct;
+    WholeSceneTrace.CaptureProductKind = WholeSceneCaptureProductKind::FullCaptureProduct;
+    WholeSceneTrace.CaptureRenderAction = WholeSceneCaptureRenderAction::CompositeCurrentOverlay;
+    GLCaptureProductResolution product = {};
+    product.Tex = highResUnderlayTex;
+    product.Accepted = true;
+    product.ProductKind = WholeSceneTrace.CaptureProductKind;
+    product.BackgroundSource = SourceABackgroundSource::FullCaptureProduct;
+    product.RenderAction = WholeSceneTrace.CaptureRenderAction;
+    product.PresentationClass =
+        CaptureProductPresentationClassForProduct(product.ProductKind,
+                                                 product.RenderAction);
+    RecordChosenCaptureProductTrace(product, {});
+
+    auto phaseStart = std::chrono::steady_clock::now();
+    RenderNativePrepass(ystart, yend);
+    AddWholeSceneUpdateTiming(WholeSceneUpdateTiming.NativePrepass, ElapsedUS(phaseStart));
+
+    WholeSceneOverlayEndpointsValid = false;
+    WholeSceneOverlayEndpointSourceTex = 0;
+
+    phaseStart = std::chrono::steady_clock::now();
+    RenderNativeExactFinalToTexture(NativeExactFinalTex,
+                                    ystart,
+                                    yend,
+                                    false,
+                                    0,
+                                    0,
+                                    false,
+                                    NativeOverlayBlackCapture128Tex,
+                                    NativeOverlayBlackCapture256Tex);
+    AddWholeSceneUpdateTiming(WholeSceneUpdateTiming.OverlayBlackExactFinal, ElapsedUS(phaseStart));
+
+    phaseStart = std::chrono::steady_clock::now();
+    RenderNativeExactFinalToTexture(NativeOutputTex,
+                                    ystart,
+                                    yend,
+                                    false,
+                                    0,
+                                    0,
+                                    false,
+                                    NativeOverlayWhiteCapture128Tex,
+                                    NativeOverlayWhiteCapture256Tex);
+    AddWholeSceneUpdateTiming(WholeSceneUpdateTiming.OverlayWhiteExactFinal, ElapsedUS(phaseStart));
+    WholeSceneTrace.NativeExactFinalValid = true;
+
+    phaseStart = std::chrono::steady_clock::now();
+    RenderNativeFinalUpscaleToTexture(NativeExactFinalTex, UpscaledExactFinalTex);
+    RenderNativeFinalUpscaleToTexture(NativeOutputTex, UpscaledCoverageTex);
+    AddWholeSceneUpdateTiming(WholeSceneUpdateTiming.FinalizerUpscale, ElapsedUS(phaseStart));
+
+    phaseStart = std::chrono::steady_clock::now();
+    RenderOverlayComposite(UpscaledExactFinalTex,
+                           UpscaledCoverageTex,
+                           highResUnderlayTex,
+                           false,
+                           0,
+                           0,
+                           0,
+                           0,
+                           false,
+                           0,
+                           targetTex,
+                           WholeSceneScaleDebugTint,
+                           0,
+                           ystart,
+                           yend,
+                           true);
+    AddWholeSceneUpdateTiming(WholeSceneUpdateTiming.FinalizerComposite, ElapsedUS(phaseStart));
+
+    return true;
+}
+
+bool GLRenderer2D::RenderCurrentBGOverlayOverHighResCaptureOBJToTexture(GLuint targetTex,
+                                                                        int ystart,
+                                                                        int yend)
+{
+    if (!targetTex || ystart != 0 || yend != 192 ||
+        !CanUseWholeSceneMixedCaptureBackedOBJOverlayPath())
+    {
+        return false;
+    }
+
+    const VisibleOBJCaptureDebug debug = BuildVisibleOBJCaptureDebug();
+    if (debug.Bank < 0 || debug.Bank >= 4)
+        return false;
+
+    const GLuint highResUnderlayTex = Parent.HighResDisplayCaptureFullTex[debug.Bank];
+    if (!highResUnderlayTex)
+        return false;
+
+    ResetWholeSceneRenderTrace();
+    RecordWholeSceneRenderTrace(WholeSceneRenderPath::SourceACaptureReplacement,
+                                ystart, yend,
+                                ScaleFactor > 1,
+                                false,
+                                false,
+                                highResUnderlayTex);
+    WholeSceneTrace.SourceACaptureMode = SourceACaptureReplacementMode::CurrentOverlay;
+    WholeSceneTrace.SourceAProductChoice =
+        SourceAProductChoiceReason::UsedBackgroundUnderlayCurrentOverlay;
+    WholeSceneTrace.EffectiveSourceABackgroundSource =
+        SourceABackgroundSource::FullCaptureProduct;
+    WholeSceneTrace.CaptureProductKind = WholeSceneCaptureProductKind::FullCaptureProduct;
+    WholeSceneTrace.CaptureRenderAction = WholeSceneCaptureRenderAction::CompositeCurrentOverlay;
+    GLCaptureProductResolution product = {};
+    product.Tex = highResUnderlayTex;
+    product.Accepted = true;
+    product.ProductKind = WholeSceneTrace.CaptureProductKind;
+    product.BackgroundSource = SourceABackgroundSource::FullCaptureProduct;
+    product.RenderAction = WholeSceneTrace.CaptureRenderAction;
+    product.PresentationClass =
+        CaptureProductPresentationClassForProduct(product.ProductKind,
+                                                 product.RenderAction);
+    RecordChosenCaptureProductTrace(product,
+                                    {debug.Bank,
+                                     0,
+                                     0,
+                                     0,
+                                     debug.EventSerial,
+                                     0,
+                                     0});
+
+    auto phaseStart = std::chrono::steady_clock::now();
+    RenderNativePrepass(ystart, yend);
+    AddWholeSceneUpdateTiming(WholeSceneUpdateTiming.NativePrepass, ElapsedUS(phaseStart));
+
+    WholeSceneOverlayEndpointsValid = false;
+    WholeSceneOverlayEndpointSourceTex = 0;
+
+    const sScanlineConfig savedScanlineConfig = ScanlineConfig;
+    auto uploadScanlineRange = [&]()
+    {
+        glBindBuffer(GL_UNIFORM_BUFFER, ScanlineConfigUBO);
+        glBufferSubData(GL_UNIFORM_BUFFER,
+                        ystart * sizeof(sScanlineConfig::sScanline),
+                        (yend - ystart) * sizeof(sScanlineConfig::sScanline),
+                        &ScanlineConfig.uScanline[ystart]);
+    };
+    auto setBackdrop = [&](u32 color)
+    {
+        for (int y = ystart; y < yend; y++)
+            ScanlineConfig.uScanline[y].BackColor = color;
+    };
+
+    setBackdrop(0x0000);
+    phaseStart = std::chrono::steady_clock::now();
+    RenderNativeExactFinalToTexture(NativeExactFinalTex,
+                                    ystart,
+                                    yend,
+                                    false,
+                                    0,
+                                    0,
+                                    false,
+                                    0,
+                                    0,
+                                    true);
+    AddWholeSceneUpdateTiming(WholeSceneUpdateTiming.OverlayBlackExactFinal, ElapsedUS(phaseStart));
+
+    setBackdrop(0x7FFF);
+    phaseStart = std::chrono::steady_clock::now();
+    RenderNativeExactFinalToTexture(NativeOutputTex,
+                                    ystart,
+                                    yend,
+                                    false,
+                                    0,
+                                    0,
+                                    false,
+                                    0,
+                                    0,
+                                    true);
+    AddWholeSceneUpdateTiming(WholeSceneUpdateTiming.OverlayWhiteExactFinal, ElapsedUS(phaseStart));
+    WholeSceneTrace.NativeExactFinalValid = true;
+
+    ScanlineConfig = savedScanlineConfig;
+    uploadScanlineRange();
+
+    phaseStart = std::chrono::steady_clock::now();
+    RenderNativeFinalUpscaleToTexture(NativeExactFinalTex, UpscaledExactFinalTex);
+    RenderNativeFinalUpscaleToTexture(NativeOutputTex, UpscaledCoverageTex);
+    AddWholeSceneUpdateTiming(WholeSceneUpdateTiming.FinalizerUpscale, ElapsedUS(phaseStart));
+
+    phaseStart = std::chrono::steady_clock::now();
+    RenderOverlayComposite(UpscaledExactFinalTex,
+                           UpscaledCoverageTex,
+                           highResUnderlayTex,
+                           false,
+                           0,
+                           0,
+                           0,
+                           0,
+                           false,
+                           0,
+                           targetTex,
+                           WholeSceneScaleDebugTint,
+                           0,
+                           ystart,
+                           yend,
+                           true);
+    AddWholeSceneUpdateTiming(WholeSceneUpdateTiming.FinalizerComposite, ElapsedUS(phaseStart));
+
     return true;
 }
 
@@ -9053,7 +10682,7 @@ void GLRenderer2D::RenderNativeMetaCoverage(int ystart, int yend)
     glDisable(GL_SCISSOR_TEST);
 }
 
-void GLRenderer2D::RenderArtCNNPass(GLuint shader, GLuint outputFB, int width, int height, GLuint source0, GLuint source1)
+void GLRenderer2D::RenderFullscreenPass(GLuint shader, GLuint outputFB, int width, int height, GLuint source0, GLuint source1)
 {
     glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, outputFB);
@@ -9084,87 +10713,464 @@ void GLRenderer2D::RenderArtCNNPass(GLuint shader, GLuint outputFB, int width, i
     glDrawArrays(GL_TRIANGLES, 0, 2*3);
 }
 
-void GLRenderer2D::RenderArtCNNPassToTexture(GLuint shader, GLuint targetTex, int width, int height, GLuint source0, GLuint source1)
+void GLRenderer2D::RenderFullscreenPassToTexture(GLuint shader, GLuint targetTex, int width, int height, GLuint source0, GLuint source1)
 {
     glBindFramebuffer(GL_FRAMEBUFFER, ArtCNNOutputFB);
     glFramebufferTexture(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, targetTex, 0);
     glDrawBuffer(GL_COLOR_ATTACHMENT0);
 
-    RenderArtCNNPass(shader, ArtCNNOutputFB, width, height, source0, source1);
+    RenderFullscreenPass(shader, ArtCNNOutputFB, width, height, source0, source1);
 }
 
-void GLRenderer2D::RenderArtCNNSpline36(GLuint sourceTex, GLuint targetTex, int width, int height, float sourceShiftX, float sourceShiftY)
+void GLRenderer2D::CopyArtCNNProgramsFrom(const GLRenderer2D& other)
 {
-    glUseProgram(ArtCNNSpline36Shader);
-    GLint sourceShiftLoc = glGetUniformLocation(ArtCNNSpline36Shader, "uSourceShift");
+    for (int model = 0; model < RendererSettings::GLArtCNNModelCount; model++)
+    {
+        for (int pass = 0; pass < 7; pass++)
+            ArtCNNConvShaders[model][pass] = other.ArtCNNConvShaders[model][pass];
+        ArtCNNDepthToSpaceShaders[model] = other.ArtCNNDepthToSpaceShaders[model];
+    }
+    ArtCNNComputeProgramsReady = other.ArtCNNComputeProgramsReady;
+    ArtCNNComputeProgramsFailed = other.ArtCNNComputeProgramsFailed;
+}
+
+bool GLRenderer2D::EnsureArtCNNComputePrograms()
+{
+    if (ArtCNNShaderOwner != this)
+    {
+        if (ArtCNNShaderOwner == nullptr || !ArtCNNShaderOwner->EnsureArtCNNComputePrograms())
+            return false;
+        CopyArtCNNProgramsFrom(*ArtCNNShaderOwner);
+        return ArtCNNComputeProgramsReady;
+    }
+
+    if (ArtCNNComputeProgramsReady)
+        return true;
+    if (ArtCNNComputeProgramsFailed)
+        return false;
+
+    for (int model = 0; model < RendererSettings::GLArtCNNModelCount; model++)
+    {
+        for (int pass = 0; pass < 7; pass++)
+        {
+            std::string shaderName = "2DArtCNN_" + std::string(kArtCNNModelLabels[model]) +
+                                     "_Conv" + std::to_string(pass) + "ComputeShader";
+            if (!OpenGL::CompileComputeProgram(ArtCNNConvShaders[model][pass],
+                                               kArtCNNConvShaderSources[model][pass],
+                                               shaderName.c_str()))
+                goto fail;
+            SetArtCNNComputeProgramDefaults(ArtCNNConvShaders[model][pass]);
+        }
+
+        std::string depthShaderName = "2DArtCNN_" + std::string(kArtCNNModelLabels[model]) +
+                                      "_DepthToSpaceComputeShader";
+        if (!OpenGL::CompileComputeProgram(ArtCNNDepthToSpaceShaders[model],
+                                           kArtCNNDepthToSpaceSources[model],
+                                           depthShaderName.c_str()))
+            goto fail;
+        SetArtCNNComputeProgramDefaults(ArtCNNDepthToSpaceShaders[model]);
+    }
+
+    ArtCNNComputeProgramsReady = true;
+    return true;
+
+fail:
+    ArtCNNComputeProgramsFailed = true;
+    return false;
+}
+
+void GLRenderer2D::CopyNNEDI3ComputeProgramsFrom(const GLRenderer2D& other)
+{
+    NNEDI3VerticalComputeShader = other.NNEDI3VerticalComputeShader;
+    NNEDI3HorizontalComputeShader = other.NNEDI3HorizontalComputeShader;
+    NNEDI3ComputeProgramsReady = other.NNEDI3ComputeProgramsReady;
+    NNEDI3ComputeProgramsFailed = other.NNEDI3ComputeProgramsFailed;
+}
+
+bool GLRenderer2D::EnsureNNEDI3ComputePrograms()
+{
+    if (NNEDI3ComputeShaderOwner != this)
+    {
+        if (NNEDI3ComputeShaderOwner == nullptr || !NNEDI3ComputeShaderOwner->EnsureNNEDI3ComputePrograms())
+            return false;
+        CopyNNEDI3ComputeProgramsFrom(*NNEDI3ComputeShaderOwner);
+        return NNEDI3ComputeProgramsReady;
+    }
+
+    if (NNEDI3ComputeProgramsReady)
+        return true;
+    if (NNEDI3ComputeProgramsFailed)
+        return false;
+
+    if (!OpenGL::CompileComputeProgram(NNEDI3VerticalComputeShader,
+                                       ::k2DNNEDI3_VerticalCS,
+                                       "2DNNEDI3VerticalComputeShader"))
+        goto fail;
+    SetNNEDI3ComputeProgramDefaults(NNEDI3VerticalComputeShader);
+
+    if (!OpenGL::CompileComputeProgram(NNEDI3HorizontalComputeShader,
+                                       ::k2DNNEDI3_HorizontalCS,
+                                       "2DNNEDI3HorizontalComputeShader"))
+        goto fail;
+    SetNNEDI3ComputeProgramDefaults(NNEDI3HorizontalComputeShader);
+
+    NNEDI3ComputeProgramsReady = true;
+    Log(LogLevel::Info, "Compiled NNEDI3 compute scaler programs\n");
+    return true;
+
+fail:
+    glDeleteProgram(NNEDI3VerticalComputeShader);
+    glDeleteProgram(NNEDI3HorizontalComputeShader);
+    NNEDI3VerticalComputeShader = 0;
+    NNEDI3HorizontalComputeShader = 0;
+    NNEDI3ComputeProgramsFailed = true;
+    Log(LogLevel::Error, "Failed to compile NNEDI3 compute scaler programs\n");
+    return false;
+}
+
+void GLRenderer2D::CopyCuNNyProgramsFrom(const GLRenderer2D& other)
+{
+    for (int model = 0; model < RendererSettings::GLCuNNyModelCount; model++)
+    {
+        CuNNyInShaders[model] = other.CuNNyInShaders[model];
+        for (int pass = 0; pass < RendererSettings::GLCuNNyMaxConvPasses; pass++)
+            CuNNyConvShaders[model][pass] = other.CuNNyConvShaders[model][pass];
+        CuNNyOutShaders[model] = other.CuNNyOutShaders[model];
+    }
+    CuNNyProgramsReady = other.CuNNyProgramsReady;
+    CuNNyProgramsFailed = other.CuNNyProgramsFailed;
+}
+
+bool GLRenderer2D::EnsureCuNNyPrograms()
+{
+    if (CuNNyShaderOwner != this)
+    {
+        if (CuNNyShaderOwner == nullptr || !CuNNyShaderOwner->EnsureCuNNyPrograms())
+            return false;
+        CopyCuNNyProgramsFrom(*CuNNyShaderOwner);
+        return CuNNyProgramsReady;
+    }
+
+    if (CuNNyProgramsReady)
+        return true;
+    if (CuNNyProgramsFailed)
+        return false;
+
+    for (int model = 0; model < RendererSettings::GLCuNNyModelCount; model++)
+    {
+        const CuNNyModelInfo& modelInfo = kCuNNyModels[model];
+        std::string shaderName = "2DCuNNy_" + std::string(kCuNNyModelLabels[model]) + "_InShader";
+        if (!OpenGL::CompileComputeProgram(CuNNyInShaders[model], modelInfo.InShader, shaderName.c_str()))
+            goto fail;
+        SetCuNNyProgramDefaults(CuNNyInShaders[model]);
+
+        for (int pass = 0; pass < modelInfo.ConvPasses; pass++)
+        {
+            shaderName = "2DCuNNy_" + std::string(kCuNNyModelLabels[model]) +
+                         "_Conv" + std::to_string(pass + 1) + "Shader";
+            if (!OpenGL::CompileComputeProgram(CuNNyConvShaders[model][pass],
+                                               modelInfo.ConvShaders[pass],
+                                               shaderName.c_str()))
+                goto fail;
+            SetCuNNyProgramDefaults(CuNNyConvShaders[model][pass]);
+        }
+
+        shaderName = "2DCuNNy_" + std::string(kCuNNyModelLabels[model]) + "_OutShuffleShader";
+        if (!OpenGL::CompileComputeProgram(CuNNyOutShaders[model], modelInfo.OutShader, shaderName.c_str()))
+            goto fail;
+        SetCuNNyProgramDefaults(CuNNyOutShaders[model]);
+    }
+
+    CuNNyProgramsReady = true;
+    return true;
+
+fail:
+    CuNNyProgramsFailed = true;
+    return false;
+}
+
+bool GLRenderer2D::EnsureCuNNyWorkTexture(int index, int width, int height)
+{
+    if (index < 0 || index >= 2 || width <= 0 || height <= 0)
+        return false;
+
+    if (CuNNyWorkTex[index] == 0)
+        glGenTextures(1, &CuNNyWorkTex[index]);
+
+    glBindTexture(GL_TEXTURE_2D, CuNNyWorkTex[index]);
+    if (CuNNyWorkTexWidth[index] != (u32)width || CuNNyWorkTexHeight[index] != (u32)height)
+    {
+        glDefaultTexParams(GL_TEXTURE_2D);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, width, height, 0, GL_RGBA, GL_HALF_FLOAT, nullptr);
+        CuNNyWorkTexWidth[index] = width;
+        CuNNyWorkTexHeight[index] = height;
+    }
+
+    return true;
+}
+
+void GLRenderer2D::RenderCuNNyComputePass(GLuint shader, GLuint sourceTex, GLuint baseTex, GLuint targetTex,
+                                          int sourceWidth, int sourceHeight,
+                                          int nativeWidth, int nativeHeight)
+{
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_STENCIL_TEST);
+    glDisable(GL_BLEND);
+    glDepthMask(GL_FALSE);
+    glColorMaski(0, GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glDisable(GL_SCISSOR_TEST);
+
+    glUseProgram(shader);
+    SetUniform2fIfPresent(shader, "LUMA_size", (GLfloat)nativeWidth, (GLfloat)nativeHeight);
+    SetUniform2fIfPresent(shader, "MAIN_size", (GLfloat)nativeWidth, (GLfloat)nativeHeight);
+    SetUniform2fIfPresent(shader, "LUMA_pt", 1.0f / (GLfloat)nativeWidth, 1.0f / (GLfloat)nativeHeight);
+    SetUniform2fIfPresent(shader, "MAIN_pt", 1.0f / (GLfloat)nativeWidth, 1.0f / (GLfloat)nativeHeight);
+    for (const char* name : kCuNNyWorkPointUniforms)
+        SetUniform2fIfPresent(shader, name, 1.0f / (GLfloat)sourceWidth, 1.0f / (GLfloat)sourceHeight);
+
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, sourceTex);
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, baseTex);
+    GLint baseMinFilter = GL_NEAREST;
+    GLint baseMagFilter = GL_NEAREST;
+    glGetTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, &baseMinFilter);
+    glGetTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, &baseMagFilter);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+
+    glBindImageTexture(0, targetTex, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA16F);
+    glDispatchCompute((GLuint)((nativeWidth + 7) / 8), (GLuint)((nativeHeight + 7) / 8), 1);
+    glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT |
+                    GL_TEXTURE_FETCH_BARRIER_BIT |
+                    GL_FRAMEBUFFER_BARRIER_BIT);
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, baseTex);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, baseMinFilter);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, baseMagFilter);
+    glBindImageTexture(0, 0, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA16F);
+}
+
+bool GLRenderer2D::RenderCuNNy2x(int modelIndex, GLuint sourceTex, GLuint targetTex)
+{
+    if (modelIndex < 0 || modelIndex >= RendererSettings::GLCuNNyModelCount)
+        return false;
+    if (!EnsureCuNNyPrograms())
+        return false;
+
+    RenderFullscreenPass(RGBAToYUVAShader, ArtCNNYUVFB, 256, 192, sourceTex, 0);
+    RenderSpline36(ArtCNNYUVTex, ArtCNNYUVA2xTex, 512, 384);
+
+    const CuNNyModelInfo& model = kCuNNyModels[modelIndex];
+    int currentWidth = 256 * model.WorkScaleX;
+    int currentHeight = 192 * model.WorkScaleY;
+    if (!EnsureCuNNyWorkTexture(0, currentWidth, currentHeight))
+        return false;
+
+    GLuint cunnyBaseTex = model.RGB ? sourceTex : ArtCNNYUVTex;
+    RenderCuNNyComputePass(CuNNyInShaders[modelIndex], cunnyBaseTex, cunnyBaseTex,
+                           CuNNyWorkTex[0], 256, 192, 256, 192);
+
+    GLuint currentTex = CuNNyWorkTex[0];
+    int currentIndex = 0;
+    for (int pass = 0; pass < model.ConvPasses; pass++)
+    {
+        const bool lastConv = pass == model.ConvPasses - 1;
+        const int targetWidth = 256 * (lastConv ? model.FinalWorkScaleX : model.WorkScaleX);
+        const int targetHeight = 192 * (lastConv ? model.FinalWorkScaleY : model.WorkScaleY);
+        const int targetIndex = currentIndex == 0 ? 1 : 0;
+        if (!EnsureCuNNyWorkTexture(targetIndex, targetWidth, targetHeight))
+            return false;
+
+        RenderCuNNyComputePass(CuNNyConvShaders[modelIndex][pass], currentTex, cunnyBaseTex,
+                               CuNNyWorkTex[targetIndex], currentWidth, currentHeight,
+                               256, 192);
+        currentTex = CuNNyWorkTex[targetIndex];
+        currentIndex = targetIndex;
+        currentWidth = targetWidth;
+        currentHeight = targetHeight;
+    }
+
+    RenderCuNNyComputePass(CuNNyOutShaders[modelIndex], currentTex, cunnyBaseTex,
+                           ArtCNNLuma2xTex, currentWidth, currentHeight, 256, 192);
+
+    GLuint rgba2xTarget = (ScaleFactor == 2) ? targetTex : ArtCNNRGBA2xTex;
+    if (model.RGB)
+        RenderFullscreenPassToTexture(AlphaReplaceShader, rgba2xTarget, 512, 384,
+                                  ArtCNNLuma2xTex, ArtCNNYUVA2xTex);
+    else
+        RenderFullscreenPassToTexture(ArtCNNYUVAToRGBA2xShader, rgba2xTarget, 512, 384,
+                                  ArtCNNYUVA2xTex, ArtCNNLuma2xTex);
+
+    if (ScaleFactor > 2)
+        RenderSpline36(ArtCNNRGBA2xTex, targetTex, ScreenW, ScreenH);
+    return true;
+}
+
+void GLRenderer2D::RenderSpline36(GLuint sourceTex, GLuint targetTex, int width, int height, float sourceShiftX, float sourceShiftY)
+{
+    glUseProgram(Spline36Shader);
+    GLint sourceShiftLoc = glGetUniformLocation(Spline36Shader, "uSourceShift");
     if (sourceShiftLoc >= 0)
         glUniform2f(sourceShiftLoc, sourceShiftX, sourceShiftY);
 
-    RenderArtCNNPassToTexture(ArtCNNSpline36Shader, targetTex, width, height, sourceTex, 0);
+    RenderFullscreenPassToTexture(Spline36Shader, targetTex, width, height, sourceTex, 0);
 }
 
-void GLRenderer2D::RenderArtCNN2x(int modelIndex, GLuint sourceTex, GLuint targetTex)
+void GLRenderer2D::RenderArtCNNComputePass(GLuint shader, GLuint targetTex, int pass)
 {
-    RenderArtCNNPass(ArtCNNRGBToYUVAShader, ArtCNNYUVFB, 256, 192, sourceTex, 0);
-    RenderArtCNNPass(ArtCNNConvShaders[modelIndex][0], ArtCNNConv0FB, 512, 384, ArtCNNYUVTex, 0);
-    RenderArtCNNPass(ArtCNNConvShaders[modelIndex][1], ArtCNNConvWorkFB[0], 512, 384, ArtCNNConv0Tex, 0);
-    RenderArtCNNPass(ArtCNNConvShaders[modelIndex][2], ArtCNNConvWorkFB[1], 512, 384, ArtCNNConvWorkTex[0], 0);
-    RenderArtCNNPass(ArtCNNConvShaders[modelIndex][3], ArtCNNConvWorkFB[0], 512, 384, ArtCNNConvWorkTex[1], 0);
-    RenderArtCNNPass(ArtCNNConvShaders[modelIndex][4], ArtCNNConvWorkFB[1], 512, 384, ArtCNNConvWorkTex[0], 0);
-    RenderArtCNNPass(ArtCNNConvShaders[modelIndex][5], ArtCNNConvWorkFB[0], 512, 384, ArtCNNConvWorkTex[1], 0);
-    RenderArtCNNPass(ArtCNNConvShaders[modelIndex][6], ArtCNNPackedFB, 256, 192, ArtCNNConv0Tex, ArtCNNConvWorkTex[0]);
-    RenderArtCNNPass(ArtCNNDepthToSpaceShaders[modelIndex], ArtCNNLuma2xFB, 512, 384, ArtCNNPackedTex, 0);
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_STENCIL_TEST);
+    glDisable(GL_BLEND);
+    glDepthMask(GL_FALSE);
+    glColorMaski(0, GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glDisable(GL_SCISSOR_TEST);
 
-    RenderArtCNNSpline36(ArtCNNYUVTex, ArtCNNYUVA2xTex, 512, 384);
+    glUseProgram(shader);
+    SetArtCNNComputeSizeUniforms(shader, 256, 192);
 
-    GLuint rgba2xTarget = (ScaleFactor == 2) ? targetTex : ArtCNNRGBA2xTex;
-    RenderArtCNNPassToTexture(ArtCNNYUVAToRGBA2xShader, rgba2xTarget, 512, 384, ArtCNNYUVA2xTex, ArtCNNLuma2xTex);
+    for (int unit = 0; unit < (int)kArtCNNSamplerUniformCount; unit++)
+        BindTextureUnit(unit, 0);
 
-    if (ScaleFactor > 2)
-        RenderArtCNNSpline36(ArtCNNRGBA2xTex, targetTex, ScreenW, ScreenH);
-}
-
-void GLRenderer2D::RenderArtCNN2xGuarded(int modelIndex, GLuint sourceTex, GLuint targetTex, bool secondLayer)
-{
-    if (!WholeSceneScaleSourceBoundaryGuard)
+    switch (pass)
     {
-        RenderArtCNN2x(modelIndex, sourceTex, targetTex);
-        return;
+    case 0:
+        BindTextureUnit(0, ArtCNNYUVTex);
+        break;
+    case 1:
+        BindTextureUnit(1, ArtCNNConv0Tex);
+        break;
+    case 2:
+        BindTextureUnit(2, ArtCNNConvWorkTex[0]);
+        break;
+    case 3:
+        BindTextureUnit(3, ArtCNNConvWorkTex[1]);
+        break;
+    case 4:
+        BindTextureUnit(4, ArtCNNConvWorkTex[0]);
+        break;
+    case 5:
+        BindTextureUnit(5, ArtCNNConvWorkTex[1]);
+        break;
+    case 6:
+        BindTextureUnit(1, ArtCNNConv0Tex);
+        BindTextureUnit(6, ArtCNNConvWorkTex[0]);
+        break;
+    default:
+        BindTextureUnit(7, ArtCNNPackedTex);
+        break;
     }
 
-    RenderArtCNN2x(modelIndex, sourceTex, UpscaledGuardColorTex);
-    RenderNativeBoundaryGuard(UpscaledGuardColorTex, sourceTex, targetTex, secondLayer);
+    glBindImageTexture(0, targetTex, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA16F);
+    const int dispatchWidth = (pass == 7) ? 512 : 256;
+    const int dispatchHeight = (pass == 7) ? 384 : 192;
+    glDispatchCompute((GLuint)((dispatchWidth + 7) / 8), (GLuint)((dispatchHeight + 7) / 8), 1);
+    glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT |
+                    GL_TEXTURE_FETCH_BARRIER_BIT |
+                    GL_FRAMEBUFFER_BARRIER_BIT);
+    glBindImageTexture(0, 0, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA16F);
+    glActiveTexture(GL_TEXTURE0);
 }
 
-void GLRenderer2D::RenderNNEDI32x(GLuint sourceTex, GLuint targetTex)
+bool GLRenderer2D::RenderArtCNN2x(int modelIndex, GLuint sourceTex, GLuint targetTex)
 {
-    RenderArtCNNPass(ArtCNNRGBToYUVAShader, ArtCNNYUVFB, 256, 192, sourceTex, 0);
-    RenderArtCNNPass(NNEDI3Pass1Shader, NNEDI3VerticalFB, 256, 384, ArtCNNYUVTex, 0);
-    RenderArtCNNPass(NNEDI3Pass2Shader, ArtCNNLuma2xFB, 512, 384, NNEDI3VerticalTex, 0);
+    if (modelIndex < 0 || modelIndex >= RendererSettings::GLArtCNNModelCount)
+        return false;
+    if (!EnsureArtCNNComputePrograms())
+        return false;
+
+    RenderFullscreenPass(RGBAToYUVAShader, ArtCNNYUVFB, 256, 192, sourceTex, 0);
+    RenderArtCNNComputePass(ArtCNNConvShaders[modelIndex][0], ArtCNNConv0Tex, 0);
+    RenderArtCNNComputePass(ArtCNNConvShaders[modelIndex][1], ArtCNNConvWorkTex[0], 1);
+    RenderArtCNNComputePass(ArtCNNConvShaders[modelIndex][2], ArtCNNConvWorkTex[1], 2);
+    RenderArtCNNComputePass(ArtCNNConvShaders[modelIndex][3], ArtCNNConvWorkTex[0], 3);
+    RenderArtCNNComputePass(ArtCNNConvShaders[modelIndex][4], ArtCNNConvWorkTex[1], 4);
+    RenderArtCNNComputePass(ArtCNNConvShaders[modelIndex][5], ArtCNNConvWorkTex[0], 5);
+    RenderArtCNNComputePass(ArtCNNConvShaders[modelIndex][6], ArtCNNPackedTex, 6);
+    RenderArtCNNComputePass(ArtCNNDepthToSpaceShaders[modelIndex], ArtCNNLuma2xTex, 7);
+
+    RenderSpline36(ArtCNNYUVTex, ArtCNNYUVA2xTex, 512, 384);
+
+    GLuint rgba2xTarget = (ScaleFactor == 2) ? targetTex : ArtCNNRGBA2xTex;
+    RenderFullscreenPassToTexture(ArtCNNYUVAToRGBA2xShader, rgba2xTarget, 512, 384, ArtCNNYUVA2xTex, ArtCNNLuma2xTex);
+
+    if (ScaleFactor > 2)
+        RenderSpline36(ArtCNNRGBA2xTex, targetTex, ScreenW, ScreenH);
+    return true;
+}
+
+bool GLRenderer2D::RenderArtCNN2xGuarded(int modelIndex, GLuint sourceTex, GLuint targetTex, bool secondLayer)
+{
+    if (!WholeSceneScaleSourceBoundaryGuard)
+        return RenderArtCNN2x(modelIndex, sourceTex, targetTex);
+
+    if (!RenderArtCNN2x(modelIndex, sourceTex, UpscaledGuardColorTex))
+        return false;
+
+    RenderNativeBoundaryGuard(UpscaledGuardColorTex, sourceTex, targetTex, secondLayer);
+    return true;
+}
+
+bool GLRenderer2D::RenderCuNNy2xGuarded(int modelIndex, GLuint sourceTex, GLuint targetTex, bool secondLayer)
+{
+    if (!WholeSceneScaleSourceBoundaryGuard)
+        return RenderCuNNy2x(modelIndex, sourceTex, targetTex);
+
+    if (!RenderCuNNy2x(modelIndex, sourceTex, UpscaledGuardColorTex))
+        return false;
+
+    RenderNativeBoundaryGuard(UpscaledGuardColorTex, sourceTex, targetTex, secondLayer);
+    return true;
+}
+
+void GLRenderer2D::RenderNNEDI3ComputePass(GLuint shader, GLuint sourceTex, GLuint targetTex,
+                                           int sourceWidth, int sourceHeight)
+{
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_STENCIL_TEST);
+    glDisable(GL_BLEND);
+    glDepthMask(GL_FALSE);
+    glColorMaski(0, GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glDisable(GL_SCISSOR_TEST);
+
+    glUseProgram(shader);
+    SetUniform2iIfPresent(shader, "uSrcSize", sourceWidth, sourceHeight);
+
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, sourceTex);
+
+    glBindImageTexture(0, targetTex, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA16F);
+    glDispatchCompute((GLuint)((sourceWidth + 7) / 8), (GLuint)((sourceHeight + 7) / 8), 1);
+    glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT |
+                    GL_TEXTURE_FETCH_BARRIER_BIT |
+                    GL_FRAMEBUFFER_BARRIER_BIT);
+    glBindImageTexture(0, 0, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA16F);
+    glActiveTexture(GL_TEXTURE0);
+}
+
+bool GLRenderer2D::RenderNNEDI32x(GLuint sourceTex, GLuint targetTex)
+{
+    if (!EnsureNNEDI3ComputePrograms())
+        return false;
+
+    RenderNNEDI3ComputePass(NNEDI3VerticalComputeShader, sourceTex, NNEDI3VerticalTex, 256, 192);
+    RenderNNEDI3ComputePass(NNEDI3HorizontalComputeShader, NNEDI3VerticalTex, ArtCNNLuma2xTex, 256, 384);
 
     if (ScaleFactor >= 4)
     {
-        RenderArtCNNPassToTexture(NNEDI3Pass1Shader, NNEDI3Vertical4xTex, 512, 768, ArtCNNLuma2xTex, 0);
-        RenderArtCNNPassToTexture(NNEDI3Pass2Shader, NNEDI3Luma4xTex, 1024, 768, NNEDI3Vertical4xTex, 0);
-        RenderArtCNNSpline36(ArtCNNYUVTex, NNEDI3YUVA4xTex, 1024, 768);
-        RenderArtCNNSpline36(NNEDI3Luma4xTex, NNEDI3Luma4xCorrectedTex, 1024, 768, -1.5f, -1.5f);
+        RenderNNEDI3ComputePass(NNEDI3VerticalComputeShader, ArtCNNLuma2xTex, NNEDI3Vertical4xTex, 512, 384);
+        RenderNNEDI3ComputePass(NNEDI3HorizontalComputeShader, NNEDI3Vertical4xTex, NNEDI3Luma4xTex, 512, 768);
 
-        GLuint rgba4xTarget = (ScaleFactor == 4) ? targetTex : NNEDI3RGBA4xTex;
-        RenderArtCNNPassToTexture(ArtCNNYUVAToRGBA2xShader, rgba4xTarget, 1024, 768, NNEDI3YUVA4xTex, NNEDI3Luma4xCorrectedTex);
-
-        if (ScaleFactor > 4)
-            RenderArtCNNSpline36(NNEDI3RGBA4xTex, targetTex, ScreenW, ScreenH);
-        return;
+        const int targetWidth = (ScaleFactor == 4) ? 1024 : ScreenW;
+        const int targetHeight = (ScaleFactor == 4) ? 768 : ScreenH;
+        RenderSpline36(NNEDI3Luma4xTex, targetTex, targetWidth, targetHeight, -1.5f, -1.5f);
+        return true;
     }
 
-    RenderArtCNNSpline36(ArtCNNLuma2xTex, ArtCNNConvWorkTex[0], 512, 384, -0.5f, -0.5f);
-    RenderArtCNNSpline36(ArtCNNYUVTex, ArtCNNYUVA2xTex, 512, 384);
-
-    GLuint rgba2xTarget = (ScaleFactor == 2) ? targetTex : ArtCNNRGBA2xTex;
-    RenderArtCNNPassToTexture(ArtCNNYUVAToRGBA2xShader, rgba2xTarget, 512, 384, ArtCNNYUVA2xTex, ArtCNNConvWorkTex[0]);
-
-    if (ScaleFactor > 2)
-        RenderArtCNNSpline36(ArtCNNRGBA2xTex, targetTex, ScreenW, ScreenH);
+    const int targetWidth = (ScaleFactor == 2) ? 512 : ScreenW;
+    const int targetHeight = (ScaleFactor == 2) ? 384 : ScreenH;
+    RenderSpline36(ArtCNNLuma2xTex, targetTex, targetWidth, targetHeight, -0.5f, -0.5f);
+    return true;
 }
 
 void GLRenderer2D::RenderNativeBoundaryGuard(GLuint scaledTex, GLuint nativeTex, GLuint targetTex, bool secondLayer)
@@ -9209,22 +11215,21 @@ void GLRenderer2D::RenderNativeBoundaryGuard(GLuint scaledTex, GLuint nativeTex,
     glDrawArrays(GL_TRIANGLES, 0, 2*3);
 }
 
-void GLRenderer2D::RenderNNEDI32xGuarded(GLuint sourceTex, GLuint targetTex, bool secondLayer)
+bool GLRenderer2D::RenderNNEDI32xGuarded(GLuint sourceTex, GLuint targetTex, bool secondLayer)
 {
     if (!WholeSceneScaleSourceBoundaryGuard)
-    {
-        RenderNNEDI32x(sourceTex, targetTex);
-        return;
-    }
+        return RenderNNEDI32x(sourceTex, targetTex);
 
-    RenderNNEDI32x(sourceTex, UpscaledGuardColorTex);
+    if (!RenderNNEDI32x(sourceTex, UpscaledGuardColorTex))
+        return false;
     RenderNativeBoundaryGuard(UpscaledGuardColorTex, sourceTex, targetTex, secondLayer);
+    return true;
 }
 
 void GLRenderer2D::RenderXBRZ(GLuint sourceTex, GLuint targetTex)
 {
-    RenderArtCNNPass(XBRZPreprocessShader, XBRZInfoFB, 256, 192, sourceTex, 0);
-    RenderArtCNNPassToTexture(XBRZFreescaleShader, targetTex, ScreenW, ScreenH, sourceTex, XBRZInfoTex);
+    RenderFullscreenPass(XBRZPreprocessShader, XBRZInfoFB, 256, 192, sourceTex, 0);
+    RenderFullscreenPassToTexture(XBRZFreescaleShader, targetTex, ScreenW, ScreenH, sourceTex, XBRZInfoTex);
 }
 
 void GLRenderer2D::RenderXBRZGuarded(GLuint sourceTex, GLuint targetTex, bool secondLayer)
@@ -9368,16 +11373,16 @@ GLuint GLRenderer2D::ResolveDirect3DToNative(GLuint sourceTex)
 
 bool GLRenderer2D::UpdateCaptureBackedHandoff3DSnapshot(GLuint sourceTex)
 {
-    const int slot = std::min<int>(CaptureBackedHandoffCurrentSlot, kCaptureBackedHandoffRouteSlots - 1);
-    if (!sourceTex || !CaptureBackedHandoff3DTex[slot] || !glBlitFramebuffer)
+    const int slot = std::min<int>(CaptureBackedHandoff.CurrentSlot, kCaptureBackedHandoffRouteSlots - 1);
+    if (!sourceTex || !CaptureBackedRouteGL[slot].Handoff3DTex || !glBlitFramebuffer)
         return false;
 
     glBindFramebuffer(GL_READ_FRAMEBUFFER, ArtCNNOutputFB);
     glFramebufferTexture(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, sourceTex, 0);
     glReadBuffer(GL_COLOR_ATTACHMENT0);
 
-    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, CaptureBackedHandoff3DFB[slot]);
-    glFramebufferTexture(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, CaptureBackedHandoff3DTex[slot], 0);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, CaptureBackedRouteGL[slot].Handoff3DFB);
+    glFramebufferTexture(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, CaptureBackedRouteGL[slot].Handoff3DTex, 0);
     glDrawBuffer(GL_COLOR_ATTACHMENT0);
 
     glDisable(GL_DEPTH_TEST);
@@ -9390,8 +11395,7 @@ bool GLRenderer2D::UpdateCaptureBackedHandoff3DSnapshot(GLuint sourceTex)
     glBlitFramebuffer(0, 0, ScreenW, ScreenH,
                       0, 0, ScreenW, ScreenH,
                       GL_COLOR_BUFFER_BIT, GL_NEAREST);
-    CaptureBackedHandoff3DValid[slot] = true;
-    CaptureBackedHandoffLatchedKey[slot] = CaptureBackedHandoffCurrentKey;
+    LatchCaptureBackedHandoffSnapshot(slot, CaptureBackedHandoff.CurrentKey);
     return true;
 }
 
@@ -9846,12 +11850,15 @@ void GLRenderer2D::RenderOverlayDebugTexture(GLuint targetTex,
     glDrawArrays(GL_TRIANGLES, 0, 2*3);
 }
 
-void GLRenderer2D::RenderScreenCurrent(int ystart, int yend, bool currentFragmentationFallback)
+void GLRenderer2D::RenderScreenCurrent(int ystart, int yend,
+                                       bool currentFragmentationFallback,
+                                       WholeSceneCurrentPathReason reason)
 {
     ResetWholeSceneRenderTrace();
     RecordWholeSceneRenderTrace(WholeSceneRenderPath::Current, ystart, yend,
                                 false, false, false, Parent.OutputTex3D,
                                 false, currentFragmentationFallback);
+    WholeSceneTrace.CurrentReason = reason;
     RenderCompositorPass(OutputFB, OBJLayerTex, ScreenW, ScreenH, ystart, yend, ScaleFactor, 0, false, false, false);
 }
 
@@ -9887,19 +11894,124 @@ void GLRenderer2D::RenderScreenWholeSceneHighRes(int ystart, int yend)
                          WholeSceneScaleDebugTint);
 }
 
+void GLRenderer2D::ApplyRouteProductLookupToSourceAChoice(SourceACaptureReplacementChoice& choice,
+                                                          const CaptureBackedRouteProductLookup& lookup) const
+{
+    choice.RouteProductTex = lookup.Tex;
+    if (!lookup.Valid)
+        return;
+
+    choice.RouteProductBackgroundEpochSerial = lookup.Identity.BackgroundEpochSerial;
+    choice.RouteProductSource3DSerial = lookup.Identity.Source3DSerial;
+    choice.RouteProductSource3DSceneHash = lookup.Identity.Source3DSceneHash;
+    choice.RouteProductCapturedEventSerial = lookup.CapturedEventSerial;
+    choice.RouteProductCapturePresentationHash = lookup.Identity.CapturePresentationHash;
+    choice.RouteProductCurrentPresentationHash = lookup.Identity.CurrentOverlayPresentationHash;
+    choice.RouteProductStableFrames = lookup.StableFrames;
+    choice.RouteProductPresentationClass = lookup.PresentationClass;
+    choice.RouteProductStoredMasterBrightness = lookup.StoredMasterBrightness;
+    choice.RouteProductHasStoredEffectState = lookup.HasStoredEffectState;
+    choice.RouteProductKind = CaptureProductKindForRouteLookup(lookup.Source);
+    choice.RouteProductProof = CaptureProofKindForRouteLookup(lookup.Source);
+}
+
 GLRenderer2D::SourceACaptureReplacementChoice GLRenderer2D::ChooseSourceACaptureReplacement(int ystart, int yend)
 {
     SourceACaptureReplacementChoice choice = {};
     choice.FullProductTex = VisibleHighResCaptureFullTex();
     choice.CaptureBank = VisibleSingleHighResCaptureBank();
-    choice.SubEngineCapturedSourceAOnly =
+    choice.FullProductCaptureBank = choice.CaptureBank;
+    choice.FullProductTexID = static_cast<int>(choice.FullProductTex);
+    choice.RouteSlot = Parent.IsEngineRoutedToFinalBottom(GPU2D.Num, ystart, yend) ? 1 : 0;
+
+    const u32 dispmode = (DispCnt >> 16) & (GPU2D.Num ? 0x1u : 0x3u);
+    choice.DirectFinalDisplayConsumer = dispmode == 1;
+    choice.DirectFinalBottomConsumer =
+        choice.DirectFinalDisplayConsumer &&
+        Parent.IsEngineRoutedToFinalBottom(GPU2D.Num, ystart, yend);
+
+    const u32 activeCapCnt = GPU.CaptureCnt;
+    choice.ActiveDisplayCaptureDstBank = GPU.CaptureEnable ? static_cast<int>((activeCapCnt >> 16) & 0x3u) : -1;
+    choice.ActiveDisplayCaptureDstOffset = GPU.CaptureEnable ? static_cast<int>((activeCapCnt >> 18) & 0x3u) : -1;
+    choice.ActiveDisplayCaptureSourceA2D =
+        !GPU2D.Num &&
+        GPU.CaptureEnable &&
+        (((activeCapCnt >> 24) & 0x1u) == 0);
+    choice.ActiveFullDisplayCaptureSourceA =
+        choice.ActiveDisplayCaptureSourceA2D &&
+        Parent.IsFullDisplayCaptureFromSourceAOnly(activeCapCnt);
+
+    if (choice.CaptureBank >= 0 && choice.CaptureBank < 4)
+    {
+        const auto& selectedEvent = Parent.HighResDisplayCapture256Event[choice.CaptureBank];
+        choice.FullProductEventValid =
+            Parent.IsFullDisplayHighResCaptureEventRecord(selectedEvent,
+                                                          static_cast<u32>(choice.CaptureBank));
+        choice.FullProductEventSerial = selectedEvent.Serial;
+        choice.FullProductEventSource3DSerial = selectedEvent.Source3DSerial;
+        choice.FullProductEventSource3DSceneHash = selectedEvent.Source3DSceneHash;
+        choice.FullProductEventSourcePresentationHash = selectedEvent.SourcePresentationHash;
+        choice.FullProductEventSourceKind = static_cast<u32>(selectedEvent.SourceKind);
+        choice.FullProductEventProductMask = selectedEvent.ProductMask;
+        choice.FullProductEventRejectReason = static_cast<u32>(selectedEvent.RejectReason);
+        choice.FullProductEventDstBlock = static_cast<int>(selectedEvent.DstBlock);
+        choice.FullProductEventDstOffset = static_cast<int>(selectedEvent.DstOffset);
+        choice.FullProductEventSourceOBJ = selectedEvent.SourceOBJVisible;
+        choice.FullProductEventScreenSwap = selectedEvent.ScreenSwap;
+        choice.FullProductEventMainFinalBottom = selectedEvent.MainEngineFinalBottom;
+    }
+
+    const u32 visibleBGMask = LayerEnable & 0x0Fu;
+    const u32 sourceAOnlyCaptureBGMask = VisibleSourceAOnlyFullDisplayCaptureBGLayerMask();
+    const bool objVisible = (LayerEnable & (1 << 4)) && OBJEnable && NumSprites > 0;
+    const bool mainEngineCapturedBGOnly =
+        !GPU2D.Num &&
+        choice.DirectFinalDisplayConsumer &&
+        choice.CaptureBank >= 0 &&
+        choice.CaptureBank < 4 &&
+        visibleBGMask != 0 &&
+        (visibleBGMask & ~sourceAOnlyCaptureBGMask) == 0 &&
+        !objVisible;
+    choice.MainEngineCapturedBGOnly = mainEngineCapturedBGOnly;
+
+    const bool subEngineFullFrameCaptureConsumer =
         GPU2D.Num &&
         ystart == 0 &&
         yend == 192 &&
-        choice.CaptureBank >= 0 &&
+        choice.CaptureBank >= 0;
+    const bool subEngineCapturedBGOnly =
+        subEngineFullFrameCaptureConsumer &&
         (LayerEnable & (1 << 4)) == 0;
+    const VisibleOBJCaptureDebug objCaptureDebug = BuildVisibleOBJCaptureDebug();
+    const bool fullFrameRange = ystart == 0 && yend == 192;
+    const bool trackedVRAMDisplayRoute =
+        fullFrameRange &&
+        Parent.IsMainVRAMDisplayFinalRouteForRange(ystart, yend);
+    const bool fullWidthSourceAProduct =
+        objCaptureDebug.FullWidthTopStrip &&
+        objCaptureDebug.CurrentFullSourceA &&
+        objCaptureDebug.EventRejectReason == 0 &&
+        objCaptureDebug.ProductAvailable &&
+        trackedVRAMDisplayRoute;
+    const bool exactOBJReplacement =
+        objCaptureDebug.NonCaptureSpriteCount == 0 &&
+        (objCaptureDebug.FullScreen || fullWidthSourceAProduct);
+    const bool subEngineCapturedOBJOnly =
+        subEngineFullFrameCaptureConsumer &&
+        (LayerEnable & 0x0Fu) == 0 &&
+        (LayerEnable & (1 << 4)) &&
+        OBJEnable &&
+        objCaptureDebug.Found &&
+        !objCaptureDebug.MixedBank &&
+        objCaptureDebug.CurrentSourceAOnly &&
+        exactOBJReplacement &&
+        objCaptureDebug.ProductAvailable;
+    choice.SubEngineCapturedSourceAOnly =
+        subEngineCapturedBGOnly || subEngineCapturedOBJOnly;
+    choice.SubEngineCapturedOBJOnly = subEngineCapturedOBJOnly;
 
-    if (!choice.SubEngineCapturedSourceAOnly)
+    if (!choice.SubEngineCapturedSourceAOnly &&
+        !choice.MainEngineCapturedBGOnly)
         return choice;
 
     const auto& event = Parent.HighResDisplayCapture256Event[choice.CaptureBank];
@@ -9907,40 +12019,151 @@ GLRenderer2D::SourceACaptureReplacementChoice GLRenderer2D::ChooseSourceACapture
         (event.ProductMask & GLRenderer::HighResCaptureProductBackground3DUnderlay)
             ? Parent.HighResDisplayCaptureBackgroundTex[choice.CaptureBank]
             : 0;
-    const int routeSlot = Parent.IsEngineRoutedToFinalBottom(GPU2D.Num, ystart, yend) ? 1 : 0;
     if (choice.BackgroundTex &&
-        Parent.UpdateCaptureBackgroundEpochForRoute(routeSlot, event))
+        Parent.UpdateCaptureBackgroundEpochForRoute(choice.RouteSlot, event))
     {
-        choice.BackgroundEpochSerial = Parent.ActiveCaptureBackgroundEpoch[routeSlot].Serial;
+        choice.BackgroundEpochSerial = Parent.ActiveCaptureBackgroundEpoch[choice.RouteSlot].Serial;
+        choice.BackgroundSource3DSerial = Parent.ActiveCaptureBackgroundEpoch[choice.RouteSlot].Source3DSerial;
+        choice.BackgroundSource3DSceneHash =
+            Parent.ActiveCaptureBackgroundEpoch[choice.RouteSlot].Source3DSceneHash;
     }
 
     choice.MainRenderer = dynamic_cast<GLRenderer2D*>(Parent.Rend2D_A.get());
     choice.CapturePresentationHash = event.SourcePresentationHash;
-    if (event.SourceOBJVisible)
+    if (choice.MainRenderer)
+    {
+        choice.CurrentPresentationHash = choice.MainRenderer->CapturePresentationHash();
+        choice.FullProductKeyMatch = CanUseCaptureProductAsPresented(
+            WholeSceneCaptureProductPresentationClass::AlreadyPresented,
+            choice.CapturePresentationHash,
+            choice.CurrentPresentationHash);
+    }
+    else
     {
         choice.FullProductKeyMatch = false;
-        if (choice.MainRenderer)
-        {
-            choice.CurrentPresentationHash = choice.MainRenderer->CapturePresentationHash();
-            choice.FullProductKeyMatch =
-                choice.CapturePresentationHash != 0 &&
-                choice.CapturePresentationHash == choice.CurrentPresentationHash;
-        }
     }
+    ResolveSourceARouteProductChoice(choice,
+                                     event.Serial,
+                                     event.Source3DSerial,
+                                     event.Source3DSceneHash,
+                                     ystart,
+                                     yend);
 
-    choice.CanUseCurrentOverlay =
-        choice.BackgroundTex &&
-        event.SourceKind == GLRenderer::HighResCaptureSourceKind::CleanEngineA2DOutput &&
+    SourceAExactFullProductPreferenceInputs preferenceInputs = {};
+    bool currentScreenSwap = GPU.ScreenSwap;
+    Parent.GetFinalPassScreenSwapForRange(ystart, yend, currentScreenSwap);
+    const bool currentMainEngineFinalBottom =
+        Parent.IsEngineRoutedToFinalBottom(0, ystart, yend);
+    DirectFinalRouteMatchInputs directFinalRouteInputs = {};
+    directFinalRouteInputs.EventScreenSwap = choice.FullProductEventScreenSwap;
+    directFinalRouteInputs.CurrentScreenSwap = currentScreenSwap;
+    directFinalRouteInputs.EventMainFinalBottom = choice.FullProductEventMainFinalBottom;
+    directFinalRouteInputs.CurrentMainFinalBottom = currentMainEngineFinalBottom;
+    preferenceInputs.DirectFinalBottomConsumer = choice.DirectFinalBottomConsumer;
+    preferenceInputs.SubEngineCapturedSourceAOnly = choice.SubEngineCapturedSourceAOnly;
+    preferenceInputs.HasFullProduct = choice.FullProductTex != 0;
+    preferenceInputs.FullProductEventValid = choice.FullProductEventValid;
+    preferenceInputs.FullProductKeyMatch = choice.FullProductKeyMatch;
+    preferenceInputs.FullProductEventRouteMatches =
+        DoesDirectFinalRouteMatch(directFinalRouteInputs);
+    preferenceInputs.FullProductEventFullEquivalent =
+        (choice.FullProductEventProductMask & GLRenderer::HighResCaptureProductFullEquivalent) != 0;
+    preferenceInputs.FullProductEventCleanEngineA2DOutput =
+        choice.FullProductEventSourceKind ==
+            static_cast<u32>(GLRenderer::HighResCaptureSourceKind::CleanEngineA2DOutput);
+    preferenceInputs.FullProductEventAccepted =
+        choice.FullProductEventRejectReason ==
+            static_cast<u32>(GLRenderer::HighResCaptureRejectReason::None);
+    preferenceInputs.FullProductEventSourceOBJVisible =
+        choice.FullProductEventSourceOBJ;
+    const bool preferExactFullProductForDirectBottom =
+        ShouldPreferSourceAExactFullProductForDirectBottom(preferenceInputs);
+    choice.PreferExactFullProduct = preferExactFullProductForDirectBottom;
+    choice.AllowExactFullProductCapturePresentation =
+        (choice.DirectFinalBottomConsumer ||
+         (choice.DirectFinalDisplayConsumer && choice.SubEngineCapturedOBJOnly) ||
+         (choice.DirectFinalDisplayConsumer &&
+          choice.MainEngineCapturedBGOnly &&
+          preferenceInputs.FullProductEventRouteMatches)) &&
+        (choice.SubEngineCapturedSourceAOnly || choice.MainEngineCapturedBGOnly) &&
+        choice.FullProductTex != 0 &&
+        choice.FullProductEventValid &&
+        preferenceInputs.FullProductEventFullEquivalent &&
+        preferenceInputs.FullProductEventCleanEngineA2DOutput &&
+        preferenceInputs.FullProductEventAccepted;
+
+    SourceACurrentOverlayEligibilityInputs overlayInputs = {};
+    overlayInputs.HasBackgroundTexture = choice.BackgroundTex != 0;
+    overlayInputs.PreferExactFullProductForDirectBottom = preferExactFullProductForDirectBottom;
+    overlayInputs.SourceIsCleanEngineA2DOutput =
+        event.SourceKind == GLRenderer::HighResCaptureSourceKind::CleanEngineA2DOutput;
+    overlayInputs.RendererCanCompositeCurrentOverlay =
+        overlayInputs.HasBackgroundTexture &&
+        !overlayInputs.PreferExactFullProductForDirectBottom &&
+        overlayInputs.SourceIsCleanEngineA2DOutput &&
         choice.MainRenderer &&
         choice.MainRenderer->CanRenderCurrentOverlayForCaptureSource(event.SourceLayerEnable,
                                                                      event.SourceBGMode,
                                                                      event.SourceVisibleBitmapMask,
                                                                      event.SourceDirect3DVisible);
+    overlayInputs.SubEngineDirectFinalTopConsumer =
+        GPU2D.Num != 0 &&
+        choice.DirectFinalDisplayConsumer &&
+        !choice.DirectFinalBottomConsumer;
+    choice.CanUseCurrentOverlay = CanUseSourceACurrentOverlay(overlayInputs);
     return choice;
 }
 
-void GLRenderer2D::BlitWholeSceneSourceAReplacement(GLuint sourceTex, int ystart, int yend)
+void GLRenderer2D::BlitWholeSceneCaptureProduct(GLuint sourceTex,
+                                                int ystart,
+                                                int yend,
+                                                u16 presentationMasterBrightness,
+                                                bool applyPresentationMasterBrightness,
+                                                WholeSceneCaptureEffectOwner presentationEffectOwner)
 {
+    // A direct-final replacement stands in for content that natively passes
+    // through the consuming engine's blend stage, so a frame-global BLDY
+    // brightness effect must be reproduced here. It preempts the Source-A
+    // master-brightness approximation below: natively the consuming engine's
+    // color effect is the only compositor-stage transform on this content,
+    // and the engine's own master brightness still runs in the final pass.
+    const u16 consumerColorEffect =
+        ConsumerFullScreenBrightnessColorEffect(BlendCnt, EVY);
+    if (consumerColorEffect != 0 &&
+        sourceTex != OutputTex &&
+        ApplyMasterBrightnessToTexture(OutputTex,
+                                       sourceTex,
+                                       ScreenW,
+                                       ScreenH,
+                                       ystart,
+                                       yend,
+                                       consumerColorEffect))
+    {
+        RecordOutputPresentationMasterBrightness(
+            WholeSceneCaptureEffectOwner::CurrentEngineColorEffect,
+            consumerColorEffect);
+        return;
+    }
+
+    const int brightMode = (presentationMasterBrightness >> 14) & 0x3;
+    const int brightFactor = std::min<int>(presentationMasterBrightness & 0x1F, 16);
+    if (applyPresentationMasterBrightness &&
+        sourceTex != OutputTex &&
+        (brightMode == 1 || brightMode == 2) &&
+        brightFactor > 0 &&
+        ApplyMasterBrightnessToTexture(OutputTex,
+                                       sourceTex,
+                                       ScreenW,
+                                       ScreenH,
+                                       ystart,
+                                       yend,
+                                       presentationMasterBrightness))
+    {
+        RecordOutputPresentationMasterBrightness(presentationEffectOwner,
+                                                 presentationMasterBrightness);
+        return;
+    }
+
     glBindFramebuffer(GL_READ_FRAMEBUFFER, WholeSceneSourceABlitFB);
     glFramebufferTexture(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, sourceTex, 0);
     glReadBuffer(GL_COLOR_ATTACHMENT0);
@@ -9962,58 +12185,174 @@ void GLRenderer2D::BlitWholeSceneSourceAReplacement(GLuint sourceTex, int ystart
                       GL_COLOR_BUFFER_BIT, GL_NEAREST);
 }
 
+void GLRenderer2D::BlitWholeSceneSourceAReplacement(GLuint sourceTex,
+                                                    int ystart,
+                                                    int yend,
+                                                    bool applySourceAMasterBrightness)
+{
+    BlitWholeSceneCaptureProduct(sourceTex,
+                                 ystart,
+                                 yend,
+                                 GPU.MasterBrightnessA,
+                                 applySourceAMasterBrightness,
+                                 WholeSceneCaptureEffectOwner::SourceA);
+}
+
+void GLRenderer2D::BlitWholeSceneHandoffProduct(const GLCaptureProductResolution& product,
+                                                int ystart,
+                                                int yend)
+{
+    const bool applyPresentationEffect =
+        ShouldApplyHandoffPresentationEffect(product.PresentationClass,
+                                            WholeSceneTrace.CaptureRequestKind);
+    const u16 currentMasterBrightness =
+        GPU2D.Num ? GPU.MasterBrightnessB : GPU.MasterBrightnessA;
+    BlitWholeSceneCaptureProduct(product.Tex,
+                                 ystart,
+                                 yend,
+                                 currentMasterBrightness,
+                                 applyPresentationEffect,
+                                 WholeSceneCaptureEffectOwner::CurrentEngine);
+}
+
+void GLRenderer2D::BlitWholeSceneSourceAProduct(const GLCaptureProductResolution& product,
+                                                int ystart,
+                                                int yend)
+{
+    const bool applyPresentationEffect =
+        ShouldApplySourceAReplacementPresentationEffect(product.PresentationClass,
+                                                       WholeSceneTrace.CaptureRequestKind,
+                                                       GPU2D.Num != 0);
+    BlitWholeSceneSourceAReplacement(product.Tex,
+                                     ystart,
+                                     yend,
+                                     applyPresentationEffect);
+}
+
+void GLRenderer2D::RenderScreenWholeSceneCaptureBackedHybridFallback(int ystart, int yend)
+{
+    RenderScreenWholeSceneOverlayOperator(ystart, yend);
+    RenderScreenWholeSceneFinalizeOverlayOperatorFullFrame(true, ystart, yend);
+}
+
 void GLRenderer2D::RenderScreenWholeSceneSourceACaptureReplacement(int ystart, int yend)
 {
-    const SourceACaptureReplacementChoice choice = ChooseSourceACaptureReplacement(ystart, yend);
-
-    if (choice.CanUseCurrentOverlay)
+    if (CanUseWholeSceneMixedCaptureBackedOBJOverlayPath())
     {
-        ResetWholeSceneRenderTrace();
-        RecordWholeSceneRenderTrace(WholeSceneRenderPath::SourceACaptureReplacement, ystart, yend,
-                                    ScaleFactor > 1, false, ScaleFactor > 1, choice.BackgroundTex);
-        WholeSceneTrace.SourceABackgroundEpochSerial = choice.BackgroundEpochSerial;
-        WholeSceneTrace.SourceACapturePresentationHash = choice.CapturePresentationHash;
-        WholeSceneTrace.SourceACurrentPresentationHash = choice.CurrentPresentationHash;
-        WholeSceneTrace.SourceAFullProductKeyMatch = choice.FullProductKeyMatch;
-        WholeSceneTrace.SourceAProductChoice =
-            SourceAProductChoiceReason::UsedBackgroundUnderlayCurrentOverlay;
-        if (choice.MainRenderer->RenderCurrentOverlayOverHighResBackgroundToTexture(OutputTex,
-                                                                                    choice.BackgroundTex,
-                                                                                    ystart,
-                                                                                    yend))
+        if (RenderCurrentBGOverlayOverHighResCaptureOBJToTexture(OutputTex, ystart, yend))
+            return;
+
+        RenderScreenWholeSceneCaptureBackedHybridFallback(ystart, yend);
+        return;
+    }
+
+    if (!GPU2D.Num &&
+        CanUseWholeSceneMixedSourceACaptureBGPath())
+    {
+        if (RenderCurrentLayersOverHighResCaptureBGToTexture(OutputTex, ystart, yend))
+            return;
+
+        RenderScreenWholeSceneCaptureBackedHybridFallback(ystart, yend);
+        return;
+    }
+
+    const SourceACaptureReplacementChoice choice = ChooseSourceACaptureReplacement(ystart, yend);
+    auto makeResolutionInputs = [&](bool allowCurrentOverlay = true)
+    {
+        SourceACaptureResolutionInputs inputs = {};
+        inputs.HasRouteProduct = choice.RouteProductTex != 0;
+        inputs.RouteProductNeedsRePresentation =
+            choice.RouteProductTex != 0 &&
+            choice.RouteProductPresentationClass ==
+                WholeSceneCaptureProductPresentationClass::RawContent &&
+            choice.RouteProductCurrentPresentationHash != 0 &&
+            choice.CurrentPresentationHash != 0 &&
+            !DoesCaptureProductPresentationMatchRequest(
+                choice.RouteProductCurrentPresentationHash,
+                choice.CurrentPresentationHash);
+        inputs.CanUseCurrentOverlay = choice.CanUseCurrentOverlay;
+        inputs.HasFullProduct = choice.FullProductTex != 0;
+        inputs.PreferExactFullProduct = choice.PreferExactFullProduct;
+        inputs.AllowCurrentOverlay = allowCurrentOverlay;
+        return inputs;
+    };
+
+    SourceACaptureResolutionKind resolutionKind =
+        ChooseSourceACaptureResolutionKind(makeResolutionInputs());
+
+    if (resolutionKind == SourceACaptureResolutionKind::RouteProduct)
+    {
+        const GLCaptureProductResolution product =
+            RecordSourceARouteProductChoiceTrace(choice, ystart, yend);
+        if (!product.Accepted)
         {
+            RenderScreenWholeSceneCaptureBackedHybridFallback(ystart, yend);
+            RecordSourceARejectedChoiceTrace(choice, ystart, yend);
+            return;
+        }
+
+        BlitWholeSceneSourceAProduct(product, ystart, yend);
+        return;
+    }
+
+    if (resolutionKind == SourceACaptureResolutionKind::BackgroundOverlay)
+    {
+        const GLCaptureProductResolution product =
+            RecordSourceABackgroundOverlayChoiceTrace(choice, ystart, yend);
+        if (!product.Accepted)
+        {
+            RenderScreenWholeSceneCaptureBackedHybridFallback(ystart, yend);
+            RecordSourceARejectedChoiceTrace(choice, ystart, yend);
+            return;
+        }
+
+        bool outputMasterBrightnessApplied = false;
+        if (choice.MainRenderer->RenderCurrentOverlayOverHighResBackgroundToTexture(OutputTex,
+                                                                                    product.Tex,
+                                                                                    ystart,
+                                                                                    yend,
+                                                                                    true,
+                                                                                    nullptr,
+                                                                                    &outputMasterBrightnessApplied))
+        {
+            if (outputMasterBrightnessApplied)
+            {
+                RecordOutputPresentationMasterBrightness(WholeSceneCaptureEffectOwner::SourceA,
+                                                         GPU.MasterBrightnessA);
+            }
             WholeSceneTrace.SourceACaptureMode = SourceACaptureReplacementMode::CurrentOverlay;
             return;
         }
         WholeSceneTrace.SourceACaptureMode = SourceACaptureReplacementMode::FullProductAfterOverlayFailed;
         WholeSceneTrace.SourceAProductChoice =
             SourceAProductChoiceReason::RejectedCurrentOverlayKeyMismatch;
+        resolutionKind = ChooseSourceACaptureResolutionKind(makeResolutionInputs(false));
     }
 
-    if (!choice.FullProductTex)
+    if (resolutionKind == SourceACaptureResolutionKind::RejectedFallback)
     {
-        RenderScreenWholeSceneOverlayOperator(ystart, yend);
-        RenderScreenWholeSceneFinalizeOverlayOperatorFullFrame(true, ystart, yend);
+        RenderScreenWholeSceneCaptureBackedHybridFallback(ystart, yend);
+        RecordSourceARejectedChoiceTrace(choice, ystart, yend);
         return;
     }
 
-    ResetWholeSceneRenderTrace();
-    RecordWholeSceneRenderTrace(WholeSceneRenderPath::SourceACaptureReplacement, ystart, yend,
-                                ScaleFactor > 1, false, false, choice.FullProductTex);
-    WholeSceneTrace.SourceACaptureMode =
-        choice.SubEngineCapturedSourceAOnly
-            ? SourceACaptureReplacementMode::FullProductAfterOverlayFailed
-            : SourceACaptureReplacementMode::FullProduct;
-    WholeSceneTrace.SourceABackgroundEpochSerial = choice.BackgroundEpochSerial;
-    WholeSceneTrace.SourceACapturePresentationHash = choice.CapturePresentationHash;
-    WholeSceneTrace.SourceACurrentPresentationHash = choice.CurrentPresentationHash;
-    WholeSceneTrace.SourceAFullProductKeyMatch = choice.FullProductKeyMatch;
-    WholeSceneTrace.SourceAProductChoice =
-        choice.SubEngineCapturedSourceAOnly
-            ? SourceAProductChoiceReason::UsedFullProductNoOverlayVisible
-            : SourceAProductChoiceReason::UsedFullProductKeyMatch;
+    if (resolutionKind != SourceACaptureResolutionKind::FullProduct)
+    {
+        RenderScreenWholeSceneCaptureBackedHybridFallback(ystart, yend);
+        RecordSourceARejectedChoiceTrace(choice, ystart, yend);
+        return;
+    }
 
-    BlitWholeSceneSourceAReplacement(choice.FullProductTex, ystart, yend);
+    const GLCaptureProductResolution product =
+        RecordSourceAFullProductChoiceTrace(choice, ystart, yend);
+    if (!product.Accepted)
+    {
+        RenderScreenWholeSceneCaptureBackedHybridFallback(ystart, yend);
+        RecordSourceARejectedChoiceTrace(choice, ystart, yend);
+        return;
+    }
+
+    BlitWholeSceneSourceAProduct(product, ystart, yend);
 }
 
 void GLRenderer2D::RenderScreenWholeSceneCaptureEpochOverlay(int ystart, int yend)
@@ -10026,429 +12365,243 @@ void GLRenderer2D::RenderScreenWholeSceneCaptureEpochOverlay(int ystart, int yen
     }
 
     const auto& epoch = Parent.ActiveCaptureBackgroundEpoch[routeSlot];
-    const GLuint backgroundTex = Parent.ActiveCaptureBackgroundEpochTex[routeSlot];
+    const u32 currentPresentationHash = CapturePresentationHash();
+    const bool useCurrentDirect3DBackground =
+        currentPresentationHash != epoch.SourcePresentationHash;
+    const SourceABackgroundSource backgroundSource =
+        useCurrentDirect3DBackground
+            ? SourceABackgroundSource::ParentOutputTex3D
+            : SourceABackgroundSource::ActiveCaptureEpochTex;
+    const GLuint backgroundTex =
+        useCurrentDirect3DBackground ? Parent.OutputTex3D : Parent.ActiveCaptureBackgroundEpochTex[routeSlot];
+    const u64 routeProductBackgroundSerial =
+        useCurrentDirect3DBackground ? 0 : epoch.Serial;
+    const u64 routeProductSource3DSerial =
+        useCurrentDirect3DBackground ? Parent.Output3DSerial : epoch.Source3DSerial;
+    const u32 routeProductSource3DSceneHash =
+        useCurrentDirect3DBackground ? Parent.Output3DSceneHash : epoch.Source3DSceneHash;
+    const u32 routeProductPresentationHash =
+        useCurrentDirect3DBackground ? currentPresentationHash : epoch.SourcePresentationHash;
+    const u16 backgroundStoredMasterBrightness =
+        useCurrentDirect3DBackground ? 0 : epoch.StoredMasterBrightness;
+    const bool backgroundHasStoredEffectState =
+        !useCurrentDirect3DBackground && epoch.HasStoredEffectState;
+    const auto& previousRoutePresentation = CaptureBackedRoute[routeSlot].Presentation;
+    const bool canPromoteLiveRouteProduct =
+        !useCurrentDirect3DBackground ||
+        (routeProductSource3DSceneHash != 0 &&
+         previousRoutePresentation.Valid &&
+         previousRoutePresentation.Source3DSceneHash == routeProductSource3DSceneHash &&
+         previousRoutePresentation.SourcePresentationHash == routeProductPresentationHash &&
+         previousRoutePresentation.CurrentOverlayPresentationHash == currentPresentationHash);
 
-    ResetWholeSceneRenderTrace();
-    RecordWholeSceneRenderTrace(WholeSceneRenderPath::CaptureEpochOverlay, ystart, yend,
-                                ScaleFactor > 1, false, ScaleFactor > 1, backgroundTex);
-    WholeSceneTrace.SourceACaptureMode = SourceACaptureReplacementMode::CurrentOverlay;
-    WholeSceneTrace.SourceABackgroundEpochSerial = epoch.Serial;
-    WholeSceneTrace.SourceAProductChoice =
-        SourceAProductChoiceReason::UsedBackgroundUnderlayCurrentOverlay;
+    UpdateCaptureBackedRoutePresentation(routeSlot,
+                                         CaptureBackedRoutePresentationMode::BackgroundCurrentOverlay,
+                                         routeProductBackgroundSerial,
+                                         epoch.CaptureBank,
+                                         routeProductSource3DSceneHash,
+                                         routeProductPresentationHash,
+                                         currentPresentationHash);
 
-    if (!RenderCurrentOverlayOverHighResBackgroundToTexture(OutputTex, backgroundTex, ystart, yend))
+    const GLCaptureProductResolution product =
+        RecordCaptureEpochOverlayTrace(routeSlot,
+                                       epoch.CaptureBank,
+                                       backgroundSource,
+                                       backgroundTex,
+                                       epoch.Serial,
+                                       routeProductBackgroundSerial,
+                                       routeProductPresentationHash,
+                                       currentPresentationHash,
+                                       backgroundStoredMasterBrightness,
+                                       backgroundHasStoredEffectState,
+                                       ystart,
+                                       yend);
+
+    if (!product.Accepted)
     {
-        WholeSceneTrace.SourceAProductChoice = SourceAProductChoiceReason::FallbackNormalHybrid;
         RenderScreenWholeSceneOverlayOperator(ystart, yend);
-    }
-}
-
-void GLRenderer2D::PrepareFinalUpscaleNative3DInput(GLuint& direct3DTex,
-                                                    GLuint& direct3DCoverageTex,
-                                                    bool& highRes3D,
-                                                    bool& linear3D)
-{
-    direct3DTex = Parent.OutputTex3D;
-    direct3DCoverageTex = 0;
-    highRes3D = !WholeSceneScaleFinalUpscaleRender3DNative && ScaleFactor > 1;
-    linear3D = highRes3D &&
-        WholeSceneScaleFinalUpscale3DFilter == RendererSettings::FinalUpscale3DDownsampleFilter::Linear &&
-        !WholeSceneScaleFinalUpscale3DCoverageAware;
-
-    if (highRes3D && WholeSceneDebugPoison.Source3D)
-        PoisonWholeSceneDebugTexture(Parent.OutputTex3D, ScreenW, ScreenH, false);
-
-    if (highRes3D && !linear3D)
-    {
-        direct3DTex = ResolveDirect3DToNative();
-        direct3DCoverageTex = NativeDirect3DTex;
-        if (WholeSceneDebugPoison.Native3DResolve)
-        {
-            PoisonWholeSceneDebugTexture(NativeDirect3DTex, 256, 192, WholeSceneDebugPoison.Native3DResolveAlpha);
-            PoisonWholeSceneDebugTexture(NativeDirect3DSemanticsTex, 256, 192, WholeSceneDebugPoison.Native3DResolveAlpha);
-            PoisonWholeSceneDebugTexture(NativeDirect3DCompositorTex, 256, 192, WholeSceneDebugPoison.Native3DResolveAlpha);
-        }
-        WholeSceneTrace.Native3DResolveValid = true;
-        WholeSceneTrace.Native3DSemanticsValid = true;
-        WholeSceneTrace.Native3DSource = WholeSceneNative3DSource::HighResResolved;
-    }
-    else if (linear3D)
-        WholeSceneTrace.Native3DSource = WholeSceneNative3DSource::HighResLinearSampled;
-    else
-        WholeSceneTrace.Native3DSource = WholeSceneNative3DSource::NativeRendered;
-}
-
-void GLRenderer2D::RenderScreenPhysicalFinalPostprocessNativeInput(int ystart, int yend)
-{
-    ResetWholeSceneRenderTrace();
-
-    GLuint direct3DTex = 0;
-    GLuint direct3DCoverageTex = 0;
-    bool highRes3D = false;
-    bool linear3D = false;
-    PrepareFinalUpscaleNative3DInput(direct3DTex, direct3DCoverageTex, highRes3D, linear3D);
-
-    RecordWholeSceneRenderTrace(WholeSceneRenderPath::PhysicalFinalPostprocessInput, ystart, yend,
-                                highRes3D, linear3D, highRes3D && !linear3D, direct3DTex);
-
-    if (linear3D)
-    {
-        glBindTexture(GL_TEXTURE_2D, Parent.OutputTex3D);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    }
-
-    auto phaseStart = std::chrono::steady_clock::now();
-    RenderCompositorPass(OutputFB, OBJLayerTex, ScreenW, ScreenH, ystart, yend, ScaleFactor,
-                         WholeSceneHighResLayerFilterMode(),
-                         WholeSceneHighResLayerFilterNoWrap(),
-                         false,
-                         false);
-    AddWholeSceneUpdateTiming(WholeSceneUpdateTiming.NativePrepass, ElapsedUS(phaseStart));
-
-    phaseStart = std::chrono::steady_clock::now();
-    RenderNativeExactFinalToTexture(NativeOutputTex, ystart, yend, WholeSceneScaleDebugTint,
-                                    direct3DTex, direct3DCoverageTex);
-    AddWholeSceneUpdateTiming(WholeSceneUpdateTiming.NativeExactFinal, ElapsedUS(phaseStart));
-    WholeSceneTrace.PhysicalFinalNativeInputValid = true;
-
-    if (linear3D)
-    {
-        glBindTexture(GL_TEXTURE_2D, Parent.OutputTex3D);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-    }
-}
-
-void GLRenderer2D::RenderScreenWholeSceneFinalUpscale(int ystart, int yend, bool hybridFragmentationFallback)
-{
-    ResetWholeSceneRenderTrace();
-
-    auto phaseStart = std::chrono::steady_clock::now();
-    RenderNativePrepass(ystart, yend);
-    AddWholeSceneUpdateTiming(WholeSceneUpdateTiming.NativePrepass, ElapsedUS(phaseStart));
-
-    GLuint direct3DTex = 0;
-    GLuint direct3DCoverageTex = 0;
-    bool highRes3D = false;
-    bool linear3D = false;
-    PrepareFinalUpscaleNative3DInput(direct3DTex, direct3DCoverageTex, highRes3D, linear3D);
-
-    RecordWholeSceneRenderTrace(WholeSceneRenderPath::FinalNativeUpscale, ystart, yend,
-                                highRes3D, linear3D, highRes3D && !linear3D, direct3DTex,
-                                hybridFragmentationFallback);
-
-    if (linear3D)
-    {
-        glBindTexture(GL_TEXTURE_2D, Parent.OutputTex3D);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    }
-
-    phaseStart = std::chrono::steady_clock::now();
-    RenderNativeExactFinal(ystart, yend, WholeSceneScaleDebugTint, direct3DTex, direct3DCoverageTex);
-    AddWholeSceneUpdateTiming(WholeSceneUpdateTiming.NativeExactFinal, ElapsedUS(phaseStart));
-    WholeSceneTrace.NativeExactFinalValid = true;
-    RecordWholeSceneNativeProductChunk(ystart, yend);
-
-    if (linear3D)
-    {
-        glBindTexture(GL_TEXTURE_2D, Parent.OutputTex3D);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-    }
-
-}
-
-void GLRenderer2D::RenderScreenWholeSceneOverlayOperator(int ystart, int yend)
-{
-    ResetWholeSceneRenderTrace();
-    const bool conservativeHybrid = WholeSceneScaleMode == RendererSettings::WholeScene2DScaleMode::ConservativeHybridUpscale;
-    const bool activeDirect3D = !GPU2D.Num && (DispCnt & (1 << 3)) && (LayerEnable & (1 << 0));
-    const bool noActiveDirect3D = !activeDirect3D;
-
-    auto phaseStart = std::chrono::steady_clock::now();
-    RenderNativePrepass(ystart, yend);
-    AddWholeSceneUpdateTiming(WholeSceneUpdateTiming.NativePrepass, ElapsedUS(phaseStart));
-
-    GLuint nativeDirect3DTex = Parent.OutputTex3D;
-    GLuint highResDirect3DTex = Parent.OutputTex3D;
-    const bool highRes3D = !WholeSceneScaleFinalUpscaleRender3DNative && ScaleFactor > 1;
-    if (highRes3D && WholeSceneDebugPoison.Source3D)
-        PoisonWholeSceneDebugTexture(Parent.OutputTex3D, ScreenW, ScreenH, false);
-
-    if (highRes3D)
-    {
-        nativeDirect3DTex = ResolveDirect3DToNative();
-        if (WholeSceneDebugPoison.Native3DResolve)
-        {
-            PoisonWholeSceneDebugTexture(NativeDirect3DTex, 256, 192, WholeSceneDebugPoison.Native3DResolveAlpha);
-            PoisonWholeSceneDebugTexture(NativeDirect3DSemanticsTex, 256, 192, WholeSceneDebugPoison.Native3DResolveAlpha);
-            PoisonWholeSceneDebugTexture(NativeDirect3DCompositorTex, 256, 192, WholeSceneDebugPoison.Native3DResolveAlpha);
-        }
-        WholeSceneTrace.Native3DResolveValid = true;
-        WholeSceneTrace.Native3DSemanticsValid = true;
-        WholeSceneTrace.Native3DSource = WholeSceneNative3DSource::HighResResolved;
-    }
-    else
-        WholeSceneTrace.Native3DSource = WholeSceneNative3DSource::NativeRendered;
-
-    if (conservativeHybrid && WholeSceneScaleCaptureBacked && activeDirect3D)
-    {
-        CaptureBackedHandoffRouteKey handoffKey = BuildCaptureBackedHandoffRouteKey(ystart, yend);
-        const int handoffSlot = CaptureBackedHandoffRouteSlot(handoffKey);
-        const u32 visibleBGLayers = handoffKey.LayerEnable & 0x0Fu;
-        const bool direct3DOnlyLiveBackground =
-            visibleBGLayers == (1u << 0) &&
-            (DispCnt & (1 << 3));
-
-        if (handoffSlot >= 0 &&
-            handoffSlot < kCaptureBackedHandoffRouteSlots &&
-            direct3DOnlyLiveBackground &&
-            IsStableCaptureBackedHandoffLiveUpdate(handoffKey))
-        {
-            CaptureBackedHandoffCurrentKey = handoffKey;
-            CaptureBackedHandoffCurrentSlot = static_cast<u8>(handoffSlot);
-            CaptureBackedHandoffBackgroundUpdated = UpdateCaptureBackedHandoff3DSnapshot(highResDirect3DTex);
-            if (CaptureBackedHandoffBackgroundUpdated)
-                CaptureBackedHandoffReuseDecision = CaptureBackedHandoffReuseReason::UpdatedLive3D;
-        }
-    }
-
-    RecordWholeSceneRenderTrace(conservativeHybrid ? WholeSceneRenderPath::ConservativeHybridUpscale : WholeSceneRenderPath::OverlayOperatorUpscale, ystart, yend,
-                                highRes3D, false, highRes3D, nativeDirect3DTex);
-
-    if (conservativeHybrid && noActiveDirect3D)
-    {
-        phaseStart = std::chrono::steady_clock::now();
-        RenderNativeExactFinal(ystart, yend);
-        AddWholeSceneUpdateTiming(WholeSceneUpdateTiming.NativeExactFinal, ElapsedUS(phaseStart));
-        WholeSceneTrace.NativeExactFinalValid = true;
-    }
-
-    RecordWholeSceneNativeProductChunk(ystart, yend);
-
-    if (conservativeHybrid)
-    {
-        if (!noActiveDirect3D && WholeSceneScaleHybridForeground2DBase)
-        {
-            auto phaseStart = std::chrono::steady_clock::now();
-            glBindFramebuffer(GL_FRAMEBUFFER, ArtCNNOutputFB);
-            glFramebufferTexture(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, Hybrid2DBaseTex, 0);
-            glDrawBuffer(GL_COLOR_ATTACHMENT0);
-            RenderCompositorPass(ArtCNNOutputFB, OBJLayerTex, ScreenW, ScreenH, ystart, yend, ScaleFactor,
-                                 WholeSceneHighResLayerFilterMode(),
-                                 WholeSceneHighResLayerFilterNoWrap(),
-                                 false,
-                                 false,
-                                 BlankColorTex,
-                                 BlankColorTex);
-            AddWholeSceneUpdateTiming(WholeSceneUpdateTiming.Hybrid2DBaseCandidate, ElapsedUS(phaseStart));
-        }
-
-        if (!noActiveDirect3D)
-        {
-            auto phaseStart = std::chrono::steady_clock::now();
-            glBindFramebuffer(GL_FRAMEBUFFER, ArtCNNOutputFB);
-            glFramebufferTexture(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, HybridForegroundTex, 0);
-            glDrawBuffer(GL_COLOR_ATTACHMENT0);
-            RenderCompositorPass(ArtCNNOutputFB, OBJLayerTex, ScreenW, ScreenH, ystart, yend, ScaleFactor,
-                                 WholeSceneHighResLayerFilterMode(),
-                                 WholeSceneHighResLayerFilterNoWrap(),
-                                 false,
-                                 WholeSceneScaleDebugTint,
-                                 highResDirect3DTex,
-                                 0);
-            AddWholeSceneUpdateTiming(WholeSceneUpdateTiming.HybridForegroundCandidate, ElapsedUS(phaseStart));
-        }
-    }
-
-}
-
-void GLRenderer2D::RenderScreenWholeSceneCaptureBackedHandoff(int ystart, int yend)
-{
-    ResetWholeSceneRenderTrace();
-
-    auto phaseStart = std::chrono::steady_clock::now();
-    RenderNativePrepass(ystart, yend);
-    AddWholeSceneUpdateTiming(WholeSceneUpdateTiming.NativePrepass, ElapsedUS(phaseStart));
-
-    CaptureBackedHandoffCurrentKey = BuildCaptureBackedHandoffRouteKey(ystart, yend);
-    const int handoffSlot = CaptureBackedHandoffRouteSlot(CaptureBackedHandoffCurrentKey);
-    CaptureBackedHandoffCurrentSlot = static_cast<u8>(handoffSlot);
-    CaptureBackedHandoffBackgroundUpdated = false;
-    CaptureBackedHandoffReuseDecision = CaptureBackedHandoffReuseReason::None;
-
-    GLuint highResBackgroundTex = 0;
-    u64 handoffBackgroundEpochSerial = 0;
-    if (IsStableCaptureBackedHandoffLiveUpdate(CaptureBackedHandoffCurrentKey))
-    {
-        phaseStart = std::chrono::steady_clock::now();
-        const u32 visibleBGLayers = CaptureBackedHandoffCurrentKey.LayerEnable & 0x0Fu;
-        const bool direct3DOnlyLiveBackground =
-            visibleBGLayers == (1u << 0) &&
-            (DispCnt & (1 << 3));
-
-        bool updatedSnapshot = false;
-        if (direct3DOnlyLiveBackground)
-        {
-            updatedSnapshot = UpdateCaptureBackedHandoff3DSnapshot(Parent.OutputTex3D);
-        }
-        else
-        {
-            RenderCompositorPass(CaptureBackedHandoff3DFB[handoffSlot],
-                                 OBJLayerTex,
-                                 ScreenW,
-                                 ScreenH,
-                                 ystart,
-                                 yend,
-                                 ScaleFactor,
-                                 0,
-                                 false,
-                                 false,
-                                 false,
-                                 0,
-                                 0,
-                                 true);
-            CaptureBackedHandoff3DValid[handoffSlot] = true;
-            CaptureBackedHandoffLatchedKey[handoffSlot] = CaptureBackedHandoffCurrentKey;
-            updatedSnapshot = true;
-        }
-        AddWholeSceneUpdateTiming(WholeSceneUpdateTiming.HybridForegroundCandidate, ElapsedUS(phaseStart));
-
-        if (!updatedSnapshot)
-        {
-            CaptureBackedHandoffReuseDecision = CaptureBackedHandoffReuseReason::RejectedNoSnapshot;
-            RenderScreenWholeSceneOverlayOperator(ystart, yend);
-            RenderScreenWholeSceneFinalizeOverlayOperatorFullFrame(true, ystart, yend);
-            return;
-        }
-
-        CaptureBackedHandoffBackgroundUpdated = true;
-        CaptureBackedHandoffReuseDecision = CaptureBackedHandoffReuseReason::UpdatedLive3D;
-
-        // Before a route has shown a captured-BG phase, keep live frames on
-        // normal Hybrid. After that, use the same handoff compositor for the
-        // route's stable live and captured phases to avoid path alternation.
-        if (!CaptureBackedHandoffRouteHasCapturedPhase[handoffSlot])
-        {
-            RenderScreenWholeSceneOverlayOperator(ystart, yend);
-            RenderScreenWholeSceneFinalizeOverlayOperatorFullFrame(true, ystart, yend);
-            return;
-        }
-
-        highResBackgroundTex = CaptureBackedHandoff3DTex[handoffSlot];
-    }
-    else if (CaptureBackedHandoffCurrentKey.Phase == CaptureBackedHandoffPhase::Live3D)
-    {
-        // A live 3D phase with a bitmap upload is useful for the current frame,
-        // but not safe as a reusable replacement for a captured BG phase.
-        CaptureBackedHandoffReuseDecision = CaptureBackedHandoffReuseReason::RejectedUnstableLivePhase;
-        RenderScreenWholeSceneOverlayOperator(ystart, yend);
-        RenderScreenWholeSceneFinalizeOverlayOperatorFullFrame(true, ystart, yend);
         return;
     }
-    else
+
+    GLuint rawRouteProductTex = OutputTex;
+
+    bool outputMasterBrightnessApplied = false;
+    if (RenderCurrentOverlayOverHighResBackgroundToTexture(OutputTex,
+                                                           product.Tex,
+                                                           ystart,
+                                                           yend,
+                                                           false,
+                                                           &rawRouteProductTex,
+                                                           &outputMasterBrightnessApplied))
     {
-        if (CaptureBackedHandoffCurrentKey.Phase == CaptureBackedHandoffPhase::CapturedBitmap)
-            CaptureBackedHandoffRouteHasCapturedPhase[handoffSlot] = true;
-
-        if (CaptureBackedHandoffCurrentKey.Phase == CaptureBackedHandoffPhase::CapturedBitmap)
+        if (outputMasterBrightnessApplied)
         {
-            CaptureBackedHandoffReuseReason reason = CaptureBackedHandoffReuseReason::None;
-            if (CanReuseCaptureBackedHandoffSnapshot(CaptureBackedHandoffCurrentKey, handoffSlot, reason))
-            {
-                CaptureBackedHandoffReuseDecision = reason;
-                highResBackgroundTex = CaptureBackedHandoff3DTex[handoffSlot];
-            }
-            else
-            {
-                const int visibleCaptureBank = VisibleSingleHighResCaptureBank();
-                const auto& epoch = Parent.ActiveCaptureBackgroundEpoch[handoffSlot];
-                if (visibleCaptureBank >= 0 &&
-                    visibleCaptureBank < 4 &&
-                    epoch.Valid &&
-                    epoch.Serial == Parent.HighResDisplayCapture256Event[visibleCaptureBank].Serial &&
-                    epoch.CaptureBank == static_cast<u32>(visibleCaptureBank) &&
-                    epoch.ConsumerRouteSlot == static_cast<u32>(handoffSlot) &&
-                    Parent.ActiveCaptureBackgroundEpochTex[handoffSlot] &&
-                    (epoch.ProductMask & GLRenderer::HighResCaptureProductBackground3DUnderlay))
-                {
-                    const GLuint fullProductTex = VisibleHighResCaptureFullTex();
-                    if (fullProductTex)
-                    {
-                        CaptureBackedHandoffReuseDecision =
-                            CaptureBackedHandoffReuseReason::UsedCaptureEventFullProduct;
-
-                        RecordWholeSceneRenderTrace(WholeSceneRenderPath::CaptureBackedHandoff, ystart, yend,
-                                                    ScaleFactor > 1, false, false, fullProductTex);
-                        WholeSceneTrace.SourceACaptureMode = SourceACaptureReplacementMode::FullProduct;
-                        WholeSceneTrace.SourceABackgroundEpochSerial = epoch.Serial;
-                        WholeSceneTrace.SourceAProductChoice =
-                            SourceAProductChoiceReason::UsedFullProductRouteBridge;
-                        WholeSceneTrace.SourceACapturePresentationHash =
-                            Parent.HighResDisplayCapture256Event[visibleCaptureBank].SourcePresentationHash;
-
-                        glBindFramebuffer(GL_READ_FRAMEBUFFER, WholeSceneSourceABlitFB);
-                        glFramebufferTexture(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, fullProductTex, 0);
-                        glReadBuffer(GL_COLOR_ATTACHMENT0);
-
-                        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, OutputFB);
-                        glDrawBuffer(GL_COLOR_ATTACHMENT0);
-
-                        glDisable(GL_DEPTH_TEST);
-                        glDisable(GL_STENCIL_TEST);
-                        glDisable(GL_BLEND);
-                        glDisable(GL_SCISSOR_TEST);
-                        glColorMaski(0, GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
-                        glDepthMask(GL_FALSE);
-
-                        const int y0 = ystart * ScaleFactor;
-                        const int y1 = yend * ScaleFactor;
-                        glBlitFramebuffer(0, y0, ScreenW, y1,
-                                          0, y0, ScreenW, y1,
-                                          GL_COLOR_BUFFER_BIT, GL_NEAREST);
-                        return;
-                    }
-
-                    highResBackgroundTex = Parent.ActiveCaptureBackgroundEpochTex[handoffSlot];
-                    handoffBackgroundEpochSerial = epoch.Serial;
-                }
-                else
-                {
-                    highResBackgroundTex = VisibleHighResCaptureBackgroundTex();
-                }
-                if (!highResBackgroundTex)
-                {
-                    CaptureBackedHandoffReuseDecision = reason;
-                    RenderScreenWholeSceneOverlayOperator(ystart, yend);
-                    RenderScreenWholeSceneFinalizeOverlayOperatorFullFrame(true, ystart, yend);
-                    return;
-                }
-
-                CaptureBackedHandoffReuseDecision = CaptureBackedHandoffReuseReason::UsedCaptureEventBackground;
-            }
+            const u16 masterBrightness = GPU2D.Num ? GPU.MasterBrightnessB : GPU.MasterBrightnessA;
+            RecordOutputPresentationMasterBrightness(WholeSceneCaptureEffectOwner::CurrentEngine,
+                                                     masterBrightness);
         }
-        else
+        StoreCurrentOverlayCaptureBackedRouteProduct(routeSlot,
+                                                     rawRouteProductTex,
+                                                     routeProductBackgroundSerial,
+                                                     routeProductSource3DSerial,
+                                                     routeProductSource3DSceneHash,
+                                                     epoch.CaptureBank,
+                                                     routeProductPresentationHash,
+                                                     currentPresentationHash,
+                                                     ystart,
+                                                     yend);
+        if (!canPromoteLiveRouteProduct)
         {
-            CaptureBackedHandoffReuseReason reason = CaptureBackedHandoffReuseReason::None;
-            if (CanReuseCaptureBackedHandoffSnapshot(CaptureBackedHandoffCurrentKey, handoffSlot, reason))
-            {
-                CaptureBackedHandoffReuseDecision = reason;
-                highResBackgroundTex = CaptureBackedHandoff3DTex[handoffSlot];
-            }
-            else
-            {
-                CaptureBackedHandoffReuseDecision = reason;
-                RenderScreenWholeSceneOverlayOperator(ystart, yend);
-                RenderScreenWholeSceneFinalizeOverlayOperatorFullFrame(true, ystart, yend);
-                return;
-            }
+            WholeSceneTrace.SourceAProductChoice =
+                SourceAProductChoiceReason::DeferredLiveScenePromotion;
         }
+
+        return;
     }
 
+    WholeSceneTrace.SourceAProductChoice = SourceAProductChoiceReason::FallbackNormalHybrid;
+    RenderScreenWholeSceneOverlayOperator(ystart, yend);
+}
+
+bool GLRenderer2D::TryRenderHandoffBackgroundOverlayProduct(const WholeSceneCaptureRequest& request,
+                                                            int handoffSlot,
+                                                            const HandoffBackgroundChoice& background,
+                                                            int ystart,
+                                                            int yend)
+{
+    if (background.Authority != WholeSceneCaptureAuthority::CaptureEventBackground ||
+        !background.Tex)
+    {
+        return false;
+    }
+
+    const u32 currentPresentationHash = CapturePresentationHash();
+    const GLCaptureProductResolution product =
+        RecordHandoffBackgroundOverlayTrace(request,
+                                            background.Source,
+                                            background.Authority,
+                                            background.Tex,
+                                            background.BackgroundEpochSerial,
+                                            background.PresentationHash,
+                                            currentPresentationHash,
+                                            background.StoredMasterBrightness,
+                                            background.HasStoredEffectState,
+                                            ystart,
+                                            yend);
+    if (!product.Accepted)
+        return false;
+
+    GLuint rawRouteProductTex = OutputTex;
+
+    bool outputMasterBrightnessApplied = false;
+    if (RenderCurrentOverlayOverHighResBackgroundToTexture(OutputTex,
+                                                           product.Tex,
+                                                           ystart,
+                                                           yend,
+                                                           false,
+                                                           &rawRouteProductTex,
+                                                           &outputMasterBrightnessApplied))
+    {
+        if (outputMasterBrightnessApplied)
+        {
+            const u16 masterBrightness = GPU2D.Num ? GPU.MasterBrightnessB : GPU.MasterBrightnessA;
+            RecordOutputPresentationMasterBrightness(WholeSceneCaptureEffectOwner::CurrentEngine,
+                                                     masterBrightness);
+        }
+        const u32 captureBank =
+            handoffSlot >= 0 &&
+            handoffSlot < kCaptureBackedHandoffRouteSlots &&
+            Parent.ActiveCaptureBackgroundEpoch[handoffSlot].Valid
+                ? Parent.ActiveCaptureBackgroundEpoch[handoffSlot].CaptureBank
+                : 0xFFFFFFFFu;
+        StoreCurrentOverlayCaptureBackedRouteProduct(handoffSlot,
+                                                     rawRouteProductTex,
+                                                     background.BackgroundEpochSerial,
+                                                     background.Source3DSerial,
+                                                     background.Source3DSceneHash,
+                                                     captureBank,
+                                                     background.PresentationHash,
+                                                     currentPresentationHash,
+                                                     ystart,
+                                                     yend);
+
+        return true;
+    }
+
+    WholeSceneTrace.SourceAProductChoice = SourceAProductChoiceReason::FallbackNormalHybrid;
+    return false;
+}
+
+bool GLRenderer2D::TryPrepareStableHandoffLiveBackground(int handoffSlot,
+                                                         HandoffBackgroundChoice& background,
+                                                         int ystart,
+                                                         int yend)
+{
+    auto phaseStart = std::chrono::steady_clock::now();
+    const u32 visibleBGLayers = CaptureBackedHandoff.CurrentKey.LayerEnable & 0x0Fu;
+    const bool direct3DOnlyLiveBackground =
+        visibleBGLayers == (1u << 0) &&
+        (DispCnt & (1 << 3));
+
+    bool updatedSnapshot = false;
+    if (direct3DOnlyLiveBackground)
+    {
+        updatedSnapshot = UpdateCaptureBackedHandoff3DSnapshot(Parent.OutputTex3D);
+    }
+    else
+    {
+        RenderCompositorPass(CaptureBackedRouteGL[handoffSlot].Handoff3DFB,
+                             OBJLayerTex,
+                             ScreenW,
+                             ScreenH,
+                             ystart,
+                             yend,
+                             ScaleFactor,
+                             0,
+                             false,
+                             false,
+                             false,
+                             0,
+                             0,
+                             true);
+        LatchCaptureBackedHandoffSnapshot(handoffSlot, CaptureBackedHandoff.CurrentKey);
+        updatedSnapshot = true;
+    }
+    AddWholeSceneUpdateTiming(WholeSceneUpdateTiming.HybridForegroundCandidate, ElapsedUS(phaseStart));
+
+    if (!updatedSnapshot)
+    {
+        CaptureBackedHandoff.ReuseDecision = CaptureBackedHandoffReuseReason::RejectedNoSnapshot;
+        RenderScreenWholeSceneCaptureBackedHybridFallback(ystart, yend);
+        return false;
+    }
+
+    CaptureBackedHandoff.BackgroundUpdated = true;
+    CaptureBackedHandoff.ReuseDecision = CaptureBackedHandoffReuseReason::UpdatedLive3D;
+
+    // Before a route has shown a captured-BG phase, keep live frames on
+    // the current/native path. After that, use the same handoff compositor
+    // for the route's stable live and captured phases to avoid path
+    // alternation.
+    if (!CaptureBackedRoute[handoffSlot].HasCapturedPhase)
+    {
+        RenderScreenCurrent(ystart, yend, true,
+                            WholeSceneCurrentPathReason::CaptureBackedLiveBeforeCapturedPhase);
+        return false;
+    }
+
+    background =
+        MakeHandoffSnapshotBackgroundChoice(CaptureBackedRouteGL[handoffSlot].Handoff3DTex);
+    return true;
+}
+
+void GLRenderer2D::RenderHandoffHybridComposite(const WholeSceneCaptureRequest& request,
+                                                const HandoffBackgroundChoice& background,
+                                                int ystart,
+                                                int yend)
+{
     const GLuint highResDirect3DTex =
-        highResBackgroundTex ? highResBackgroundTex : Parent.OutputTex3D;
+        background.Tex ? background.Tex : Parent.OutputTex3D;
 
     GLuint nativeDirect3DTex = highResDirect3DTex;
     const bool highRes3D = ScaleFactor > 1;
@@ -10462,9 +12615,18 @@ void GLRenderer2D::RenderScreenWholeSceneCaptureBackedHandoff(int ystart, int ye
     else
         WholeSceneTrace.Native3DSource = WholeSceneNative3DSource::NativeRendered;
 
-    RecordWholeSceneRenderTrace(WholeSceneRenderPath::CaptureBackedHandoff, ystart, yend,
-                                highRes3D, false, highRes3D, highResDirect3DTex);
-    WholeSceneTrace.SourceABackgroundEpochSerial = handoffBackgroundEpochSerial;
+    const SourceABackgroundSource resolvedBackgroundSource =
+        background.Tex ? background.Source : SourceABackgroundSource::ParentOutputTex3D;
+    RecordHandoffHybridTrace(request,
+                             resolvedBackgroundSource,
+                             background.Authority,
+                             highResDirect3DTex,
+                             highRes3D,
+                             background.BackgroundEpochSerial,
+                             background.PresentationHash,
+                             background.Tex != 0,
+                             ystart,
+                             yend);
 
     UpdateCompositorConfig();
     const auto savedCompositorConfig = CompositorConfig;
@@ -10489,7 +12651,7 @@ void GLRenderer2D::RenderScreenWholeSceneCaptureBackedHandoff(int ystart, int ye
 
     EnsureWholeSceneOverlayEndpoints(nativeDirect3DTex);
 
-    phaseStart = std::chrono::steady_clock::now();
+    auto phaseStart = std::chrono::steady_clock::now();
     RenderNativeExactFinalToTexture(NativeExactFinalTex, ystart, yend, false,
                                     NativeOverlayBlack3DTex, nativeDirect3DTex, true);
     AddWholeSceneUpdateTiming(WholeSceneUpdateTiming.OverlayBlackExactFinal, ElapsedUS(phaseStart));
@@ -10526,6 +12688,244 @@ void GLRenderer2D::RenderScreenWholeSceneCaptureBackedHandoff(int ystart, int ye
     CompositorConfig = savedCompositorConfig;
     glBindBuffer(GL_UNIFORM_BUFFER, CompositorConfigUBO);
     glBufferSubData(GL_UNIFORM_BUFFER, 0, sizeof(CompositorConfig), &CompositorConfig);
+}
+
+void GLRenderer2D::PrepareFinalUpscaleNative3DInput(GLuint& direct3DTex,
+                                                    GLuint& direct3DCoverageTex,
+                                                    bool& highRes3D)
+{
+    direct3DTex = Parent.OutputTex3D;
+    direct3DCoverageTex = 0;
+    highRes3D = !WholeSceneScaleFinalUpscaleRender3DNative && ScaleFactor > 1;
+
+    if (highRes3D && WholeSceneDebugPoison.Source3D)
+        PoisonWholeSceneDebugTexture(Parent.OutputTex3D, ScreenW, ScreenH, false);
+
+    if (highRes3D)
+    {
+        direct3DTex = ResolveDirect3DToNative();
+        direct3DCoverageTex = NativeDirect3DTex;
+        if (WholeSceneDebugPoison.Native3DResolve)
+        {
+            PoisonWholeSceneDebugTexture(NativeDirect3DTex, 256, 192, WholeSceneDebugPoison.Native3DResolveAlpha);
+            PoisonWholeSceneDebugTexture(NativeDirect3DSemanticsTex, 256, 192, WholeSceneDebugPoison.Native3DResolveAlpha);
+            PoisonWholeSceneDebugTexture(NativeDirect3DCompositorTex, 256, 192, WholeSceneDebugPoison.Native3DResolveAlpha);
+        }
+        WholeSceneTrace.Native3DResolveValid = true;
+        WholeSceneTrace.Native3DSemanticsValid = true;
+        WholeSceneTrace.Native3DSource = WholeSceneNative3DSource::HighResResolved;
+    }
+    else
+        WholeSceneTrace.Native3DSource = WholeSceneNative3DSource::NativeRendered;
+}
+
+void GLRenderer2D::RenderScreenPhysicalFinalPostprocessNativeInput(int ystart, int yend)
+{
+    ResetWholeSceneRenderTrace();
+
+    GLuint direct3DTex = 0;
+    GLuint direct3DCoverageTex = 0;
+    bool highRes3D = false;
+    PrepareFinalUpscaleNative3DInput(direct3DTex, direct3DCoverageTex, highRes3D);
+
+    RecordWholeSceneRenderTrace(WholeSceneRenderPath::PhysicalFinalPostprocessInput, ystart, yend,
+                                highRes3D, false, highRes3D, direct3DTex);
+
+    auto phaseStart = std::chrono::steady_clock::now();
+    RenderCompositorPass(OutputFB, OBJLayerTex, ScreenW, ScreenH, ystart, yend, ScaleFactor,
+                         WholeSceneHighResLayerFilterMode(),
+                         WholeSceneHighResLayerFilterNoWrap(),
+                         false,
+                         false);
+    AddWholeSceneUpdateTiming(WholeSceneUpdateTiming.NativePrepass, ElapsedUS(phaseStart));
+
+    phaseStart = std::chrono::steady_clock::now();
+    RenderNativeExactFinalToTexture(NativeOutputTex, ystart, yend, WholeSceneScaleDebugTint,
+                                    direct3DTex, direct3DCoverageTex);
+    AddWholeSceneUpdateTiming(WholeSceneUpdateTiming.NativeExactFinal, ElapsedUS(phaseStart));
+    WholeSceneTrace.PhysicalFinalNativeInputValid = true;
+}
+
+void GLRenderer2D::RenderScreenWholeSceneFinalUpscale(int ystart, int yend, bool hybridFragmentationFallback)
+{
+    ResetWholeSceneRenderTrace();
+
+    auto phaseStart = std::chrono::steady_clock::now();
+    RenderNativePrepass(ystart, yend);
+    AddWholeSceneUpdateTiming(WholeSceneUpdateTiming.NativePrepass, ElapsedUS(phaseStart));
+
+    GLuint direct3DTex = 0;
+    GLuint direct3DCoverageTex = 0;
+    bool highRes3D = false;
+    PrepareFinalUpscaleNative3DInput(direct3DTex, direct3DCoverageTex, highRes3D);
+
+    RecordWholeSceneRenderTrace(WholeSceneRenderPath::FinalNativeUpscale, ystart, yend,
+                                highRes3D, false, highRes3D, direct3DTex,
+                                hybridFragmentationFallback);
+
+    phaseStart = std::chrono::steady_clock::now();
+    RenderNativeExactFinal(ystart, yend, WholeSceneScaleDebugTint, direct3DTex, direct3DCoverageTex);
+    AddWholeSceneUpdateTiming(WholeSceneUpdateTiming.NativeExactFinal, ElapsedUS(phaseStart));
+    WholeSceneTrace.NativeExactFinalValid = true;
+    RecordWholeSceneNativeProductChunk(ystart, yend);
+}
+
+void GLRenderer2D::RenderScreenWholeSceneOverlayOperator(int ystart, int yend)
+{
+    ResetWholeSceneRenderTrace();
+    const HybridSourceDecision sourceDecision = ChooseHybridSourceDecision();
+
+    auto phaseStart = std::chrono::steady_clock::now();
+    RenderNativePrepass(ystart, yend);
+    AddWholeSceneUpdateTiming(WholeSceneUpdateTiming.NativePrepass, ElapsedUS(phaseStart));
+
+    GLuint nativeDirect3DTex = Parent.OutputTex3D;
+    GLuint highResDirect3DTex = Parent.OutputTex3D;
+    const bool highRes3D = !WholeSceneScaleFinalUpscaleRender3DNative && ScaleFactor > 1;
+    if (highRes3D && WholeSceneDebugPoison.Source3D)
+        PoisonWholeSceneDebugTexture(Parent.OutputTex3D, ScreenW, ScreenH, false);
+
+    if (highRes3D)
+    {
+        nativeDirect3DTex = ResolveDirect3DToNative();
+        if (WholeSceneDebugPoison.Native3DResolve)
+        {
+            PoisonWholeSceneDebugTexture(NativeDirect3DTex, 256, 192, WholeSceneDebugPoison.Native3DResolveAlpha);
+            PoisonWholeSceneDebugTexture(NativeDirect3DSemanticsTex, 256, 192, WholeSceneDebugPoison.Native3DResolveAlpha);
+            PoisonWholeSceneDebugTexture(NativeDirect3DCompositorTex, 256, 192, WholeSceneDebugPoison.Native3DResolveAlpha);
+        }
+        WholeSceneTrace.Native3DResolveValid = true;
+        WholeSceneTrace.Native3DSemanticsValid = true;
+        WholeSceneTrace.Native3DSource = WholeSceneNative3DSource::HighResResolved;
+    }
+    else
+        WholeSceneTrace.Native3DSource = WholeSceneNative3DSource::NativeRendered;
+
+    if (sourceDecision.EffectiveConservativeHybrid &&
+        WholeSceneScaleCaptureBacked &&
+        sourceDecision.ActiveDirect3D)
+    {
+        CaptureBackedHandoffRouteKey handoffKey = BuildCaptureBackedHandoffRouteKey(ystart, yend);
+        const int handoffSlot = CaptureBackedHandoffRouteSlot(handoffKey);
+        const u32 visibleBGLayers = handoffKey.LayerEnable & 0x0Fu;
+        const bool direct3DOnlyLiveBackground =
+            visibleBGLayers == (1u << 0) &&
+            (DispCnt & (1 << 3));
+
+        if (handoffSlot >= 0 &&
+            handoffSlot < kCaptureBackedHandoffRouteSlots &&
+            direct3DOnlyLiveBackground &&
+            IsStableCaptureBackedHandoffLiveUpdate(handoffKey))
+        {
+            CaptureBackedHandoff.CurrentKey = handoffKey;
+            CaptureBackedHandoff.CurrentSlot = static_cast<u8>(handoffSlot);
+            CaptureBackedHandoff.BackgroundUpdated = UpdateCaptureBackedHandoff3DSnapshot(highResDirect3DTex);
+            if (CaptureBackedHandoff.BackgroundUpdated)
+                CaptureBackedHandoff.ReuseDecision = CaptureBackedHandoffReuseReason::UpdatedLive3D;
+        }
+    }
+
+    RecordWholeSceneRenderTrace(sourceDecision.Path, ystart, yend,
+                                highRes3D, false, highRes3D, nativeDirect3DTex);
+
+    if (sourceDecision.RenderNativeFallback)
+    {
+        phaseStart = std::chrono::steady_clock::now();
+        RenderNativeExactFinal(ystart, yend);
+        AddWholeSceneUpdateTiming(WholeSceneUpdateTiming.NativeExactFinal, ElapsedUS(phaseStart));
+        WholeSceneTrace.NativeExactFinalValid = true;
+    }
+
+    RecordWholeSceneNativeProductChunk(ystart, yend);
+
+    if (sourceDecision.EffectiveConservativeHybrid)
+    {
+        if (sourceDecision.RenderForeground2DBase)
+        {
+            auto phaseStart = std::chrono::steady_clock::now();
+            glBindFramebuffer(GL_FRAMEBUFFER, ArtCNNOutputFB);
+            glFramebufferTexture(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, Hybrid2DBaseTex, 0);
+            glDrawBuffer(GL_COLOR_ATTACHMENT0);
+            RenderCompositorPass(ArtCNNOutputFB, OBJLayerTex, ScreenW, ScreenH, ystart, yend, ScaleFactor,
+                                 WholeSceneHighResLayerFilterMode(),
+                                 WholeSceneHighResLayerFilterNoWrap(),
+                                 false,
+                                 false,
+                                 BlankColorTex,
+                                 BlankColorTex);
+            AddWholeSceneUpdateTiming(WholeSceneUpdateTiming.Hybrid2DBaseCandidate, ElapsedUS(phaseStart));
+        }
+
+        if (sourceDecision.RenderForegroundCandidate)
+        {
+            auto phaseStart = std::chrono::steady_clock::now();
+            glBindFramebuffer(GL_FRAMEBUFFER, ArtCNNOutputFB);
+            glFramebufferTexture(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, HybridForegroundTex, 0);
+            glDrawBuffer(GL_COLOR_ATTACHMENT0);
+            RenderCompositorPass(ArtCNNOutputFB, OBJLayerTex, ScreenW, ScreenH, ystart, yend, ScaleFactor,
+                                 WholeSceneHighResLayerFilterMode(),
+                                 WholeSceneHighResLayerFilterNoWrap(),
+                                 false,
+                                 WholeSceneScaleDebugTint,
+                                 highResDirect3DTex,
+                                 0);
+            AddWholeSceneUpdateTiming(WholeSceneUpdateTiming.HybridForegroundCandidate, ElapsedUS(phaseStart));
+        }
+    }
+
+}
+
+void GLRenderer2D::RenderScreenWholeSceneCaptureBackedHandoff(int ystart, int yend)
+{
+    ResetWholeSceneRenderTrace();
+
+    auto phaseStart = std::chrono::steady_clock::now();
+    RenderNativePrepass(ystart, yend);
+    AddWholeSceneUpdateTiming(WholeSceneUpdateTiming.NativePrepass, ElapsedUS(phaseStart));
+
+    const int handoffSlot = BeginCaptureBackedHandoffRoute(ystart, yend);
+    const WholeSceneCaptureRequest handoffRequestBase =
+        ::melonDS::MakeHandoffConsumerCaptureRequest(ystart, yend, handoffSlot);
+
+    HandoffBackgroundChoice handoffBackground = {};
+    if (IsStableCaptureBackedHandoffLiveUpdate(CaptureBackedHandoff.CurrentKey))
+    {
+        if (!TryPrepareStableHandoffLiveBackground(handoffSlot,
+                                                   handoffBackground,
+                                                   ystart,
+                                                   yend))
+        {
+            return;
+        }
+    }
+    else if (CaptureBackedHandoff.CurrentKey.Phase == CaptureBackedHandoffPhase::Live3D)
+    {
+        // A live 3D phase with a bitmap upload is useful for the current frame,
+        // but not safe as a reusable replacement for a captured BG phase.
+        CaptureBackedHandoff.ReuseDecision = CaptureBackedHandoffReuseReason::RejectedUnstableLivePhase;
+        RenderScreenWholeSceneCaptureBackedHybridFallback(ystart, yend);
+        return;
+    }
+    else
+    {
+        const HandoffBackgroundResolveResult resolution =
+            ResolveCapturedHandoffBackgroundChoice(handoffRequestBase, handoffSlot, ystart, yend);
+        if (resolution.Finished)
+            return;
+
+        handoffBackground = resolution.Background;
+    }
+
+    if (TryRenderHandoffBackgroundOverlayProduct(handoffRequestBase,
+                                                 handoffSlot,
+                                                 handoffBackground,
+                                                 ystart,
+                                                 yend))
+    {
+        return;
+    }
+
+    RenderHandoffHybridComposite(handoffRequestBase, handoffBackground, ystart, yend);
 }
 
 void GLRenderer2D::RenderScreenWholeSceneFinalizeFinalUpscaleFullFrame()
@@ -10749,9 +13149,23 @@ void GLRenderer2D::RenderScreenWholeSceneFinalizeFullFrame()
     if (!WholeSceneNativeProductFinalizerPathSeen)
         return;
 
-    if (!CanFinalizeWholeSceneNativeProducts())
+    const bool allowCaptureBackedCadenceFinalize =
+        WholeSceneScaleMode == RendererSettings::WholeScene2DScaleMode::ConservativeHybridUpscale &&
+        IsWholeSceneCaptureBackedHandoffGuardActive() &&
+        WholeSceneTrace.Path == WholeSceneRenderPath::ConservativeHybridUpscale &&
+        WholeSceneNativeProductsFrameComplete &&
+        !WholeSceneFullFrameFinalizerUnsafeFrame;
+
+    if (!CanFinalizeWholeSceneNativeProducts() && !allowCaptureBackedCadenceFinalize)
     {
-        RenderScreenCurrent(LastLine, 192, true);
+        const WholeSceneCaptureBackedPlan capturePlan =
+            ChooseWholeSceneCaptureBackedPlan(LastLine, 192);
+        if (capturePlan.Stage == WholeSceneCaptureBackedPlanStage::AfterGeneralFallbacks)
+            RenderScreenWholeSceneCaptureBackedPlan(capturePlan, LastLine, 192);
+        else
+            RenderScreenCurrent(LastLine, 192, true,
+                                WholeSceneCurrentPathReason::NativeProductFinalizerIncomplete);
+
         const auto end = std::chrono::steady_clock::now();
         WholeSceneTrace.RenderTimeUS +=
             static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(end - start).count());
@@ -10782,89 +13196,213 @@ void GLRenderer2D::RenderScreenWholeSceneFinalizeFullFrame()
 
 void GLRenderer2D::RenderScreenWholeScene(int ystart, int yend)
 {
-    if (CanUseWholeSceneHighResPath())
-        RenderScreenWholeSceneHighRes(ystart, yend);
-    else if (CanUseWholeSceneScalePath() &&
-        CanUseWholeSceneCaptureOnlyHighResPath())
-        RenderScreenWholeSceneSourceACaptureReplacement(ystart, yend);
-    else if (CanUseWholeSceneOverlayOperatorPath())
+    const WholeSceneScaleDecision decision = ChooseWholeSceneScaleDecision(ystart, yend);
+    switch (decision.Reason)
     {
-        if (WholeSceneScaleMode == RendererSettings::WholeScene2DScaleMode::ConservativeHybridUpscale &&
-            ShouldUseWholeSceneCaptureBackedHandoffForRange(ystart, yend))
-            RenderScreenWholeSceneCaptureBackedHandoff(ystart, yend);
-        else if (WholeSceneScaleMode == RendererSettings::WholeScene2DScaleMode::ConservativeHybridUpscale &&
-            IsWholeSceneHybridFragmentationGuardActive())
-            RenderScreenWholeSceneFinalUpscale(ystart, yend, true);
-        else
-            RenderScreenWholeSceneOverlayOperator(ystart, yend);
-    }
-    else if (CanUseWholeSceneFinalUpscalePath())
+    case WholeSceneScaleDecisionReason::HighResCompositor:
+        RenderScreenWholeSceneHighRes(ystart, yend);
+        break;
+    case WholeSceneScaleDecisionReason::SourceACaptureOnlyReplacement:
+        RenderScreenWholeSceneSourceACaptureReplacement(ystart, yend);
+        break;
+    case WholeSceneScaleDecisionReason::CaptureBackedBeforeGeneralFallbacks:
+        RenderScreenWholeSceneCaptureBackedPlan(decision.CapturePlan, ystart, yend);
+        break;
+    case WholeSceneScaleDecisionReason::HybridFragmentationFinalUpscale:
+        RenderScreenWholeSceneFinalUpscale(ystart, yend, true);
+        break;
+    case WholeSceneScaleDecisionReason::OverlayOperator:
+        RenderScreenWholeSceneOverlayOperator(ystart, yend);
+        break;
+    case WholeSceneScaleDecisionReason::FinalNativeUpscale:
         RenderScreenWholeSceneFinalUpscale(ystart, yend);
-    else
+        break;
+    case WholeSceneScaleDecisionReason::LegacyNativeUpscale:
         RenderScreenWholeSceneLegacy(ystart, yend);
+        break;
+    case WholeSceneScaleDecisionReason::None:
+        break;
+    }
+}
+
+WholeSceneScaleDecision GLRenderer2D::ChooseWholeSceneScaleDecision(int ystart, int yend) const
+{
+    WholeSceneScaleDecision decision = {};
+
+    if (CanUseWholeSceneHighResPath())
+    {
+        decision.Reason = WholeSceneScaleDecisionReason::HighResCompositor;
+        decision.Path = WholeSceneRenderPath::HighResCompositor;
+        return decision;
+    }
+
+    if (CanUseWholeSceneScalePath() &&
+        WholeSceneScaleMode == RendererSettings::WholeScene2DScaleMode::ConservativeHybridUpscale &&
+        CanUseWholeSceneMixedSourceACaptureBGPath())
+    {
+        decision.Reason = WholeSceneScaleDecisionReason::SourceACaptureOnlyReplacement;
+        decision.Path = WholeSceneRenderPath::SourceACaptureReplacement;
+        return decision;
+    }
+
+    if (CanUseWholeSceneScalePath() &&
+        CanUseWholeSceneMixedCaptureBackedOBJOverlayPath())
+    {
+        decision.Reason = WholeSceneScaleDecisionReason::SourceACaptureOnlyReplacement;
+        decision.Path = WholeSceneRenderPath::SourceACaptureReplacement;
+        return decision;
+    }
+
+    if (CanUseWholeSceneScalePath() &&
+        CanUseWholeSceneCaptureOnlyHighResPath(ystart, yend))
+    {
+        decision.Reason = WholeSceneScaleDecisionReason::SourceACaptureOnlyReplacement;
+        decision.Path = WholeSceneRenderPath::SourceACaptureReplacement;
+        return decision;
+    }
+
+    if (CanUseWholeSceneOverlayOperatorPath())
+    {
+        WholeSceneOverlayScaleDecisionInputs inputs = {};
+        inputs.CapturePlan = ChooseWholeSceneCaptureBackedPlan(ystart, yend);
+        inputs.ConservativeHybridMode =
+            WholeSceneScaleMode == RendererSettings::WholeScene2DScaleMode::ConservativeHybridUpscale;
+        inputs.HybridFragmentationGuardActive =
+            inputs.ConservativeHybridMode && IsWholeSceneHybridFragmentationGuardActive();
+        return ::melonDS::ChooseWholeSceneOverlayScaleDecision(inputs);
+    }
+
+    if (CanUseWholeSceneFinalUpscalePath())
+    {
+        decision.Reason = WholeSceneScaleDecisionReason::FinalNativeUpscale;
+        decision.Path = WholeSceneRenderPath::FinalNativeUpscale;
+        return decision;
+    }
+
+    decision.Reason = WholeSceneScaleDecisionReason::LegacyNativeUpscale;
+    decision.Path = WholeSceneRenderPath::LegacyNativeUpscale;
+    return decision;
+}
+
+GLRenderer2D::WholeSceneCaptureBackedPlan GLRenderer2D::ChooseWholeSceneCaptureBackedPlan(int ystart, int yend) const
+{
+    int captureEpochOverlayRouteSlot = -1;
+    const bool captureEpochOverlayAvailable =
+        CanUseCaptureEpochBackgroundForLiveOverlay(ystart, yend, captureEpochOverlayRouteSlot);
+
+    if (!captureEpochOverlayAvailable &&
+        CanUseWholeSceneScalePath() &&
+        CanUseWholeSceneOverlayOperatorPath() &&
+        ShouldUseWholeSceneCaptureBackedHandoffForRange(ystart, yend))
+    {
+        return MakeWholeSceneCaptureBackedHandoffPlan();
+    }
+
+    if (WholeSceneScaleRequested &&
+        (WholeSceneScaleState == WholeSceneScaleEligibility::CaptureBackedBG ||
+         WholeSceneScaleState == WholeSceneScaleEligibility::CaptureBackedOBJ) &&
+        CanUseWholeSceneCaptureOnlyHighResPath(ystart, yend))
+    {
+        WholeSceneCaptureBackedPlan plan = MakeWholeSceneSourceACaptureReplacementPlan();
+        if (CanUseSourceABackgroundCurrentOverlayPath() ||
+            CanUseSourceAExactFullProductBridgePath(ystart, yend))
+        {
+            plan.Stage = WholeSceneCaptureBackedPlanStage::BeforeGeneralFallbacks;
+        }
+        return plan;
+    }
+
+    if (captureEpochOverlayAvailable)
+    {
+        return MakeWholeSceneCaptureEpochOverlayPlan(captureEpochOverlayRouteSlot);
+    }
+
+    return {};
+}
+
+void GLRenderer2D::RenderScreenWholeSceneCaptureBackedPlan(const WholeSceneCaptureBackedPlan& plan, int ystart, int yend)
+{
+    switch (plan.Kind)
+    {
+    case WholeSceneCaptureBackedPlanKind::CaptureBackedHandoff:
+        RenderScreenWholeSceneCaptureBackedHandoff(ystart, yend);
+        break;
+    case WholeSceneCaptureBackedPlanKind::SourceACaptureReplacement:
+        RenderScreenWholeSceneSourceACaptureReplacement(ystart, yend);
+        break;
+    case WholeSceneCaptureBackedPlanKind::CaptureEpochOverlay:
+        RenderScreenWholeSceneCaptureEpochOverlay(ystart, yend);
+        break;
+    case WholeSceneCaptureBackedPlanKind::None:
+        break;
+    }
+}
+
+WholeScenePathDecision GLRenderer2D::ChooseWholeScenePathDecision(int ystart, int yend) const
+{
+    WholeScenePathDecisionInputs inputs = {};
+    inputs.CapturePlan = ChooseWholeSceneCaptureBackedPlan(ystart, yend);
+    inputs.CanUseScalePath = CanUseWholeSceneScalePath();
+    inputs.ChunkedUnsafeOverlayAvailable =
+        inputs.CanUseScalePath &&
+        WholeSceneFullFrameFinalizerUnsafeFrame &&
+        WholeSceneScaleFragmentationFallback == RendererSettings::WholeScene2DFragmentationFallback::Off &&
+        CanUseWholeSceneOverlayOperatorPath() &&
+        !IsWholeSceneCaptureBackedHandoffGuardActive();
+    inputs.CurrentFallbackAvailable =
+        inputs.CanUseScalePath &&
+        (WholeSceneFullFrameFinalizerUnsafeFrame ||
+         IsWholeSceneCurrentFragmentationGuardActive());
+    inputs.PhysicalFinalPostprocessNativeInputAvailable =
+        CanUsePhysicalFinalPostprocessNativeInputPath();
+    inputs.HybridPresentationGuardActive =
+        IsWholeSceneHybridPresentationGuardActive(ystart, yend);
+    inputs.SplitLegacyFallbackAvailable = CanUseWholeSceneSplitLegacyFallbackPath();
+    inputs.ConservativeHybridMode =
+        WholeSceneScaleMode == RendererSettings::WholeScene2DScaleMode::ConservativeHybridUpscale;
+
+    return ::melonDS::ChooseWholeScenePathDecision(inputs);
 }
 
 void GLRenderer2D::RenderScreen(int ystart, int yend)
 {
     const auto start = std::chrono::steady_clock::now();
 
-    const bool useChunkedUnsafeOverlay =
-        CanUseWholeSceneScalePath() &&
-        WholeSceneFullFrameFinalizerUnsafeFrame &&
-        WholeSceneScaleFragmentationFallback == RendererSettings::WholeScene2DFragmentationFallback::Off &&
-        CanUseWholeSceneOverlayOperatorPath() &&
-        !IsWholeSceneCaptureBackedHandoffGuardActive();
-    const bool useCurrentFallback =
-        CanUseWholeSceneScalePath() &&
-        (WholeSceneFullFrameFinalizerUnsafeFrame ||
-         IsWholeSceneCurrentFragmentationGuardActive());
-    const bool useCaptureBackedHandoff =
-        CanUseWholeSceneScalePath() &&
-        CanUseWholeSceneOverlayOperatorPath() &&
-        ShouldUseWholeSceneCaptureBackedHandoffForRange(ystart, yend);
-    const bool useCaptureBackedHighResReplacement =
-        WholeSceneScaleRequested &&
-        WholeSceneScaleState == WholeSceneScaleEligibility::CaptureBackedBG &&
-        CanUseWholeSceneCaptureOnlyHighResPath();
-    const bool usePhysicalFinalPostprocessNativeInput =
-        CanUsePhysicalFinalPostprocessNativeInputPath();
-    int captureEpochOverlayRouteSlot = -1;
-    const bool useCaptureEpochOverlay =
-        CanUseCaptureEpochBackgroundForLiveOverlay(ystart, yend, captureEpochOverlayRouteSlot);
-
-    if (useCaptureBackedHandoff)
+    const WholeScenePathDecision decision = ChooseWholeScenePathDecision(ystart, yend);
+    switch (decision.Reason)
     {
-        RenderScreenWholeSceneCaptureBackedHandoff(ystart, yend);
-    }
-    else if (useChunkedUnsafeOverlay)
-    {
-        const bool conservativeHybrid =
-            WholeSceneScaleMode == RendererSettings::WholeScene2DScaleMode::ConservativeHybridUpscale;
+    case WholeScenePathDecisionReason::CaptureBackedProducerDuringHybridGuard:
+    case WholeScenePathDecisionReason::CaptureBackedBeforeGeneralFallbacks:
+    case WholeScenePathDecisionReason::CaptureBackedAfterGeneralFallbacks:
+        RenderScreenWholeSceneCaptureBackedPlan(decision.CapturePlan, ystart, yend);
+        break;
+    case WholeScenePathDecisionReason::HybridPresentationGuard:
+        RenderScreenCurrent(0, 192, false, decision.CurrentReason);
+        break;
+    case WholeScenePathDecisionReason::ChunkedUnsafeOverlay:
         RenderScreenWholeSceneOverlayOperator(ystart, yend);
-        RenderScreenWholeSceneFinalizeOverlayOperatorFullFrame(conservativeHybrid, ystart, yend);
-    }
-    else if (usePhysicalFinalPostprocessNativeInput)
-    {
+        RenderScreenWholeSceneFinalizeOverlayOperatorFullFrame(decision.ConservativeHybrid,
+                                                              ystart,
+                                                              yend);
+        break;
+    case WholeScenePathDecisionReason::PhysicalFinalPostprocessNativeInput:
         RenderScreenPhysicalFinalPostprocessNativeInput(ystart, yend);
-    }
-    else if (CanUseWholeSceneSplitLegacyFallbackPath())
+        break;
+    case WholeScenePathDecisionReason::SplitLegacyFallback:
         RenderScreenWholeSceneLegacy(ystart, yend);
-    else if (useCurrentFallback)
-    {
-        RenderScreenCurrent(ystart, yend, true);
-    }
-    else if (useCaptureBackedHighResReplacement)
-    {
-        RenderScreenWholeSceneSourceACaptureReplacement(ystart, yend);
-    }
-    else if (useCaptureEpochOverlay)
-    {
-        RenderScreenWholeSceneCaptureEpochOverlay(ystart, yend);
-    }
-    else if (CanUseWholeSceneScalePath())
+        break;
+    case WholeScenePathDecisionReason::FragmentationOrUnsafeFrameCurrentFallback:
+        RenderScreenCurrent(ystart, yend, true, decision.CurrentReason);
+        break;
+    case WholeScenePathDecisionReason::WholeSceneScale:
         RenderScreenWholeScene(ystart, yend);
-    else
-        RenderScreenCurrent(ystart, yend);
+        break;
+    case WholeScenePathDecisionReason::ScalePathUnavailable:
+        RenderScreenCurrent(ystart, yend, false, decision.CurrentReason);
+        break;
+    case WholeScenePathDecisionReason::None:
+        break;
+    }
 
     const auto end = std::chrono::steady_clock::now();
     WholeSceneTrace.RenderTimeUS =

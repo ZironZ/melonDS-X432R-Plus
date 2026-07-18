@@ -1582,7 +1582,8 @@ void GPU::CheckCaptureStart()
         // we have an old capture here, and it was at a different offset/size
         // sync it and invalidate it
 
-        Rend->SyncVRAMCapture(dstbank, oldstart, oldsize, (oldflags & CBFlag_Complete));
+        Rend->SetVRAMCaptureSyncReason(2);
+        Rend->SyncVRAMCapture(dstbank, oldstart, oldsize, (oldflags & CBFlag_Complete), true);
         VRAMCBFlagsClear(dstbank, oldstart);
     }
 
@@ -1625,11 +1626,16 @@ void GPU::SyncVRAMCaptureBlock(u32 block, bool write)
     if (flags & CBFlag_Synced)
     {
         if (write)
+        {
+            Rend->SetVRAMCaptureSyncReason(1);
+            Rend->SyncVRAMCapture(bank, start, len, (flags & CBFlag_Complete), true);
             VRAMCBFlagsClear(bank, start);
+        }
         return;
     }
 
-    Rend->SyncVRAMCapture(bank, start, len, (flags & CBFlag_Complete));
+    Rend->SetVRAMCaptureSyncReason(write ? 1 : 0);
+    Rend->SyncVRAMCapture(bank, start, len, (flags & CBFlag_Complete), write);
 
     if (write)
     {
@@ -1658,7 +1664,8 @@ void GPU::SyncAllVRAMCaptures()
         u32 start = flags & 0x3;
         u32 len = (flags >> 6) & 0x3;
 
-        Rend->SyncVRAMCapture(bank, start, len, (flags & CBFlag_Complete));
+        Rend->SetVRAMCaptureSyncReason(3);
+        Rend->SyncVRAMCapture(bank, start, len, (flags & CBFlag_Complete), true);
         VRAMCBFlagsClear(bank, start);
     }
 }
@@ -1670,6 +1677,27 @@ int GPU::GetCaptureBlock_LCDC(u32 offset)
     if (flags & CBFlag_IsCapture)
         return ((offset >> 15) & 0xC) | (flags & 0x3);
     return -1;
+}
+
+bool GPU::HasUnsyncedVRAMCaptureBlock(u32 block) const
+{
+    // Only completed captures count: syncing an in-progress capture would
+    // read back a partial frame.
+    u16 flags = VRAMCaptureBlockFlags[block & 0xF];
+    return (flags & CBFlag_IsCapture) &&
+           (flags & CBFlag_Complete) &&
+           !(flags & CBFlag_Synced);
+}
+
+void GPU::SyncVRAMCaptureBlockForRead(u32 block)
+{
+    SyncVRAMCaptureBlock(block & 0xF, false);
+}
+
+void GPU::NotifyVRAMWrite(u32 bank, u32 offset, u32 bytes, bool changed) noexcept
+{
+    if (Rend)
+        Rend->NotifyVRAMWrite(bank, offset, bytes, changed);
 }
 
 void GPU::GetCaptureInfo(int* info, u16** cbf, int len)

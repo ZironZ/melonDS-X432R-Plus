@@ -29,26 +29,31 @@ struct RendererSettings
     enum class GLScaleAlgorithm : u8
     {
         Spline36 = 0,
-        ArtCNN = 1,
+        ArtCNNDN = 1,
         XBRZ = 2,
-        ArtCNNNonDN = 3,
+        ArtCNN = 3,
         NNEDI3 = 4,
+        CuNNy4x32 = 5,
     };
 
     static constexpr int GLArtCNNModelCount = 2;
+    static constexpr int GLCuNNyModelCount = 1;
+    static constexpr int GLCuNNyMaxConvPasses = 4;
 
     static constexpr GLScaleAlgorithm GetGLScaleAlgorithm(int value)
     {
         switch (value)
         {
-        case static_cast<int>(GLScaleAlgorithm::ArtCNN):
-            return GLScaleAlgorithm::ArtCNN;
+        case static_cast<int>(GLScaleAlgorithm::ArtCNNDN):
+            return GLScaleAlgorithm::ArtCNNDN;
         case static_cast<int>(GLScaleAlgorithm::XBRZ):
             return GLScaleAlgorithm::XBRZ;
-        case static_cast<int>(GLScaleAlgorithm::ArtCNNNonDN):
-            return GLScaleAlgorithm::ArtCNNNonDN;
+        case static_cast<int>(GLScaleAlgorithm::ArtCNN):
+            return GLScaleAlgorithm::ArtCNN;
         case static_cast<int>(GLScaleAlgorithm::NNEDI3):
             return GLScaleAlgorithm::NNEDI3;
+        case static_cast<int>(GLScaleAlgorithm::CuNNy4x32):
+            return GLScaleAlgorithm::CuNNy4x32;
         default:
             return GLScaleAlgorithm::Spline36;
         }
@@ -62,7 +67,7 @@ struct RendererSettings
     static constexpr bool IsGLArtCNNAlgorithm(GLScaleAlgorithm value)
     {
         return value == GLScaleAlgorithm::ArtCNN ||
-               value == GLScaleAlgorithm::ArtCNNNonDN;
+               value == GLScaleAlgorithm::ArtCNNDN;
     }
 
     static constexpr bool IsGLNNEDI3Algorithm(GLScaleAlgorithm value)
@@ -70,9 +75,19 @@ struct RendererSettings
         return value == GLScaleAlgorithm::NNEDI3;
     }
 
+    static constexpr bool IsGLCuNNyAlgorithm(GLScaleAlgorithm value)
+    {
+        return value == GLScaleAlgorithm::CuNNy4x32;
+    }
+
+    static constexpr int GetGLCuNNyModelIndex(GLScaleAlgorithm)
+    {
+        return 0;
+    }
+
     static constexpr int GetGLArtCNNModelIndex(GLScaleAlgorithm value)
     {
-        return value == GLScaleAlgorithm::ArtCNNNonDN ? 1 : 0;
+        return value == GLScaleAlgorithm::ArtCNN ? 1 : 0;
     }
 
     enum class WholeScene2DScaleMode : u8
@@ -341,6 +356,16 @@ struct RendererSettings
         // crop simple draw UV bounds into separate texture variants for alpha-aware filterable mipmaps
         bool MipmapSubrectHandling = false;
 
+        // force nearest sampling for simple pixel-mapped 2D sprite-like 3D draws
+        bool Smart2DFiltering = false;
+
+        // force nearest sampling for large translucent textured draws that show filtered seams
+        bool TranslucentTextureFilteringGuard = false;
+
+        // inset simple sprite-like draw UVs before sampling, reducing atlas-edge bleed
+        // from filtered or scaled 3D textures
+        bool SpriteUVInset = false;
+
         // use transparent-edge RGB padding before generating filterable 3D texture mipmaps
         bool MipmapAlphaHandling = false;
 
@@ -356,6 +381,9 @@ struct RendererSettings
                 BinaryAlphaHandling == other.BinaryAlphaHandling &&
                 TopologyAwareMipHandling == other.TopologyAwareMipHandling &&
                 MipmapSubrectHandling == other.MipmapSubrectHandling &&
+                Smart2DFiltering == other.Smart2DFiltering &&
+                TranslucentTextureFilteringGuard == other.TranslucentTextureFilteringGuard &&
+                SpriteUVInset == other.SpriteUVInset &&
                 MipmapAlphaHandling == other.MipmapAlphaHandling &&
                 MipDepth == other.MipDepth &&
                 LosslessRGB6Repack == other.LosslessRGB6Repack;
@@ -396,6 +424,12 @@ struct RendererSettings
         // use the full GPU 3D texture alpha-edge padding for comparison
         bool QualityAlphaHandling = false;
 
+        // use xBRZ instead of Spline36 for eligible GPU texture-scaling alpha
+        bool AlphaXBRZ = false;
+
+        // use Spline36 instead of center-aligned linear alpha for GPU texture scaling
+        bool Spline36Alpha = false;
+
         bool operator==(const TextureScalingSettings& other) const
         {
             return Enabled == other.Enabled &&
@@ -406,7 +440,9 @@ struct RendererSettings
                 SourceMips == other.SourceMips &&
                 EdgeExtendUnusedMargins == other.EdgeExtendUnusedMargins &&
                 LegacyAlphaHandling == other.LegacyAlphaHandling &&
-                QualityAlphaHandling == other.QualityAlphaHandling;
+                QualityAlphaHandling == other.QualityAlphaHandling &&
+                AlphaXBRZ == other.AlphaXBRZ &&
+                Spline36Alpha == other.Spline36Alpha;
         }
 
         bool operator!=(const TextureScalingSettings& other) const

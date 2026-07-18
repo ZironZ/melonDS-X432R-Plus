@@ -18,7 +18,10 @@
 
 #include <string.h>
 #include <stdio.h>
+#include <algorithm>
 #include <chrono>
+#include <utility>
+#include <vector>
 #include "NDS.h"
 #include "GPU_OpenGL.h"
 
@@ -29,11 +32,23 @@ using Platform::LogLevel;
 
 namespace
 {
+constexpr u32 VRAMCaptureInvalidationPreWriteSync = 1;
+constexpr u32 MainVRAMDisplayCaptureBlockBytes = 64 * 512;
+constexpr u32 MainVRAMDisplayCaptureVisibleBytes = 192 * 512;
+constexpr u32 MainVRAMDisplayCaptureRowBytes = 512;
+
 u64 ElapsedUS(std::chrono::steady_clock::time_point start)
 {
     return static_cast<u64>(
         std::chrono::duration_cast<std::chrono::microseconds>(
             std::chrono::steady_clock::now() - start).count());
+}
+
+bool IsFullWholeSceneSourcePath(WholeSceneRenderPath path)
+{
+    return path == WholeSceneRenderPath::HighResCompositor ||
+           path == WholeSceneRenderPath::OverlayOperatorUpscale ||
+           path == WholeSceneRenderPath::ConservativeHybridUpscale;
 }
 
 }
@@ -71,6 +86,27 @@ GLRenderer::GLRenderer(melonDS::NDS& nds, bool compute)
     memset(PhysicalFinalNativeInputValid, 0, sizeof(PhysicalFinalNativeInputValid));
     memset(PhysicalFinalNativeInputPath, 0, sizeof(PhysicalFinalNativeInputPath));
     FinalCaptureSourceDebug = {};
+    LastFinalPresentationState = {};
+    FinalPresentationScreenSwapExcursionBaseline = {};
+    FinalPresentationStateStableScanlines = 0;
+    FinalPresentationScreenSwapExcursionScanlines = 0;
+    FinalPresentationScreenSwapExcursionActive = false;
+    FinalPresentationTransitionGuardFrames = 0;
+    Output3DSerial = 0;
+    Output3DSceneHash = 0;
+    memset(MainVRAMDisplayExactProductEvent, 0, sizeof(MainVRAMDisplayExactProductEvent));
+    VRAMDisplayWriteDebug = {};
+    WholeSceneDebugViewsActive.store(false, std::memory_order_relaxed);
+    RollingFinalDebugCaptureEnabled = false;
+    RollingFinalDebugCapacity = 0;
+    RollingFinalDebugWriteIndex = 0;
+    RollingFinalDebugSerial = 0;
+    WholeSceneTimingFrameValid = false;
+    WholeSceneTimingFrame = 0;
+    RollingFinalDebugTex = 0;
+    RollingFinalDebugFB = 0;
+    RollingFinalDebugWidth = 0;
+    RollingFinalDebugHeight = 0;
 }
 
 #define glTexParams(target, wrap) \
@@ -154,6 +190,8 @@ bool GLRenderer::Init()
     glGenFramebuffers(2, &PhysicalFinalNativeFB[0]);
     glGenFramebuffers(2, &PhysicalFinalScaledFB[0]);
     glGenFramebuffers(2, &PhysicalFinalOutputLayerFB[0]);
+    glGenTextures(1, &RollingFinalDebugTex);
+    glGenFramebuffers(1, &RollingFinalDebugFB);
 
     // capture vertex data: 2x position, 2x texcoord
     glGenBuffers(1, &CaptureVtxBuffer);
@@ -225,6 +263,17 @@ bool GLRenderer::Init()
     glDrawBuffer(GL_COLOR_ATTACHMENT0);
     glReadBuffer(GL_COLOR_ATTACHMENT0);
 
+    glGenTextures(1, &CaptureLumaProbeTex);
+    glBindTexture(GL_TEXTURE_2D, CaptureLumaProbeTex);
+    glTexParams(GL_TEXTURE_2D, GL_CLAMP_TO_EDGE);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 256, 256, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+
+    glGenFramebuffers(1, &CaptureLumaProbeFB);
+    glBindFramebuffer(GL_FRAMEBUFFER, CaptureLumaProbeFB);
+    glFramebufferTexture(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, CaptureLumaProbeTex, 0);
+    glDrawBuffer(GL_COLOR_ATTACHMENT0);
+    glReadBuffer(GL_COLOR_ATTACHMENT0);
+
     glGenTextures(4, HighResDisplayCaptureBackgroundTex);
     glGenFramebuffers(4, HighResDisplayCaptureBackgroundFB);
     glGenFramebuffers(1, &HighResDisplayCaptureBackgroundReadFB);
@@ -233,6 +282,8 @@ bool GLRenderer::Init()
     glGenFramebuffers(1, &HighResDisplayCaptureFullReadFB);
     glGenTextures(2, ActiveCaptureBackgroundEpochTex);
     glGenFramebuffers(2, ActiveCaptureBackgroundEpochFB);
+    glGenTextures(4, MainVRAMDisplayEpochTex);
+    glGenFramebuffers(4, MainVRAMDisplayEpochFB);
     for (int i = 0; i < 4; i++)
     {
         glBindTexture(GL_TEXTURE_2D, HighResDisplayCaptureBackgroundTex[i]);
@@ -248,6 +299,14 @@ bool GLRenderer::Init()
 
         glBindFramebuffer(GL_FRAMEBUFFER, HighResDisplayCaptureFullFB[i]);
         glFramebufferTexture(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, HighResDisplayCaptureFullTex[i], 0);
+        glDrawBuffer(GL_COLOR_ATTACHMENT0);
+        glReadBuffer(GL_COLOR_ATTACHMENT0);
+
+        glBindTexture(GL_TEXTURE_2D, MainVRAMDisplayEpochTex[i]);
+        glTexParams(GL_TEXTURE_2D, GL_CLAMP_TO_EDGE);
+
+        glBindFramebuffer(GL_FRAMEBUFFER, MainVRAMDisplayEpochFB[i]);
+        glFramebufferTexture(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, MainVRAMDisplayEpochTex[i], 0);
         glDrawBuffer(GL_COLOR_ATTACHMENT0);
         glReadBuffer(GL_COLOR_ATTACHMENT0);
     }
@@ -344,6 +403,8 @@ GLRenderer::~GLRenderer()
     glDeleteFramebuffers(2, PhysicalFinalNativeFB);
     glDeleteFramebuffers(2, PhysicalFinalScaledFB);
     glDeleteFramebuffers(2, PhysicalFinalOutputLayerFB);
+    glDeleteTextures(1, &RollingFinalDebugTex);
+    glDeleteFramebuffers(1, &RollingFinalDebugFB);
     glDeleteTextures(1, &AuxInputTex);
     glDeleteTextures(1, &CaptureVRAMTex);
     glDeleteTextures(2, FPOutputTex);
@@ -360,6 +421,8 @@ GLRenderer::~GLRenderer()
     glDeleteFramebuffers(16, CaptureOutput128FB);
     glDeleteTextures(1, &CaptureSyncTex);
     glDeleteFramebuffers(1, &CaptureSyncFB);
+    glDeleteTextures(1, &CaptureLumaProbeTex);
+    glDeleteFramebuffers(1, &CaptureLumaProbeFB);
     glDeleteTextures(4, HighResDisplayCaptureBackgroundTex);
     glDeleteFramebuffers(4, HighResDisplayCaptureBackgroundFB);
     glDeleteFramebuffers(1, &HighResDisplayCaptureBackgroundReadFB);
@@ -368,6 +431,8 @@ GLRenderer::~GLRenderer()
     glDeleteFramebuffers(1, &HighResDisplayCaptureFullReadFB);
     glDeleteTextures(2, ActiveCaptureBackgroundEpochTex);
     glDeleteFramebuffers(2, ActiveCaptureBackgroundEpochFB);
+    glDeleteTextures(4, MainVRAMDisplayEpochTex);
+    glDeleteFramebuffers(4, MainVRAMDisplayEpochFB);
 
     glDeleteBuffers(1, &FPConfigUBO);
     glDeleteBuffers(1, &CaptureConfigUBO);
@@ -385,9 +450,16 @@ void GLRenderer::Reset()
     memset(LastDisplayCapture128Debug, 0, sizeof(LastDisplayCapture128Debug));
     memset(&LastHighResDisplayCaptureEvent, 0, sizeof(LastHighResDisplayCaptureEvent));
     memset(HighResDisplayCapture256Event, 0, sizeof(HighResDisplayCapture256Event));
+    memset(MainVRAMDisplayExactProductEvent, 0, sizeof(MainVRAMDisplayExactProductEvent));
     memset(ActiveCaptureBackgroundEpoch, 0, sizeof(ActiveCaptureBackgroundEpoch));
+    memset(MainVRAMDisplayEpoch, 0, sizeof(MainVRAMDisplayEpoch));
+    MainVRAMDisplayEpochInvalidationDebug = {};
+    PendingVRAMCaptureSyncReason = 0;
     memset(CaptureOutput256Valid, 0, sizeof(CaptureOutput256Valid));
     HighResDisplayCaptureEventSerial = 0;
+    Output3DSerial = 0;
+    Output3DSceneHash = 0;
+    ClearRollingFinalDebugCapture();
 
     AuxUsageMask = 0;
 
@@ -402,6 +474,12 @@ void GLRenderer::Reset()
     LastCapLine = 0;
     Aux0VRAMCap = -1;
     FinalPassInvalidCaptureReseed = false;
+    LastFinalPresentationState = {};
+    FinalPresentationScreenSwapExcursionBaseline = {};
+    FinalPresentationStateStableScanlines = 0;
+    FinalPresentationScreenSwapExcursionScanlines = 0;
+    FinalPresentationScreenSwapExcursionActive = false;
+    FinalPresentationTransitionGuardFrames = 0;
     ResetWholeSceneFrameTiming();
 
     Rend2D_A->Reset();
@@ -412,7 +490,18 @@ void GLRenderer::Reset()
 void GLRenderer::ResetWholeSceneFrameTiming()
 {
     WholeSceneFrameTiming = {};
+    LastCaptureNativeLumaDebug = {};
+    if (WholeSceneTimingCSVActiveFrames > 0)
+        WholeSceneTimingCSVActiveFrames--;
+    MainVRAMDisplayEpochInvalidationDebug = {};
+    VRAMDisplayWriteDebug = {};
+    VRAMDisplayWriteDebug.DisplayBank = 0xFFFFFFFFu;
+    VRAMDisplayWriteDebug.DisplayFirstOffset = 0xFFFFFFFFu;
+    VRAMDisplayWriteDebug.DisplayDirtyYStart = 192;
+    VRAMDisplayWriteDebug.DisplayDirtyYEnd = 0;
     FinalPassInvalidCaptureReseed = false;
+    if (FinalPresentationTransitionGuardFrames > 0)
+        FinalPresentationTransitionGuardFrames--;
     memset(PhysicalFinalNativeRowValid, 0, sizeof(PhysicalFinalNativeRowValid));
     PhysicalFinalNativeValidRows = 0;
     PhysicalFinalPostprocessApplied = false;
@@ -529,7 +618,11 @@ void GLRenderer::SetScaleFactor(int scale)
     }
     memset(&LastHighResDisplayCaptureEvent, 0, sizeof(LastHighResDisplayCaptureEvent));
     memset(HighResDisplayCapture256Event, 0, sizeof(HighResDisplayCapture256Event));
+    memset(MainVRAMDisplayExactProductEvent, 0, sizeof(MainVRAMDisplayExactProductEvent));
     memset(ActiveCaptureBackgroundEpoch, 0, sizeof(ActiveCaptureBackgroundEpoch));
+    memset(MainVRAMDisplayEpoch, 0, sizeof(MainVRAMDisplayEpoch));
+    MainVRAMDisplayEpochInvalidationDebug = {};
+    PendingVRAMCaptureSyncReason = 0;
 
     for (int i = 0; i < 4; i++)
     {
@@ -546,6 +639,14 @@ void GLRenderer::SetScaleFactor(int scale)
 
         glBindFramebuffer(GL_FRAMEBUFFER, HighResDisplayCaptureFullFB[i]);
         glFramebufferTexture(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, HighResDisplayCaptureFullTex[i], 0);
+        glDrawBuffer(GL_COLOR_ATTACHMENT0);
+        glReadBuffer(GL_COLOR_ATTACHMENT0);
+
+        glBindTexture(GL_TEXTURE_2D, MainVRAMDisplayEpochTex[i]);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, ScreenW, ScreenH, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+
+        glBindFramebuffer(GL_FRAMEBUFFER, MainVRAMDisplayEpochFB[i]);
+        glFramebufferTexture(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, MainVRAMDisplayEpochTex[i], 0);
         glDrawBuffer(GL_COLOR_ATTACHMENT0);
         glReadBuffer(GL_COLOR_ATTACHMENT0);
     }
@@ -606,6 +707,11 @@ void GLRenderer::SetScaleFactor(int scale)
         glReadBuffer(GL_COLOR_ATTACHMENT0);
     }
 
+    if (RollingFinalDebugCaptureEnabled)
+        EnsureRollingFinalDebugStorage();
+    else
+        ClearRollingFinalDebugCapture();
+
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
 }
 
@@ -636,6 +742,8 @@ void GLRenderer::DrawScanline(u32 line)
         need_render = true;
         need_capture = true;
     }
+
+    UpdateFinalPresentationTransitionGuard();
 
     NeedPartialRender = need_render;
     Rend2D_A->DrawScanline(line);
@@ -745,6 +853,14 @@ void GLRenderer::Start3DRendering()
 {
     const auto phaseStart = std::chrono::steady_clock::now();
     Rend3D->RenderFrame();
+    bool output3DUpdated = true;
+    if (auto* rend3d = dynamic_cast<GLRenderer3D*>(Rend3D.get()))
+        output3DUpdated = !rend3d->WasLastRenderFrameSkipped();
+    else if (auto* rend3d = dynamic_cast<ComputeRenderer3D*>(Rend3D.get()))
+        output3DUpdated = !rend3d->WasLastRenderFrameSkipped();
+    if (output3DUpdated)
+        Output3DSerial++;
+    Output3DSceneHash = GPU.GPU3D.GetRenderSceneHash();
     AddWholeScenePhaseTiming(WholeSceneFrameTiming.Start3D, ElapsedUS(phaseStart));
 }
 
@@ -770,7 +886,8 @@ void GLRenderer::RenderFinalPassToFramebuffer(int ystart,
                                               int viewportH,
                                               int framebufferScale,
                                               GLuint mainInputTex,
-                                              GLuint subInputTex)
+                                              GLuint subInputTex,
+                                              bool mainInputReplacesVRAMDisplay)
 {
     glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, targetFB);
@@ -806,13 +923,73 @@ void GLRenderer::RenderFinalPassToFramebuffer(int ystart,
     {
         glUseProgram(FPShader);
 
+        const u32 modeA = (DispCntA >> 16) & 0x3;
         FinalPassConfig.uScaleFactor = ScaleFactor;
-        FinalPassConfig.uDispModeA = (DispCntA >> 16) & 0x3;
+        FinalPassConfig.uDispModeA = (mainInputReplacesVRAMDisplay && modeA == 2) ? 1 : modeA;
         FinalPassConfig.uDispModeB = (DispCntB >> 16) & 0x1;
         FinalPassConfig.uBrightModeA = (MasterBrightnessA >> 14) & 0x3;
         FinalPassConfig.uBrightModeB = (MasterBrightnessB >> 14) & 0x3;
         FinalPassConfig.uBrightFactorA = std::min(MasterBrightnessA & 0x1F, 16);
         FinalPassConfig.uBrightFactorB = std::min(MasterBrightnessB & 0x1F, 16);
+
+        const auto packedMasterBrightness = [](u16 masterBrightness)
+        {
+            const u32 mode = (masterBrightness >> 14) & 0x3;
+            const u32 factor = std::min<u32>(masterBrightness & 0x1F, 16);
+            return (mode << 8) | factor;
+        };
+        const auto masterBrightnessActive = [](u16 masterBrightness)
+        {
+            const u32 mode = (masterBrightness >> 14) & 0x3;
+            const u32 factor = std::min<u32>(masterBrightness & 0x1F, 16);
+            return (mode == 1 || mode == 2) && factor > 0;
+        };
+        const auto outputHasBrightnessProof =
+            [&](const GLRenderer2D* renderer,
+                u16 masterBrightness,
+                WholeSceneCaptureEffectOwner effectOwner)
+        {
+            if (!renderer || !masterBrightnessActive(masterBrightness))
+                return false;
+
+            const auto& trace = renderer->WholeSceneTrace;
+            return ystart >= trace.YStart &&
+                   yend <= trace.YEnd &&
+                   trace.OutputPresentationMasterBrightnessApplied &&
+                   trace.OutputPresentationEffectOwner == static_cast<u32>(effectOwner) &&
+                   trace.OutputPresentationEffectState == packedMasterBrightness(masterBrightness);
+        };
+
+        const auto* rendA = dynamic_cast<const GLRenderer2D*>(Rend2D_A.get());
+        const bool mainInputBrightnessAlreadyApplied =
+            outputHasBrightnessProof(rendA,
+                                     MasterBrightnessA,
+                                     WholeSceneCaptureEffectOwner::CurrentEngine) ||
+            outputHasBrightnessProof(rendA,
+                                     MasterBrightnessA,
+                                     WholeSceneCaptureEffectOwner::SourceA);
+        if (mainInputBrightnessAlreadyApplied)
+        {
+            FinalPassConfig.uBrightModeA = 0;
+            FinalPassConfig.uBrightFactorA = 0;
+        }
+
+        const auto* rendB = dynamic_cast<const GLRenderer2D*>(Rend2D_B.get());
+        const bool subInputBrightnessAlreadyApplied =
+            outputHasBrightnessProof(rendB,
+                                     MasterBrightnessB,
+                                     WholeSceneCaptureEffectOwner::CurrentEngine) ||
+            (rendB &&
+             rendB->WholeSceneTrace.Path ==
+                 GLRenderer2D::WholeSceneRenderPath::SourceACaptureReplacement &&
+             outputHasBrightnessProof(rendB,
+                                      MasterBrightnessA,
+                                      WholeSceneCaptureEffectOwner::SourceA));
+        if (subInputBrightnessAlreadyApplied)
+        {
+            FinalPassConfig.uBrightModeB = 0;
+            FinalPassConfig.uBrightFactorB = 0;
+        }
 
         if (AuxUsageMask)
         {
@@ -836,9 +1013,8 @@ void GLRenderer::RenderFinalPassToFramebuffer(int ystart,
         glBindTexture(GL_TEXTURE_2D, subInputTex);
 
         glActiveTexture(GL_TEXTURE2);
-        u32 modeA = (DispCntA >> 16) & 0x3;
         bool invalidTrackedFeedbackReseed = false;
-        if ((modeA == 2) && (vramcap != -1))
+        if (!mainInputReplacesVRAMDisplay && (modeA == 2) && (vramcap != -1))
         {
             const u32 trackedBank = static_cast<u32>(vramcap) >> 2;
             const u32 trackedOffset = static_cast<u32>(vramcap) & 0x3u;
@@ -870,7 +1046,7 @@ void GLRenderer::RenderFinalPassToFramebuffer(int ystart,
                 FinalPassConfig.uAuxColorFactor = 63.75f;
             }
         }
-        else if (modeA >= 2)
+        else if (!mainInputReplacesVRAMDisplay && modeA >= 2)
         {
             glBindTexture(GL_TEXTURE_2D_ARRAY, AuxInputTex);
             FinalPassConfig.uAuxLayer = (modeA - 2);
@@ -887,6 +1063,244 @@ void GLRenderer::RenderFinalPassToFramebuffer(int ystart,
     }
 
     glDisable(GL_SCISSOR_TEST);
+}
+
+void GLRenderer::RenderMainVRAMDisplayNativeFallbackUpscale(int backbuf, int ystart, int yend)
+{
+    auto* scaler = dynamic_cast<GLRenderer2D*>(Rend2D_A.get());
+    if (!scaler)
+        return;
+
+    const int y0 = std::max(0, std::min(192, ystart));
+    const int y1 = std::max(y0, std::min(192, yend));
+    if (y0 >= y1)
+        return;
+
+    bool mainBottom = IsEngineRoutedToFinalBottom(0, y0, y1);
+    const int layer = mainBottom ? 1 : 0;
+
+    RenderFinalPassToFramebuffer(ystart, yend,
+                                 NativeFPOutputFB[backbuf],
+                                 256, 192, 1,
+                                 OutputTex2D[0],
+                                 OutputTex2D[1]);
+
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, NativeFPOutputLayerReadFB[layer]);
+    glFramebufferTextureLayer(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                              NativeFPOutputTex[backbuf], 0, layer);
+    glReadBuffer(GL_COLOR_ATTACHMENT0);
+
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, PhysicalFinalNativeFB[layer]);
+    glDrawBuffer(GL_COLOR_ATTACHMENT0);
+
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_STENCIL_TEST);
+    glDisable(GL_BLEND);
+    glDisable(GL_SCISSOR_TEST);
+    glColorMaski(0, GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glDepthMask(GL_FALSE);
+
+    glBlitFramebuffer(0, y0, 256, y1,
+                      0, y0, 256, y1,
+                      GL_COLOR_BUFFER_BIT, GL_NEAREST);
+
+    scaler->RenderNativeFinalUpscaleToTexture(PhysicalFinalNativeTex[layer],
+                                              PhysicalFinalScaledTex[layer]);
+
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, PhysicalFinalScaledFB[layer]);
+    glReadBuffer(GL_COLOR_ATTACHMENT0);
+
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, PhysicalFinalOutputLayerFB[layer]);
+    glFramebufferTextureLayer(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                              FPOutputTex[backbuf], 0, layer);
+    glDrawBuffer(GL_COLOR_ATTACHMENT0);
+
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_STENCIL_TEST);
+    glDisable(GL_BLEND);
+    glDisable(GL_SCISSOR_TEST);
+    glColorMaski(0, GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glDepthMask(GL_FALSE);
+
+    glBlitFramebuffer(0, y0 * ScaleFactor, ScreenW, y1 * ScaleFactor,
+                      0, y0 * ScaleFactor, ScreenW, y1 * ScaleFactor,
+                      GL_COLOR_BUFFER_BIT, GL_NEAREST);
+}
+
+bool GLRenderer::EnsureRollingFinalDebugStorage()
+{
+    if (!RollingFinalDebugCaptureEnabled || RollingFinalDebugCapacity <= 0)
+        return false;
+
+    if (RollingFinalDebugTex == 0)
+        glGenTextures(1, &RollingFinalDebugTex);
+    if (RollingFinalDebugFB == 0)
+        glGenFramebuffers(1, &RollingFinalDebugFB);
+
+    if (RollingFinalDebugWidth == ScreenW &&
+        RollingFinalDebugHeight == ScreenH &&
+        static_cast<int>(RollingFinalDebugSlots.size()) == RollingFinalDebugCapacity)
+    {
+        return true;
+    }
+
+    GLint prevActiveTexture = GL_TEXTURE0;
+    GLint prevArrayBinding = 0;
+    glGetIntegerv(GL_ACTIVE_TEXTURE, &prevActiveTexture);
+    glActiveTexture(GL_TEXTURE0);
+    glGetIntegerv(GL_TEXTURE_BINDING_2D_ARRAY, &prevArrayBinding);
+
+    glBindTexture(GL_TEXTURE_2D_ARRAY, RollingFinalDebugTex);
+    glTexParams(GL_TEXTURE_2D_ARRAY, GL_CLAMP_TO_EDGE);
+    glTexImage3D(GL_TEXTURE_2D_ARRAY,
+                 0,
+                 GL_RGBA,
+                 ScreenW,
+                 ScreenH,
+                 RollingFinalDebugCapacity * 2,
+                 0,
+                 GL_RGBA,
+                 GL_UNSIGNED_BYTE,
+                 nullptr);
+    glBindTexture(GL_TEXTURE_2D_ARRAY, prevArrayBinding);
+    glActiveTexture(prevActiveTexture);
+
+    RollingFinalDebugWidth = ScreenW;
+    RollingFinalDebugHeight = ScreenH;
+    RollingFinalDebugWriteIndex = 0;
+    RollingFinalDebugSlots.assign(RollingFinalDebugCapacity, {});
+    return true;
+}
+
+void GLRenderer::ClearRollingFinalDebugCapture()
+{
+    RollingFinalDebugWriteIndex = 0;
+    RollingFinalDebugSlots.assign(RollingFinalDebugCapacity > 0 ? RollingFinalDebugCapacity : 0, {});
+}
+
+void GLRenderer::SetWholeScene2DTimingFrame(u64 frame, bool valid)
+{
+    WholeSceneTimingFrame = frame;
+    WholeSceneTimingFrameValid = valid;
+}
+
+WholeScene2DFinalDebugFrame GLRenderer::CaptureRollingFinalDebugMetadata(u64 serial) const
+{
+    auto fillEngine = [](const GLRenderer2D* renderer) -> WholeScene2DEngineDebugIdentity
+    {
+        WholeScene2DEngineDebugIdentity identity;
+        if (!renderer)
+            return identity;
+
+        const auto& trace = renderer->WholeSceneTrace;
+        identity.Path = static_cast<int>(trace.Path);
+        identity.ProductChoice = static_cast<int>(trace.SourceAProductChoice);
+        identity.SourceAResolutionMode = static_cast<int>(trace.SourceACaptureMode);
+        identity.ChosenProductKind = static_cast<int>(trace.SourceAChosenProductKind);
+        identity.ChosenProductRenderAction = static_cast<int>(trace.SourceAChosenProductRenderAction);
+        identity.ChosenProductTex = trace.SourceAChosenProductTex;
+        identity.ChosenProductCaptureBank = trace.SourceAChosenProductCaptureBank;
+        identity.ChosenProductBackgroundEpochSerial = trace.SourceAChosenProductBackgroundEpochSerial;
+        identity.ChosenProductSource3DSerial = trace.SourceAChosenProductSource3DSerial;
+        identity.ChosenProductCaptureEventSerial = trace.SourceAChosenProductCaptureEventSerial;
+        identity.ChosenProductCapturePresentationHash = trace.SourceAChosenProductCapturePresentationHash;
+        identity.ChosenProductCurrentPresentationHash = trace.SourceAChosenProductCurrentPresentationHash;
+        identity.RequestCapturePresentationHash = trace.SourceACapturePresentationHash;
+        identity.RequestCurrentPresentationHash = trace.SourceACurrentPresentationHash;
+        return identity;
+    };
+
+    WholeScene2DFinalDebugFrame frame;
+    frame.Serial = serial;
+    frame.TimingFrameValid = WholeSceneTimingFrameValid;
+    frame.TimingFrame = WholeSceneTimingFrame;
+
+    const int finalDispModeA = (DispCntA >> 16) & 0x3;
+    const int finalDispModeB = (DispCntB >> 16) & 0x1;
+    const int finalScreenSwap = FinalPassConfig.uScreenSwap[0] ? 1 : 0;
+    const int finalMainVRAMBank = finalDispModeA == 2 ? static_cast<int>((DispCntA >> 18) & 0x3) : -1;
+    bool finalVRAMDisplayUsedEpoch = false;
+    const bool finalVRAMDisplayReplacementEligible =
+        finalDispModeA == 2 &&
+        finalMainVRAMBank >= 0 &&
+        CanUseMainVRAMDisplayHighResCaptureReplacement(static_cast<u32>(finalMainVRAMBank),
+                                                       nullptr,
+                                                       nullptr,
+                                                       &finalVRAMDisplayUsedEpoch);
+    (void)finalVRAMDisplayUsedEpoch;
+
+    const int finalMainSource =
+        FinalPassInvalidCaptureReseed ? 6 :
+        (finalDispModeA == 0) ? 0 :
+        (finalDispModeA == 1) ? 1 :
+        (finalDispModeA == 2 && (Aux0VRAMCap != -1 || finalVRAMDisplayReplacementEligible)) ? 3 :
+        (finalDispModeA == 2) ? 4 :
+        (finalDispModeA == 3) ? 5 : -1;
+    const int finalSubSource = finalDispModeB == 0 ? 0 : 2;
+    frame.FinalTopSource = finalScreenSwap ? finalMainSource : finalSubSource;
+    frame.FinalBottomSource = finalScreenSwap ? finalSubSource : finalMainSource;
+
+    frame.EngineA = fillEngine(dynamic_cast<const GLRenderer2D*>(Rend2D_A.get()));
+    frame.EngineB = fillEngine(dynamic_cast<const GLRenderer2D*>(Rend2D_B.get()));
+    return frame;
+}
+
+void GLRenderer::CaptureRollingFinalDebugFrame(int backbuf)
+{
+    if (!RollingFinalDebugCaptureEnabled || !EnsureRollingFinalDebugStorage())
+        return;
+
+    GLint prevReadFB = 0;
+    GLint prevDrawFB = 0;
+    GLint prevReadBuffer = GL_COLOR_ATTACHMENT0;
+    GLint prevDrawBuffers[2] = {GL_COLOR_ATTACHMENT0, GL_NONE};
+    glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &prevReadFB);
+    glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &prevDrawFB);
+    glGetIntegerv(GL_READ_BUFFER, &prevReadBuffer);
+    glGetIntegerv(GL_DRAW_BUFFER0, &prevDrawBuffers[0]);
+    glGetIntegerv(GL_DRAW_BUFFER1, &prevDrawBuffers[1]);
+
+    const int slot = RollingFinalDebugWriteIndex;
+    const int topLayer = slot * 2;
+    const int bottomLayer = topLayer + 1;
+
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, FPOutputFB[backbuf]);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, RollingFinalDebugFB);
+    glDrawBuffer(GL_COLOR_ATTACHMENT0);
+
+    glReadBuffer(GL_COLOR_ATTACHMENT0);
+    glFramebufferTextureLayer(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, RollingFinalDebugTex, 0, topLayer);
+    glBlitFramebuffer(0, 0, ScreenW, ScreenH,
+                      0, 0, ScreenW, ScreenH,
+                      GL_COLOR_BUFFER_BIT, GL_NEAREST);
+
+    glReadBuffer(GL_COLOR_ATTACHMENT1);
+    glFramebufferTextureLayer(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, RollingFinalDebugTex, 0, bottomLayer);
+    glBlitFramebuffer(0, 0, ScreenW, ScreenH,
+                      0, 0, ScreenW, ScreenH,
+                      GL_COLOR_BUFFER_BIT, GL_NEAREST);
+
+    const u64 serial = RollingFinalDebugSerial++;
+    RollingFinalDebugSlots[slot].Valid = true;
+    RollingFinalDebugSlots[slot].Serial = serial;
+    RollingFinalDebugSlots[slot].Metadata = CaptureRollingFinalDebugMetadata(serial);
+    RollingFinalDebugWriteIndex = (RollingFinalDebugWriteIndex + 1) % RollingFinalDebugCapacity;
+
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, prevReadFB);
+    glReadBuffer(prevReadBuffer);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, prevDrawFB);
+    if (prevDrawFB != 0 && prevDrawBuffers[1] != GL_NONE)
+    {
+        const GLenum drawBuffers[2] = {
+            static_cast<GLenum>(prevDrawBuffers[0]),
+            static_cast<GLenum>(prevDrawBuffers[1]),
+        };
+        glDrawBuffers(2, drawBuffers);
+    }
+    else
+    {
+        glDrawBuffer(prevDrawBuffers[0]);
+    }
 }
 
 bool GLRenderer::CanRenderPhysicalFinalUpscaleForRange(int ystart, int yend) const
@@ -912,6 +1326,27 @@ bool GLRenderer::CanRenderPhysicalFinalUpscaleForRange(int ystart, int yend) con
 
     return (!mainNeedsEngineInput || rendererHasPhysicalFinalInputForRange(rendA)) &&
            (!subNeedsEngineInput || rendererHasPhysicalFinalInputForRange(rendB));
+}
+
+bool GLRenderer::CanUpscaleMainVRAMDisplayNativeFallbackForRange(int ystart, int yend) const
+{
+    if (ScaleFactor <= 1 ||
+        ystart > 0 ||
+        yend < 192 ||
+        ((DispCntA >> 16) & 0x3u) != 2)
+    {
+        return false;
+    }
+
+    bool screenSwap = GPU.ScreenSwap;
+    if (!GetFinalPassScreenSwapForRange(ystart, yend, screenSwap))
+        return false;
+
+    const auto* rendA = dynamic_cast<const GLRenderer2D*>(Rend2D_A.get());
+    return rendA &&
+           rendA->WholeSceneScaleRequested &&
+           rendA->WholeSceneScaleCaptureBacked &&
+           rendA->WholeSceneScaleMode == RendererSettings::WholeScene2DScaleMode::ConservativeHybridUpscale;
 }
 
 void GLRenderer::RenderScreen(int ystart, int yend)
@@ -952,11 +1387,60 @@ void GLRenderer::RenderScreen(int ystart, int yend)
 
     // Keep the existing per-engine scaled final pass populated. Display capture
     // and non-postprocess fallbacks still depend on OutputTex2D semantics.
+    GLuint scaledMainInput = OutputTex2D[0];
+    bool scaledMainInputReplacesVRAMDisplay = false;
+    int scaledMainVRAMDisplayBank = -1;
+    ResetFinalVRAMDisplayTrace(FinalVRAMDisplayRenderTrace, -1);
+    if (((DispCntA >> 16) & 0x3) == 2)
+    {
+        const u32 displayBank = (DispCntA >> 18) & 0x3;
+        ResetFinalVRAMDisplayTrace(FinalVRAMDisplayRenderTrace,
+                                   static_cast<int>(displayBank));
+
+        GLuint replacementTex = 0;
+        int replacementRejectReason = 0;
+        bool replacementUsedEpoch = false;
+        if (CanUseMainVRAMDisplayHighResCaptureReplacement(displayBank,
+                                                           &replacementTex,
+                                                           &replacementRejectReason,
+                                                           &replacementUsedEpoch,
+                                                           &FinalVRAMDisplayRenderTrace))
+        {
+            scaledMainInput = replacementTex;
+            scaledMainInputReplacesVRAMDisplay = true;
+            scaledMainVRAMDisplayBank = static_cast<int>(displayBank);
+            RecordFinalVRAMDisplayTraceAccepted(displayBank,
+                                                replacementTex,
+                                                replacementUsedEpoch);
+        }
+        else
+        {
+            RecordFinalVRAMDisplayTraceRejected(replacementRejectReason);
+        }
+    }
+    else
+    {
+        RecordFinalVRAMDisplayTraceRejected(1);
+    }
+
     RenderFinalPassToFramebuffer(ystart, yend,
                                  FPOutputFB[backbuf],
                                  ScreenW, ScreenH, ScaleFactor,
-                                 OutputTex2D[0],
-                                 OutputTex2D[1]);
+                                 scaledMainInput,
+                                 OutputTex2D[1],
+                                 scaledMainInputReplacesVRAMDisplay);
+    if (scaledMainInputReplacesVRAMDisplay &&
+        scaledMainVRAMDisplayBank >= 0 &&
+        scaledMainVRAMDisplayBank < 4)
+    {
+        const auto& epoch = MainVRAMDisplayEpoch[scaledMainVRAMDisplayBank];
+        if (epoch.HasDirtyRows && epoch.DirtyYStart < epoch.DirtyYEnd)
+            RenderMainVRAMDisplayNativeFallbackUpscale(backbuf, epoch.DirtyYStart, epoch.DirtyYEnd);
+    }
+    else if (CanUpscaleMainVRAMDisplayNativeFallbackForRange(ystart, yend))
+    {
+        RenderMainVRAMDisplayNativeFallbackUpscale(backbuf, ystart, yend);
+    }
 
     AddWholeScenePhaseTiming(WholeSceneFrameTiming.RenderScreen, ElapsedUS(phaseStart));
 }
@@ -1254,7 +1738,6 @@ void GLRenderer::DoCapture(int ystart, int yend)
     capture.FinalNativeSourceA = FinalCaptureSourceDebug.SourceAUsed;
     capture.FinalNativeSourceAKind = static_cast<u32>(FinalCaptureSourceDebug.SourceAKind);
     RecordDisplayCaptureDebug(capture);
-    RecordHighResDisplayCaptureEvent(capture);
 
     glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
     if (capsize == 0)
@@ -1375,12 +1858,77 @@ void GLRenderer::DoCapture(int ystart, int yend)
             CaptureOutput256Valid[dstblock] = true;
     }
 
+    if (WholeSceneTimingCSVActiveFrames > 0 && yend >= dstheight)
+    {
+        MeasureCaptureNativeLumaDebug(capcnt, dstblock, capture.DstOffset,
+                                      dstwidth, dstheight, capsize,
+                                      capsize == 0
+                                          ? CaptureOutput128FB[(dstblock << 2) | capture.DstOffset]
+                                          : CaptureOutput256FB[dstblock]);
+    }
+
+    RecordHighResDisplayCaptureEvent(capture);
+
     AddWholeScenePhaseTiming(WholeSceneFrameTiming.DoCapture, ElapsedUS(phaseStart));
+}
+
+void GLRenderer::MeasureCaptureNativeLumaDebug(u32 capcnt, u32 dstblock, u32 dstoffset,
+                                               int dstwidth, int dstheight, u32 capsize,
+                                               GLuint captureFB)
+{
+    const int bufferwidth = (capsize == 0) ? 128 : 256;
+    const int bufferheight = (capsize == 0) ? 128 : 256;
+
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, captureFB);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, CaptureLumaProbeFB);
+    glBlitFramebuffer(0, 0, bufferwidth * ScaleFactor, bufferheight * ScaleFactor,
+                      0, 0, bufferwidth, bufferheight,
+                      GL_COLOR_BUFFER_BIT, GL_LINEAR);
+
+    std::vector<u8> pixels((size_t)bufferwidth * bufferheight * 4);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, CaptureLumaProbeFB);
+    glReadPixels(0, 0, bufferwidth, bufferheight, GL_RGBA, GL_UNSIGNED_BYTE, pixels.data());
+
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, captureFB);
+
+    // 128-size captures use a dedicated per-offset buffer starting at row 0;
+    // 256-size captures land at dstoffset*64 in the shared bank buffer and can
+    // wrap, matching the destination math in DoCapture.
+    const int y0 = (capsize == 0) ? 0 : (int)((dstoffset & 3) * 64);
+    u64 sum = 0;
+    u64 count = 0;
+    for (int row = 0; row < dstheight; row++)
+    {
+        const int y = (y0 + row) & (bufferheight - 1);
+        const u8* line = &pixels[(size_t)y * bufferwidth * 4];
+        for (int x = 0; x < dstwidth; x++)
+        {
+            sum += line[x * 4 + 0];
+            sum += line[x * 4 + 1];
+            sum += line[x * 4 + 2];
+        }
+        count += (u64)dstwidth * 3;
+    }
+
+    LastCaptureNativeLumaDebug.Valid = true;
+    LastCaptureNativeLumaDebug.CaptureCnt = capcnt;
+    LastCaptureNativeLumaDebug.DstBlock = dstblock;
+    LastCaptureNativeLumaDebug.DstOffset = dstoffset;
+    LastCaptureNativeLumaDebug.LumaX1000 = count ? (int)((sum * 1000) / count) : 0;
 }
 
 
 void GLRenderer::AllocCapture(u32 bank, u32 start, u32 len)
 {
+    if (bank < 4)
+    {
+        LastDisplayCapture256Debug[bank] = {};
+        HighResDisplayCapture256Event[bank] = {};
+        if (start != 0 || len != 3)
+            MainVRAMDisplayExactProductEvent[bank] = {};
+    }
+
     auto rend2D = dynamic_cast<GLRenderer2D*>(Rend2D_A.get());
     rend2D->LayerConfigDirty = true;
     rend2D->SpriteConfigDirty = true;
@@ -1413,10 +1961,120 @@ void GLRenderer::DownscaleCapture(int width, int height, int layer)
     glDrawArrays(GL_TRIANGLES, 0, 2*3);
 }
 
-void GLRenderer::SyncVRAMCapture(u32 bank, u32 start, u32 len, bool complete)
+void GLRenderer::SetVRAMCaptureSyncReason(u32 reason)
+{
+    PendingVRAMCaptureSyncReason = reason;
+}
+
+void GLRenderer::RecordVRAMDisplayWriteDebug(u32 bank, u32 offset, u32 bytes, bool changed)
+{
+    if (!WholeSceneDebugViewsActive.load(std::memory_order_relaxed) ||
+        bank >= 4 ||
+        bytes == 0)
+        return;
+
+    auto& debug = VRAMDisplayWriteDebug;
+    debug.WriteCount++;
+    debug.WriteBytes += bytes;
+    debug.BankMask |= 1u << bank;
+    if (changed)
+    {
+        debug.ChangedWriteCount++;
+        debug.ChangedWriteBytes += bytes;
+    }
+
+    if (((DispCntA >> 16) & 0x3u) != 2)
+        return;
+
+    const u32 displayBank = (DispCntA >> 18) & 0x3u;
+    debug.DisplayBank = displayBank;
+    if (displayBank != bank)
+        return;
+
+    const u64 writeEnd = static_cast<u64>(offset) + bytes;
+    if (offset >= MainVRAMDisplayCaptureVisibleBytes || writeEnd == 0)
+        return;
+
+    const u32 visibleStart = offset;
+    const u32 visibleEnd = static_cast<u32>(std::min<u64>(writeEnd, MainVRAMDisplayCaptureVisibleBytes));
+    if (visibleStart >= visibleEnd)
+        return;
+
+    const u32 visibleBytes = visibleEnd - visibleStart;
+    debug.DisplayWriteCount++;
+    debug.DisplayWriteBytes += visibleBytes;
+    debug.DisplayFirstOffset = std::min(debug.DisplayFirstOffset, visibleStart);
+    debug.DisplayLastEnd = std::max(debug.DisplayLastEnd, visibleEnd);
+
+    if (!changed)
+        return;
+
+    debug.DisplayChangedWriteCount++;
+    debug.DisplayChangedWriteBytes += visibleBytes;
+
+    const u32 dirtyYStart = std::min<u32>(visibleStart / MainVRAMDisplayCaptureRowBytes, 191);
+    const u32 dirtyYEnd = std::min<u32>(
+        (visibleEnd + MainVRAMDisplayCaptureRowBytes - 1) / MainVRAMDisplayCaptureRowBytes,
+        192);
+    debug.DisplayDirtyYStart = std::min(debug.DisplayDirtyYStart, dirtyYStart);
+    debug.DisplayDirtyYEnd = std::max(debug.DisplayDirtyYEnd, dirtyYEnd);
+}
+
+void GLRenderer::NotifyVRAMWrite(u32 bank, u32 offset, u32 bytes, bool changed)
+{
+    RecordVRAMDisplayWriteDebug(bank, offset, bytes, changed);
+
+    if (!changed || bank >= 4)
+        return;
+
+    MainVRAMDisplayExactProductEvent[bank] = {};
+
+    auto& epoch = MainVRAMDisplayEpoch[bank];
+    if (!epoch.Valid)
+        return;
+
+    const u32 captureStart = epoch.DstOffset * MainVRAMDisplayCaptureBlockBytes;
+    const u32 captureEnd = captureStart + MainVRAMDisplayCaptureVisibleBytes;
+    const u64 writeEnd = static_cast<u64>(offset) + bytes;
+    if (offset >= captureEnd || writeEnd <= captureStart)
+        return;
+
+    const u32 dirtyStartByte = offset > captureStart ? offset - captureStart : 0;
+    const u32 dirtyEndByte = static_cast<u32>(
+        std::min<u64>(writeEnd, captureEnd) - captureStart);
+    const u32 dirtyYStart = std::min<u32>(dirtyStartByte / MainVRAMDisplayCaptureRowBytes, 191);
+    const u32 dirtyYEnd = std::min<u32>(
+        (dirtyEndByte + MainVRAMDisplayCaptureRowBytes - 1) / MainVRAMDisplayCaptureRowBytes,
+        192);
+
+    if (!epoch.HasDirtyRows)
+    {
+        epoch.HasDirtyRows = true;
+        epoch.DirtyYStart = dirtyYStart;
+        epoch.DirtyYEnd = dirtyYEnd;
+    }
+    else
+    {
+        epoch.DirtyYStart = std::min(epoch.DirtyYStart, dirtyYStart);
+        epoch.DirtyYEnd = std::max(epoch.DirtyYEnd, dirtyYEnd);
+    }
+}
+
+void GLRenderer::SyncVRAMCapture(u32 bank, u32 start, u32 len, bool complete, bool invalidate)
 {
     if (!complete)
         Log(LogLevel::Error, "GPU_OpenGL: !!! READING VRAM AS IT IS BEING CAPTURED TO\n");
+
+    const u32 reason = PendingVRAMCaptureSyncReason;
+    PendingVRAMCaptureSyncReason = 0;
+
+    if (invalidate && bank < 4)
+    {
+        LastDisplayCapture256Debug[bank] = {};
+        HighResDisplayCapture256Event[bank] = {};
+        if (reason != VRAMCaptureInvalidationPreWriteSync)
+            InvalidateMainVRAMDisplayEpochForBank(bank, reason, start, len, complete);
+    }
 
     u8* vram = GPU.VRAM[bank];
 
@@ -1470,6 +2128,231 @@ bool GLRenderer::GetFramebuffers(void** top, void** bottom)
     return false;
 }
 
+void GLRenderer::SwapBuffers()
+{
+    CaptureRollingFinalDebugFrame(BackBuffer);
+    Renderer::SwapBuffers();
+}
+
+bool GLRenderer::ReadFinalDebugFrameFromFramebuffer(int framebuffer,
+                                                    u64 serial,
+                                                    WholeScene2DFinalDebugFrame& frame,
+                                                    std::string* status)
+{
+    frame = {};
+
+    if (framebuffer < 0 || framebuffer >= 2 || FPOutputFB[framebuffer] == 0)
+    {
+        if (status)
+            *status = "Final output framebuffer is unavailable.";
+        return false;
+    }
+
+    GLint prevReadFB = 0;
+    GLint prevReadBuffer = GL_COLOR_ATTACHMENT0;
+    GLint prevPackAlignment = 4;
+    glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &prevReadFB);
+    glGetIntegerv(GL_READ_BUFFER, &prevReadBuffer);
+    glGetIntegerv(GL_PACK_ALIGNMENT, &prevPackAlignment);
+
+    frame = CaptureRollingFinalDebugMetadata(serial);
+    frame.Width = ScreenW;
+    frame.Height = ScreenH;
+    const size_t pixelCount = static_cast<size_t>(frame.Width) *
+                              static_cast<size_t>(frame.Height);
+    frame.TopRGBA.resize(pixelCount);
+    frame.BottomRGBA.resize(pixelCount);
+
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, FPOutputFB[framebuffer]);
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+
+    glReadBuffer(GL_COLOR_ATTACHMENT0);
+    glReadPixels(0,
+                 0,
+                 frame.Width,
+                 frame.Height,
+                 GL_RGBA,
+                 GL_UNSIGNED_BYTE,
+                 frame.TopRGBA.data());
+
+    glReadBuffer(GL_COLOR_ATTACHMENT1);
+    glReadPixels(0,
+                 0,
+                 frame.Width,
+                 frame.Height,
+                 GL_RGBA,
+                 GL_UNSIGNED_BYTE,
+                 frame.BottomRGBA.data());
+
+    glPixelStorei(GL_PACK_ALIGNMENT, prevPackAlignment);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, prevReadFB);
+    glReadBuffer(prevReadBuffer);
+
+    if (status)
+    {
+        *status = "Read current final output frame from buffer ";
+        *status += std::to_string(framebuffer);
+        *status += ".";
+    }
+    return true;
+}
+
+bool GLRenderer::SetWholeScene2DRollingDebugCapture(bool enabled,
+                                                    int frameCount,
+                                                    std::string* status)
+{
+    if (frameCount <= 0)
+        frameCount = 60;
+    if (frameCount > 180)
+        frameCount = 180;
+
+    RollingFinalDebugCaptureEnabled = enabled;
+    RollingFinalDebugCapacity = enabled ? frameCount : 0;
+    RollingFinalDebugWriteIndex = 0;
+    RollingFinalDebugSerial = 0;
+    RollingFinalDebugWidth = 0;
+    RollingFinalDebugHeight = 0;
+    RollingFinalDebugSlots.clear();
+
+    if (!enabled)
+    {
+        if (RollingFinalDebugTex != 0)
+        {
+            glDeleteTextures(1, &RollingFinalDebugTex);
+            RollingFinalDebugTex = 0;
+        }
+        if (RollingFinalDebugFB != 0)
+        {
+            glDeleteFramebuffers(1, &RollingFinalDebugFB);
+            RollingFinalDebugFB = 0;
+        }
+    }
+
+    if (enabled && !EnsureRollingFinalDebugStorage())
+    {
+        RollingFinalDebugCaptureEnabled = false;
+        RollingFinalDebugCapacity = 0;
+        if (status)
+            *status = "Failed to allocate whole-scene rolling debug capture.";
+        return false;
+    }
+
+    if (status)
+    {
+        if (enabled)
+        {
+            const u64 bytes =
+                static_cast<u64>(ScreenW) *
+                static_cast<u64>(ScreenH) *
+                2u *
+                static_cast<u64>(RollingFinalDebugCapacity) *
+                4u;
+            *status = "Whole-scene rolling debug capture enabled: ";
+            *status += std::to_string(RollingFinalDebugCapacity);
+            *status += " frames, ";
+            *status += std::to_string(bytes / (1024u * 1024u));
+            *status += " MiB GPU texture ring.";
+        }
+        else
+        {
+            *status = "Whole-scene rolling debug capture disabled.";
+        }
+    }
+
+    return true;
+}
+
+bool GLRenderer::ReadWholeScene2DCurrentFinalDebugFrame(WholeScene2DFinalDebugFrame& frame,
+                                                        std::string* status)
+{
+    return ReadFinalDebugFrameFromFramebuffer(BackBuffer ^ 1, 0, frame, status);
+}
+
+bool GLRenderer::ReadWholeScene2DRollingDebugFrames(std::vector<WholeScene2DFinalDebugFrame>& frames,
+                                                    std::string* status)
+{
+    frames.clear();
+
+    if (!RollingFinalDebugCaptureEnabled ||
+        RollingFinalDebugCapacity <= 0 ||
+        RollingFinalDebugWidth <= 0 ||
+        RollingFinalDebugHeight <= 0)
+    {
+        if (status)
+            *status = "Whole-scene rolling debug capture is not active.";
+        return false;
+    }
+
+    std::vector<int> slotOrder;
+    for (int i = 0; i < static_cast<int>(RollingFinalDebugSlots.size()); i++)
+    {
+        if (RollingFinalDebugSlots[i].Valid)
+            slotOrder.push_back(i);
+    }
+
+    std::sort(slotOrder.begin(), slotOrder.end(), [this](int a, int b) {
+        return RollingFinalDebugSlots[a].Serial < RollingFinalDebugSlots[b].Serial;
+    });
+
+    GLint prevPackAlignment = 4;
+    glGetIntegerv(GL_PACK_ALIGNMENT, &prevPackAlignment);
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, RollingFinalDebugFB);
+    glReadBuffer(GL_COLOR_ATTACHMENT0);
+
+    const size_t pixelCount = static_cast<size_t>(RollingFinalDebugWidth) *
+                              static_cast<size_t>(RollingFinalDebugHeight);
+    for (int slot : slotOrder)
+    {
+        WholeScene2DFinalDebugFrame frame = RollingFinalDebugSlots[slot].Metadata;
+        frame.Width = RollingFinalDebugWidth;
+        frame.Height = RollingFinalDebugHeight;
+        frame.TopRGBA.resize(pixelCount);
+        frame.BottomRGBA.resize(pixelCount);
+
+        glFramebufferTextureLayer(GL_READ_FRAMEBUFFER,
+                                  GL_COLOR_ATTACHMENT0,
+                                  RollingFinalDebugTex,
+                                  0,
+                                  slot * 2);
+        glReadPixels(0,
+                     0,
+                     RollingFinalDebugWidth,
+                     RollingFinalDebugHeight,
+                     GL_RGBA,
+                     GL_UNSIGNED_BYTE,
+                     frame.TopRGBA.data());
+
+        glFramebufferTextureLayer(GL_READ_FRAMEBUFFER,
+                                  GL_COLOR_ATTACHMENT0,
+                                  RollingFinalDebugTex,
+                                  0,
+                                  slot * 2 + 1);
+        glReadPixels(0,
+                     0,
+                     RollingFinalDebugWidth,
+                     RollingFinalDebugHeight,
+                     GL_RGBA,
+                     GL_UNSIGNED_BYTE,
+                     frame.BottomRGBA.data());
+
+        frames.push_back(std::move(frame));
+    }
+
+    glPixelStorei(GL_PACK_ALIGNMENT, prevPackAlignment);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+
+    if (status)
+    {
+        *status = "Read ";
+        *status += std::to_string(frames.size());
+        *status += " rolling final frames.";
+    }
+
+    return !frames.empty();
+}
+
 bool GLRenderer::IsEngineRoutedToFinalBottom(u32 engine) const
 {
     return engine == (GPU.ScreenSwap ? 1u : 0u);
@@ -1499,6 +2382,134 @@ bool GLRenderer::GetFinalPassScreenSwapForRange(int ystart, int yend, bool& scre
     return true;
 }
 
+void GLRenderer::UpdateFinalPresentationTransitionGuard()
+{
+    sFinalPresentationState state = {};
+    state.Valid = true;
+    state.ScreenSwap = GPU.ScreenSwap;
+    state.DispModeA = (GPU.GPU2D_A.DispCnt >> 16) & 0x3u;
+    state.DispModeB = (GPU.GPU2D_B.DispCnt >> 16) & 0x1u;
+
+    const bool stateChanged =
+        LastFinalPresentationState.Valid &&
+        (state.ScreenSwap != LastFinalPresentationState.ScreenSwap ||
+         state.DispModeA != LastFinalPresentationState.DispModeA ||
+         state.DispModeB != LastFinalPresentationState.DispModeB);
+    const bool screenSwapOnlyChanged =
+        stateChanged &&
+        state.ScreenSwap != LastFinalPresentationState.ScreenSwap &&
+        state.DispModeA == LastFinalPresentationState.DispModeA &&
+        state.DispModeB == LastFinalPresentationState.DispModeB;
+    const bool stateMatchesExcursionBaseline =
+        FinalPresentationScreenSwapExcursionActive &&
+        state.ScreenSwap == FinalPresentationScreenSwapExcursionBaseline.ScreenSwap &&
+        state.DispModeA == FinalPresentationScreenSwapExcursionBaseline.DispModeA &&
+        state.DispModeB == FinalPresentationScreenSwapExcursionBaseline.DispModeB;
+    const bool directOutputScreenSwapOnlyChanged =
+        screenSwapOnlyChanged &&
+        state.DispModeA == 1 &&
+        state.DispModeB == 1 &&
+        LastFinalPresentationState.DispModeA == 1 &&
+        LastFinalPresentationState.DispModeB == 1;
+    const auto masterBrightnessActive = [](u16 masterBrightness)
+    {
+        const u32 mode = (masterBrightness >> 14) & 0x3;
+        const u32 factor = masterBrightness & 0x1F;
+        return (mode == 1 || mode == 2) && factor > 0;
+    };
+    const bool directOutputFadeSwap =
+        directOutputScreenSwapOnlyChanged &&
+        GPU.MasterBrightnessA == GPU.MasterBrightnessB &&
+        masterBrightnessActive(GPU.MasterBrightnessA);
+    const u32 requiredStableScanlines =
+        directOutputScreenSwapOnlyChanged ?
+            kFinalPresentationDirectSwapGuardStableScanlines :
+            kFinalPresentationStableRouteScanlines;
+    const bool startsScreenSwapExcursion =
+        screenSwapOnlyChanged &&
+        !directOutputFadeSwap &&
+        !FinalPresentationScreenSwapExcursionActive &&
+        FinalPresentationStateStableScanlines >= requiredStableScanlines;
+
+    // Master brightness is applied in the final pass; fade-only changes do not
+    // alter which renderer owns the screen content.
+    if (startsScreenSwapExcursion)
+    {
+        FinalPresentationScreenSwapExcursionBaseline = LastFinalPresentationState;
+        FinalPresentationScreenSwapExcursionScanlines = 0;
+        FinalPresentationScreenSwapExcursionActive = true;
+    }
+    else if (stateChanged && !screenSwapOnlyChanged)
+    {
+        FinalPresentationScreenSwapExcursionActive = false;
+        FinalPresentationScreenSwapExcursionBaseline = {};
+        FinalPresentationScreenSwapExcursionScanlines = 0;
+        if (FinalPresentationTransitionGuardFrames < kFinalPresentationTransitionGuardFrames)
+            FinalPresentationTransitionGuardFrames = kFinalPresentationTransitionGuardFrames;
+    }
+
+    if (FinalPresentationScreenSwapExcursionActive)
+    {
+        if (stateMatchesExcursionBaseline)
+        {
+            FinalPresentationScreenSwapExcursionActive = false;
+            FinalPresentationScreenSwapExcursionBaseline = {};
+            FinalPresentationScreenSwapExcursionScanlines = 0;
+            if (FinalPresentationTransitionGuardFrames < kFinalPresentationTransitionGuardFrames)
+                FinalPresentationTransitionGuardFrames = kFinalPresentationTransitionGuardFrames;
+        }
+        else
+        {
+            if (FinalPresentationTransitionGuardFrames < kFinalPresentationTransitionGuardFrames)
+                FinalPresentationTransitionGuardFrames = kFinalPresentationTransitionGuardFrames;
+            if (FinalPresentationScreenSwapExcursionScanlines < 0xFFFFFFFFu)
+                FinalPresentationScreenSwapExcursionScanlines++;
+            if (FinalPresentationScreenSwapExcursionScanlines >= kFinalPresentationScreenSwapExcursionMaxScanlines)
+            {
+                FinalPresentationScreenSwapExcursionActive = false;
+                FinalPresentationScreenSwapExcursionBaseline = {};
+                FinalPresentationScreenSwapExcursionScanlines = 0;
+            }
+        }
+    }
+
+    if (stateChanged)
+    {
+        LastFinalPresentationState = state;
+        FinalPresentationStateStableScanlines = 1;
+    }
+    else
+    {
+        LastFinalPresentationState = state;
+        if (FinalPresentationStateStableScanlines < 0xFFFFFFFFu)
+            FinalPresentationStateStableScanlines++;
+    }
+}
+
+bool GLRenderer::IsFinalPresentationTransitionGuardActiveForRange(int ystart, int yend) const
+{
+    bool screenSwap = false;
+    if (!GetFinalPassScreenSwapForRange(ystart, yend, screenSwap))
+        return true;
+
+    return FinalPresentationTransitionGuardFrames > 0;
+}
+
+bool GLRenderer::IsFinalPresentationScreenSwapExcursionActiveForRange(int ystart, int yend) const
+{
+    if (!FinalPresentationScreenSwapExcursionActive)
+        return false;
+
+    bool screenSwap = false;
+    if (!GetFinalPassScreenSwapForRange(ystart, yend, screenSwap))
+        return true;
+
+    if (!FinalPresentationScreenSwapExcursionBaseline.Valid)
+        return true;
+
+    return screenSwap != FinalPresentationScreenSwapExcursionBaseline.ScreenSwap;
+}
+
 bool GLRenderer::IsEngineRoutedToFinalBottom(u32 engine, int ystart, int yend) const
 {
     bool screenSwap = GPU.ScreenSwap;
@@ -1506,20 +2517,324 @@ bool GLRenderer::IsEngineRoutedToFinalBottom(u32 engine, int ystart, int yend) c
     return engine == (screenSwap ? 1u : 0u);
 }
 
+bool GLRenderer::IsMainVRAMDisplayFinalRouteForRange(int ystart, int yend) const
+{
+    const u32 finalDispModeA = (DispCntA >> 16) & 0x3u;
+    return finalDispModeA == 2 && IsEngineRoutedToFinalBottom(0, ystart, yend);
+}
+
 bool GLRenderer::HasMainVRAMDisplayCaptureFinalRoute() const
 {
     const u32 finalDispModeA = (DispCntA >> 16) & 0x3u;
-    if (finalDispModeA != 2 || Aux0VRAMCap < 0)
+    if (finalDispModeA != 2)
         return false;
 
-    const int captureBank = Aux0VRAMCap >> 2;
-    const u32 captureOffset = static_cast<u32>(Aux0VRAMCap & 0x3);
-    if (captureBank < 0 || captureBank >= 4)
-        return false;
+    const u32 displayBank = (DispCntA >> 18) & 0x3u;
+    return CanUseMainVRAMDisplayHighResCaptureReplacement(displayBank);
+}
 
-    const auto& event = HighResDisplayCapture256Event[captureBank];
-    return IsFullDisplayHighResCaptureEventRecord(event, static_cast<u32>(captureBank)) &&
-           event.DstOffset == captureOffset;
+bool GLRenderer::IsAcceptedMainVRAMDisplayFullProductSource(HighResCaptureSourceKind sourceKind)
+{
+    return sourceKind == HighResCaptureSourceKind::CleanOutput3D ||
+           sourceKind == HighResCaptureSourceKind::CleanEngineA2DOutput;
+}
+
+void GLRenderer::ResetFinalVRAMDisplayTrace(sFinalVRAMDisplayRenderTrace& trace, int displayBank)
+{
+    trace = {};
+    trace.DisplayBank = displayBank;
+}
+
+void GLRenderer::RecordFinalVRAMDisplayTraceEvent(sFinalVRAMDisplayRenderTrace& trace,
+                                                  const sHighResDisplayCaptureEvent& event,
+                                                  GLuint fullTex,
+                                                  bool eventMatches,
+                                                  bool exactRouteMatches,
+                                                  bool exactProductAvailable,
+                                                  bool exactProductUsable)
+{
+    trace.EventValid = event.Valid ? 1 : 0;
+    trace.EventSerial = event.Serial;
+    trace.EventDstBlock = static_cast<int>(event.DstBlock);
+    trace.EventDstOffset = static_cast<int>(event.DstOffset);
+    trace.EventScreenSwap = event.ScreenSwap ? 1 : 0;
+    trace.EventMainFinalBottom = event.MainEngineFinalBottom ? 1 : 0;
+    trace.EventSourceOBJ = event.SourceOBJVisible ? 1 : 0;
+    trace.EventSourceRenderedFullWholeScene = event.SourceRenderedFullWholeScene ? 1 : 0;
+    trace.EventSourceKind = static_cast<u32>(event.SourceKind);
+    trace.EventProductMask = event.ProductMask;
+    trace.EventRejectReason = static_cast<u32>(event.RejectReason);
+    trace.EventFullTex = static_cast<int>(fullTex);
+    trace.EventMatchesNativeCapture = eventMatches ? 1 : 0;
+    trace.ExactEventRouteMatches = exactRouteMatches ? 1 : 0;
+    trace.ExactEventProductAvailable = exactProductAvailable ? 1 : 0;
+    trace.ExactEventProductUsable = exactProductUsable ? 1 : 0;
+}
+
+void GLRenderer::RecordFinalVRAMDisplayTraceChosenEvent(sFinalVRAMDisplayRenderTrace& trace,
+                                                        u32 displayBank,
+                                                        GLuint texture,
+                                                        const sHighResDisplayCaptureEvent& event)
+{
+    trace.ChosenBank = static_cast<int>(displayBank);
+    trace.ChosenSerial = event.Serial;
+    trace.ChosenSource3DSerial = event.Source3DSerial;
+    trace.ChosenSource3DSceneHash = event.Source3DSceneHash;
+    trace.ChosenSourcePresentationHash = event.SourcePresentationHash;
+    trace.ChosenSourceKind = static_cast<u32>(event.SourceKind);
+    trace.ChosenProductMask = event.ProductMask;
+    trace.ChosenTex = static_cast<int>(texture);
+}
+
+void GLRenderer::RecordFinalVRAMDisplayTraceChosenEpoch(sFinalVRAMDisplayRenderTrace& trace,
+                                                        u32 displayBank,
+                                                        GLuint texture,
+                                                        const sMainVRAMDisplayEpoch& epoch)
+{
+    trace.ChosenBank = static_cast<int>(displayBank);
+    trace.ChosenSerial = epoch.Serial;
+    trace.ChosenSource3DSerial = epoch.Source3DSerial;
+    trace.ChosenSource3DSceneHash = epoch.Source3DSceneHash;
+    trace.ChosenSourcePresentationHash = epoch.SourcePresentationHash;
+    trace.ChosenSourceKind = static_cast<u32>(epoch.SourceKind);
+    trace.ChosenProductMask = epoch.ProductMask;
+    trace.ChosenTex = static_cast<int>(texture);
+}
+
+void GLRenderer::RecordFinalVRAMDisplayTraceAccepted(u32 displayBank,
+                                                     GLuint texture,
+                                                     bool usedEpoch)
+{
+    FinalVRAMDisplayRenderTrace.ReplacementEligible = 1;
+    FinalVRAMDisplayRenderTrace.RejectReason = 0;
+    FinalVRAMDisplayRenderTrace.UsedEpoch = usedEpoch ? 1 : 0;
+    FinalVRAMDisplayRenderTrace.ChosenBank = static_cast<int>(displayBank);
+    FinalVRAMDisplayRenderTrace.ChosenTex = static_cast<int>(texture);
+
+    if (usedEpoch)
+    {
+        RecordFinalVRAMDisplayTraceChosenEpoch(FinalVRAMDisplayRenderTrace,
+                                               displayBank,
+                                               texture,
+                                               MainVRAMDisplayEpoch[displayBank]);
+    }
+    else if (FinalVRAMDisplayRenderTrace.ChosenSerial == 0)
+    {
+        RecordFinalVRAMDisplayTraceChosenEvent(FinalVRAMDisplayRenderTrace,
+                                               displayBank,
+                                               texture,
+                                               HighResDisplayCapture256Event[displayBank]);
+    }
+}
+
+void GLRenderer::RecordFinalVRAMDisplayTraceRejected(int rejectReason)
+{
+    FinalVRAMDisplayRenderTrace.RejectReason = rejectReason;
+}
+
+bool GLRenderer::CanUseMainVRAMDisplayHighResCaptureReplacement(u32 displayBank,
+                                                                GLuint* replacementTex,
+                                                                int* rejectReason,
+                                                                bool* usedEpoch,
+                                                                sFinalVRAMDisplayRenderTrace* trace) const
+{
+    if (replacementTex)
+        *replacementTex = 0;
+    if (rejectReason)
+        *rejectReason = 0;
+    if (usedEpoch)
+        *usedEpoch = false;
+    if (trace)
+    {
+        ResetFinalVRAMDisplayTrace(*trace, static_cast<int>(displayBank));
+    }
+
+    const u32 finalDispModeA = (DispCntA >> 16) & 0x3u;
+    if (finalDispModeA != 2)
+    {
+        if (rejectReason)
+            *rejectReason = 1;
+        return false;
+    }
+
+    if (displayBank >= 4)
+    {
+        if (rejectReason)
+            *rejectReason = 3;
+        return false;
+    }
+
+    const auto* rendA = dynamic_cast<const GLRenderer2D*>(Rend2D_A.get());
+    if (!rendA ||
+        !rendA->WholeSceneScaleRequested ||
+        !rendA->WholeSceneScaleCaptureBacked ||
+        rendA->WholeSceneScaleMode != RendererSettings::WholeScene2DScaleMode::ConservativeHybridUpscale)
+    {
+        if (rejectReason)
+            *rejectReason = 2;
+        return false;
+    }
+
+    const auto& capture = LastDisplayCapture256Debug[displayBank];
+    const auto& event = HighResDisplayCapture256Event[displayBank];
+    const auto& retainedExactEvent = MainVRAMDisplayExactProductEvent[displayBank];
+    MainVRAMDisplayEventMatchInputs eventMatchInputs = {};
+    eventMatchInputs.NativeCaptureRecordValid =
+        IsFullDisplaySourceACaptureRecord(capture, displayBank);
+    eventMatchInputs.HighResEventRecordValid =
+        IsFullDisplayHighResCaptureEventRecord(event, displayBank);
+    eventMatchInputs.NativeCaptureDstOffset = capture.DstOffset;
+    eventMatchInputs.HighResEventDstOffset = event.DstOffset;
+    eventMatchInputs.NativeCaptureCnt = capture.CaptureCnt;
+    eventMatchInputs.HighResEventCaptureCnt = event.CaptureCnt;
+    const bool eventMatches =
+        DoesMainVRAMDisplayEventMatchNativeCapture(eventMatchInputs);
+    bool screenSwap = GPU.ScreenSwap;
+    GetFinalPassScreenSwapForRange(0, 192, screenSwap);
+    const bool mainEngineFinalBottom = IsEngineRoutedToFinalBottom(0, 0, 192);
+    const sHighResDisplayCaptureEvent* exactEvent = &event;
+    if (!IsFullDisplayHighResCaptureExactReplacementRecord(*exactEvent, displayBank) &&
+        IsFullDisplayHighResCaptureExactReplacementRecord(retainedExactEvent, displayBank))
+    {
+        exactEvent = &retainedExactEvent;
+    }
+    const bool exactFullEventRouteMatches =
+        exactEvent->ScreenSwap == screenSwap &&
+        exactEvent->MainEngineFinalBottom == mainEngineFinalBottom;
+    const bool exactFullEventRecordValid =
+        IsFullDisplayHighResCaptureExactReplacementRecord(*exactEvent, displayBank);
+    const bool exactFullEventDstOffsetZero = exactEvent->DstOffset == 0;
+    const bool exactFullEventAccepted =
+        exactEvent->RejectReason == HighResCaptureRejectReason::None;
+    const bool exactFullEventFullEquivalent =
+        (exactEvent->ProductMask & HighResCaptureProductFullEquivalent) != 0;
+    const bool exactFullEventAcceptedSource =
+        IsAcceptedMainVRAMDisplayFullProductSource(exactEvent->SourceKind);
+    const bool exactFullEventHasFullTexture =
+        HighResDisplayCaptureFullTex[displayBank] != 0;
+    const bool exactFullEventProductAvailable =
+        exactFullEventRecordValid &&
+        exactFullEventDstOffsetZero &&
+        exactFullEventAccepted &&
+        exactFullEventFullEquivalent &&
+        exactFullEventAcceptedSource &&
+        exactFullEventHasFullTexture;
+    MainVRAMDisplayExactEventReplacementInputs exactEventInputs = {};
+    exactEventInputs.EventRecordValid = exactFullEventRecordValid;
+    exactEventInputs.EventDstOffsetZero = exactFullEventDstOffsetZero;
+    exactEventInputs.EventAccepted = exactFullEventAccepted;
+    exactEventInputs.EventFullEquivalent = exactFullEventFullEquivalent;
+    exactEventInputs.EventAcceptedSource = exactFullEventAcceptedSource;
+    exactEventInputs.HasFullTexture = exactFullEventHasFullTexture;
+    exactEventInputs.EventRouteMatches = exactFullEventRouteMatches;
+    exactEventInputs.EventSourceOBJVisible = exactEvent->SourceOBJVisible;
+    exactEventInputs.EventSourceRenderedFullWholeScene =
+        exactEvent->SourceRenderedFullWholeScene;
+    const bool exactFullEventProductUsable =
+        CanUseMainVRAMDisplayExactEventReplacement(exactEventInputs);
+
+    if (trace)
+    {
+        RecordFinalVRAMDisplayTraceEvent(*trace,
+                                         *exactEvent,
+                                         HighResDisplayCaptureFullTex[displayBank],
+                                         eventMatches,
+                                         exactFullEventRouteMatches,
+                                         exactFullEventProductAvailable,
+                                         exactFullEventProductUsable);
+    }
+
+    if (exactFullEventProductUsable)
+    {
+        if (replacementTex)
+            *replacementTex = HighResDisplayCaptureFullTex[displayBank];
+        if (trace)
+            RecordFinalVRAMDisplayTraceChosenEvent(*trace,
+                                                   displayBank,
+                                                   HighResDisplayCaptureFullTex[displayBank],
+                                                   *exactEvent);
+        return true;
+    }
+
+    if (eventMatches)
+    {
+        if (event.RejectReason != HighResCaptureRejectReason::None)
+        {
+            if (rejectReason)
+            {
+                MainVRAMDisplayMixedOrOBJRejectInputs mixedRejectInputs = {};
+                mixedRejectInputs.DirtyOrPartialSourceReject =
+                    event.RejectReason == HighResCaptureRejectReason::DirtyOrPartialSource;
+                mixedRejectInputs.NativeOnlyOutput2DSource =
+                    event.SourceKind == HighResCaptureSourceKind::NativeOnlyOutput2D;
+                mixedRejectInputs.SourceDirect3DVisible = event.SourceDirect3DVisible;
+                mixedRejectInputs.SourceHasNoVisibleBitmap =
+                    event.SourceVisibleBitmapMask == 0;
+                mixedRejectInputs.SourceBG0Visible =
+                    (event.SourceLayerEnable & (1u << 0)) != 0;
+                mixedRejectInputs.SourceOBJVisible = event.SourceOBJVisible;
+                mixedRejectInputs.SourceOtherBGVisible =
+                    (event.SourceLayerEnable & 0x0Eu) != 0;
+                const bool mixedOrOBJFullFrameCapture =
+                    IsMainVRAMDisplayMixedOrOBJReject(mixedRejectInputs);
+                *rejectReason = mixedOrOBJFullFrameCapture ? 8 : 5;
+            }
+            return false;
+        }
+
+        if (!(event.ProductMask & HighResCaptureProductFullEquivalent))
+        {
+            if (rejectReason)
+                *rejectReason = 6;
+            return false;
+        }
+
+        if (!IsAcceptedMainVRAMDisplayFullProductSource(event.SourceKind))
+        {
+            if (event.SourceKind != HighResCaptureSourceKind::DerivedMainVRAMDisplayEpoch)
+            {
+                if (rejectReason)
+                    *rejectReason = 7;
+                return false;
+            }
+        }
+        else if (!HighResDisplayCaptureFullTex[displayBank])
+        {
+            if (rejectReason)
+                *rejectReason = 6;
+            return false;
+        }
+    }
+
+    const auto& epoch = MainVRAMDisplayEpoch[displayBank];
+    MainVRAMDisplayEpochReplacementInputs epochInputs = {};
+    epochInputs.EpochValid = epoch.Valid;
+    epochInputs.EpochCaptureBank = epoch.CaptureBank;
+    epochInputs.DisplayBank = displayBank;
+    epochInputs.EpochDstOffset = epoch.DstOffset;
+    epochInputs.EpochHasFullDirtyRows =
+        epoch.HasDirtyRows &&
+        epoch.DirtyYStart == 0 &&
+        epoch.DirtyYEnd >= 192;
+    epochInputs.EpochFullEquivalent =
+        (epoch.ProductMask & HighResCaptureProductFullEquivalent) != 0;
+    epochInputs.EpochAcceptedSource =
+        IsAcceptedMainVRAMDisplayFullProductSource(epoch.SourceKind);
+    epochInputs.HasEpochTexture = MainVRAMDisplayEpochTex[displayBank] != 0;
+    const int epochRejectReason =
+        MainVRAMDisplayEpochReplacementRejectReason(epochInputs);
+    if (epochRejectReason != 0)
+    {
+        if (rejectReason)
+            *rejectReason = epochRejectReason;
+        return false;
+    }
+
+    if (replacementTex)
+        *replacementTex = MainVRAMDisplayEpochTex[displayBank];
+    if (usedEpoch)
+        *usedEpoch = true;
+    return true;
 }
 
 void GLRenderer::RecordDisplayCaptureDebug(const sLastDisplayCaptureDebug& capture)
@@ -1544,6 +2859,8 @@ GLRenderer::sHighResDisplayCaptureEvent GLRenderer::BuildHighResDisplayCaptureEv
     sHighResDisplayCaptureEvent event = {};
     event.Valid = true;
     event.Serial = ++HighResDisplayCaptureEventSerial;
+    event.Source3DSerial = Output3DSerial;
+    event.Source3DSceneHash = Output3DSceneHash;
     event.CaptureCnt = capture.CaptureCnt;
     event.YStart = capture.YStart;
     event.YEnd = capture.YEnd;
@@ -1572,7 +2889,22 @@ GLRenderer::sHighResDisplayCaptureEvent GLRenderer::BuildHighResDisplayCaptureEv
             (sourceRenderer->DispCnt & (1 << 3)) && (sourceRenderer->LayerEnable & (1 << 0));
         event.SourceOBJVisible =
             (sourceRenderer->LayerEnable & (1 << 4)) && sourceRenderer->OBJEnable && sourceRenderer->NumSprites > 0;
+        event.SourceWholeScenePath = static_cast<u32>(sourceRenderer->WholeSceneTrace.Path);
+        event.SourceWholeSceneYStart = sourceRenderer->WholeSceneTrace.YStart;
+        event.SourceWholeSceneYEnd = sourceRenderer->WholeSceneTrace.YEnd;
+        event.SourceVisibleBGLayers = sourceRenderer->LayerEnable & 0x0Fu;
+        for (int layer = 0; layer < 4; layer++)
+        {
+            event.SourceBGLayerTypes |=
+                (sourceRenderer->LayerConfig.uBGConfig[layer].Type & 0xFFu) << (layer * 8);
+        }
+        event.SourceRenderedFullWholeScene =
+            sourceRenderer->WholeSceneTrace.YStart <= 0 &&
+            sourceRenderer->WholeSceneTrace.YEnd >= 192 &&
+            IsFullWholeSceneSourcePath(sourceRenderer->WholeSceneTrace.Path);
         event.SourcePresentationHash = sourceRenderer->CapturePresentationHash();
+        event.SourceMasterBrightness = GPU.MasterBrightnessA;
+        event.HasSourceEffectState = true;
     }
 
     return event;
@@ -1584,15 +2916,23 @@ void GLRenderer::ClassifyHighResDisplayCaptureEvent(const sLastDisplayCaptureDeb
                                                     bool sourceAOnly,
                                                     sHighResDisplayCaptureEvent& event)
 {
+    const bool trackedSourceBBlend =
+        !sourceAOnly &&
+        capture.UsesSrcB &&
+        capture.SrcBUsesTrackedCapture &&
+        capture.CapSize == 3 &&
+        capture.DstOffset == 0;
+    const bool allowBackgroundProduct = sourceAOnly;
+
     if (!fullDisplay)
         event.RejectReason = HighResCaptureRejectReason::NotFullDisplay;
-    else if (!sourceAOnly)
+    else if (!sourceAOnly && !trackedSourceBBlend)
     {
         event.RejectReason = capture.UsesSrcB
             ? HighResCaptureRejectReason::UsesSourceB
             : HighResCaptureRejectReason::BlendedOrFeedback;
     }
-    else if (capture.SrcBSameDstBank)
+    else if (capture.SrcBSameDstBank && !trackedSourceBBlend)
         event.RejectReason = HighResCaptureRejectReason::SameBankReadWrite;
 
     if (event.RejectReason != HighResCaptureRejectReason::None)
@@ -1601,8 +2941,9 @@ void GLRenderer::ClassifyHighResDisplayCaptureEvent(const sLastDisplayCaptureDeb
     if (capture.SrcA)
     {
         event.SourceKind = HighResCaptureSourceKind::CleanOutput3D;
-        event.ProductMask = HighResCaptureProductFullEquivalent |
-                            HighResCaptureProductBackground3DUnderlay;
+        event.ProductMask = HighResCaptureProductFullEquivalent;
+        if (allowBackgroundProduct)
+            event.ProductMask |= HighResCaptureProductBackground3DUnderlay;
         return;
     }
 
@@ -1613,47 +2954,64 @@ void GLRenderer::ClassifyHighResDisplayCaptureEvent(const sLastDisplayCaptureDeb
         return;
     }
 
-    const u32 visibleBGLayers = sourceRenderer->LayerEnable & 0x0Fu;
+    const u32 visibleBGLayers = event.SourceVisibleBGLayers;
     const bool direct3DOnlyBackground =
         event.SourceDirect3DVisible &&
         visibleBGLayers == (1u << 0) &&
         event.SourceVisibleBitmapMask == 0;
+    event.SourceDirect3DOnlyBackground = direct3DOnlyBackground;
+    const auto sourcePath = static_cast<GLRenderer2D::WholeSceneRenderPath>(event.SourceWholeScenePath);
     if (direct3DOnlyBackground)
     {
         event.SourceKind = HighResCaptureSourceKind::CleanEngineA2DOutput;
-        event.ProductMask = HighResCaptureProductFullEquivalent |
-                            HighResCaptureProductBackground3DUnderlay;
+        event.ProductMask = HighResCaptureProductFullEquivalent;
+        if (allowBackgroundProduct)
+            event.ProductMask |= HighResCaptureProductBackground3DUnderlay;
     }
-    else if (sourceRenderer->WholeSceneTrace.Path == GLRenderer2D::WholeSceneRenderPath::CaptureBackedHandoff)
+    else if (sourcePath == GLRenderer2D::WholeSceneRenderPath::CaptureBackedHandoff)
     {
         event.SourceKind = HighResCaptureSourceKind::RecursiveHandoffOutput;
         event.RejectReason = HighResCaptureRejectReason::RecursiveSource;
     }
-    else if (sourceRenderer->WholeSceneTrace.Path == GLRenderer2D::WholeSceneRenderPath::SourceACaptureReplacement ||
-             sourceRenderer->WholeSceneTrace.Path == GLRenderer2D::WholeSceneRenderPath::CaptureEpochOverlay)
+    else if (sourcePath == GLRenderer2D::WholeSceneRenderPath::SourceACaptureReplacement ||
+             sourcePath == GLRenderer2D::WholeSceneRenderPath::CaptureEpochOverlay)
     {
         event.SourceKind = HighResCaptureSourceKind::RecursiveSourceReplacementOutput;
         event.RejectReason = HighResCaptureRejectReason::RecursiveSource;
     }
+    else if (trackedSourceBBlend && event.SourceRenderedFullWholeScene)
+    {
+        event.SourceKind = HighResCaptureSourceKind::CleanEngineA2DOutput;
+        event.ProductMask = HighResCaptureProductFullEquivalent;
+    }
     else
     {
-        bool direct3DWithTextBGFullEquivalent = event.SourceDirect3DVisible &&
-                                                !event.SourceOBJVisible &&
-                                                event.SourceVisibleBitmapMask == 0 &&
-                                                (visibleBGLayers & (1u << 0)) != 0;
-        for (int layer = 0; direct3DWithTextBGFullEquivalent && layer < 4; layer++)
+        bool direct3DWithTextBGShapeFullEquivalent =
+            event.SourceDirect3DVisible &&
+            event.SourceVisibleBitmapMask == 0 &&
+            (visibleBGLayers & (1u << 0)) != 0;
+        for (int layer = 0; direct3DWithTextBGShapeFullEquivalent && layer < 4; layer++)
         {
             if (!(visibleBGLayers & (1u << layer)))
                 continue;
 
             const u32 type = sourceRenderer->LayerConfig.uBGConfig[layer].Type;
             if (layer == 0)
-                direct3DWithTextBGFullEquivalent = type == 6;
+                direct3DWithTextBGShapeFullEquivalent = type == 6;
             else
-                direct3DWithTextBGFullEquivalent = type <= 1;
+                direct3DWithTextBGShapeFullEquivalent = type <= 1;
         }
+        const bool direct3DWithTextBGFullEquivalent =
+            direct3DWithTextBGShapeFullEquivalent && !event.SourceOBJVisible;
+        const bool direct3DWithTextBGAndOBJFullEquivalent =
+            direct3DWithTextBGShapeFullEquivalent &&
+            event.SourceOBJVisible &&
+            event.SourceRenderedFullWholeScene;
+        event.SourceTextBGShapeFullEquivalent = direct3DWithTextBGShapeFullEquivalent;
+        event.SourceTextBGFullEquivalent =
+            direct3DWithTextBGFullEquivalent || direct3DWithTextBGAndOBJFullEquivalent;
 
-        if (direct3DWithTextBGFullEquivalent)
+        if (event.SourceTextBGFullEquivalent)
         {
             event.SourceKind = HighResCaptureSourceKind::CleanEngineA2DOutput;
             event.ProductMask = HighResCaptureProductFullEquivalent;
@@ -1662,6 +3020,8 @@ void GLRenderer::ClassifyHighResDisplayCaptureEvent(const sLastDisplayCaptureDeb
         {
             event.SourceKind = HighResCaptureSourceKind::NativeOnlyOutput2D;
             event.RejectReason = HighResCaptureRejectReason::DirtyOrPartialSource;
+            event.SourceOBJOnlyDirtyOrPartial =
+                direct3DWithTextBGShapeFullEquivalent && event.SourceOBJVisible;
         }
     }
 }
@@ -1670,15 +3030,16 @@ void GLRenderer::StoreHighResDisplayCaptureEventProducts(const sLastDisplayCaptu
                                                          sHighResDisplayCaptureEvent& event)
 {
     if ((event.ProductMask & HighResCaptureProductBackground3DUnderlay) &&
-        !StoreHighResDisplayCaptureBackgroundProduct(capture.DstBlock, OutputTex3D))
+        !(capture.SrcA
+              ? StoreHighResDisplayCaptureBackgroundProductFromCaptureOutput(capture.DstBlock)
+              : StoreHighResDisplayCaptureBackgroundProduct(capture.DstBlock, OutputTex3D)))
     {
         event.ProductMask &= ~HighResCaptureProductBackground3DUnderlay;
     }
 
     if (event.ProductMask & HighResCaptureProductFullEquivalent)
     {
-        const GLuint fullSourceTex = capture.SrcA ? OutputTex3D : OutputTex2D[0];
-        if (!StoreHighResDisplayCaptureFullProduct(capture.DstBlock, fullSourceTex))
+        if (!StoreHighResDisplayCaptureFullProductFromCaptureOutput(capture.DstBlock))
             event.ProductMask &= ~HighResCaptureProductFullEquivalent;
     }
 
@@ -1690,6 +3051,59 @@ void GLRenderer::StoreHighResDisplayCaptureEventProducts(const sLastDisplayCaptu
     }
 }
 
+bool GLRenderer::TryPromoteCaptureEventFromMainVRAMDisplayEpoch(const sLastDisplayCaptureDebug& capture,
+                                                                bool fullDisplay,
+                                                                bool sourceAOnly,
+                                                                sHighResDisplayCaptureEvent& event)
+{
+    if (!fullDisplay ||
+        !sourceAOnly ||
+        capture.DstBlock >= 4 ||
+        capture.DstOffset != 0 ||
+        capture.UsesSrcB ||
+        capture.SrcBUsesTrackedCapture ||
+        capture.SrcBSameDstBank ||
+        event.RejectReason != HighResCaptureRejectReason::DirtyOrPartialSource ||
+        event.SourceKind != HighResCaptureSourceKind::NativeOnlyOutput2D ||
+        event.ProductMask != 0)
+    {
+        return false;
+    }
+
+    const auto& epoch = MainVRAMDisplayEpoch[capture.DstBlock];
+    if (!epoch.Valid ||
+        epoch.CaptureBank != capture.DstBlock ||
+        epoch.DstOffset != 0 ||
+        epoch.ScreenSwap != event.ScreenSwap ||
+        epoch.MainEngineFinalBottom != event.MainEngineFinalBottom ||
+        epoch.HasDirtyRows ||
+        !(epoch.ProductMask & HighResCaptureProductFullEquivalent) ||
+        !IsAcceptedMainVRAMDisplayFullProductSource(epoch.SourceKind) ||
+        !MainVRAMDisplayEpochTex[capture.DstBlock])
+    {
+        return false;
+    }
+
+    if (!StoreHighResDisplayCaptureFullProduct(capture.DstBlock,
+                                               MainVRAMDisplayEpochTex[capture.DstBlock]))
+    {
+        return false;
+    }
+
+    event.Source3DSerial = epoch.Source3DSerial;
+    event.Source3DSceneHash = epoch.Source3DSceneHash;
+    event.SourceLayerEnable = epoch.SourceLayerEnable;
+    event.SourceBGMode = epoch.SourceBGMode;
+    event.SourceVisibleBitmapMask = epoch.SourceVisibleBitmapMask;
+    event.SourceDirect3DVisible = epoch.SourceDirect3DVisible;
+    event.SourceOBJVisible = epoch.SourceOBJVisible;
+    event.SourcePresentationHash = epoch.SourcePresentationHash;
+    event.SourceKind = HighResCaptureSourceKind::DerivedMainVRAMDisplayEpoch;
+    event.ProductMask = HighResCaptureProductFullEquivalent;
+    event.RejectReason = HighResCaptureRejectReason::None;
+    return true;
+}
+
 void GLRenderer::PublishHighResDisplayCaptureEvent(const sLastDisplayCaptureDebug& capture,
                                                    const sHighResDisplayCaptureEvent& event,
                                                    bool fullDisplay)
@@ -1699,21 +3113,62 @@ void GLRenderer::PublishHighResDisplayCaptureEvent(const sLastDisplayCaptureDebu
         if (capture.DstBlock < 4)
         {
             HighResDisplayCapture256Event[capture.DstBlock] = {};
+            MainVRAMDisplayExactProductEvent[capture.DstBlock] = {};
+            InvalidateMainVRAMDisplayEpochForBank(capture.DstBlock, 2,
+                                                   capture.DstOffset,
+                                                   capture.CapSize,
+                                                   true);
             InvalidateCaptureBackgroundEpochForBank(capture.DstBlock);
         }
         LastHighResDisplayCaptureEvent = event;
         return;
     }
 
+    if (capture.DstBlock < 4 &&
+        (!fullDisplay ||
+         capture.DstOffset != 0 ||
+         event.RejectReason != HighResCaptureRejectReason::None ||
+         !(event.ProductMask & HighResCaptureProductFullEquivalent) ||
+         !IsAcceptedMainVRAMDisplayFullProductSource(event.SourceKind) ||
+         HighResDisplayCaptureFullTex[capture.DstBlock] == 0))
+    {
+        MainVRAMDisplayExactProductEvent[capture.DstBlock] = {};
+    }
+
     if (event.RejectReason != HighResCaptureRejectReason::None ||
         !(event.ProductMask & HighResCaptureProductBackground3DUnderlay))
     {
         InvalidateCaptureBackgroundEpochForBank(capture.DstBlock);
+        InvalidateMainVRAMDisplayEpochForBank(capture.DstBlock, 3,
+                                               capture.DstOffset,
+                                               capture.CapSize,
+                                               true);
         if (fullDisplay)
             InvalidateCaptureBackgroundEpoch();
     }
 
     HighResDisplayCapture256Event[capture.DstBlock] = event;
+    if (capture.DstBlock < 4 &&
+        fullDisplay &&
+        capture.DstOffset == 0 &&
+        event.RejectReason == HighResCaptureRejectReason::None &&
+        (event.ProductMask & HighResCaptureProductFullEquivalent) &&
+        IsAcceptedMainVRAMDisplayFullProductSource(event.SourceKind) &&
+        HighResDisplayCaptureFullTex[capture.DstBlock] != 0)
+    {
+        MainVRAMDisplayExactProductEvent[capture.DstBlock] = event;
+    }
+    if (event.RejectReason == HighResCaptureRejectReason::None &&
+        (event.ProductMask & HighResCaptureProductFullEquivalent))
+    {
+        UpdateMainVRAMDisplayEpochFromEvent(event);
+    }
+    if (event.RejectReason == HighResCaptureRejectReason::None &&
+        (event.ProductMask & HighResCaptureProductBackground3DUnderlay))
+    {
+        const int routeSlot = event.MainEngineFinalBottom ? 1 : 0;
+        UpdateCaptureBackgroundEpochForRoute(routeSlot, event);
+    }
     LastHighResDisplayCaptureEvent = event;
 }
 
@@ -1730,11 +3185,64 @@ void GLRenderer::RecordHighResDisplayCaptureEvent(const sLastDisplayCaptureDebug
         capture.YStart == 0 &&
         capture.YEnd >= 192;
     const bool sourceAOnly = IsFullDisplayCaptureFromSourceAOnly(capture.CaptureCnt) && !capture.UsesSrcB;
+    const auto storeCapturedRouteProduct = [&]()
+    {
+        if (!sourceRenderer ||
+            !fullDisplay ||
+            !sourceAOnly ||
+            capture.DstBlock >= 4 ||
+            event.RejectReason != HighResCaptureRejectReason::None ||
+            !(event.ProductMask & HighResCaptureProductFullEquivalent) ||
+            !event.SourceRenderedFullWholeScene ||
+            !IsAcceptedMainVRAMDisplayFullProductSource(event.SourceKind) ||
+            event.Source3DSerial == 0 ||
+            event.Source3DSceneHash == 0 ||
+            event.SourcePresentationHash == 0)
+        {
+            return;
+        }
+
+        const GLuint fullProductTex = HighResDisplayCaptureFullTex[event.DstBlock];
+        if (!fullProductTex)
+            return;
+
+        sourceRenderer->StoreRawCaptureBackedRouteProduct(
+            event.MainEngineFinalBottom ? 1 : 0,
+            fullProductTex,
+            0,
+            event.Source3DSerial,
+            event.Source3DSceneHash,
+            event.DstBlock,
+            event.SourcePresentationHash,
+            event.SourcePresentationHash,
+            0,
+            192);
+    };
+    const auto tagCapturedRouteProduct = [&]()
+    {
+        if (!sourceRenderer ||
+            !fullDisplay ||
+            capture.DstBlock >= 4 ||
+            event.RejectReason != HighResCaptureRejectReason::None ||
+            !(event.ProductMask & HighResCaptureProductFullEquivalent))
+        {
+            return;
+        }
+
+        const int routeSlot = event.MainEngineFinalBottom ? 1 : 0;
+        sourceRenderer->NoteCaptureBackedRouteProductCaptured(routeSlot,
+                                                              event.Serial,
+                                                              event.DstBlock,
+                                                              event.SourcePresentationHash,
+                                                              event.Source3DSerial,
+                                                              event.Source3DSceneHash);
+    };
 
     if (capture.CapSize == 0)
     {
         event.RejectReason = HighResCaptureRejectReason::UnsupportedSize;
         PublishHighResDisplayCaptureEvent(capture, event, fullDisplay);
+        tagCapturedRouteProduct();
         return;
     }
 
@@ -1752,12 +3260,16 @@ void GLRenderer::RecordHighResDisplayCaptureEvent(const sLastDisplayCaptureDebug
         event.ProductMask = 0;
         event.RejectReason = HighResCaptureRejectReason::FinalNativePostprocessSource;
         PublishHighResDisplayCaptureEvent(capture, event, fullDisplay);
+        tagCapturedRouteProduct();
         return;
     }
 
     ClassifyHighResDisplayCaptureEvent(capture, sourceRenderer, fullDisplay, sourceAOnly, event);
     StoreHighResDisplayCaptureEventProducts(capture, event);
+    TryPromoteCaptureEventFromMainVRAMDisplayEpoch(capture, fullDisplay, sourceAOnly, event);
     PublishHighResDisplayCaptureEvent(capture, event, fullDisplay);
+    storeCapturedRouteProduct();
+    tagCapturedRouteProduct();
 }
 
 bool GLRenderer::StoreHighResDisplayCaptureBackgroundProduct(u32 captureBank, GLuint sourceTex)
@@ -1778,8 +3290,28 @@ bool GLRenderer::StoreHighResDisplayCaptureFullProduct(u32 captureBank, GLuint s
 
     return StoreHighResDisplayCaptureProduct(HighResDisplayCaptureFullFB[captureBank],
                                              HighResDisplayCaptureFullTex[captureBank],
-                                             HighResDisplayCaptureFullReadFB,
-                                             sourceTex);
+                                              HighResDisplayCaptureFullReadFB,
+                                              sourceTex);
+}
+
+bool GLRenderer::StoreHighResDisplayCaptureBackgroundProductFromCaptureOutput(u32 captureBank)
+{
+    if (captureBank >= 4)
+        return false;
+
+    return StoreHighResDisplayCaptureProductFromFramebuffer(HighResDisplayCaptureBackgroundFB[captureBank],
+                                                           HighResDisplayCaptureBackgroundTex[captureBank],
+                                                           CaptureOutput256FB[captureBank]);
+}
+
+bool GLRenderer::StoreHighResDisplayCaptureFullProductFromCaptureOutput(u32 captureBank)
+{
+    if (captureBank >= 4)
+        return false;
+
+    return StoreHighResDisplayCaptureProductFromFramebuffer(HighResDisplayCaptureFullFB[captureBank],
+                                                           HighResDisplayCaptureFullTex[captureBank],
+                                                           CaptureOutput256FB[captureBank]);
 }
 
 bool GLRenderer::UpdateCaptureBackgroundEpochForRoute(int routeSlot,
@@ -1807,6 +3339,8 @@ bool GLRenderer::UpdateCaptureBackgroundEpochForRoute(int routeSlot,
     auto& epoch = ActiveCaptureBackgroundEpoch[routeSlot];
     epoch.Valid = true;
     epoch.Serial = event.Serial;
+    epoch.Source3DSerial = event.Source3DSerial;
+    epoch.Source3DSceneHash = event.Source3DSceneHash;
     epoch.CaptureBank = event.DstBlock;
     epoch.DstBlock = event.DstBlock;
     epoch.DstOffset = event.DstOffset;
@@ -1820,6 +3354,9 @@ bool GLRenderer::UpdateCaptureBackgroundEpochForRoute(int routeSlot,
     epoch.SourceVisibleBitmapMask = event.SourceVisibleBitmapMask;
     epoch.SourceDirect3DVisible = event.SourceDirect3DVisible;
     epoch.SourceOBJVisible = event.SourceOBJVisible;
+    epoch.SourcePresentationHash = event.SourcePresentationHash;
+    epoch.StoredMasterBrightness = event.SourceMasterBrightness;
+    epoch.HasStoredEffectState = event.HasSourceEffectState;
     return true;
 }
 
@@ -1877,6 +3414,108 @@ bool GLRenderer::StoreHighResDisplayCaptureProduct(GLuint dstFB,
     return true;
 }
 
+bool GLRenderer::StoreHighResDisplayCaptureProductFromFramebuffer(GLuint dstFB,
+                                                                  GLuint dstTex,
+                                                                  GLuint sourceFB)
+{
+    if (!dstFB ||
+        !dstTex ||
+        !sourceFB ||
+        !glBlitFramebuffer)
+    {
+        return false;
+    }
+
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, sourceFB);
+    glReadBuffer(GL_COLOR_ATTACHMENT0);
+
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, dstFB);
+    glFramebufferTexture(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, dstTex, 0);
+    glDrawBuffer(GL_COLOR_ATTACHMENT0);
+
+    glDisable(GL_SCISSOR_TEST);
+    glDisable(GL_BLEND);
+    glBlitFramebuffer(0, 0, ScreenW, ScreenH,
+                      0, 0, ScreenW, ScreenH,
+                      GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    return true;
+}
+
+bool GLRenderer::UpdateMainVRAMDisplayEpochFromEvent(const sHighResDisplayCaptureEvent& event)
+{
+    if (event.DstBlock >= 4 ||
+        event.DstOffset != 0 ||
+        event.RejectReason != HighResCaptureRejectReason::None ||
+        !(event.ProductMask & HighResCaptureProductFullEquivalent) ||
+        !IsAcceptedMainVRAMDisplayFullProductSource(event.SourceKind) ||
+        !HighResDisplayCaptureFullTex[event.DstBlock] ||
+        !MainVRAMDisplayEpochTex[event.DstBlock] ||
+        !MainVRAMDisplayEpochFB[event.DstBlock])
+    {
+        if (event.DstBlock < 4)
+            InvalidateMainVRAMDisplayEpochForBank(event.DstBlock, 4,
+                                                   event.DstOffset,
+                                                   event.CapSize,
+                                                   true);
+        return false;
+    }
+
+    if (event.SourceOBJVisible)
+        return false;
+
+    if (!StoreHighResDisplayCaptureProduct(MainVRAMDisplayEpochFB[event.DstBlock],
+                                           MainVRAMDisplayEpochTex[event.DstBlock],
+                                           HighResDisplayCaptureFullReadFB,
+                                           HighResDisplayCaptureFullTex[event.DstBlock]))
+    {
+        InvalidateMainVRAMDisplayEpochForBank(event.DstBlock, 5,
+                                               event.DstOffset,
+                                               event.CapSize,
+                                               true);
+        return false;
+    }
+
+    auto& epoch = MainVRAMDisplayEpoch[event.DstBlock];
+    epoch.Valid = true;
+    epoch.Serial = event.Serial;
+    epoch.Source3DSerial = event.Source3DSerial;
+    epoch.Source3DSceneHash = event.Source3DSceneHash;
+    epoch.CaptureCnt = event.CaptureCnt;
+    epoch.CaptureBank = event.DstBlock;
+    epoch.DstOffset = event.DstOffset;
+    epoch.ScreenSwap = event.ScreenSwap;
+    epoch.MainEngineFinalBottom = event.MainEngineFinalBottom;
+    epoch.SourceKind = event.SourceKind;
+    epoch.ProductMask = event.ProductMask;
+    epoch.SourceLayerEnable = event.SourceLayerEnable;
+    epoch.SourceBGMode = event.SourceBGMode;
+    epoch.SourceVisibleBitmapMask = event.SourceVisibleBitmapMask;
+    epoch.SourceDirect3DVisible = event.SourceDirect3DVisible;
+    epoch.SourceOBJVisible = event.SourceOBJVisible;
+    epoch.SourcePresentationHash = event.SourcePresentationHash;
+    epoch.HasDirtyRows = false;
+    epoch.DirtyYStart = 192;
+    epoch.DirtyYEnd = 0;
+    return true;
+}
+
+void GLRenderer::InvalidateMainVRAMDisplayEpochForBank(u32 captureBank,
+                                                       u32 reason,
+                                                       u32 start,
+                                                       u32 len,
+                                                       bool complete)
+{
+    if (captureBank >= 4)
+        return;
+
+    MainVRAMDisplayEpochInvalidationDebug.Reason = reason;
+    MainVRAMDisplayEpochInvalidationDebug.Bank = captureBank;
+    MainVRAMDisplayEpochInvalidationDebug.Start = start;
+    MainVRAMDisplayEpochInvalidationDebug.Len = len;
+    MainVRAMDisplayEpochInvalidationDebug.Complete = complete;
+    MainVRAMDisplayEpoch[captureBank] = {};
+}
+
 bool GLRenderer::IsFullDisplaySourceACaptureRecord(const sLastDisplayCaptureDebug& capture,
                                                    u32 expectedBlock) const
 {
@@ -1899,6 +3538,18 @@ bool GLRenderer::IsFullDisplayHighResCaptureEventRecord(const sHighResDisplayCap
            event.YStart == 0 &&
            event.YEnd >= 192 &&
            IsFullDisplayCaptureFromSourceAOnly(event.CaptureCnt);
+}
+
+bool GLRenderer::IsFullDisplayHighResCaptureExactReplacementRecord(
+    const sHighResDisplayCaptureEvent& event,
+    u32 expectedBlock) const
+{
+    return event.Valid &&
+           event.DstBlock == expectedBlock &&
+           event.DstWidth == 256 &&
+           event.DstHeight == 192 &&
+           event.YStart == 0 &&
+           event.YEnd >= 192;
 }
 
 u32 GLRenderer::DisplayCapture256ValidMask() const
@@ -2245,6 +3896,379 @@ bool GLRenderer::ReadWholeScene2DDebugView(int screen,
                                            std::vector<u32>& rgba,
                                            std::string* status)
 {
+    auto fixedBankIndex = [](WholeScene2DDebugView view,
+                             WholeScene2DDebugView first) -> int
+    {
+        const int index = static_cast<int>(view) - static_cast<int>(first);
+        return (index >= 0 && index < 4) ? index : -1;
+    };
+    auto readTexture2D = [&](GLuint tex,
+                             int texWidth,
+                             int texHeight) -> bool
+    {
+        if (!tex || texWidth <= 0 || texHeight <= 0)
+            return false;
+
+        GLint prevActiveTexture = GL_TEXTURE0;
+        GLint prevBinding = 0;
+        GLint prevPackAlignment = 4;
+        glGetIntegerv(GL_ACTIVE_TEXTURE, &prevActiveTexture);
+        glActiveTexture(GL_TEXTURE0);
+        glGetIntegerv(GL_TEXTURE_BINDING_2D, &prevBinding);
+        glGetIntegerv(GL_PACK_ALIGNMENT, &prevPackAlignment);
+
+        width = texWidth;
+        height = texHeight;
+        rgba.resize(static_cast<size_t>(width) * height);
+        glBindTexture(GL_TEXTURE_2D, tex);
+        glPixelStorei(GL_PACK_ALIGNMENT, 1);
+        glGetTexImage(GL_TEXTURE_2D, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
+
+        glPixelStorei(GL_PACK_ALIGNMENT, prevPackAlignment);
+        glBindTexture(GL_TEXTURE_2D, prevBinding);
+        glActiveTexture(prevActiveTexture);
+        return true;
+    };
+    auto readFramebuffer = [&](GLuint fb,
+                               int fbWidth,
+                               int fbHeight) -> bool
+    {
+        if (!fb || fbWidth <= 0 || fbHeight <= 0)
+            return false;
+
+        GLint prevReadFB = 0;
+        GLint prevReadBuffer = GL_COLOR_ATTACHMENT0;
+        GLint prevPackAlignment = 4;
+        glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &prevReadFB);
+        glGetIntegerv(GL_READ_BUFFER, &prevReadBuffer);
+        glGetIntegerv(GL_PACK_ALIGNMENT, &prevPackAlignment);
+
+        width = fbWidth;
+        height = fbHeight;
+        rgba.resize(static_cast<size_t>(width) * height);
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, fb);
+        glReadBuffer(GL_COLOR_ATTACHMENT0);
+        glPixelStorei(GL_PACK_ALIGNMENT, 1);
+        glReadPixels(0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
+
+        glPixelStorei(GL_PACK_ALIGNMENT, prevPackAlignment);
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, prevReadFB);
+        glReadBuffer(prevReadBuffer);
+        return true;
+    };
+    auto appendEventStatus = [](std::string& text,
+                                const sHighResDisplayCaptureEvent& event)
+    {
+        text += "\n  event valid: ";
+        text += event.Valid ? "yes" : "no";
+        text += "\n  event serial: ";
+        text += std::to_string(event.Serial);
+        text += "\n  source 3D serial: ";
+        text += std::to_string(event.Source3DSerial);
+        text += "\n  source 3D scene hash: ";
+        text += std::to_string(event.Source3DSceneHash);
+        text += "\n  source presentation hash: ";
+        text += std::to_string(event.SourcePresentationHash);
+        text += "\n  source kind: ";
+        text += std::to_string(static_cast<u32>(event.SourceKind));
+        text += "\n  product mask: ";
+        text += std::to_string(event.ProductMask);
+        text += "\n  reject reason: ";
+        text += std::to_string(static_cast<u32>(event.RejectReason));
+        text += "\n  destination: bank ";
+        text += static_cast<char>('A' + event.DstBlock);
+        text += ", offset ";
+        text += std::to_string(event.DstOffset);
+        text += "\n  route bottom: ";
+        text += event.MainEngineFinalBottom ? "yes" : "no";
+    };
+
+    const int rawBank = fixedBankIndex(view, WholeScene2DDebugView::MainVRAMDisplayRawBank0);
+    if (rawBank >= 0)
+    {
+        width = 256;
+        height = 192;
+        rgba.assign(static_cast<size_t>(width) * height, 0xFF000000u);
+
+        const u16* vram = reinterpret_cast<const u16*>(GPU.VRAM[rawBank]);
+        auto expand5 = [](u16 value) -> u32
+        {
+            return (value << 3) | (value >> 2);
+        };
+
+        for (int y = 0; y < height; y++)
+        {
+            for (int x = 0; x < width; x++)
+            {
+                const u16 pixel = vram[y * width + x];
+                const u32 r = expand5(pixel & 0x1Fu);
+                const u32 g = expand5((pixel >> 5) & 0x1Fu);
+                const u32 b = expand5((pixel >> 10) & 0x1Fu);
+                rgba[static_cast<size_t>(y) * width + x] =
+                    r | (g << 8) | (b << 16) | 0xFF000000u;
+            }
+        }
+
+        if (status)
+        {
+            const bool mapped = (GPU.VRAMMap_LCDC & (1u << rawBank)) != 0;
+            *status = "Raw native-resolution CPU VRAM interpreted as a 256x192 display image.";
+            *status += "\n  screen selector: ignored";
+            *status += "\n  bank: ";
+            *status += static_cast<char>('A' + rawBank);
+            *status += mapped ? " mapped to LCDC" : " not mapped to LCDC";
+            *status += "\n  main display route: ";
+            *status += DescribeMainDisplayRoute();
+        }
+        return true;
+    }
+
+    const int captureOutputBank =
+        fixedBankIndex(view, WholeScene2DDebugView::CaptureOutput256Bank0);
+    if (captureOutputBank >= 0)
+    {
+        if (!CaptureOutput256Valid[captureOutputBank])
+        {
+            if (status)
+            {
+                *status = "No valid high-resolution 256x256 capture output for bank ";
+                *status += static_cast<char>('A' + captureOutputBank);
+                *status += ".";
+            }
+            return false;
+        }
+
+        if (!readFramebuffer(CaptureOutput256FB[captureOutputBank],
+                             256 * ScaleFactor,
+                             256 * ScaleFactor))
+        {
+            if (status)
+                *status = "Capture output framebuffer is unavailable.";
+            return false;
+        }
+
+        if (status)
+        {
+            *status = "High-resolution 256x256 display-capture output layer.";
+            *status += "\n  screen selector: ignored";
+            *status += "\n  bank: ";
+            *status += static_cast<char>('A' + captureOutputBank);
+            *status += "\n  size: ";
+            *status += std::to_string(width) + "x" + std::to_string(height);
+            appendEventStatus(*status, HighResDisplayCapture256Event[captureOutputBank]);
+        }
+        return true;
+    }
+
+    const int fullProductBank =
+        fixedBankIndex(view, WholeScene2DDebugView::HighResDisplayCaptureFullBank0);
+    if (fullProductBank >= 0)
+    {
+        const auto& event = HighResDisplayCapture256Event[fullProductBank];
+        if (!event.Valid || !(event.ProductMask & HighResCaptureProductFullEquivalent))
+        {
+            if (status)
+            {
+                *status = "No valid full-equivalent high-resolution capture product for bank ";
+                *status += static_cast<char>('A' + fullProductBank);
+                *status += ".";
+                appendEventStatus(*status, event);
+            }
+            return false;
+        }
+        if (!readTexture2D(HighResDisplayCaptureFullTex[fullProductBank], ScreenW, ScreenH))
+        {
+            if (status)
+                *status = "Full-equivalent capture product texture is unavailable.";
+            return false;
+        }
+
+        if (status)
+        {
+            *status = "High-resolution full-equivalent display-capture product.";
+            *status += "\n  screen selector: ignored";
+            *status += "\n  bank: ";
+            *status += static_cast<char>('A' + fullProductBank);
+            *status += "\n  size: ";
+            *status += std::to_string(width) + "x" + std::to_string(height);
+            appendEventStatus(*status, event);
+        }
+        return true;
+    }
+
+    const int backgroundProductBank =
+        fixedBankIndex(view, WholeScene2DDebugView::HighResDisplayCaptureBackgroundBank0);
+    if (backgroundProductBank >= 0)
+    {
+        const auto& event = HighResDisplayCapture256Event[backgroundProductBank];
+        if (!event.Valid || !(event.ProductMask & HighResCaptureProductBackground3DUnderlay))
+        {
+            if (status)
+            {
+                *status = "No valid background/3D-underlay capture product for bank ";
+                *status += static_cast<char>('A' + backgroundProductBank);
+                *status += ".";
+                appendEventStatus(*status, event);
+            }
+            return false;
+        }
+        if (!readTexture2D(HighResDisplayCaptureBackgroundTex[backgroundProductBank], ScreenW, ScreenH))
+        {
+            if (status)
+                *status = "Background/3D-underlay capture product texture is unavailable.";
+            return false;
+        }
+
+        if (status)
+        {
+            *status = "High-resolution background/3D-underlay display-capture product.";
+            *status += "\n  screen selector: ignored";
+            *status += "\n  bank: ";
+            *status += static_cast<char>('A' + backgroundProductBank);
+            *status += "\n  size: ";
+            *status += std::to_string(width) + "x" + std::to_string(height);
+            appendEventStatus(*status, event);
+        }
+        return true;
+    }
+
+    const int fixedEpochBank =
+        fixedBankIndex(view, WholeScene2DDebugView::MainVRAMDisplayEpochBank0);
+    if (fixedEpochBank >= 0)
+    {
+        const auto& epoch = MainVRAMDisplayEpoch[fixedEpochBank];
+        if (!epoch.Valid || !MainVRAMDisplayEpochTex[fixedEpochBank])
+        {
+            if (status)
+            {
+                *status = "No valid main VRAM display epoch texture for bank ";
+                *status += static_cast<char>('A' + fixedEpochBank);
+                *status += ".";
+            }
+            return false;
+        }
+        if (!readTexture2D(MainVRAMDisplayEpochTex[fixedEpochBank], ScreenW, ScreenH))
+        {
+            if (status)
+                *status = "Main VRAM display epoch texture is unavailable.";
+            return false;
+        }
+
+        if (status)
+        {
+            *status = "Main VRAM display epoch texture before dirty-row native overlay.";
+            *status += "\n  screen selector: ignored";
+            *status += "\n  bank: ";
+            *status += static_cast<char>('A' + fixedEpochBank);
+            *status += "\n  size: ";
+            *status += std::to_string(width) + "x" + std::to_string(height);
+            *status += "\n  serial: ";
+            *status += std::to_string(epoch.Serial);
+            *status += "\n  source 3D serial: ";
+            *status += std::to_string(epoch.Source3DSerial);
+            *status += "\n  source 3D scene hash: ";
+            *status += std::to_string(epoch.Source3DSceneHash);
+            *status += "\n  source presentation hash: ";
+            *status += std::to_string(epoch.SourcePresentationHash);
+            *status += "\n  source kind: ";
+            *status += std::to_string(static_cast<u32>(epoch.SourceKind));
+            *status += "\n  product mask: ";
+            *status += std::to_string(epoch.ProductMask);
+            *status += "\n  dirty rows: ";
+            if (epoch.HasDirtyRows)
+                *status += std::to_string(epoch.DirtyYStart) + "-" + std::to_string(epoch.DirtyYEnd);
+            else
+                *status += "none";
+        }
+        return true;
+    }
+
+    if (view == WholeScene2DDebugView::MainVRAMDisplayRaw)
+    {
+        width = 256;
+        height = 192;
+        rgba.clear();
+
+        const u32 finalDispModeA = (DispCntA >> 16) & 0x3u;
+        if (finalDispModeA != 2)
+        {
+            if (status)
+                *status = "Main engine is not currently using VRAM display mode.";
+            return false;
+        }
+
+        const u32 displayBank = (DispCntA >> 18) & 0x3u;
+        if (displayBank >= 4)
+        {
+            if (status)
+                *status = "Main VRAM display bank is invalid.";
+            return false;
+        }
+
+        rgba.assign(static_cast<size_t>(width) * height, 0xFF000000u);
+        const bool mapped = (GPU.VRAMMap_LCDC & (1u << displayBank)) != 0;
+        if (mapped)
+        {
+            const u16* vram = reinterpret_cast<const u16*>(GPU.VRAM[displayBank]);
+            auto expand5 = [](u16 value) -> u32
+            {
+                return (value << 3) | (value >> 2);
+            };
+
+            for (int y = 0; y < height; y++)
+            {
+                for (int x = 0; x < width; x++)
+                {
+                    const u16 pixel = vram[y * width + x];
+                    const u32 r = expand5(pixel & 0x1Fu);
+                    const u32 g = expand5((pixel >> 5) & 0x1Fu);
+                    const u32 b = expand5((pixel >> 10) & 0x1Fu);
+                    rgba[static_cast<size_t>(y) * width + x] =
+                        r | (g << 8) | (b << 16) | 0xFF000000u;
+                }
+            }
+        }
+
+        if (status)
+        {
+            *status = "Raw native-resolution CPU VRAM selected by main engine VRAM display.";
+            *status += "\n  screen selector: ignored";
+            *status += "\n  bank: ";
+            *status += static_cast<char>('A' + displayBank);
+            *status += mapped ? " mapped" : " not mapped";
+            *status += "\n  size: 256x192";
+            *status += "\n  output 3D serial: ";
+            *status += std::to_string(Output3DSerial);
+            if (WholeSceneDebugViewsActive.load(std::memory_order_relaxed))
+            {
+                const auto& debug = VRAMDisplayWriteDebug;
+                *status += "\n  VRAM writes this frame: ";
+                *status += std::to_string(debug.WriteCount);
+                *status += " total, ";
+                *status += std::to_string(debug.ChangedWriteCount);
+                *status += " changed";
+                *status += "\n  visible display-bank writes: ";
+                *status += std::to_string(debug.DisplayWriteCount);
+                *status += " total, ";
+                *status += std::to_string(debug.DisplayChangedWriteCount);
+                *status += " changed";
+                *status += "\n  visible changed rows: ";
+                if (debug.DisplayDirtyYStart < debug.DisplayDirtyYEnd)
+                    *status += std::to_string(debug.DisplayDirtyYStart) + "-" +
+                               std::to_string(debug.DisplayDirtyYEnd);
+                else
+                    *status += "none";
+            }
+            else
+            {
+                *status += "\n  VRAM write coverage: inactive because whole-scene debug views are disabled";
+            }
+            *status += "\n  main display route: ";
+            *status += DescribeMainDisplayRoute();
+        }
+        return true;
+    }
+
     if (view == WholeScene2DDebugView::FinalTop || view == WholeScene2DDebugView::FinalBottom)
     {
         width = ScreenW;
@@ -2360,6 +4384,8 @@ bool GLRenderer::SetWholeScene2DDebugPoison(bool source3D,
 bool GLRenderer::SetWholeScene2DDebugViewsActive(bool active,
                                                  std::string* status)
 {
+    WholeSceneDebugViewsActive.store(active, std::memory_order_relaxed);
+
     auto* rendA = dynamic_cast<GLRenderer2D*>(Rend2D_A.get());
     auto* rendB = dynamic_cast<GLRenderer2D*>(Rend2D_B.get());
     if (!rendA && !rendB)
@@ -2385,6 +4411,12 @@ bool GLRenderer::SetWholeScene2DDebugViewsActive(bool active,
 void GLRenderer::AppendWholeSceneFrameTimingCSVHeader(std::string& header)
 {
     auto add = [&header](const char* name)
+    {
+        if (!header.empty())
+            header += ",";
+        header += name;
+    };
+    auto addName = [&header](const std::string& name)
     {
         if (!header.empty())
             header += ",";
@@ -2430,9 +4462,16 @@ void GLRenderer::AppendWholeSceneFrameTimingCSVHeader(std::string& header)
     add("last_capture_dst_mode");
     add("last_capture_eva");
     add("last_capture_evb");
+    add("last_capture_native_luma_valid");
+    add("last_capture_native_luma_x1000");
+    add("last_capture_native_luma_dst_block");
     add("capture256_valid_mask");
     add("capture256_full_source_a_mask");
+    add("output_3d_serial");
+    add("output_3d_scene_hash");
     add("capture_event_serial");
+    add("capture_event_source_3d_serial");
+    add("capture_event_source_3d_scene_hash");
     add("capture_event_valid_mask");
     add("capture_event_clean3d_mask");
     add("capture_event_clean_2d_output_mask");
@@ -2449,12 +4488,36 @@ void GLRenderer::AppendWholeSceneFrameTimingCSVHeader(std::string& header)
     add("capture_event_source_bitmap_mask");
     add("capture_event_source_direct3d");
     add("capture_event_source_obj");
+    add("capture_event_source_path");
+    add("capture_event_source_y_start");
+    add("capture_event_source_y_end");
+    add("capture_event_source_visible_bg_layers");
+    add("capture_event_source_bg_layer_types");
+    add("capture_event_source_full_whole_scene");
+    add("capture_event_source_direct3d_only_background");
+    add("capture_event_source_text_bg_shape_full_equivalent");
+    add("capture_event_source_text_bg_full_equivalent");
+    add("capture_event_source_obj_only_dirty_or_partial");
     add("capture_event_source_presentation_hash");
     add("capture_event_final_native_source");
     add("capture_event_hybrid_product_suppressed");
     add("final_disp_mode_a");
     add("final_disp_mode_b");
     add("final_screen_swap");
+    add("final_master_brightness_a");
+    add("final_master_brightness_b");
+    add("final_bright_mode_a");
+    add("final_bright_mode_b");
+    add("final_bright_factor_a");
+    add("final_bright_factor_b");
+    add("final_main_input_brightness_applied");
+    add("final_main_input_effect_owner");
+    add("final_main_input_effect_state");
+    add("final_main_input_tex");
+    add("final_sub_input_brightness_applied");
+    add("final_sub_input_effect_owner");
+    add("final_sub_input_effect_state");
+    add("final_sub_input_tex");
     add("final_main_vram_bank");
     add("final_aux0_vramcap");
     add("final_aux_layer");
@@ -2471,6 +4534,132 @@ void GLRenderer::AppendWholeSceneFrameTimingCSVHeader(std::string& header)
     add("final_vram_display_capture_reject_reason");
     add("final_vram_display_replacement_eligible");
     add("final_vram_display_replacement_reject_reason");
+    add("final_vram_display_chosen_bank");
+    add("final_vram_display_chosen_serial");
+    add("final_vram_display_chosen_source_3d_serial");
+    add("final_vram_display_chosen_source_3d_scene_hash");
+    add("final_vram_display_chosen_source_presentation_hash");
+    add("final_vram_display_chosen_source_kind");
+    add("final_vram_display_chosen_product_mask");
+    add("final_vram_display_chosen_tex");
+    add("final_vram_display_chosen_epoch");
+    add("final_vram_display_render_time_bank");
+    add("final_vram_display_render_time_eligible");
+    add("final_vram_display_render_time_reject_reason");
+    add("final_vram_display_render_time_used_epoch");
+    add("final_vram_display_render_time_chosen_bank");
+    add("final_vram_display_render_time_chosen_serial");
+    add("final_vram_display_render_time_chosen_source_3d_serial");
+    add("final_vram_display_render_time_chosen_source_3d_scene_hash");
+    add("final_vram_display_render_time_chosen_source_presentation_hash");
+    add("final_vram_display_render_time_chosen_source_kind");
+    add("final_vram_display_render_time_chosen_product_mask");
+    add("final_vram_display_render_time_chosen_tex");
+    add("final_vram_display_render_time_event_valid");
+    add("final_vram_display_render_time_event_serial");
+    add("final_vram_display_render_time_event_dst_block");
+    add("final_vram_display_render_time_event_dst_offset");
+    add("final_vram_display_render_time_event_screen_swap");
+    add("final_vram_display_render_time_event_main_final_bottom");
+    add("final_vram_display_render_time_event_source_obj");
+    add("final_vram_display_render_time_event_source_full_whole_scene");
+    add("final_vram_display_render_time_event_source_kind");
+    add("final_vram_display_render_time_event_product_mask");
+    add("final_vram_display_render_time_event_reject_reason");
+    add("final_vram_display_render_time_event_full_tex");
+    add("final_vram_display_render_time_event_matches_native_capture");
+    add("final_vram_display_render_time_exact_event_route_matches");
+    add("final_vram_display_render_time_exact_event_product_available");
+    add("final_vram_display_render_time_exact_event_product_usable");
+    add("final_vram_display_epoch_valid");
+    add("final_vram_display_epoch_used");
+    add("final_vram_display_epoch_serial");
+    add("final_vram_display_epoch_source_3d_serial");
+    add("final_vram_display_epoch_source_3d_scene_hash");
+    add("final_vram_display_epoch_source_kind");
+    add("final_vram_display_epoch_product_mask");
+    add("final_vram_display_epoch_dirty_rows");
+    add("final_vram_display_epoch_dirty_y_start");
+    add("final_vram_display_epoch_dirty_y_end");
+    add("final_vram_display_epoch_invalidation_reason");
+    add("final_vram_display_epoch_invalidation_bank");
+    add("final_vram_display_epoch_invalidation_start");
+    add("final_vram_display_epoch_invalidation_len");
+    add("final_vram_display_epoch_invalidation_complete");
+    for (int bank = 0; bank < 4; bank++)
+    {
+        const std::string prefix = "capture_bank" + std::to_string(bank) + "_";
+        addName(prefix + "native_valid");
+        addName(prefix + "native_capture_cnt");
+        addName(prefix + "native_dst_block");
+        addName(prefix + "native_dst_offset");
+        addName(prefix + "native_cap_size");
+        addName(prefix + "native_dst_mode");
+        addName(prefix + "native_src_a");
+        addName(prefix + "native_src_b");
+        addName(prefix + "native_uses_src_b");
+        addName(prefix + "native_src_b_block");
+        addName(prefix + "native_src_b_offset");
+        addName(prefix + "native_src_b_tracked_layer");
+        addName(prefix + "native_src_b_same_dst");
+        addName(prefix + "native_final_native_source_a");
+        addName(prefix + "output256_valid");
+        addName(prefix + "event_valid");
+        addName(prefix + "event_serial");
+        addName(prefix + "event_source_3d_serial");
+        addName(prefix + "event_source_3d_scene_hash");
+        addName(prefix + "event_source_presentation_hash");
+        addName(prefix + "event_source_kind");
+        addName(prefix + "event_product_mask");
+        addName(prefix + "event_reject_reason");
+        addName(prefix + "event_dst_block");
+        addName(prefix + "event_dst_offset");
+        addName(prefix + "event_screen_swap");
+        addName(prefix + "event_main_final_bottom");
+        addName(prefix + "event_source_layer_enable");
+        addName(prefix + "event_source_bitmap_mask");
+        addName(prefix + "event_source_direct3d");
+        addName(prefix + "event_source_obj");
+        addName(prefix + "event_source_path");
+        addName(prefix + "event_source_y_start");
+        addName(prefix + "event_source_y_end");
+        addName(prefix + "event_source_visible_bg_layers");
+        addName(prefix + "event_source_bg_layer_types");
+        addName(prefix + "event_source_full_whole_scene");
+        addName(prefix + "event_source_direct3d_only_background");
+        addName(prefix + "event_source_text_bg_shape_full_equivalent");
+        addName(prefix + "event_source_text_bg_full_equivalent");
+        addName(prefix + "event_source_obj_only_dirty_or_partial");
+        addName(prefix + "full_tex_id");
+        addName(prefix + "background_tex_id");
+        addName(prefix + "epoch_valid");
+        addName(prefix + "epoch_serial");
+        addName(prefix + "epoch_source_3d_serial");
+        addName(prefix + "epoch_source_3d_scene_hash");
+        addName(prefix + "epoch_source_presentation_hash");
+        addName(prefix + "epoch_source_kind");
+        addName(prefix + "epoch_product_mask");
+        addName(prefix + "epoch_screen_swap");
+        addName(prefix + "epoch_main_final_bottom");
+        addName(prefix + "epoch_dirty_rows");
+        addName(prefix + "epoch_dirty_y_start");
+        addName(prefix + "epoch_dirty_y_end");
+        addName(prefix + "epoch_tex_id");
+    }
+    add("vram_write_count");
+    add("vram_write_changed_count");
+    add("vram_write_bank_mask");
+    add("vram_write_bytes");
+    add("vram_write_changed_bytes");
+    add("vram_display_write_bank");
+    add("vram_display_write_count");
+    add("vram_display_write_changed_count");
+    add("vram_display_write_bytes");
+    add("vram_display_write_changed_bytes");
+    add("vram_display_write_first_offset");
+    add("vram_display_write_last_end");
+    add("vram_display_write_dirty_y_start");
+    add("vram_display_write_dirty_y_end");
     add("physical_final_postprocess_enabled");
     add("physical_final_postprocess_applied");
     add("physical_final_postprocess_reject_reason");
@@ -2536,9 +4725,16 @@ void GLRenderer::AppendWholeSceneFrameTimingCSVRow(std::string& row) const
     addInt(LastDisplayCaptureDebug.DstMode);
     addInt(LastDisplayCaptureDebug.EVA);
     addInt(LastDisplayCaptureDebug.EVB);
+    addInt(LastCaptureNativeLumaDebug.Valid);
+    addInt(LastCaptureNativeLumaDebug.LumaX1000);
+    addInt(LastCaptureNativeLumaDebug.DstBlock);
     addInt(DisplayCapture256ValidMask());
     addInt(DisplayCapture256FullSourceAMask());
+    addU64(Output3DSerial);
+    addU64(Output3DSceneHash);
     addU64(LastHighResDisplayCaptureEvent.Serial);
+    addU64(LastHighResDisplayCaptureEvent.Source3DSerial);
+    addU64(LastHighResDisplayCaptureEvent.Source3DSceneHash);
     addInt(HighResDisplayCapture256ValidMask());
     addInt(HighResDisplayCapture256SourceKindMask(HighResCaptureSourceKind::CleanOutput3D));
     addInt(HighResDisplayCapture256SourceKindMask(HighResCaptureSourceKind::CleanEngineA2DOutput));
@@ -2555,6 +4751,16 @@ void GLRenderer::AppendWholeSceneFrameTimingCSVRow(std::string& row) const
     addInt(LastHighResDisplayCaptureEvent.SourceVisibleBitmapMask);
     addInt(LastHighResDisplayCaptureEvent.SourceDirect3DVisible);
     addInt(LastHighResDisplayCaptureEvent.SourceOBJVisible);
+    addInt(LastHighResDisplayCaptureEvent.SourceWholeScenePath);
+    addInt(LastHighResDisplayCaptureEvent.SourceWholeSceneYStart);
+    addInt(LastHighResDisplayCaptureEvent.SourceWholeSceneYEnd);
+    addInt(LastHighResDisplayCaptureEvent.SourceVisibleBGLayers);
+    addInt(LastHighResDisplayCaptureEvent.SourceBGLayerTypes);
+    addInt(LastHighResDisplayCaptureEvent.SourceRenderedFullWholeScene);
+    addInt(LastHighResDisplayCaptureEvent.SourceDirect3DOnlyBackground);
+    addInt(LastHighResDisplayCaptureEvent.SourceTextBGShapeFullEquivalent);
+    addInt(LastHighResDisplayCaptureEvent.SourceTextBGFullEquivalent);
+    addInt(LastHighResDisplayCaptureEvent.SourceOBJOnlyDirtyOrPartial);
     addU64(LastHighResDisplayCaptureEvent.SourcePresentationHash);
     addInt(LastDisplayCaptureDebug.FinalNativeSourceA);
     addInt(LastHighResDisplayCaptureEvent.RejectReason ==
@@ -2569,25 +4775,12 @@ void GLRenderer::AppendWholeSceneFrameTimingCSVRow(std::string& row) const
         (finalDispModeA == 3) ? 1 :
         (finalDispModeA == 2) ? 0 : -1;
 
-    // Source kind values: 0 disabled/white, 1 A output, 2 B output,
-    // 3 A VRAM tracked capture, 4 A VRAM raw aux copy, 5 A display FIFO,
-    // 6 A output used to reseed an invalid tracked feedback capture.
-    const int finalMainSource =
-        FinalPassInvalidCaptureReseed ? 6 :
-        (finalDispModeA == 0) ? 0 :
-        (finalDispModeA == 1) ? 1 :
-        (finalDispModeA == 2 && Aux0VRAMCap != -1) ? 3 :
-        (finalDispModeA == 2) ? 4 :
-        (finalDispModeA == 3) ? 5 : -1;
-    const int finalSubSource = finalDispModeB == 0 ? 0 : 2;
-    const int finalTopSource = finalScreenSwap ? finalMainSource : finalSubSource;
-    const int finalBottomSource = finalScreenSwap ? finalSubSource : finalMainSource;
-
     // Final VRAM-display replacement reject reasons:
     // 0 eligible, 1 not main VRAM display, 2 no tracked capture source,
     // 3 invalid tracked bank, 4 no matching full-display event,
     // 5 capture event itself rejected, 6 missing full-equivalent product,
-    // 7 unsupported product source kind, 8 mixed/OBJ full-frame capture.
+    // 7 unsupported product source kind, 8 mixed/OBJ full-frame capture,
+    // 9 no valid main VRAM display epoch, 10 full native dirty-row coverage.
     int finalVRAMDisplayCaptureBank = -1;
     int finalVRAMDisplayCaptureOffset = -1;
     int finalVRAMDisplayCaptureMatch = 0;
@@ -2597,19 +4790,59 @@ void GLRenderer::AppendWholeSceneFrameTimingCSVRow(std::string& row) const
     u32 finalVRAMDisplayCaptureRejectReason = static_cast<u32>(HighResCaptureRejectReason::None);
     int finalVRAMDisplayReplacementEligible = 0;
     int finalVRAMDisplayReplacementRejectReason = 0;
+    int finalVRAMDisplayChosenBank = -1;
+    u64 finalVRAMDisplayChosenSerial = 0;
+    u64 finalVRAMDisplayChosenSource3DSerial = 0;
+    u32 finalVRAMDisplayChosenSource3DSceneHash = 0;
+    u32 finalVRAMDisplayChosenSourcePresentationHash = 0;
+    u32 finalVRAMDisplayChosenSourceKind = static_cast<u32>(HighResCaptureSourceKind::None);
+    u32 finalVRAMDisplayChosenProductMask = 0;
+    int finalVRAMDisplayChosenTex = 0;
+    int finalVRAMDisplayChosenEpoch = 0;
+    int finalVRAMDisplayEpochValid = 0;
+    int finalVRAMDisplayEpochUsed = 0;
+    u64 finalVRAMDisplayEpochSerial = 0;
+    u64 finalVRAMDisplayEpochSource3DSerial = 0;
+    u32 finalVRAMDisplayEpochSource3DSceneHash = 0;
+    u32 finalVRAMDisplayEpochSourceKind = static_cast<u32>(HighResCaptureSourceKind::None);
+    u32 finalVRAMDisplayEpochProductMask = 0;
+    int finalVRAMDisplayEpochDirtyRows = 0;
+    int finalVRAMDisplayEpochDirtyYStart = -1;
+    int finalVRAMDisplayEpochDirtyYEnd = -1;
+    bool finalVRAMDisplayUsedEpoch = false;
 
+    if (finalMainVRAMBank >= 0 && finalMainVRAMBank < 4)
+    {
+        const auto& epoch = MainVRAMDisplayEpoch[finalMainVRAMBank];
+        finalVRAMDisplayEpochValid = epoch.Valid ? 1 : 0;
+        finalVRAMDisplayEpochSerial = epoch.Serial;
+        finalVRAMDisplayEpochSource3DSerial = epoch.Source3DSerial;
+        finalVRAMDisplayEpochSource3DSceneHash = epoch.Source3DSceneHash;
+        finalVRAMDisplayEpochSourceKind = static_cast<u32>(epoch.SourceKind);
+        finalVRAMDisplayEpochProductMask = epoch.ProductMask;
+        finalVRAMDisplayEpochDirtyRows = epoch.HasDirtyRows ? 1 : 0;
+        finalVRAMDisplayEpochDirtyYStart = epoch.HasDirtyRows ? static_cast<int>(epoch.DirtyYStart) : -1;
+        finalVRAMDisplayEpochDirtyYEnd = epoch.HasDirtyRows ? static_cast<int>(epoch.DirtyYEnd) : -1;
+    }
+
+    const bool finalVRAMDisplayPersistentReplacement =
+        finalDispModeA == 2 &&
+        finalMainVRAMBank >= 0 &&
+        CanUseMainVRAMDisplayHighResCaptureReplacement(static_cast<u32>(finalMainVRAMBank),
+                                                       nullptr,
+                                                       &finalVRAMDisplayReplacementRejectReason,
+                                                       &finalVRAMDisplayUsedEpoch);
     if (finalDispModeA != 2)
     {
         finalVRAMDisplayReplacementRejectReason = 1;
     }
-    else if (Aux0VRAMCap == -1)
-    {
-        finalVRAMDisplayReplacementRejectReason = 2;
-    }
     else
     {
-        finalVRAMDisplayCaptureBank = Aux0VRAMCap >> 2;
-        finalVRAMDisplayCaptureOffset = Aux0VRAMCap & 0x3;
+        finalVRAMDisplayCaptureBank =
+            Aux0VRAMCap != -1 ? (Aux0VRAMCap >> 2) : finalMainVRAMBank;
+        finalVRAMDisplayCaptureOffset =
+            Aux0VRAMCap != -1 ? (Aux0VRAMCap & 0x3) : 0;
+
         if (finalVRAMDisplayCaptureBank < 0 || finalVRAMDisplayCaptureBank >= 4)
         {
             finalVRAMDisplayReplacementRejectReason = 3;
@@ -2622,44 +4855,79 @@ void GLRenderer::AppendWholeSceneFrameTimingCSVRow(std::string& row) const
             finalVRAMDisplayCaptureSourceKind = static_cast<u32>(event.SourceKind);
             finalVRAMDisplayCaptureRejectReason = static_cast<u32>(event.RejectReason);
             finalVRAMDisplayCaptureMatch =
-                IsFullDisplayHighResCaptureEventRecord(event, finalVRAMDisplayCaptureBank) &&
+                IsFullDisplayHighResCaptureExactReplacementRecord(event, static_cast<u32>(finalVRAMDisplayCaptureBank)) &&
                 event.DstOffset == static_cast<u32>(finalVRAMDisplayCaptureOffset);
 
-            if (!finalVRAMDisplayCaptureMatch)
-            {
-                finalVRAMDisplayReplacementRejectReason = 4;
-            }
-            else if (event.RejectReason != HighResCaptureRejectReason::None)
-            {
-                const bool mixedOrOBJFullFrameCapture =
-                    event.RejectReason == HighResCaptureRejectReason::DirtyOrPartialSource &&
-                    event.SourceKind == HighResCaptureSourceKind::NativeOnlyOutput2D &&
-                    event.SourceDirect3DVisible &&
-                    event.SourceVisibleBitmapMask == 0 &&
-                    (event.SourceLayerEnable & (1u << 0)) &&
-                    (event.SourceOBJVisible || (event.SourceLayerEnable & 0x0Eu));
-                finalVRAMDisplayReplacementRejectReason =
-                    mixedOrOBJFullFrameCapture ? 8 : 5;
-            }
-            else if (!(event.ProductMask & HighResCaptureProductFullEquivalent))
-            {
-                finalVRAMDisplayReplacementRejectReason = 6;
-            }
-            else if (event.SourceKind != HighResCaptureSourceKind::CleanOutput3D &&
-                     event.SourceKind != HighResCaptureSourceKind::CleanEngineA2DOutput)
-            {
-                finalVRAMDisplayReplacementRejectReason = 7;
-            }
-            else
+            if (finalVRAMDisplayPersistentReplacement)
             {
                 finalVRAMDisplayReplacementEligible = 1;
+                finalVRAMDisplayEpochUsed = finalVRAMDisplayUsedEpoch ? 1 : 0;
+                finalVRAMDisplayReplacementRejectReason = 0;
+
+                if (finalVRAMDisplayUsedEpoch &&
+                    finalMainVRAMBank >= 0 &&
+                    finalMainVRAMBank < 4)
+                {
+                    const auto& chosen = MainVRAMDisplayEpoch[finalMainVRAMBank];
+                    finalVRAMDisplayChosenBank = finalMainVRAMBank;
+                    finalVRAMDisplayChosenSerial = chosen.Serial;
+                    finalVRAMDisplayChosenSource3DSerial = chosen.Source3DSerial;
+                    finalVRAMDisplayChosenSource3DSceneHash = chosen.Source3DSceneHash;
+                    finalVRAMDisplayChosenSourcePresentationHash = chosen.SourcePresentationHash;
+                    finalVRAMDisplayChosenSourceKind = static_cast<u32>(chosen.SourceKind);
+                    finalVRAMDisplayChosenProductMask = chosen.ProductMask;
+                    finalVRAMDisplayChosenTex = static_cast<int>(MainVRAMDisplayEpochTex[finalMainVRAMBank]);
+                    finalVRAMDisplayChosenEpoch = 1;
+                }
+                else
+                {
+                    finalVRAMDisplayChosenBank = finalVRAMDisplayCaptureBank;
+                    finalVRAMDisplayChosenSerial = event.Serial;
+                    finalVRAMDisplayChosenSource3DSerial = event.Source3DSerial;
+                    finalVRAMDisplayChosenSource3DSceneHash = event.Source3DSceneHash;
+                    finalVRAMDisplayChosenSourcePresentationHash = event.SourcePresentationHash;
+                    finalVRAMDisplayChosenSourceKind = static_cast<u32>(event.SourceKind);
+                    finalVRAMDisplayChosenProductMask = event.ProductMask;
+                    finalVRAMDisplayChosenTex =
+                        static_cast<int>(HighResDisplayCaptureFullTex[finalVRAMDisplayCaptureBank]);
+                }
             }
         }
     }
 
+    // Source kind values: 0 disabled/white, 1 A output, 2 B output,
+    // 3 A VRAM tracked capture, 4 A VRAM raw aux copy, 5 A display FIFO,
+    // 6 A output used to reseed an invalid tracked feedback capture.
+    const int finalMainSource =
+        FinalPassInvalidCaptureReseed ? 6 :
+        (finalDispModeA == 0) ? 0 :
+        (finalDispModeA == 1) ? 1 :
+        (finalDispModeA == 2 && (Aux0VRAMCap != -1 || finalVRAMDisplayReplacementEligible)) ? 3 :
+        (finalDispModeA == 2) ? 4 :
+        (finalDispModeA == 3) ? 5 : -1;
+    const int finalSubSource = finalDispModeB == 0 ? 0 : 2;
+    const int finalTopSource = finalScreenSwap ? finalMainSource : finalSubSource;
+    const int finalBottomSource = finalScreenSwap ? finalSubSource : finalMainSource;
+    const auto* rendA = dynamic_cast<const GLRenderer2D*>(Rend2D_A.get());
+    const auto* rendB = dynamic_cast<const GLRenderer2D*>(Rend2D_B.get());
+
     addInt(finalDispModeA);
     addInt(finalDispModeB);
     addInt(finalScreenSwap);
+    addInt(MasterBrightnessA);
+    addInt(MasterBrightnessB);
+    addInt(FinalPassConfig.uBrightModeA);
+    addInt(FinalPassConfig.uBrightModeB);
+    addInt(FinalPassConfig.uBrightFactorA);
+    addInt(FinalPassConfig.uBrightFactorB);
+    addInt(rendA ? rendA->WholeSceneTrace.OutputPresentationMasterBrightnessApplied : 0);
+    addInt(rendA ? rendA->WholeSceneTrace.OutputPresentationEffectOwner : 0);
+    addInt(rendA ? rendA->WholeSceneTrace.OutputPresentationEffectState : 0);
+    addInt(rendA ? rendA->WholeSceneTrace.OutputPresentationTex : 0);
+    addInt(rendB ? rendB->WholeSceneTrace.OutputPresentationMasterBrightnessApplied : 0);
+    addInt(rendB ? rendB->WholeSceneTrace.OutputPresentationEffectOwner : 0);
+    addInt(rendB ? rendB->WholeSceneTrace.OutputPresentationEffectState : 0);
+    addInt(rendB ? rendB->WholeSceneTrace.OutputPresentationTex : 0);
     addInt(finalMainVRAMBank);
     addInt(Aux0VRAMCap);
     addInt(finalAuxLayer);
@@ -2676,6 +4944,158 @@ void GLRenderer::AppendWholeSceneFrameTimingCSVRow(std::string& row) const
     addInt(finalVRAMDisplayCaptureRejectReason);
     addInt(finalVRAMDisplayReplacementEligible);
     addInt(finalVRAMDisplayReplacementRejectReason);
+    addInt(finalVRAMDisplayChosenBank);
+    addU64(finalVRAMDisplayChosenSerial);
+    addU64(finalVRAMDisplayChosenSource3DSerial);
+    addU64(finalVRAMDisplayChosenSource3DSceneHash);
+    addU64(finalVRAMDisplayChosenSourcePresentationHash);
+    addInt(finalVRAMDisplayChosenSourceKind);
+    addInt(finalVRAMDisplayChosenProductMask);
+    addInt(finalVRAMDisplayChosenTex);
+    addInt(finalVRAMDisplayChosenEpoch);
+    addInt(FinalVRAMDisplayRenderTrace.DisplayBank);
+    addInt(FinalVRAMDisplayRenderTrace.ReplacementEligible);
+    addInt(FinalVRAMDisplayRenderTrace.RejectReason);
+    addInt(FinalVRAMDisplayRenderTrace.UsedEpoch);
+    addInt(FinalVRAMDisplayRenderTrace.ChosenBank);
+    addU64(FinalVRAMDisplayRenderTrace.ChosenSerial);
+    addU64(FinalVRAMDisplayRenderTrace.ChosenSource3DSerial);
+    addU64(FinalVRAMDisplayRenderTrace.ChosenSource3DSceneHash);
+    addU64(FinalVRAMDisplayRenderTrace.ChosenSourcePresentationHash);
+    addInt(FinalVRAMDisplayRenderTrace.ChosenSourceKind);
+    addInt(FinalVRAMDisplayRenderTrace.ChosenProductMask);
+    addInt(FinalVRAMDisplayRenderTrace.ChosenTex);
+    addInt(FinalVRAMDisplayRenderTrace.EventValid);
+    addU64(FinalVRAMDisplayRenderTrace.EventSerial);
+    addInt(FinalVRAMDisplayRenderTrace.EventDstBlock);
+    addInt(FinalVRAMDisplayRenderTrace.EventDstOffset);
+    addInt(FinalVRAMDisplayRenderTrace.EventScreenSwap);
+    addInt(FinalVRAMDisplayRenderTrace.EventMainFinalBottom);
+    addInt(FinalVRAMDisplayRenderTrace.EventSourceOBJ);
+    addInt(FinalVRAMDisplayRenderTrace.EventSourceRenderedFullWholeScene);
+    addInt(FinalVRAMDisplayRenderTrace.EventSourceKind);
+    addInt(FinalVRAMDisplayRenderTrace.EventProductMask);
+    addInt(FinalVRAMDisplayRenderTrace.EventRejectReason);
+    addInt(FinalVRAMDisplayRenderTrace.EventFullTex);
+    addInt(FinalVRAMDisplayRenderTrace.EventMatchesNativeCapture);
+    addInt(FinalVRAMDisplayRenderTrace.ExactEventRouteMatches);
+    addInt(FinalVRAMDisplayRenderTrace.ExactEventProductAvailable);
+    addInt(FinalVRAMDisplayRenderTrace.ExactEventProductUsable);
+    addInt(finalVRAMDisplayEpochValid);
+    addInt(finalVRAMDisplayEpochUsed);
+    addU64(finalVRAMDisplayEpochSerial);
+    addU64(finalVRAMDisplayEpochSource3DSerial);
+    addU64(finalVRAMDisplayEpochSource3DSceneHash);
+    addInt(finalVRAMDisplayEpochSourceKind);
+    addInt(finalVRAMDisplayEpochProductMask);
+    addInt(finalVRAMDisplayEpochDirtyRows);
+    addInt(finalVRAMDisplayEpochDirtyYStart);
+    addInt(finalVRAMDisplayEpochDirtyYEnd);
+    addInt(MainVRAMDisplayEpochInvalidationDebug.Reason);
+    addInt(MainVRAMDisplayEpochInvalidationDebug.Bank);
+    addInt(MainVRAMDisplayEpochInvalidationDebug.Start);
+    addInt(MainVRAMDisplayEpochInvalidationDebug.Len);
+    addInt(MainVRAMDisplayEpochInvalidationDebug.Complete);
+
+    for (int bank = 0; bank < 4; bank++)
+    {
+        const auto& native = LastDisplayCapture256Debug[bank];
+        const auto& event = HighResDisplayCapture256Event[bank];
+        const auto& epoch = MainVRAMDisplayEpoch[bank];
+
+        addInt(native.Valid);
+        addInt(native.CaptureCnt);
+        addInt(native.DstBlock);
+        addInt(native.DstOffset);
+        addInt(native.CapSize);
+        addInt(native.DstMode);
+        addInt(native.SrcA);
+        addInt(native.SrcB);
+        addInt(native.UsesSrcB);
+        addInt(native.SrcBBlock);
+        addInt(native.SrcBOffset);
+        addInt(native.SrcBTrackedLayer);
+        addInt(native.SrcBSameDstBank);
+        addInt(native.FinalNativeSourceA);
+        addInt(CaptureOutput256Valid[bank]);
+        addInt(event.Valid);
+        addU64(event.Serial);
+        addU64(event.Source3DSerial);
+        addU64(event.Source3DSceneHash);
+        addU64(event.SourcePresentationHash);
+        addInt(event.SourceKind);
+        addInt(event.ProductMask);
+        addInt(event.RejectReason);
+        addInt(event.DstBlock);
+        addInt(event.DstOffset);
+        addInt(event.ScreenSwap);
+        addInt(event.MainEngineFinalBottom);
+        addInt(event.SourceLayerEnable);
+        addInt(event.SourceVisibleBitmapMask);
+        addInt(event.SourceDirect3DVisible);
+        addInt(event.SourceOBJVisible);
+        addInt(event.SourceWholeScenePath);
+        addInt(event.SourceWholeSceneYStart);
+        addInt(event.SourceWholeSceneYEnd);
+        addInt(event.SourceVisibleBGLayers);
+        addInt(event.SourceBGLayerTypes);
+        addInt(event.SourceRenderedFullWholeScene);
+        addInt(event.SourceDirect3DOnlyBackground);
+        addInt(event.SourceTextBGShapeFullEquivalent);
+        addInt(event.SourceTextBGFullEquivalent);
+        addInt(event.SourceOBJOnlyDirtyOrPartial);
+        addInt(HighResDisplayCaptureFullTex[bank]);
+        addInt(HighResDisplayCaptureBackgroundTex[bank]);
+        addInt(epoch.Valid);
+        addU64(epoch.Serial);
+        addU64(epoch.Source3DSerial);
+        addU64(epoch.Source3DSceneHash);
+        addU64(epoch.SourcePresentationHash);
+        addInt(epoch.SourceKind);
+        addInt(epoch.ProductMask);
+        addInt(epoch.ScreenSwap);
+        addInt(epoch.MainEngineFinalBottom);
+        addInt(epoch.HasDirtyRows);
+        addInt(epoch.HasDirtyRows ? static_cast<int>(epoch.DirtyYStart) : -1);
+        addInt(epoch.HasDirtyRows ? static_cast<int>(epoch.DirtyYEnd) : -1);
+        addInt(MainVRAMDisplayEpochTex[bank]);
+    }
+
+    const int vramDisplayWriteBank =
+        VRAMDisplayWriteDebug.DisplayBank == 0xFFFFFFFFu
+            ? -1
+            : static_cast<int>(VRAMDisplayWriteDebug.DisplayBank);
+    const int vramDisplayWriteFirstOffset =
+        VRAMDisplayWriteDebug.DisplayFirstOffset == 0xFFFFFFFFu
+            ? -1
+            : static_cast<int>(VRAMDisplayWriteDebug.DisplayFirstOffset);
+    const int vramDisplayWriteLastEnd =
+        VRAMDisplayWriteDebug.DisplayWriteCount == 0
+            ? -1
+            : static_cast<int>(VRAMDisplayWriteDebug.DisplayLastEnd);
+    const int vramDisplayWriteDirtyYStart =
+        VRAMDisplayWriteDebug.DisplayDirtyYStart < VRAMDisplayWriteDebug.DisplayDirtyYEnd
+            ? static_cast<int>(VRAMDisplayWriteDebug.DisplayDirtyYStart)
+            : -1;
+    const int vramDisplayWriteDirtyYEnd =
+        VRAMDisplayWriteDebug.DisplayDirtyYStart < VRAMDisplayWriteDebug.DisplayDirtyYEnd
+            ? static_cast<int>(VRAMDisplayWriteDebug.DisplayDirtyYEnd)
+            : -1;
+    addInt(VRAMDisplayWriteDebug.WriteCount);
+    addInt(VRAMDisplayWriteDebug.ChangedWriteCount);
+    addInt(VRAMDisplayWriteDebug.BankMask);
+    addU64(VRAMDisplayWriteDebug.WriteBytes);
+    addU64(VRAMDisplayWriteDebug.ChangedWriteBytes);
+    addInt(vramDisplayWriteBank);
+    addInt(VRAMDisplayWriteDebug.DisplayWriteCount);
+    addInt(VRAMDisplayWriteDebug.DisplayChangedWriteCount);
+    addU64(VRAMDisplayWriteDebug.DisplayWriteBytes);
+    addU64(VRAMDisplayWriteDebug.DisplayChangedWriteBytes);
+    addInt(vramDisplayWriteFirstOffset);
+    addInt(vramDisplayWriteLastEnd);
+    addInt(vramDisplayWriteDirtyYStart);
+    addInt(vramDisplayWriteDirtyYEnd);
+
     addInt(PhysicalFinalUpscale);
     addInt(PhysicalFinalPostprocessApplied);
     addInt(PhysicalFinalPostprocessRejectReason);
@@ -2704,6 +5124,9 @@ bool GLRenderer::ReadWholeScene2DTimingCSV(std::string& header,
 
     header.clear();
     row.clear();
+    // Arm the capture-content luma probe for the next few frames; it stays off
+    // outside logging so normal rendering never pays the readback.
+    WholeSceneTimingCSVActiveFrames = 8;
     AppendWholeSceneFrameTimingCSVHeader(header);
     AppendWholeSceneFrameTimingCSVRow(row);
 

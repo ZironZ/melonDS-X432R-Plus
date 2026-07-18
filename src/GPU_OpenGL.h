@@ -19,6 +19,9 @@
 #ifndef GPU_OPENGL_H
 #define GPU_OPENGL_H
 
+#include <atomic>
+#include <vector>
+
 #include "OpenGLSupport.h"
 #include "GPU.h"
 #include "GPU2D_OpenGL.h"
@@ -51,7 +54,9 @@ public:
     void VBlankEnd() override;
 
     void AllocCapture(u32 bank, u32 start, u32 len) override;
-    void SyncVRAMCapture(u32 bank, u32 start, u32 len, bool complete) override;
+    void SetVRAMCaptureSyncReason(u32 reason) override;
+    void NotifyVRAMWrite(u32 bank, u32 offset, u32 bytes, bool changed) override;
+    void SyncVRAMCapture(u32 bank, u32 start, u32 len, bool complete, bool invalidate) override;
 
     bool GetFramebuffers(void** top, void** bottom) override;
     bool ReadWholeScene2DDebugView(int screen,
@@ -68,6 +73,14 @@ public:
                                          std::string* status = nullptr) override;
     bool ReadWholeScene2DTimingCSV(std::string& header,
                                    std::string& row) override;
+    void SetWholeScene2DTimingFrame(u64 frame, bool valid) override;
+    bool SetWholeScene2DRollingDebugCapture(bool enabled,
+                                            int frameCount,
+                                            std::string* status = nullptr) override;
+    bool ReadWholeScene2DCurrentFinalDebugFrame(WholeScene2DFinalDebugFrame& frame,
+                                                std::string* status = nullptr) override;
+    bool ReadWholeScene2DRollingDebugFrames(std::vector<WholeScene2DFinalDebugFrame>& frames,
+                                            std::string* status = nullptr) override;
     bool ReadTextureScalingDebugStats(TextureScalingDebugStats& stats,
                                       std::string* status = nullptr) override;
     bool ResetTextureScalingDebugStats(std::string* status = nullptr) override;
@@ -79,6 +92,8 @@ public:
                                               std::string* status = nullptr) override;
     bool SetTextureScalingDebugFrameCaptureEnabled(bool enabled,
                                                    std::string* status = nullptr) override;
+
+    void SwapBuffers() override;
 
     bool NeedsShaderCompile() override;
     void ShaderCompileStep(int& current, int& count) override;
@@ -138,6 +153,25 @@ private:
     GLuint PhysicalFinalScaledFB[2];
     GLuint PhysicalFinalOutputLayerFB[2];
 
+    struct RollingFinalDebugSlot
+    {
+        bool Valid = false;
+        u64 Serial = 0;
+        WholeScene2DFinalDebugFrame Metadata;
+    };
+
+    bool RollingFinalDebugCaptureEnabled;
+    int RollingFinalDebugCapacity;
+    int RollingFinalDebugWriteIndex;
+    u64 RollingFinalDebugSerial;
+    bool WholeSceneTimingFrameValid;
+    u64 WholeSceneTimingFrame;
+    GLuint RollingFinalDebugTex;
+    GLuint RollingFinalDebugFB;
+    int RollingFinalDebugWidth;
+    int RollingFinalDebugHeight;
+    std::vector<RollingFinalDebugSlot> RollingFinalDebugSlots;
+
     struct sCaptureConfig
     {
         float uInvCaptureSize[2];
@@ -179,6 +213,18 @@ private:
     sLastDisplayCaptureDebug LastDisplayCapture256Debug[4];
     sLastDisplayCaptureDebug LastDisplayCapture128Debug[16];
 
+    // Mean luma of the display-capture content stored this frame. Register and
+    // presentation-hash traces cannot see a fade that lives inside the captured
+    // content itself; this is the only field that can.
+    struct sCaptureNativeLumaDebug
+    {
+        bool Valid;
+        u32 CaptureCnt;
+        u32 DstBlock;
+        u32 DstOffset;
+        int LumaX1000;
+    } LastCaptureNativeLumaDebug = {};
+
     enum class HighResCaptureSourceKind : u8
     {
         None = 0,
@@ -188,6 +234,7 @@ private:
         RecursiveSourceReplacementOutput = 4,
         NativeOnlyOutput2D = 5,
         Unknown = 6,
+        DerivedMainVRAMDisplayEpoch = 7,
     };
 
     enum class HighResCaptureRejectReason : u8
@@ -219,6 +266,8 @@ private:
     {
         bool Valid;
         u64 Serial;
+        u64 Source3DSerial;
+        u32 Source3DSceneHash;
         u32 CaptureCnt;
         int YStart;
         int YEnd;
@@ -238,13 +287,28 @@ private:
         u32 SourceVisibleBitmapMask;
         bool SourceDirect3DVisible;
         bool SourceOBJVisible;
+        u32 SourceWholeScenePath;
+        int SourceWholeSceneYStart;
+        int SourceWholeSceneYEnd;
+        u32 SourceVisibleBGLayers;
+        u32 SourceBGLayerTypes;
+        bool SourceRenderedFullWholeScene;
+        bool SourceDirect3DOnlyBackground;
+        bool SourceTextBGShapeFullEquivalent;
+        bool SourceTextBGFullEquivalent;
+        bool SourceOBJOnlyDirtyOrPartial;
         u32 SourcePresentationHash;
+        u16 SourceMasterBrightness;
+        bool HasSourceEffectState;
         HighResCaptureSourceKind SourceKind;
         u32 ProductMask;
         HighResCaptureRejectReason RejectReason;
     } LastHighResDisplayCaptureEvent;
     sHighResDisplayCaptureEvent HighResDisplayCapture256Event[4];
+    sHighResDisplayCaptureEvent MainVRAMDisplayExactProductEvent[4];
     u64 HighResDisplayCaptureEventSerial;
+    u64 Output3DSerial;
+    u32 Output3DSceneHash;
     GLuint HighResDisplayCaptureBackgroundTex[4];
     GLuint HighResDisplayCaptureBackgroundFB[4];
     GLuint HighResDisplayCaptureBackgroundReadFB;
@@ -256,6 +320,8 @@ private:
     {
         bool Valid;
         u64 Serial;
+        u64 Source3DSerial;
+        u32 Source3DSceneHash;
         u32 CaptureBank;
         u32 DstBlock;
         u32 DstOffset;
@@ -269,10 +335,68 @@ private:
         u32 SourceVisibleBitmapMask;
         bool SourceDirect3DVisible;
         bool SourceOBJVisible;
+        u32 SourcePresentationHash;
+        u16 StoredMasterBrightness;
+        bool HasStoredEffectState;
     };
     sCaptureBackgroundEpoch ActiveCaptureBackgroundEpoch[2];
     GLuint ActiveCaptureBackgroundEpochTex[2];
     GLuint ActiveCaptureBackgroundEpochFB[2];
+
+    struct sMainVRAMDisplayEpoch
+    {
+        bool Valid;
+        u64 Serial;
+        u64 Source3DSerial;
+        u32 Source3DSceneHash;
+        u32 CaptureCnt;
+        u32 CaptureBank;
+        u32 DstOffset;
+        bool ScreenSwap;
+        bool MainEngineFinalBottom;
+        HighResCaptureSourceKind SourceKind;
+        u32 ProductMask;
+        u32 SourceLayerEnable;
+        u32 SourceBGMode;
+        u32 SourceVisibleBitmapMask;
+        bool SourceDirect3DVisible;
+        bool SourceOBJVisible;
+        u32 SourcePresentationHash;
+        bool HasDirtyRows;
+        u32 DirtyYStart;
+        u32 DirtyYEnd;
+    };
+    sMainVRAMDisplayEpoch MainVRAMDisplayEpoch[4];
+    GLuint MainVRAMDisplayEpochTex[4];
+    GLuint MainVRAMDisplayEpochFB[4];
+    struct sMainVRAMDisplayEpochInvalidationDebug
+    {
+        u32 Reason;
+        u32 Bank;
+        u32 Start;
+        u32 Len;
+        bool Complete;
+    } MainVRAMDisplayEpochInvalidationDebug;
+    u32 PendingVRAMCaptureSyncReason;
+
+    struct sVRAMDisplayWriteDebug
+    {
+        u32 WriteCount;
+        u32 ChangedWriteCount;
+        u64 WriteBytes;
+        u64 ChangedWriteBytes;
+        u32 BankMask;
+        u32 DisplayBank;
+        u32 DisplayWriteCount;
+        u32 DisplayChangedWriteCount;
+        u64 DisplayWriteBytes;
+        u64 DisplayChangedWriteBytes;
+        u32 DisplayFirstOffset;
+        u32 DisplayLastEnd;
+        u32 DisplayDirtyYStart;
+        u32 DisplayDirtyYEnd;
+    } VRAMDisplayWriteDebug;
+    std::atomic_bool WholeSceneDebugViewsActive;
 
     GLuint CaptureShader;
     GLuint CaptureConfigUBO;
@@ -291,6 +415,12 @@ private:
 
     GLuint CaptureSyncFB;
     GLuint CaptureSyncTex;
+
+    // Native-size scratch target for the capture-content luma probe. Only
+    // touched while the whole-scene timing CSV is being read.
+    GLuint CaptureLumaProbeFB;
+    GLuint CaptureLumaProbeTex;
+    int WholeSceneTimingCSVActiveFrames = 0;
 
     u16* AuxInputBuffer[2];
     u8 AuxUsageMask;
@@ -331,6 +461,54 @@ private:
     bool PhysicalFinalNativeInputValid[2];
     int PhysicalFinalNativeInputPath[2];
 
+    struct sFinalVRAMDisplayRenderTrace
+    {
+        int DisplayBank = -1;
+        int ReplacementEligible = 0;
+        int RejectReason = 0;
+        int UsedEpoch = 0;
+        int ChosenBank = -1;
+        u64 ChosenSerial = 0;
+        u64 ChosenSource3DSerial = 0;
+        u32 ChosenSource3DSceneHash = 0;
+        u32 ChosenSourcePresentationHash = 0;
+        u32 ChosenSourceKind = 0;
+        u32 ChosenProductMask = 0;
+        int ChosenTex = 0;
+        int EventValid = 0;
+        u64 EventSerial = 0;
+        int EventDstBlock = -1;
+        int EventDstOffset = -1;
+        int EventScreenSwap = 0;
+        int EventMainFinalBottom = 0;
+        int EventSourceOBJ = 0;
+        int EventSourceRenderedFullWholeScene = 0;
+        u32 EventSourceKind = 0;
+        u32 EventProductMask = 0;
+        u32 EventRejectReason = 0;
+        int EventFullTex = 0;
+        int EventMatchesNativeCapture = 0;
+        int ExactEventRouteMatches = 0;
+        int ExactEventProductAvailable = 0;
+        int ExactEventProductUsable = 0;
+    } FinalVRAMDisplayRenderTrace;
+
+    static constexpr u32 kFinalPresentationTransitionGuardFrames = 2;
+    static constexpr u32 kFinalPresentationStableRouteScanlines = 6 * 192;
+    static constexpr u32 kFinalPresentationDirectSwapGuardStableScanlines = 48 * 192;
+    static constexpr u32 kFinalPresentationScreenSwapExcursionMaxScanlines = 32 * 192;
+    struct sFinalPresentationState
+    {
+        bool Valid;
+        bool ScreenSwap;
+        u32 DispModeA;
+        u32 DispModeB;
+    } LastFinalPresentationState, FinalPresentationScreenSwapExcursionBaseline;
+    u32 FinalPresentationStateStableScanlines;
+    u32 FinalPresentationScreenSwapExcursionScanlines;
+    bool FinalPresentationScreenSwapExcursionActive;
+    u32 FinalPresentationTransitionGuardFrames;
+
     enum class FinalCaptureSourceKind : u32
     {
         NormalOutputTex2D = 0,
@@ -348,10 +526,41 @@ private:
     } FinalCaptureSourceDebug;
 
     bool GetFinalPassScreenSwapForRange(int ystart, int yend, bool& screenSwap) const;
+    void UpdateFinalPresentationTransitionGuard();
+    bool IsFinalPresentationTransitionGuardActiveForRange(int ystart, int yend) const;
+    bool IsFinalPresentationScreenSwapExcursionActiveForRange(int ystart, int yend) const;
     bool IsEngineRoutedToFinalBottom(u32 engine) const;
     bool IsEngineRoutedToFinalBottom(u32 engine, int ystart, int yend) const;
+    bool IsMainVRAMDisplayFinalRouteForRange(int ystart, int yend) const;
     bool HasMainVRAMDisplayCaptureFinalRoute() const;
+    static bool IsAcceptedMainVRAMDisplayFullProductSource(HighResCaptureSourceKind sourceKind);
+    static void ResetFinalVRAMDisplayTrace(sFinalVRAMDisplayRenderTrace& trace, int displayBank);
+    static void RecordFinalVRAMDisplayTraceEvent(sFinalVRAMDisplayRenderTrace& trace,
+                                                 const sHighResDisplayCaptureEvent& event,
+                                                 GLuint fullTex,
+                                                 bool eventMatches,
+                                                 bool exactRouteMatches,
+                                                 bool exactProductAvailable,
+                                                 bool exactProductUsable);
+    static void RecordFinalVRAMDisplayTraceChosenEvent(sFinalVRAMDisplayRenderTrace& trace,
+                                                       u32 displayBank,
+                                                       GLuint texture,
+                                                       const sHighResDisplayCaptureEvent& event);
+    static void RecordFinalVRAMDisplayTraceChosenEpoch(sFinalVRAMDisplayRenderTrace& trace,
+                                                       u32 displayBank,
+                                                       GLuint texture,
+                                                       const sMainVRAMDisplayEpoch& epoch);
+    void RecordFinalVRAMDisplayTraceAccepted(u32 displayBank,
+                                             GLuint texture,
+                                             bool usedEpoch);
+    void RecordFinalVRAMDisplayTraceRejected(int rejectReason);
+    bool CanUseMainVRAMDisplayHighResCaptureReplacement(u32 displayBank,
+                                                        GLuint* replacementTex = nullptr,
+                                                        int* rejectReason = nullptr,
+                                                        bool* usedEpoch = nullptr,
+                                                        sFinalVRAMDisplayRenderTrace* trace = nullptr) const;
     bool CanRenderPhysicalFinalUpscaleForRange(int ystart, int yend) const;
+    bool CanUpscaleMainVRAMDisplayNativeFallbackForRange(int ystart, int yend) const;
     void RenderFinalPassToFramebuffer(int ystart,
                                       int yend,
                                       GLuint targetFB,
@@ -359,7 +568,17 @@ private:
                                       int viewportH,
                                       int framebufferScale,
                                       GLuint mainInputTex,
-                                      GLuint subInputTex);
+                                      GLuint subInputTex,
+                                      bool mainInputReplacesVRAMDisplay = false);
+    void RenderMainVRAMDisplayNativeFallbackUpscale(int backbuf, int ystart, int yend);
+    bool EnsureRollingFinalDebugStorage();
+    void ClearRollingFinalDebugCapture();
+    void CaptureRollingFinalDebugFrame(int backbuf);
+    WholeScene2DFinalDebugFrame CaptureRollingFinalDebugMetadata(u64 serial) const;
+    bool ReadFinalDebugFrameFromFramebuffer(int framebuffer,
+                                            u64 serial,
+                                            WholeScene2DFinalDebugFrame& frame,
+                                            std::string* status = nullptr);
     bool RenderPhysicalFinalUpscale();
     void RecordDisplayCaptureDebug(const sLastDisplayCaptureDebug& capture);
     void RecordHighResDisplayCaptureEvent(const sLastDisplayCaptureDebug& capture);
@@ -372,12 +591,26 @@ private:
                                             sHighResDisplayCaptureEvent& event);
     void StoreHighResDisplayCaptureEventProducts(const sLastDisplayCaptureDebug& capture,
                                                  sHighResDisplayCaptureEvent& event);
+    bool TryPromoteCaptureEventFromMainVRAMDisplayEpoch(const sLastDisplayCaptureDebug& capture,
+                                                        bool fullDisplay,
+                                                        bool sourceAOnly,
+                                                        sHighResDisplayCaptureEvent& event);
     void PublishHighResDisplayCaptureEvent(const sLastDisplayCaptureDebug& capture,
                                            const sHighResDisplayCaptureEvent& event,
                                            bool fullDisplay);
     bool StoreHighResDisplayCaptureBackgroundProduct(u32 captureBank, GLuint sourceTex);
     bool StoreHighResDisplayCaptureFullProduct(u32 captureBank, GLuint sourceTex);
+    bool StoreHighResDisplayCaptureBackgroundProductFromCaptureOutput(u32 captureBank);
+    bool StoreHighResDisplayCaptureFullProductFromCaptureOutput(u32 captureBank);
     bool StoreHighResDisplayCaptureProduct(GLuint dstFB, GLuint dstTex, GLuint readFB, GLuint sourceTex);
+    bool StoreHighResDisplayCaptureProductFromFramebuffer(GLuint dstFB, GLuint dstTex, GLuint sourceFB);
+    bool UpdateMainVRAMDisplayEpochFromEvent(const sHighResDisplayCaptureEvent& event);
+    void RecordVRAMDisplayWriteDebug(u32 bank, u32 offset, u32 bytes, bool changed);
+    void InvalidateMainVRAMDisplayEpochForBank(u32 captureBank,
+                                               u32 reason = 0,
+                                               u32 start = 0,
+                                               u32 len = 0,
+                                               bool complete = false);
     bool UpdateCaptureBackgroundEpochForRoute(int routeSlot,
                                               const sHighResDisplayCaptureEvent& event);
     void InvalidateCaptureBackgroundEpochForBank(u32 captureBank);
@@ -386,6 +619,8 @@ private:
                                            u32 expectedBlock) const;
     bool IsFullDisplayHighResCaptureEventRecord(const sHighResDisplayCaptureEvent& event,
                                                 u32 expectedBlock) const;
+    bool IsFullDisplayHighResCaptureExactReplacementRecord(const sHighResDisplayCaptureEvent& event,
+                                                           u32 expectedBlock) const;
     u32 DisplayCapture256ValidMask() const;
     u32 DisplayCapture256FullSourceAMask() const;
     u32 HighResDisplayCapture256ValidMask() const;
@@ -420,6 +655,9 @@ private:
     std::string DescribeMainDisplayRoute() const;
     std::string DescribeLastDisplayCapture() const;
     void ResetWholeSceneFrameTiming();
+    void MeasureCaptureNativeLumaDebug(u32 capcnt, u32 dstblock, u32 dstoffset,
+                                       int dstwidth, int dstheight, u32 capsize,
+                                       GLuint captureFB);
     void AddWholeScenePhaseTiming(sPhaseTiming& phase, u64 elapsedUS);
     static void AppendWholeSceneFrameTimingCSVHeader(std::string& header);
     void AppendWholeSceneFrameTimingCSVRow(std::string& row) const;

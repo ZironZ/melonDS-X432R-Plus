@@ -604,6 +604,24 @@ MainWindow::MainWindow(int id, EmuInstance* inst, QWidget* parent) :
             actWholeScene2DTimingLog = menu->addAction("Log whole-scene frame times...");
             actWholeScene2DTimingLog->setCheckable(true);
             connect(actWholeScene2DTimingLog, &QAction::triggered, this, &MainWindow::onToggleWholeScene2DTimingLog);
+
+            actWholeScene2DDebugDump = menu->addAction("Dump whole-scene debug frame");
+            actWholeScene2DDebugDump->setShortcut(QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_D));
+            connect(actWholeScene2DDebugDump, &QAction::triggered, this, &MainWindow::onDumpWholeScene2DDebugFrame);
+
+            actWholeScene2DRollingDebugDump = menu->addAction("Dump whole-scene rolling debug frames");
+            actWholeScene2DRollingDebugDump->setShortcut(QKeySequence(Qt::CTRL | Qt::SHIFT | Qt::Key_R));
+            connect(actWholeScene2DRollingDebugDump,
+                    &QAction::triggered,
+                    this,
+                    &MainWindow::onDumpWholeScene2DRollingDebugFrames);
+
+            actWholeScene2DRollingDebugCapture = menu->addAction("Capture last second of whole-scene debug frames");
+            actWholeScene2DRollingDebugCapture->setCheckable(true);
+            connect(actWholeScene2DRollingDebugCapture,
+                    &QAction::triggered,
+                    this,
+                    &MainWindow::onToggleWholeScene2DRollingDebugCapture);
         }
         {
             QMenu * menu = menubar->addMenu("Config");
@@ -897,6 +915,9 @@ void MainWindow::createScreenPanel()
         actWholeScene2DDebugView->setEnabled(hasOGL);
         actTextureScalingDebugView->setEnabled(hasOGL);
         actWholeScene2DTimingLog->setEnabled(hasOGL);
+        actWholeScene2DDebugDump->setEnabled(hasOGL);
+        actWholeScene2DRollingDebugDump->setEnabled(hasOGL);
+        actWholeScene2DRollingDebugCapture->setEnabled(hasOGL);
     }
     panel->osdSetEnabled(showOSD);
 
@@ -1952,6 +1973,127 @@ void MainWindow::onToggleWholeScene2DTimingLog()
     actWholeScene2DTimingLog->setChecked(true);
     if (emuInstance)
         emuInstance->osdAddMessage(0, "Started whole-scene timing log");
+}
+
+void MainWindow::onDumpWholeScene2DDebugFrame()
+{
+    if (!emuThread || !emuInstance)
+        return;
+
+    if (!hasOGL)
+    {
+        emuInstance->osdAddMessage(0, "Whole-scene debug dump requires OpenGL");
+        return;
+    }
+
+    QString timingCsvPath;
+    QString errorstr;
+    u64 nextFrame = 0;
+    if (!emuThread->flushWholeSceneTimingLog(timingCsvPath, nextFrame, errorstr))
+    {
+        emuInstance->osdAddMessage(0,
+                                   "Start whole-scene timing log before dumping debug frames: %s",
+                                   errorstr.toUtf8().constData());
+        return;
+    }
+
+    const u64 timingFrame = nextFrame > 0 ? nextFrame - 1 : 0;
+    QString exportPath;
+    if (!WholeScene2DDebugDialog::dumpCurrentFrame(this,
+                                                   timingCsvPath,
+                                                   timingFrame,
+                                                   &exportPath,
+                                                   &errorstr))
+    {
+        emuInstance->osdAddMessage(0,
+                                   "Whole-scene debug dump failed: %s",
+                                   errorstr.toUtf8().constData());
+        return;
+    }
+
+    emuInstance->osdAddMessage(0,
+                               "Whole-scene debug dump saved: %s",
+                               exportPath.toUtf8().constData());
+}
+
+void MainWindow::onDumpWholeScene2DRollingDebugFrames()
+{
+    if (!emuThread || !emuInstance)
+        return;
+
+    if (!hasOGL)
+    {
+        emuInstance->osdAddMessage(0, "Whole-scene rolling dump requires OpenGL");
+        return;
+    }
+
+    QString timingCsvPath;
+    QString errorstr;
+    u64 nextFrame = 0;
+    if (!emuThread->flushWholeSceneTimingLog(timingCsvPath, nextFrame, errorstr))
+    {
+        emuInstance->osdAddMessage(0,
+                                   "Start whole-scene timing log before dumping rolling frames: %s",
+                                   errorstr.toUtf8().constData());
+        return;
+    }
+
+    const u64 timingFrame = nextFrame > 0 ? nextFrame - 1 : 0;
+    QString exportPath;
+    if (!WholeScene2DDebugDialog::dumpRollingFrames(this,
+                                                    timingCsvPath,
+                                                    timingFrame,
+                                                    &exportPath,
+                                                    &errorstr))
+    {
+        emuInstance->osdAddMessage(0,
+                                   "Whole-scene rolling dump failed: %s",
+                                   errorstr.toUtf8().constData());
+        return;
+    }
+
+    emuInstance->osdAddMessage(0,
+                               "Whole-scene rolling dump saved: %s",
+                               exportPath.toUtf8().constData());
+}
+
+void MainWindow::onToggleWholeScene2DRollingDebugCapture(bool checked)
+{
+    if (!emuThread || !emuInstance)
+        return;
+
+    if (!hasOGL)
+    {
+        actWholeScene2DRollingDebugCapture->setChecked(false);
+        emuInstance->osdAddMessage(0, "Whole-scene rolling capture requires OpenGL");
+        return;
+    }
+
+    if (checked && !emuThread->wholeSceneTimingLogActive())
+    {
+        actWholeScene2DRollingDebugCapture->setChecked(false);
+        emuInstance->osdAddMessage(0, "Start whole-scene timing log before enabling rolling capture");
+        return;
+    }
+
+    auto* nds = emuInstance->getNDS();
+    if (!nds)
+    {
+        actWholeScene2DRollingDebugCapture->setChecked(false);
+        return;
+    }
+
+    std::string status;
+    emuThread->borrowGL();
+    makeCurrentGL();
+    const bool ok = nds->GPU.GetRenderer().SetWholeScene2DRollingDebugCapture(checked, 60, &status);
+    releaseGL();
+    emuThread->returnGL();
+
+    if (!ok)
+        actWholeScene2DRollingDebugCapture->setChecked(false);
+
+    emuInstance->osdAddMessage(0, "%s", status.c_str());
 }
 
 void MainWindow::onOpenCameraSettings()

@@ -16,31 +16,41 @@ set(OPENGL_SHADER_FILES
     2DOverlayBaselineCompositeFS.glsl
     2DOverlayCompositeFS.glsl
     2DOverlayDebugFS.glsl
-    2DArtCNNPassVS.glsl
-    2DArtCNN_RGBToYUVAFS.glsl
-    2DArtCNN_Spline36FS.glsl
+    2DMasterBrightnessFS.glsl
+    2DFullscreenPassVS.glsl
+    2DRGBAToYUVAFS.glsl
+    2DSpline36FS.glsl
     2DArtCNN_YUVAToRGBA2xFS.glsl
-    2DArtCNN_C4F16_Conv0FS.glsl
-    2DArtCNN_C4F16_Conv1FS.glsl
-    2DArtCNN_C4F16_Conv2FS.glsl
-    2DArtCNN_C4F16_Conv3FS.glsl
-    2DArtCNN_C4F16_Conv4FS.glsl
-    2DArtCNN_C4F16_Conv5FS.glsl
-    2DArtCNN_C4F16_Conv6FS.glsl
-    2DArtCNN_C4F16_DepthToSpaceFS.glsl
-    2DArtCNN_C4F16DN_Conv0FS.glsl
-    2DArtCNN_C4F16DN_Conv1FS.glsl
-    2DArtCNN_C4F16DN_Conv2FS.glsl
-    2DArtCNN_C4F16DN_Conv3FS.glsl
-    2DArtCNN_C4F16DN_Conv4FS.glsl
-    2DArtCNN_C4F16DN_Conv5FS.glsl
-    2DArtCNN_C4F16DN_Conv6FS.glsl
-    2DArtCNN_C4F16DN_DepthToSpaceFS.glsl
-    2DNNEDI3_CommonFS.glsl
-    2DNNEDI3_NNS16Win8x4KernelFS.glsl
+    2DAlphaReplaceFS.glsl
+    2DMidpointAlphaFS.glsl
+    2DArtCNN_C4F16_Conv0CS.glsl
+    2DArtCNN_C4F16_Conv1CS.glsl
+    2DArtCNN_C4F16_Conv2CS.glsl
+    2DArtCNN_C4F16_Conv3CS.glsl
+    2DArtCNN_C4F16_Conv4CS.glsl
+    2DArtCNN_C4F16_Conv5CS.glsl
+    2DArtCNN_C4F16_Conv6CS.glsl
+    2DArtCNN_C4F16_DepthToSpaceCS.glsl
+    2DArtCNN_C4F16DN_Conv0CS.glsl
+    2DArtCNN_C4F16DN_Conv1CS.glsl
+    2DArtCNN_C4F16DN_Conv2CS.glsl
+    2DArtCNN_C4F16DN_Conv3CS.glsl
+    2DArtCNN_C4F16DN_Conv4CS.glsl
+    2DArtCNN_C4F16DN_Conv5CS.glsl
+    2DArtCNN_C4F16DN_Conv6CS.glsl
+    2DArtCNN_C4F16DN_DepthToSpaceCS.glsl
+    2DNNEDI3_VerticalCS.glsl
+    2DNNEDI3_HorizontalCS.glsl
+    2DCuNNy4x32_InCS.glsl
+    2DCuNNy4x32_Conv1CS.glsl
+    2DCuNNy4x32_Conv2CS.glsl
+    2DCuNNy4x32_Conv3CS.glsl
+    2DCuNNy4x32_Conv4CS.glsl
+    2DCuNNy4x32_OutShuffleCS.glsl
     2DXBRZ_PreprocessFS.glsl
     2DXBRZ_FreescaleFS.glsl
     3DTexcacheRepackFS.glsl
+    3DAlphaAwareMipFS.glsl
 
     FinalPassVS.glsl
     FinalPassFS.glsl

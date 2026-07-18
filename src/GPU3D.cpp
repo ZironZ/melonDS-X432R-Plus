@@ -177,6 +177,7 @@ void GPU3D::ResetRenderingState() noexcept
 
     RenderClearAttr1 = 0x3F000000;
     RenderClearAttr2 = 0x00007FFF;
+    RenderSceneHash = 0;
 }
 
 void GPU3D::Reset() noexcept
@@ -542,6 +543,7 @@ void GPU3D::DoSavestate(Savestate* file) noexcept
     file->Var32(&TexPalette);
 
     RenderFrameIdentical = false;
+    RenderSceneHash = 0;
 }
 
 
@@ -2422,6 +2424,101 @@ bool YSort(Polygon* a, Polygon* b)
     return a->SortKey < b->SortKey;
 }
 
+static u32 Hash3DValue(u32 hash, u32 value) noexcept
+{
+    hash ^= value;
+    hash *= 16777619u;
+    return hash;
+}
+
+static u32 HashRenderScene(const GPU3D& gpu3D) noexcept
+{
+    u32 hash = 2166136261u;
+    auto mix = [&hash](u32 value)
+    {
+        hash = Hash3DValue(hash, value);
+    };
+    auto mixS32 = [&mix](s32 value)
+    {
+        mix(static_cast<u32>(value));
+    };
+
+    mix(gpu3D.RenderDispCnt);
+    mix(gpu3D.RenderAlphaRef);
+    mix(gpu3D.RenderFogColor);
+    mix(gpu3D.RenderFogOffset);
+    mix(gpu3D.RenderFogShift);
+    mix(gpu3D.RenderClearAttr1);
+    mix(gpu3D.RenderClearAttr2);
+    for (u16 color : gpu3D.RenderToonTable)
+        mix(color);
+    for (u16 color : gpu3D.RenderEdgeTable)
+        mix(color);
+    for (u8 density : gpu3D.RenderFogDensityTable)
+        mix(density);
+
+    mix(gpu3D.RenderNumPolygons);
+    for (u32 i = 0; i < gpu3D.RenderNumPolygons; i++)
+    {
+        const Polygon* poly = gpu3D.RenderPolygonRAM[i];
+        if (!poly)
+        {
+            mix(0xFFFFFFFFu);
+            continue;
+        }
+
+        mix(poly->NumVertices);
+        for (u32 v = 0; v < poly->NumVertices && v < 10; v++)
+        {
+            mixS32(poly->FinalZ[v]);
+            mixS32(poly->FinalW[v]);
+        }
+        mix(poly->WBuffer);
+        mix(poly->Attr);
+        mix(poly->TexParam);
+        mix(poly->TexPalette);
+        mix(poly->Degenerate);
+        mix(poly->FacingView);
+        mix(poly->Translucent);
+        mix(poly->IsShadowMask);
+        mix(poly->IsShadow);
+        mix(static_cast<u32>(poly->Type));
+        mix(poly->VTop);
+        mix(poly->VBottom);
+        mixS32(poly->YTop);
+        mixS32(poly->YBottom);
+        mixS32(poly->XTop);
+        mixS32(poly->XBottom);
+        mix(poly->SortKey);
+
+        for (u32 v = 0; v < poly->NumVertices && v < 10; v++)
+        {
+            const Vertex* vertex = poly->Vertices[v];
+            if (!vertex)
+            {
+                mix(0xFFFFFFFEu);
+                continue;
+            }
+
+            for (s32 coord : vertex->Position)
+                mixS32(coord);
+            for (s32 color : vertex->Color)
+                mixS32(color);
+            for (s16 coord : vertex->TexCoords)
+                mix(static_cast<u16>(coord));
+            mix(vertex->Clipped);
+            for (s32 coord : vertex->FinalPosition)
+                mixS32(coord);
+            for (s32 color : vertex->FinalColor)
+                mixS32(color);
+            for (s32 coord : vertex->HiresPosition)
+                mixS32(coord);
+        }
+    }
+
+    return hash ? hash : 1;
+}
+
 void GPU3D::VBlank() noexcept
 {
     if (GeometryEnabled)
@@ -2482,6 +2579,7 @@ void GPU3D::VBlank() noexcept
 
             RenderClearAttr1 = ClearAttr1;
             RenderClearAttr2 = ClearAttr2;
+            RenderSceneHash = HashRenderScene(*this);
         }
 
         if (FlushRequest)

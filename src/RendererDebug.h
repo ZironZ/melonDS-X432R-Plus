@@ -21,6 +21,8 @@
 
 #include "types.h"
 
+#include <vector>
+
 namespace melonDS
 {
 
@@ -77,6 +79,60 @@ enum class WholeScene2DDebugView : u8
     OverlayFinalResult,
     FinalTop,
     FinalBottom,
+    MainVRAMDisplayRaw,
+    MainVRAMDisplayRawBank0,
+    MainVRAMDisplayRawBank1,
+    MainVRAMDisplayRawBank2,
+    MainVRAMDisplayRawBank3,
+    CaptureOutput256Bank0,
+    CaptureOutput256Bank1,
+    CaptureOutput256Bank2,
+    CaptureOutput256Bank3,
+    HighResDisplayCaptureFullBank0,
+    HighResDisplayCaptureFullBank1,
+    HighResDisplayCaptureFullBank2,
+    HighResDisplayCaptureFullBank3,
+    HighResDisplayCaptureBackgroundBank0,
+    HighResDisplayCaptureBackgroundBank1,
+    HighResDisplayCaptureBackgroundBank2,
+    HighResDisplayCaptureBackgroundBank3,
+    MainVRAMDisplayEpochBank0,
+    MainVRAMDisplayEpochBank1,
+    MainVRAMDisplayEpochBank2,
+    MainVRAMDisplayEpochBank3,
+};
+
+struct WholeScene2DEngineDebugIdentity
+{
+    int Path = 0;
+    int ProductChoice = 0;
+    int SourceAResolutionMode = 0;
+    int ChosenProductKind = 0;
+    int ChosenProductRenderAction = 0;
+    int ChosenProductTex = 0;
+    int ChosenProductCaptureBank = -1;
+    u64 ChosenProductBackgroundEpochSerial = 0;
+    u64 ChosenProductSource3DSerial = 0;
+    u64 ChosenProductCaptureEventSerial = 0;
+    u64 ChosenProductCapturePresentationHash = 0;
+    u64 ChosenProductCurrentPresentationHash = 0;
+    u64 RequestCapturePresentationHash = 0;
+    u64 RequestCurrentPresentationHash = 0;
+};
+
+struct WholeScene2DFinalDebugFrame
+{
+    u64 Serial = 0;
+    bool TimingFrameValid = false;
+    u64 TimingFrame = 0;
+    int FinalTopSource = -1;
+    int FinalBottomSource = -1;
+    WholeScene2DEngineDebugIdentity EngineA;
+    WholeScene2DEngineDebugIdentity EngineB;
+    int Width = 0;
+    int Height = 0;
+    std::vector<u32> TopRGBA;
+    std::vector<u32> BottomRGBA;
 };
 
 }

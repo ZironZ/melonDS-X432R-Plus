@@ -26,7 +26,10 @@ uniform int uRenderMode; // 0=opaque 1=translucent 2=shadowmask
 
 smooth in vec4 fColor;
 smooth in vec2 fTexcoord;
+flat in vec4 fTexcoordInsetBounds;
 flat in ivec3 fPolygonAttr;
+flat in int fTexRepeat;
+flat in int fForceNearestTexture;
 
 #ifdef WBuffer
 smooth in float fZ;
@@ -35,7 +38,49 @@ smooth in float fZ;
 out vec4 oColor;
 out vec4 oAttr;
 
+int WrapNearestCoord(float scaledCoord, int size, bool repeat, bool mirror)
+{
+    int coord = int(floor(scaledCoord));
+    if (repeat)
+    {
+        if (mirror)
+        {
+            int period = size * 2;
+            coord = coord % period;
+            if (coord < 0)
+                coord += period;
+            if (coord >= size)
+                coord = period - 1 - coord;
+        }
+        else
+        {
+            coord = coord % size;
+            if (coord < 0)
+                coord += size;
+        }
+    }
+    else
+    {
+        coord = clamp(coord, 0, size - 1);
+    }
+    return coord;
+}
+
+ivec2 WrapNearestTexelCoord(vec2 texcoord, ivec2 texSize)
+{
+    return ivec2(
+        WrapNearestCoord(texcoord.x * float(texSize.x), texSize.x, (fTexRepeat & 1) != 0, (fTexRepeat & 4) != 0),
+        WrapNearestCoord(texcoord.y * float(texSize.y), texSize.y, (fTexRepeat & 2) != 0, (fTexRepeat & 8) != 0));
+}
+
 #ifdef FILTERABLE_TEXTURE_CACHE
+vec4 SampleCachedTextureNearest(vec3 texcoord)
+{
+    ivec2 texSize = textureSize(CurTexture, 0).xy;
+    ivec2 texelCoord = WrapNearestTexelCoord(texcoord.xy, texSize);
+    return texelFetch(CurTexture, ivec3(texelCoord, int(texcoord.z)), 0) * (255.0 / uTextureNormalize);
+}
+
 vec4 SampleCachedTextureAtLod(vec3 texcoord, float lod)
 {
     return textureLod(CurTexture, texcoord, lod) * (255.0 / uTextureNormalize);
@@ -87,6 +132,13 @@ vec4 SampleCachedTexture(vec3 texcoord)
     return accum / sampleCountF;
 }
 #else
+vec4 SampleCachedTextureNearest(vec3 texcoord)
+{
+    ivec2 texSize = textureSize(CurTexture, 0).xy;
+    ivec2 texelCoord = WrapNearestTexelCoord(texcoord.xy, texSize);
+    return vec4(texelFetch(CurTexture, ivec3(texelCoord, int(texcoord.z)), 0)) / uTextureNormalize;
+}
+
 vec4 SampleCachedTexture(vec3 texcoord)
 {
     return vec4(texture(CurTexture, texcoord)) / uTextureNormalize;
@@ -121,11 +173,17 @@ vec4 FinalColor()
     }
     else
     {
-        vec3 texcoord = vec3(fTexcoord, fPolygonAttr.y);
+        vec2 texcoordXY = fTexcoord;
+        if (fTexcoordInsetBounds.z > fTexcoordInsetBounds.x &&
+            fTexcoordInsetBounds.w > fTexcoordInsetBounds.y)
+        {
+            texcoordXY = clamp(texcoordXY, fTexcoordInsetBounds.xy, fTexcoordInsetBounds.zw);
+        }
+        vec3 texcoord = vec3(texcoordXY, fPolygonAttr.y);
         vec4 tcol;
         if (fPolygonAttr.z == 0)
         {
-            tcol = SampleCachedTexture(texcoord);
+            tcol = fForceNearestTexture != 0 ? SampleCachedTextureNearest(texcoord) : SampleCachedTexture(texcoord);
             if (uBinaryAlphaTexture != 0)
             {
                 tcol.a = tcol.a >= 0.5 ? 1.0 : 0.0;

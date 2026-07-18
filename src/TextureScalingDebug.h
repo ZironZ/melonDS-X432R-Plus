@@ -57,6 +57,8 @@ struct TextureScalingDebugStats
     bool DeferredScalingEnabled = false;
     bool LegacyAlphaHandling = false;
     bool QualityAlphaHandling = false;
+    bool AlphaXBRZ = false;
+    bool Spline36Alpha = false;
     bool ReadableTextureCache = false;
     int AlgorithmIndex = 0;
     u32 ScaleFactor = 1;

@@ -2,6 +2,8 @@
 
 uniform sampler2D Source;
 uniform sampler2D artcnn_luma;
+uniform sampler2D AlphaSource;
+uniform bool uUseAlphaSource;
 
 smooth in vec2 fTexcoord;
 
@@ -24,6 +26,7 @@ void main()
 {
     vec4 inputY = texture(artcnn_luma, fTexcoord);
     vec4 inputYUVA = texture(Source, fTexcoord);
-    vec4 yuva = vec4(inputY.x, inputYUVA.y, inputYUVA.z, inputYUVA.w);
+    vec4 inputAlpha = uUseAlphaSource ? texture(AlphaSource, fTexcoord) : inputYUVA;
+    vec4 yuva = vec4(inputY.x, inputYUVA.y, inputYUVA.z, inputAlpha.a);
     oColor = clamp(YUVAToRGBA(yuva), 0.0, 1.0);
 }

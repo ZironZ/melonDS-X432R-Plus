@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <assert.h>
+#include <chrono>
 #include <unordered_map>
 #include <vector>
 
@@ -53,6 +54,7 @@ private:
         bool UsedFrequentChangeFallback = false;
         bool DeferredScalePending = false;
         bool DeferredScaleQueued = false;
+        bool SamplingBoundsEdgeExtendMargins = false;
         u32 DeferredUseCount = 0;
         u64 DeferredFirstSeenFrame = 0;
         u64 CreatedFrame = 0;
@@ -69,6 +71,14 @@ private:
         bool SecondaryCacheReuseSeen = false;
     };
 
+    struct EdgeExtendChurnEntry
+    {
+        u64 WindowStartFrame = 0;
+        u64 SuppressedUntilFrame = 0;
+        u64 LastSeenFrame = 0;
+        u32 NewVariantCount = 0;
+    };
+
     struct SecondaryCacheEntry
     {
         TexCacheEntry Entry;
@@ -77,6 +87,33 @@ private:
     };
 
 public:
+    struct TextureCacheTimingPhase
+    {
+        u64 TotalUS = 0;
+        u64 MaxUS = 0;
+        u32 Count = 0;
+    };
+
+    struct TextureCacheFrameTiming
+    {
+        TextureCacheTimingPhase PaletteHash;
+        TextureCacheTimingPhase MissTotal;
+        TextureCacheTimingPhase Decode;
+        TextureCacheTimingPhase BoundsProcess;
+        TextureCacheTimingPhase TextureHash;
+        TextureCacheTimingPhase SecondaryRestore;
+        TextureCacheTimingPhase StorageAlloc;
+        TextureCacheTimingPhase ScaleSourceDecode;
+        TextureCacheTimingPhase ScaleAlphaPrep;
+        TextureCacheTimingPhase GPUScale;
+        TextureCacheTimingPhase CPUScale;
+        TextureCacheTimingPhase MipPrep;
+        TextureCacheTimingPhase BinaryAlphaScan;
+        TextureCacheTimingPhase PreviewCapture;
+        TextureCacheTimingPhase Upload;
+        TextureCacheTimingPhase CacheInsert;
+    };
+
     Texcache(melonDS::GPU& gpu, const TexLoaderT& texloader)
         : GPU(gpu), TexLoader(texloader) // probably better if this would be a move constructor???
     {}
@@ -131,8 +168,17 @@ public:
         Debug.RotateFrame(FrameIndex);
         EdgeExtendNewVariantsThisFrame = 0;
         EdgeExtendThrottledVariantsThisFrame = 0;
+        EdgeExtendSuppressedVariantsThisFrame = 0;
+        EdgeExtendSecondaryRestoreHitThisFrame = 0;
+        EdgeExtendSecondaryRestoreMissNoEntryThisFrame = 0;
+        EdgeExtendSecondaryRestoreMissMismatchThisFrame = 0;
+        EdgeExtendSecondaryRestoreSkippedThisFrame = 0;
+        EdgeExtendSecondaryStoreThisFrame = 0;
+        EdgeExtendSecondaryEvictionThisFrame = 0;
         FrequentChangeFallbackPromotionsThisFrame = 0;
         FrequentChangeFallbackPromotionTexelsThisFrame = 0;
+        TextureFrameTiming = {};
+        PruneEdgeExtendChurnState();
         bool cacheStateChanged = false;
         std::unordered_map<u64, bool> frequentChangeInvalidatedBases;
 
@@ -252,7 +298,8 @@ public:
     }
 
     void GetTexture(u32 texParam, u32 palBase, TexHandleT& textureHandle, u32& layer, u32*& helper,
-                    bool* binaryAlphaTexture = nullptr, const TextureSamplingBounds* samplingBounds = nullptr)
+                    bool* binaryAlphaTexture = nullptr, const TextureSamplingBounds* samplingBounds = nullptr,
+                    bool* cacheHit = nullptr)
     {
         u32 rawTexParam = texParam;
         // remove sampling and texcoord gen params
@@ -310,11 +357,24 @@ public:
         u64 subrectKey = useSamplingBoundsKey ? MakeSubrectKey(activeSamplingBounds) : 0;
         u64 texPalHash = 0;
         if (texPalSize > 0)
+        {
+            ScopedTextureCacheTiming timing(*this, TextureFrameTiming.PaletteHash);
             texPalHash = MaskedHash(GPU.VRAMFlat_TexPal, sizeof(GPU.VRAMFlat_TexPal), texPalStart, texPalSize);
+        }
         u64 key = MakeVariantKey(baseKey, texPalHash, texPalSize > 0, subrectKey);
         if (useMarginExtension && Cache.find(key) == Cache.end())
         {
-            if (EdgeExtendNewVariantsThisFrame >= MaxEdgeExtendNewVariantsPerFrame)
+            const bool edgeExtendVariantAtCapacity = EdgeExtendVariantAtCapacity(baseKey);
+            if (edgeExtendVariantAtCapacity && ShouldSuppressEdgeExtendVariant(baseKey))
+            {
+                EdgeExtendSuppressedVariantsThisFrame++;
+                activeSamplingBounds = {};
+                useMarginExtension = false;
+                useSamplingBoundsKey = false;
+                subrectKey = 0;
+                key = MakeVariantKey(baseKey, texPalHash, texPalSize > 0, subrectKey);
+            }
+            else if (EdgeExtendNewVariantsThisFrame >= MaxEdgeExtendNewVariantsPerFrame)
             {
                 EdgeExtendThrottledVariantsThisFrame++;
                 activeSamplingBounds = {};
@@ -326,6 +386,8 @@ public:
             else
             {
                 EdgeExtendNewVariantsThisFrame++;
+                if (edgeExtendVariantAtCapacity)
+                    RecordEdgeExtendVariantMiss(baseKey);
             }
         }
         bool deferScaleOnMiss = DeferredScalingEnabled && !InDeferredPromotion && !useSamplingBoundsKey &&
@@ -355,10 +417,14 @@ public:
                 Cache.erase(it);
 
                 InFrequentChangeFallbackPromotion = true;
-                GetTexture(rawTexParam, palBase, textureHandle, layer, helper, binaryAlphaTexture, samplingBounds);
+                GetTexture(rawTexParam, palBase, textureHandle, layer, helper, binaryAlphaTexture, samplingBounds,
+                           cacheHit);
                 InFrequentChangeFallbackPromotion = false;
                 return;
             }
+
+            if (cacheHit)
+                *cacheHit = true;
 
             TouchVariantKey(baseKey, key);
             if (it->second.DeferredScalePending)
@@ -396,8 +462,13 @@ public:
             return;
         }
 
+        if (cacheHit)
+            *cacheHit = false;
+
         if (!InDeferredPromotion)
             Debug.CountEvent(&TextureScalingDebugFrameStats::CacheMisses);
+
+        ScopedTextureCacheTiming missTiming(*this, TextureFrameTiming.MissTotal);
 
         TextureScalingDebugLastMiss lastMiss = {};
         lastMiss.Valid = true;
@@ -428,6 +499,7 @@ public:
         entry.DeferredUseCount = deferScaleOnMiss ? 1 : 0;
         entry.DeferredFirstSeenFrame = FrameIndex;
         entry.CreatedFrame = FrameIndex;
+        entry.SamplingBoundsEdgeExtendMargins = useMarginExtension;
 
         entry.TextureRAMStart[0] = addr;
         entry.WidthLog2 = widthLog2;
@@ -438,114 +510,118 @@ public:
         int outputFmt = TexLoader.PreferredOutputFormat();
         const TextureVRAMView vram = VRAMView();
 
-        // apparently a new texture
-        if (fmt == 7)
         {
-            entry.TextureRAMSize[0] = width*height*2;
-
-            switch (outputFmt)
+            ScopedTextureCacheTiming timing(*this, TextureFrameTiming.Decode);
+            // apparently a new texture
+            if (fmt == 7)
             {
-            case outputFmt_RGB6A5:
-                ConvertBitmapTexture<outputFmt_RGB6A5>(width, height, DecodeBuffer(width * height), addr, vram);
-                break;
-            case outputFmt_RGBA8:
-                ConvertBitmapTexture<outputFmt_RGBA8>(width, height, DecodeBuffer(width * height), addr, vram);
-                break;
-            case outputFmt_BGRA8:
-                ConvertBitmapTexture<outputFmt_BGRA8>(width, height, DecodeBuffer(width * height), addr, vram);
-                break;
+                entry.TextureRAMSize[0] = width*height*2;
+
+                switch (outputFmt)
+                {
+                case outputFmt_RGB6A5:
+                    ConvertBitmapTexture<outputFmt_RGB6A5>(width, height, DecodeBuffer(width * height), addr, vram);
+                    break;
+                case outputFmt_RGBA8:
+                    ConvertBitmapTexture<outputFmt_RGBA8>(width, height, DecodeBuffer(width * height), addr, vram);
+                    break;
+                case outputFmt_BGRA8:
+                    ConvertBitmapTexture<outputFmt_BGRA8>(width, height, DecodeBuffer(width * height), addr, vram);
+                    break;
+                }
             }
-        }
-        else if (fmt == 5)
-        {
-            u32 slot1addr = 0x20000 + ((addr & 0x1FFFC) >> 1);
-            if (addr >= 0x40000)
-                slot1addr += 0x10000;
-
-            entry.TextureRAMSize[0] = width*height/16*4;
-            entry.TextureRAMStart[1] = slot1addr;
-            entry.TextureRAMSize[1] = width*height/16*2;
-
-            switch (outputFmt)
+            else if (fmt == 5)
             {
-            case outputFmt_RGB6A5:
-                ConvertCompressedTexture<outputFmt_RGB6A5>(width, height, DecodeBuffer(width * height), addr, slot1addr, entry.TexPalStart, vram);
-                break;
-            case outputFmt_RGBA8:
-                ConvertCompressedTexture<outputFmt_RGBA8>(width, height, DecodeBuffer(width * height), addr, slot1addr, entry.TexPalStart, vram);
-                break;
-            case outputFmt_BGRA8:
-                ConvertCompressedTexture<outputFmt_BGRA8>(width, height, DecodeBuffer(width * height), addr, slot1addr, entry.TexPalStart, vram);
-                break;
+                u32 slot1addr = 0x20000 + ((addr & 0x1FFFC) >> 1);
+                if (addr >= 0x40000)
+                    slot1addr += 0x10000;
+
+                entry.TextureRAMSize[0] = width*height/16*4;
+                entry.TextureRAMStart[1] = slot1addr;
+                entry.TextureRAMSize[1] = width*height/16*2;
+
+                switch (outputFmt)
+                {
+                case outputFmt_RGB6A5:
+                    ConvertCompressedTexture<outputFmt_RGB6A5>(width, height, DecodeBuffer(width * height), addr, slot1addr, entry.TexPalStart, vram);
+                    break;
+                case outputFmt_RGBA8:
+                    ConvertCompressedTexture<outputFmt_RGBA8>(width, height, DecodeBuffer(width * height), addr, slot1addr, entry.TexPalStart, vram);
+                    break;
+                case outputFmt_BGRA8:
+                    ConvertCompressedTexture<outputFmt_BGRA8>(width, height, DecodeBuffer(width * height), addr, slot1addr, entry.TexPalStart, vram);
+                    break;
+                }
             }
-        }
-        else
-        {
-            u32 texSize, palAddr = texPalStart, numPalEntries;
-            switch (fmt)
+            else
             {
-            case 1: texSize = width*height; numPalEntries = 32; break;
-            case 6: texSize = width*height; numPalEntries = 8; break;
-            case 2: texSize = width*height/4; numPalEntries = 4; break;
-            case 3: texSize = width*height/2; numPalEntries = 16; break;
-            case 4: texSize = width*height; numPalEntries = 256; break;
-            }
+                u32 texSize, palAddr = texPalStart, numPalEntries;
+                switch (fmt)
+                {
+                case 1: texSize = width*height; numPalEntries = 32; break;
+                case 6: texSize = width*height; numPalEntries = 8; break;
+                case 2: texSize = width*height/4; numPalEntries = 4; break;
+                case 3: texSize = width*height/2; numPalEntries = 16; break;
+                case 4: texSize = width*height; numPalEntries = 256; break;
+                }
 
-            /*printf("creating texture | fmt: %d | %dx%d | %08x | %08x\n", fmt, width, height, addr, palAddr);
-            svcSleepThread(1000*1000);*/
+                /*printf("creating texture | fmt: %d | %dx%d | %08x | %08x\n", fmt, width, height, addr, palAddr);
+                svcSleepThread(1000*1000);*/
 
-            entry.TextureRAMSize[0] = texSize;
-            entry.TexPalSize = numPalEntries*2;
+                entry.TextureRAMSize[0] = texSize;
+                entry.TexPalSize = numPalEntries*2;
 
-            //assert(entry.TexPalStart+entry.TexPalSize <= 128*1024*1024);
+                //assert(entry.TexPalStart+entry.TexPalSize <= 128*1024*1024);
 
-            switch (fmt)
-            {
-            case 1:
-                switch (outputFmt)
+                switch (fmt)
                 {
-                case outputFmt_RGB6A5: ConvertAXIYTexture<outputFmt_RGB6A5, 3, 5>(width, height, DecodeBuffer(width * height), addr, palAddr, vram); break;
-                case outputFmt_RGBA8: ConvertAXIYTexture<outputFmt_RGBA8, 3, 5>(width, height, DecodeBuffer(width * height), addr, palAddr, vram); break;
-                case outputFmt_BGRA8: ConvertAXIYTexture<outputFmt_BGRA8, 3, 5>(width, height, DecodeBuffer(width * height), addr, palAddr, vram); break;
+                case 1:
+                    switch (outputFmt)
+                    {
+                    case outputFmt_RGB6A5: ConvertAXIYTexture<outputFmt_RGB6A5, 3, 5>(width, height, DecodeBuffer(width * height), addr, palAddr, vram); break;
+                    case outputFmt_RGBA8: ConvertAXIYTexture<outputFmt_RGBA8, 3, 5>(width, height, DecodeBuffer(width * height), addr, palAddr, vram); break;
+                    case outputFmt_BGRA8: ConvertAXIYTexture<outputFmt_BGRA8, 3, 5>(width, height, DecodeBuffer(width * height), addr, palAddr, vram); break;
+                    }
+                    break;
+                case 6:
+                    switch (outputFmt)
+                    {
+                    case outputFmt_RGB6A5: ConvertAXIYTexture<outputFmt_RGB6A5, 5, 3>(width, height, DecodeBuffer(width * height), addr, palAddr, vram); break;
+                    case outputFmt_RGBA8: ConvertAXIYTexture<outputFmt_RGBA8, 5, 3>(width, height, DecodeBuffer(width * height), addr, palAddr, vram); break;
+                    case outputFmt_BGRA8: ConvertAXIYTexture<outputFmt_BGRA8, 5, 3>(width, height, DecodeBuffer(width * height), addr, palAddr, vram); break;
+                    }
+                    break;
+                case 2:
+                    switch (outputFmt)
+                    {
+                    case outputFmt_RGB6A5: ConvertNColorsTexture<outputFmt_RGB6A5, 2>(width, height, DecodeBuffer(width * height), addr, palAddr, color0Transparent, vram); break;
+                    case outputFmt_RGBA8: ConvertNColorsTexture<outputFmt_RGBA8, 2>(width, height, DecodeBuffer(width * height), addr, palAddr, color0Transparent, vram); break;
+                    case outputFmt_BGRA8: ConvertNColorsTexture<outputFmt_BGRA8, 2>(width, height, DecodeBuffer(width * height), addr, palAddr, color0Transparent, vram); break;
+                    }
+                    break;
+                case 3:
+                    switch (outputFmt)
+                    {
+                    case outputFmt_RGB6A5: ConvertNColorsTexture<outputFmt_RGB6A5, 4>(width, height, DecodeBuffer(width * height), addr, palAddr, color0Transparent, vram); break;
+                    case outputFmt_RGBA8: ConvertNColorsTexture<outputFmt_RGBA8, 4>(width, height, DecodeBuffer(width * height), addr, palAddr, color0Transparent, vram); break;
+                    case outputFmt_BGRA8: ConvertNColorsTexture<outputFmt_BGRA8, 4>(width, height, DecodeBuffer(width * height), addr, palAddr, color0Transparent, vram); break;
+                    }
+                    break;
+                case 4:
+                    switch (outputFmt)
+                    {
+                    case outputFmt_RGB6A5: ConvertNColorsTexture<outputFmt_RGB6A5, 8>(width, height, DecodeBuffer(width * height), addr, palAddr, color0Transparent, vram); break;
+                    case outputFmt_RGBA8: ConvertNColorsTexture<outputFmt_RGBA8, 8>(width, height, DecodeBuffer(width * height), addr, palAddr, color0Transparent, vram); break;
+                    case outputFmt_BGRA8: ConvertNColorsTexture<outputFmt_BGRA8, 8>(width, height, DecodeBuffer(width * height), addr, palAddr, color0Transparent, vram); break;
+                    }
+                    break;
                 }
-                break;
-            case 6:
-                switch (outputFmt)
-                {
-                case outputFmt_RGB6A5: ConvertAXIYTexture<outputFmt_RGB6A5, 5, 3>(width, height, DecodeBuffer(width * height), addr, palAddr, vram); break;
-                case outputFmt_RGBA8: ConvertAXIYTexture<outputFmt_RGBA8, 5, 3>(width, height, DecodeBuffer(width * height), addr, palAddr, vram); break;
-                case outputFmt_BGRA8: ConvertAXIYTexture<outputFmt_BGRA8, 5, 3>(width, height, DecodeBuffer(width * height), addr, palAddr, vram); break;
-                }
-                break;
-            case 2:
-                switch (outputFmt)
-                {
-                case outputFmt_RGB6A5: ConvertNColorsTexture<outputFmt_RGB6A5, 2>(width, height, DecodeBuffer(width * height), addr, palAddr, color0Transparent, vram); break;
-                case outputFmt_RGBA8: ConvertNColorsTexture<outputFmt_RGBA8, 2>(width, height, DecodeBuffer(width * height), addr, palAddr, color0Transparent, vram); break;
-                case outputFmt_BGRA8: ConvertNColorsTexture<outputFmt_BGRA8, 2>(width, height, DecodeBuffer(width * height), addr, palAddr, color0Transparent, vram); break;
-                }
-                break;
-            case 3:
-                switch (outputFmt)
-                {
-                case outputFmt_RGB6A5: ConvertNColorsTexture<outputFmt_RGB6A5, 4>(width, height, DecodeBuffer(width * height), addr, palAddr, color0Transparent, vram); break;
-                case outputFmt_RGBA8: ConvertNColorsTexture<outputFmt_RGBA8, 4>(width, height, DecodeBuffer(width * height), addr, palAddr, color0Transparent, vram); break;
-                case outputFmt_BGRA8: ConvertNColorsTexture<outputFmt_BGRA8, 4>(width, height, DecodeBuffer(width * height), addr, palAddr, color0Transparent, vram); break;
-                }
-                break;
-            case 4:
-                switch (outputFmt)
-                {
-                case outputFmt_RGB6A5: ConvertNColorsTexture<outputFmt_RGB6A5, 8>(width, height, DecodeBuffer(width * height), addr, palAddr, color0Transparent, vram); break;
-                case outputFmt_RGBA8: ConvertNColorsTexture<outputFmt_RGBA8, 8>(width, height, DecodeBuffer(width * height), addr, palAddr, color0Transparent, vram); break;
-                case outputFmt_BGRA8: ConvertNColorsTexture<outputFmt_BGRA8, 8>(width, height, DecodeBuffer(width * height), addr, palAddr, color0Transparent, vram); break;
-                }
-                break;
             }
         }
 
         if (useSubrectHandling)
         {
+            ScopedTextureCacheTiming timing(*this, TextureFrameTiming.BoundsProcess);
             const u32 cropWidth = activeSamplingBounds.X1 - activeSamplingBounds.X0;
             const u32 cropHeight = activeSamplingBounds.Y1 - activeSamplingBounds.Y0;
             CropTexture(width, height, DecodeBufferStorage.data(), activeSamplingBounds, CroppedBufferStorage);
@@ -557,6 +633,7 @@ public:
         }
         else if (useMarginExtension)
         {
+            ScopedTextureCacheTiming timing(*this, TextureFrameTiming.BoundsProcess);
             EdgeExtendTextureMargins(width, height, DecodeBufferStorage.data(), activeSamplingBounds);
         }
 
@@ -567,22 +644,34 @@ public:
         entry.ScaleFactor = effectiveScaleFactor;
         entry.OutputFormat = outputFmt;
 
-        for (int i = 0; i < 2; i++)
         {
-            if (entry.TextureRAMSize[i])
-                entry.TextureHash[i] = MaskedHash(GPU.VRAMFlat_Texture, sizeof(GPU.VRAMFlat_Texture),
-                    entry.TextureRAMStart[i], entry.TextureRAMSize[i]);
+            ScopedTextureCacheTiming timing(*this, TextureFrameTiming.TextureHash);
+            for (int i = 0; i < 2; i++)
+            {
+                if (entry.TextureRAMSize[i])
+                    entry.TextureHash[i] = MaskedHash(GPU.VRAMFlat_Texture, sizeof(GPU.VRAMFlat_Texture),
+                        entry.TextureRAMStart[i], entry.TextureRAMSize[i]);
+            }
+            if (entry.TexPalSize)
+                entry.TexPalHash = texPalHash;
         }
-        if (entry.TexPalSize)
-            entry.TexPalHash = texPalHash;
 
-        if (TryRestoreSecondaryCacheEntry(key, entry, textureHandle, layer, helper,
-                binaryAlphaTexture, activeSamplingBounds, addr, fmt, color0Transparent))
+        bool restoredSecondary = false;
+        {
+            ScopedTextureCacheTiming timing(*this, TextureFrameTiming.SecondaryRestore);
+            restoredSecondary = TryRestoreSecondaryCacheEntry(key, entry, textureHandle, layer, helper,
+                binaryAlphaTexture, activeSamplingBounds, addr, fmt, color0Transparent);
+        }
+        if (restoredSecondary)
             return;
 
-        TexArrayEntry storagePlace =
-            AcquireStoragePlace(widthLog2, heightLog2, scaledWidth, scaledHeight, storageBucket, useSubrectHandling,
-                                effectiveScaleFactor);
+        TexArrayEntry storagePlace;
+        {
+            ScopedTextureCacheTiming timing(*this, TextureFrameTiming.StorageAlloc);
+            storagePlace =
+                AcquireStoragePlace(widthLog2, heightLog2, scaledWidth, scaledHeight, storageBucket, useSubrectHandling,
+                                    effectiveScaleFactor);
+        }
         entry.Texture = storagePlace;
         lastMiss.SourceWidth = width;
         lastMiss.SourceHeight = height;
@@ -616,22 +705,28 @@ public:
             {
                 bool binaryAlpha = false;
                 u32* rgbaBuffer = DecodeRGBA8Buffer(width * height);
-                TextureScaleDecodeSourceRGBA8(fmt, width, height, rgbaBuffer, addr, entry.TextureRAMStart[1],
-                                              entry.TexPalStart, color0Transparent, vram);
-                if (useMarginExtension)
-                    EdgeExtendTextureMargins(width, height, rgbaBuffer, activeSamplingBounds);
+                {
+                    ScopedTextureCacheTiming timing(*this, TextureFrameTiming.ScaleSourceDecode);
+                    TextureScaleDecodeSourceRGBA8(fmt, width, height, rgbaBuffer, addr, entry.TextureRAMStart[1],
+                                                  entry.TexPalStart, color0Transparent, vram);
+                    if (useMarginExtension)
+                        EdgeExtendTextureMargins(width, height, rgbaBuffer, activeSamplingBounds);
+                }
                 if (capturePreviewImages)
                     sourcePreviewData = rgbaBuffer;
                 bool hasTransparentAlpha = false;
-                binaryAlpha = TextureHasBinaryAlpha(width, height, rgbaBuffer, 255, &hasTransparentAlpha);
-                binaryAlphaTextureValue = binaryAlpha && hasTransparentAlpha;
-                binaryAlphaTextureKnown = true;
-                sourceBinaryAlphaTextureValue = binaryAlphaTextureValue;
-                sourceBinaryAlphaTextureKnown = true;
-                if (binaryAlpha && hasTransparentAlpha && TexLoader.UseFilterableMipTopologyHandling())
                 {
-                    conservativeAtlasFallback = TextureMipShouldUseConservativeAtlasFallback(width, height, rgbaBuffer);
-                    conservativeAtlasFallbackKnown = true;
+                    ScopedTextureCacheTiming timing(*this, TextureFrameTiming.ScaleAlphaPrep);
+                    binaryAlpha = TextureHasBinaryAlpha(width, height, rgbaBuffer, 255, &hasTransparentAlpha);
+                    binaryAlphaTextureValue = binaryAlpha && hasTransparentAlpha;
+                    binaryAlphaTextureKnown = true;
+                    sourceBinaryAlphaTextureValue = binaryAlphaTextureValue;
+                    sourceBinaryAlphaTextureKnown = true;
+                    if (binaryAlpha && hasTransparentAlpha && TexLoader.UseFilterableMipTopologyHandling())
+                    {
+                        conservativeAtlasFallback = TextureMipShouldUseConservativeAtlasFallback(width, height, rgbaBuffer);
+                        conservativeAtlasFallbackKnown = true;
+                    }
                 }
                 bool useImprovedFilterableMipPath =
                     TexLoader.FilterableSamplingEnabled() &&
@@ -642,6 +737,7 @@ public:
                 if (binaryAlpha && hasTransparentAlpha && !TexLoader.UseLegacyAlphaHandling() &&
                     (!useImprovedFilterableMipPath || effectiveScaleFactor > 1))
                 {
+                    ScopedTextureCacheTiming timing(*this, TextureFrameTiming.ScaleAlphaPrep);
                     if (TexLoader.UseQualityAlphaHandling())
                         PadTransparentTextureRGB(width, height, rgbaBuffer);
                     else
@@ -649,12 +745,28 @@ public:
                 }
                 sourceMipNativeRGBA8 = rgbaBuffer;
 
-                if (!useImprovedFilterableMipPath &&
-                    !(TexLoader.FilterableSamplingEnabled() && TexLoader.UseSourceMipScaling() && effectiveScaleFactor > 1 &&
-                      (effectiveScaleFactor & (effectiveScaleFactor - 1)) == 0) &&
-                    TexLoader.ProcessTextureGPUScaleToCacheLayer(width, height, effectiveScaleFactor, rgbaBuffer,
+                bool processedGPUDirect = false;
+                const bool useDefaultFilterableBinaryAlphaMips =
+                    TexLoader.FilterableSamplingEnabled() &&
+                    TexLoader.UseFilterableMipAlphaHandling() &&
+                    binaryAlpha &&
+                    !useImprovedFilterableMipPath;
+                const bool useSourceScaledCPUPath =
+                    !useImprovedFilterableMipPath &&
+                    TexLoader.FilterableSamplingEnabled() &&
+                    TexLoader.UseSourceMipScaling() &&
+                    effectiveScaleFactor > 1 &&
+                    (effectiveScaleFactor & (effectiveScaleFactor - 1)) == 0;
+                if (!useSourceScaledCPUPath)
+                {
+                    ScopedTextureCacheTiming timing(*this, TextureFrameTiming.GPUScale);
+                    processedGPUDirect = TexLoader.ProcessTextureGPUScaleToCacheLayer(width, height, effectiveScaleFactor, rgbaBuffer,
                         outputFmt, binaryAlpha, storagePlace.TextureID, storagePlace.Layer,
-                        capturePreviewImages ? &ScaledRGBA8Storage : nullptr))
+                        capturePreviewImages ? &ScaledRGBA8Storage : nullptr,
+                        useImprovedFilterableMipPath,
+                        useDefaultFilterableBinaryAlphaMips);
+                }
+                if (processedGPUDirect)
                 {
                     if (capturePreviewImages && !ScaledRGBA8Storage.empty())
                         resultPreviewData = ScaledRGBA8Storage.data();
@@ -673,44 +785,65 @@ public:
                     if (lastMiss.UsedSpline36)
                         Debug.CountEvent(&TextureScalingDebugFrameStats::Spline36ScaledUploads);
                 }
-                else if (TexLoader.ProcessTextureGPUScale(width, height, effectiveScaleFactor, rgbaBuffer, ScaledRGBA8Storage))
+                else
                 {
-                    u32* scaledBuffer = ScaledBuffer(scaledWidth * scaledHeight);
-                    TextureScalePackRGBA8ToOutput(outputFmt, scaledWidth, scaledHeight, ScaledRGBA8Storage.data(),
-                                                  scaledBuffer, binaryAlpha);
-                    uploadData = scaledBuffer;
-                    resultPreviewData = ScaledRGBA8Storage.data();
-                    filterableMipSourceRGBA8 = ScaledRGBA8Storage.data();
-                    usedCustomScaler = true;
-                    lastMiss.UsedGPUScaler = true;
-                    lastMiss.UsedXBRZ = scalingAlgorithm == RendererSettings::GLScaleAlgorithm::XBRZ;
-                    lastMiss.UsedSpline36 = scalingAlgorithm == RendererSettings::GLScaleAlgorithm::Spline36;
-                    Debug.CountEvent(&TextureScalingDebugFrameStats::ScaledUploads);
-                    Debug.CountEvent(&TextureScalingDebugFrameStats::GPUScaledUploads);
-                    Debug.CountEvent(&TextureScalingDebugFrameStats::GPULegacyReadbackUploads);
-                    if (lastMiss.UsedXBRZ)
-                        Debug.CountEvent(&TextureScalingDebugFrameStats::XBRZScaledUploads);
-                    if (lastMiss.UsedSpline36)
-                        Debug.CountEvent(&TextureScalingDebugFrameStats::Spline36ScaledUploads);
-                }
-                else if (scalingAlgorithm == RendererSettings::GLScaleAlgorithm::XBRZ &&
-                         TextureScaleRunXBRZ(width, height, effectiveScaleFactor, rgbaBuffer, ScaledRGBA8Storage))
-                {
-                    u32* scaledBuffer = ScaledBuffer(scaledWidth * scaledHeight);
-                    TextureScalePackRGBA8ToOutput(outputFmt, scaledWidth, scaledHeight, ScaledRGBA8Storage.data(),
-                                                  scaledBuffer, binaryAlpha);
-                    uploadData = scaledBuffer;
-                    resultPreviewData = ScaledRGBA8Storage.data();
-                    filterableMipSourceRGBA8 = ScaledRGBA8Storage.data();
-                    usedCustomScaler = true;
-                    lastMiss.UsedXBRZ = true;
-                    Debug.CountEvent(&TextureScalingDebugFrameStats::ScaledUploads);
-                    Debug.CountEvent(&TextureScalingDebugFrameStats::XBRZScaledUploads);
+                    bool processedGPUReadback = false;
+                    {
+                        ScopedTextureCacheTiming timing(*this, TextureFrameTiming.GPUScale);
+                        processedGPUReadback = TexLoader.ProcessTextureGPUScale(width, height, effectiveScaleFactor,
+                            rgbaBuffer, ScaledRGBA8Storage);
+                    }
+                    if (processedGPUReadback)
+                    {
+                        ScopedTextureCacheTiming timing(*this, TextureFrameTiming.CPUScale);
+                        u32* scaledBuffer = ScaledBuffer(scaledWidth * scaledHeight);
+                        TextureScalePackRGBA8ToOutput(outputFmt, scaledWidth, scaledHeight, ScaledRGBA8Storage.data(),
+                                                      scaledBuffer, binaryAlpha);
+                        uploadData = scaledBuffer;
+                        resultPreviewData = ScaledRGBA8Storage.data();
+                        filterableMipSourceRGBA8 = ScaledRGBA8Storage.data();
+                        usedCustomScaler = true;
+                        lastMiss.UsedGPUScaler = true;
+                        lastMiss.UsedXBRZ = scalingAlgorithm == RendererSettings::GLScaleAlgorithm::XBRZ;
+                        lastMiss.UsedSpline36 = scalingAlgorithm == RendererSettings::GLScaleAlgorithm::Spline36;
+                        Debug.CountEvent(&TextureScalingDebugFrameStats::ScaledUploads);
+                        Debug.CountEvent(&TextureScalingDebugFrameStats::GPUScaledUploads);
+                        Debug.CountEvent(&TextureScalingDebugFrameStats::GPULegacyReadbackUploads);
+                        if (lastMiss.UsedXBRZ)
+                            Debug.CountEvent(&TextureScalingDebugFrameStats::XBRZScaledUploads);
+                        if (lastMiss.UsedSpline36)
+                            Debug.CountEvent(&TextureScalingDebugFrameStats::Spline36ScaledUploads);
+                    }
+                    else
+                    {
+                        bool processedXBRZ = false;
+                        if (scalingAlgorithm == RendererSettings::GLScaleAlgorithm::XBRZ)
+                        {
+                            ScopedTextureCacheTiming timing(*this, TextureFrameTiming.CPUScale);
+                            processedXBRZ = TextureScaleRunXBRZ(width, height, effectiveScaleFactor,
+                                rgbaBuffer, ScaledRGBA8Storage);
+                        }
+                        if (processedXBRZ)
+                        {
+                            ScopedTextureCacheTiming timing(*this, TextureFrameTiming.CPUScale);
+                            u32* scaledBuffer = ScaledBuffer(scaledWidth * scaledHeight);
+                            TextureScalePackRGBA8ToOutput(outputFmt, scaledWidth, scaledHeight,
+                                                          ScaledRGBA8Storage.data(), scaledBuffer, binaryAlpha);
+                            uploadData = scaledBuffer;
+                            resultPreviewData = ScaledRGBA8Storage.data();
+                            filterableMipSourceRGBA8 = ScaledRGBA8Storage.data();
+                            usedCustomScaler = true;
+                            lastMiss.UsedXBRZ = true;
+                            Debug.CountEvent(&TextureScalingDebugFrameStats::ScaledUploads);
+                            Debug.CountEvent(&TextureScalingDebugFrameStats::XBRZScaledUploads);
+                        }
+                    }
                 }
             }
 
             if (!usedCustomScaler)
             {
+                ScopedTextureCacheTiming timing(*this, TextureFrameTiming.CPUScale);
                 u32* scaledBuffer = ScaledBuffer(scaledWidth * scaledHeight);
                 TextureScaleRunCPUFallback(outputFmt, width, height, DecodeBufferStorage.data(), effectiveScaleFactor,
                                            scaledBuffer, useFrequentChangeFallback);
@@ -746,6 +879,7 @@ public:
             TexLoader.FilterableSamplingEnabled() &&
             (TexLoader.UseFilterableMipAlphaHandling() || sourceScaledMipLevels))
         {
+            ScopedTextureCacheTiming timing(*this, TextureFrameTiming.MipPrep);
             if (sourceScaledMipLevels && sourceMipNativeRGBA8 == nullptr)
             {
                 sourceMipNativeRGBA8Storage.resize(static_cast<size_t>(width) * static_cast<size_t>(height));
@@ -878,6 +1012,7 @@ public:
 
         if (!binaryAlphaTextureKnown && !uploadedDirectly && uploadData)
         {
+            ScopedTextureCacheTiming timing(*this, TextureFrameTiming.BinaryAlphaScan);
             u32* preview = PreviewBuffer(static_cast<size_t>(scaledWidth) * static_cast<size_t>(scaledHeight));
             switch (outputFmt)
             {
@@ -900,6 +1035,7 @@ public:
 
         if (capturePreviewImages && !sourcePreviewData)
         {
+            ScopedTextureCacheTiming timing(*this, TextureFrameTiming.PreviewCapture);
             u32* preview = PreviewBuffer(width * height);
             switch (outputFmt)
             {
@@ -916,10 +1052,14 @@ public:
             lastMiss.SourceRGBA.assign(preview, preview + (static_cast<size_t>(width) * static_cast<size_t>(height)));
         }
         else if (capturePreviewImages && sourcePreviewData)
+        {
+            ScopedTextureCacheTiming timing(*this, TextureFrameTiming.PreviewCapture);
             lastMiss.SourceRGBA.assign(sourcePreviewData, sourcePreviewData + (static_cast<size_t>(width) * static_cast<size_t>(height)));
+        }
 
         if (capturePreviewImages && !resultPreviewData && uploadData)
         {
+            ScopedTextureCacheTiming timing(*this, TextureFrameTiming.PreviewCapture);
             u32* preview = PreviewBuffer(scaledWidth * scaledHeight);
             switch (outputFmt)
             {
@@ -936,10 +1076,14 @@ public:
             lastMiss.ResultRGBA.assign(preview, preview + (static_cast<size_t>(scaledWidth) * static_cast<size_t>(scaledHeight)));
         }
         else if (capturePreviewImages && resultPreviewData)
+        {
+            ScopedTextureCacheTiming timing(*this, TextureFrameTiming.PreviewCapture);
             lastMiss.ResultRGBA.assign(resultPreviewData, resultPreviewData + (static_cast<size_t>(scaledWidth) * static_cast<size_t>(scaledHeight)));
+        }
 
         if (!uploadedDirectly && uploadData)
         {
+            ScopedTextureCacheTiming timing(*this, TextureFrameTiming.Upload);
             if (uploadedCustomMipChain)
             {
                 for (size_t level = 0; level < filterableMipChain.PackedLevels.size(); level++)
@@ -962,16 +1106,20 @@ public:
         Debug.CountPixels(&TextureScalingDebugFrameStats::UploadPixels, static_cast<u64>(scaledWidth) * static_cast<u64>(scaledHeight));
         //printf("using storage place %d %d | %d %d (%d)\n", width, height, storagePlace.TexArrayIdx, storagePlace.LayerIdx, array.ImageDescriptor);
 
-        textureHandle = storagePlace.TextureID;
-        layer = storagePlace.Layer;
-        entry.BinaryAlphaTexture = binaryAlphaTextureValue;
-        EvictOldPaletteVariantIfNeeded(baseKey, key);
-        helper = &Cache.emplace(std::make_pair(key, entry)).first->second.LastVariant;
-        if (binaryAlphaTexture)
-            *binaryAlphaTexture = binaryAlphaTextureValue;
-        TouchVariantKey(baseKey, key);
+        {
+            ScopedTextureCacheTiming timing(*this, TextureFrameTiming.CacheInsert);
+            textureHandle = storagePlace.TextureID;
+            layer = storagePlace.Layer;
+            entry.BinaryAlphaTexture = binaryAlphaTextureValue;
+            EvictOldPaletteVariantIfNeeded(baseKey, key);
+            helper = &Cache.emplace(std::make_pair(key, entry)).first->second.LastVariant;
+            if (binaryAlphaTexture)
+                *binaryAlphaTexture = binaryAlphaTextureValue;
+            TouchVariantKey(baseKey, key);
+        }
         if (captureFrameTexture)
         {
+            ScopedTextureCacheTiming timing(*this, TextureFrameTiming.PreviewCapture);
             TextureScalingDebugFrameTexture frameTexture = MakeDebugFrameTextureRecord(
                 key, baseKey, rawTexParam, palBase, fmt, width, height, scaledWidth, scaledHeight,
                 effectiveScaleFactor, activeSamplingBounds, addr, entry.TextureRAMStart[1],
@@ -1038,13 +1186,22 @@ public:
         SecondaryCache.clear();
         SecondaryCacheTexels = 0;
         FrequentChangeByBase.clear();
+        EdgeExtendChurnByBase.clear();
         VariantKeysByBase.clear();
         DeferredScaleQueue.clear();
         Debug.ResetCacheState();
         EdgeExtendNewVariantsThisFrame = 0;
         EdgeExtendThrottledVariantsThisFrame = 0;
+        EdgeExtendSuppressedVariantsThisFrame = 0;
+        EdgeExtendSecondaryRestoreHitThisFrame = 0;
+        EdgeExtendSecondaryRestoreMissNoEntryThisFrame = 0;
+        EdgeExtendSecondaryRestoreMissMismatchThisFrame = 0;
+        EdgeExtendSecondaryRestoreSkippedThisFrame = 0;
+        EdgeExtendSecondaryStoreThisFrame = 0;
+        EdgeExtendSecondaryEvictionThisFrame = 0;
         FrequentChangeFallbackPromotionsThisFrame = 0;
         FrequentChangeFallbackPromotionTexelsThisFrame = 0;
+        TextureFrameTiming = {};
         InFrequentChangeFallbackPromotion = false;
         FrameIndex = 0;
     }
@@ -1060,6 +1217,8 @@ public:
             DeferredScalingEnabled,
             TexLoader.UseLegacyAlphaHandling(),
             TexLoader.UseQualityAlphaHandling(),
+            TexLoader.UseAlphaXBRZ(),
+            TexLoader.UseSpline36Alpha(),
             RendererSettings::GetGLScaleAlgorithmIndex(TexLoader.ScalingAlgorithm()),
             TextureScaleFactor,
             static_cast<u32>(Cache.size()),
@@ -1101,6 +1260,11 @@ public:
         Debug.FinishFrameTextureCapture();
     }
 
+    void FlushPendingMipmaps()
+    {
+        TexLoader.FlushPendingMipmaps();
+    }
+
     u32 GetEdgeExtendNewVariantsThisFrame() const
     {
         return EdgeExtendNewVariantsThisFrame;
@@ -1109,6 +1273,46 @@ public:
     u32 GetEdgeExtendThrottledVariantsThisFrame() const
     {
         return EdgeExtendThrottledVariantsThisFrame;
+    }
+
+    u32 GetEdgeExtendSuppressedVariantsThisFrame() const
+    {
+        return EdgeExtendSuppressedVariantsThisFrame;
+    }
+
+    u32 GetEdgeExtendSecondaryRestoreHitThisFrame() const
+    {
+        return EdgeExtendSecondaryRestoreHitThisFrame;
+    }
+
+    u32 GetEdgeExtendSecondaryRestoreMissNoEntryThisFrame() const
+    {
+        return EdgeExtendSecondaryRestoreMissNoEntryThisFrame;
+    }
+
+    u32 GetEdgeExtendSecondaryRestoreMissMismatchThisFrame() const
+    {
+        return EdgeExtendSecondaryRestoreMissMismatchThisFrame;
+    }
+
+    u32 GetEdgeExtendSecondaryRestoreSkippedThisFrame() const
+    {
+        return EdgeExtendSecondaryRestoreSkippedThisFrame;
+    }
+
+    u32 GetEdgeExtendSecondaryStoreThisFrame() const
+    {
+        return EdgeExtendSecondaryStoreThisFrame;
+    }
+
+    u32 GetEdgeExtendSecondaryEvictionThisFrame() const
+    {
+        return EdgeExtendSecondaryEvictionThisFrame;
+    }
+
+    const TextureCacheFrameTiming& GetTextureCacheFrameTiming() const
+    {
+        return TextureFrameTiming;
     }
 
     bool ApplyTextureSettings(u32 renderScaleFactor,
@@ -1127,6 +1331,8 @@ public:
         changed |= SetTextureScalingEdgeExtendUnusedMargins(scaling.EdgeExtendUnusedMargins);
         changed |= SetLegacyAlphaHandling(scaling.LegacyAlphaHandling);
         changed |= SetQualityAlphaHandling(scaling.QualityAlphaHandling);
+        changed |= SetAlphaXBRZ(scaling.AlphaXBRZ);
+        changed |= SetSpline36Alpha(scaling.Spline36Alpha);
         changed |= SetLosslessRGB6Repack(filter.LosslessRGB6Repack);
         changed |= SetFilterableMipTopologyHandling(filter.TopologyAwareMipHandling);
         changed |= SetFilterableMipSubrectHandling(filter.MipmapSubrectHandling);
@@ -1201,6 +1407,14 @@ public:
     {
         return TexLoader.SetQualityAlphaHandling(qualityAlphaHandling);
     }
+    bool SetAlphaXBRZ(bool alphaXBRZ)
+    {
+        return TexLoader.SetAlphaXBRZ(alphaXBRZ);
+    }
+    bool SetSpline36Alpha(bool spline36Alpha)
+    {
+        return TexLoader.SetSpline36Alpha(spline36Alpha);
+    }
     bool SetLosslessRGB6Repack(bool losslessRGB6Repack)
     {
         return TexLoader.SetLosslessRGB6Repack(losslessRGB6Repack);
@@ -1238,6 +1452,36 @@ private:
     static constexpr size_t SecondaryCacheMaxEntries = 32;
     static constexpr size_t SecondaryCacheMaxEntriesPerBase = 4;
     static constexpr u64 SecondaryCacheMaxTexels = 16 * 1024 * 1024;
+
+    static u64 ElapsedTextureCacheUS(std::chrono::steady_clock::time_point start)
+    {
+        return std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - start).count();
+    }
+
+    void AddTextureCacheTiming(TextureCacheTimingPhase& phase, u64 elapsedUS)
+    {
+        phase.TotalUS += elapsedUS;
+        if (elapsedUS > phase.MaxUS)
+            phase.MaxUS = elapsedUS;
+        phase.Count++;
+    }
+
+    struct ScopedTextureCacheTiming
+    {
+        ScopedTextureCacheTiming(Texcache& owner, TextureCacheTimingPhase& phase)
+            : Owner(owner), Phase(phase), Start(std::chrono::steady_clock::now())
+        {}
+
+        ~ScopedTextureCacheTiming()
+        {
+            Owner.AddTextureCacheTiming(Phase, Texcache::ElapsedTextureCacheUS(Start));
+        }
+
+        Texcache& Owner;
+        TextureCacheTimingPhase& Phase;
+        std::chrono::steady_clock::time_point Start;
+    };
 
     TextureVRAMView VRAMView() const
     {
@@ -1557,6 +1801,77 @@ private:
         return it->second.Hot && !it->second.SecondaryCacheReuseSeen;
     }
 
+    bool ShouldSuppressEdgeExtendVariant(u64 baseKey)
+    {
+        auto it = EdgeExtendChurnByBase.find(baseKey);
+        if (it == EdgeExtendChurnByBase.end())
+            return false;
+
+        EdgeExtendChurnEntry& entry = it->second;
+        entry.LastSeenFrame = FrameIndex;
+
+        if (entry.SuppressedUntilFrame > FrameIndex)
+            return true;
+
+        if (entry.SuppressedUntilFrame != 0 && entry.SuppressedUntilFrame <= FrameIndex)
+        {
+            entry.WindowStartFrame = FrameIndex;
+            entry.SuppressedUntilFrame = 0;
+            entry.NewVariantCount = 0;
+            return false;
+        }
+
+        if (entry.WindowStartFrame == 0 ||
+            FrameIndex - entry.WindowStartFrame > EdgeExtendChurnWindowFrames)
+        {
+            entry.WindowStartFrame = FrameIndex;
+            entry.NewVariantCount = 0;
+            return false;
+        }
+
+        return entry.NewVariantCount >= EdgeExtendChurnLimit();
+    }
+
+    void RecordEdgeExtendVariantMiss(u64 baseKey)
+    {
+        EdgeExtendChurnEntry& entry = EdgeExtendChurnByBase[baseKey];
+        entry.LastSeenFrame = FrameIndex;
+
+        if (entry.WindowStartFrame == 0 ||
+            FrameIndex - entry.WindowStartFrame > EdgeExtendChurnWindowFrames ||
+            (entry.SuppressedUntilFrame != 0 && entry.SuppressedUntilFrame <= FrameIndex))
+        {
+            entry.WindowStartFrame = FrameIndex;
+            entry.SuppressedUntilFrame = 0;
+            entry.NewVariantCount = 0;
+        }
+
+        entry.NewVariantCount++;
+        if (entry.NewVariantCount >= EdgeExtendChurnLimit())
+            entry.SuppressedUntilFrame = FrameIndex + EdgeExtendChurnCooldownFrames;
+    }
+
+    u32 EdgeExtendChurnLimit() const
+    {
+        return TexLoader.FilterableSamplingEnabled() ?
+            EdgeExtendFilterableChurnVariantLimit :
+            EdgeExtendChurnVariantLimit;
+    }
+
+    void PruneEdgeExtendChurnState()
+    {
+        for (auto it = EdgeExtendChurnByBase.begin(); it != EdgeExtendChurnByBase.end();)
+        {
+            const EdgeExtendChurnEntry& entry = it->second;
+            const u64 keepUntil = std::max(entry.LastSeenFrame + EdgeExtendChurnCooldownFrames,
+                                           entry.SuppressedUntilFrame);
+            if (keepUntil < FrameIndex)
+                it = EdgeExtendChurnByBase.erase(it);
+            else
+                ++it;
+        }
+    }
+
     bool IsFrequentChangeHot(u64 baseKey) const
     {
         if (!FrequentChangePolicyEnabled || TextureScaleFactor <= 1)
@@ -1607,6 +1922,13 @@ private:
         auto& variants = VariantKeysByBase[baseKey];
         variants.erase(std::remove(variants.begin(), variants.end(), key), variants.end());
         variants.push_back(key);
+    }
+
+    bool EdgeExtendVariantAtCapacity(u64 baseKey) const
+    {
+        auto variantsIt = VariantKeysByBase.find(baseKey);
+        return variantsIt != VariantKeysByBase.end() &&
+            variantsIt->second.size() >= MaxPaletteVariantsPerBaseKey;
     }
 
     void EvictOldPaletteVariantIfNeeded(u64 baseKey, u64 keepKey)
@@ -1700,6 +2022,9 @@ private:
         if (victim == SecondaryCache.end())
             return false;
 
+        if (victim->second.Entry.SamplingBoundsEdgeExtendMargins)
+            EdgeExtendSecondaryEvictionThisFrame++;
+
         SecondaryCacheTexels -= std::min(SecondaryCacheTexels, victim->second.TexelCost);
         ReleaseStoragePlace(victim->second.Entry);
         SecondaryCache.erase(victim);
@@ -1734,6 +2059,9 @@ private:
         auto existing = SecondaryCache.find(secondaryKey);
         if (existing != SecondaryCache.end())
         {
+            if (existing->second.Entry.SamplingBoundsEdgeExtendMargins)
+                EdgeExtendSecondaryEvictionThisFrame++;
+
             SecondaryCacheTexels -= std::min(SecondaryCacheTexels, existing->second.TexelCost);
             ReleaseStoragePlace(existing->second.Entry);
             SecondaryCache.erase(existing);
@@ -1747,6 +2075,8 @@ private:
         SecondaryCacheTexels += secondaryEntry.TexelCost;
         SecondaryCache.emplace(secondaryKey, secondaryEntry);
         Debug.CountEvent(&TextureScalingDebugFrameStats::SecondaryCacheStores);
+        if (entry.SamplingBoundsEdgeExtendMargins)
+            EdgeExtendSecondaryStoreThisFrame++;
         TrimSecondaryCache(entry.BaseKey);
         return true;
     }
@@ -1776,18 +2106,35 @@ private:
                                        u32 fmt,
                                        bool color0Transparent)
     {
+        const bool edgeExtendRestore =
+            activeSamplingBounds.Valid && activeSamplingBounds.EdgeExtendMargins;
+
         if (!CanUseSecondaryCache(probe))
+        {
+            if (edgeExtendRestore)
+                EdgeExtendSecondaryRestoreSkippedThisFrame++;
             return false;
+        }
 
         const u64 secondaryKey = MakeSecondaryCacheKey(key, probe);
         auto secondaryIt = SecondaryCache.find(secondaryKey);
         if (secondaryIt == SecondaryCache.end())
+        {
+            if (edgeExtendRestore)
+                EdgeExtendSecondaryRestoreMissNoEntryThisFrame++;
             return false;
+        }
 
         if (!SecondaryCacheEntryMatches(secondaryIt->second.Entry, probe))
+        {
+            if (edgeExtendRestore)
+                EdgeExtendSecondaryRestoreMissMismatchThisFrame++;
             return false;
+        }
 
         TexCacheEntry restored = secondaryIt->second.Entry;
+        if (edgeExtendRestore)
+            EdgeExtendSecondaryRestoreHitThisFrame++;
         SecondaryCacheTexels -= std::min(SecondaryCacheTexels, secondaryIt->second.TexelCost);
         SecondaryCache.erase(secondaryIt);
 
@@ -1894,6 +2241,7 @@ private:
     std::unordered_map<u64, TexCacheEntry> Cache;
     std::unordered_map<u64, SecondaryCacheEntry> SecondaryCache;
     std::unordered_map<u64, FrequentChangeEntry> FrequentChangeByBase;
+    std::unordered_map<u64, EdgeExtendChurnEntry> EdgeExtendChurnByBase;
     std::unordered_map<u64, std::vector<u64>> VariantKeysByBase;
 
     TexLoaderT TexLoader;
@@ -1916,10 +2264,22 @@ private:
     u32 FrequentChangeFallbackPromotionsThisFrame = 0;
     u64 FrequentChangeFallbackPromotionTexelsThisFrame = 0;
     bool TextureScalingEdgeExtendUnusedMargins = false;
-    static constexpr u32 MaxEdgeExtendNewVariantsPerFrame = 1;
+    static constexpr u32 MaxEdgeExtendNewVariantsPerFrame = 2;
+    static constexpr u32 EdgeExtendChurnWindowFrames = 30;
+    static constexpr u32 EdgeExtendChurnCooldownFrames = 180;
+    static constexpr u32 EdgeExtendChurnVariantLimit = 4;
+    static constexpr u32 EdgeExtendFilterableChurnVariantLimit = 2;
     u32 EdgeExtendNewVariantsThisFrame = 0;
     u32 EdgeExtendThrottledVariantsThisFrame = 0;
+    u32 EdgeExtendSuppressedVariantsThisFrame = 0;
+    u32 EdgeExtendSecondaryRestoreHitThisFrame = 0;
+    u32 EdgeExtendSecondaryRestoreMissNoEntryThisFrame = 0;
+    u32 EdgeExtendSecondaryRestoreMissMismatchThisFrame = 0;
+    u32 EdgeExtendSecondaryRestoreSkippedThisFrame = 0;
+    u32 EdgeExtendSecondaryStoreThisFrame = 0;
+    u32 EdgeExtendSecondaryEvictionThisFrame = 0;
     u64 FrameIndex = 0;
+    TextureCacheFrameTiming TextureFrameTiming;
     TextureScalingDebugTracker Debug;
 };
 

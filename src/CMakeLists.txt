@@ -41,6 +41,10 @@ add_library(core STATIC
     GPU3D_Soft.cpp
     GPU3D_Texcache.cpp
     GPU3D_Texcache.h
+    WholeSceneCapturePolicy.cpp
+    WholeSceneCapturePolicy.h
+    WholeSceneScalePolicy.cpp
+    WholeSceneScalePolicy.h
     Mic.cpp
     NDS.cpp
     NDSCart.cpp
@@ -101,6 +105,7 @@ if (ENABLE_OGLRENDERER)
     add_subdirectory(OpenGL_shaders)
     target_sources(core PRIVATE
         GPU_OpenGL.cpp
+        GPU2D_OpenGL_CaptureAdapter.cpp
         GPU2D_OpenGL.cpp
         GPU3D_OpenGL.cpp
         GPU3D_Compute.cpp

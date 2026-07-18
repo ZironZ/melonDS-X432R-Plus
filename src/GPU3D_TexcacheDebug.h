@@ -176,6 +176,8 @@ public:
                   bool deferredScalingEnabled,
                   bool legacyAlphaHandling,
                   bool qualityAlphaHandling,
+                  bool alphaXBRZ,
+                  bool spline36Alpha,
                   int algorithmIndex,
                   u32 scaleFactor,
                   u32 cacheEntries,
@@ -194,6 +196,8 @@ public:
         stats.DeferredScalingEnabled = deferredScalingEnabled;
         stats.LegacyAlphaHandling = legacyAlphaHandling;
         stats.QualityAlphaHandling = qualityAlphaHandling;
+        stats.AlphaXBRZ = alphaXBRZ;
+        stats.Spline36Alpha = spline36Alpha;
         stats.ReadableTextureCache = readableTextureCache;
         stats.AlgorithmIndex = algorithmIndex;
         stats.ScaleFactor = scaleFactor;

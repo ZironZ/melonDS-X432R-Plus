@@ -73,6 +73,10 @@ private slots:
     void on_cb3DTextureFilterBinaryAlphaHandling_stateChanged(int state);
     void on_cb3DTextureFilterMipmapTopologyHandling_stateChanged(int state);
     void on_cb3DTextureFilterMipmapSubrectHandling_stateChanged(int state);
+    void on_cb3DTexture2DAtlasProtection_stateChanged(int state);
+    void on_cb3DTextureFilterSmart2D_stateChanged(int state);
+    void on_cb3DTextureFilterTranslucentGuard_stateChanged(int state);
+    void on_cb3DTextureFilterSpriteUVInset_stateChanged(int state);
     void on_cb3DTextureFilterMipmapAlphaHandling_stateChanged(int state);
     void on_cbx3DTextureFilterMipDepth_currentIndexChanged(int idx);
     void on_cb3DTextureLosslessRGB6Repack_stateChanged(int state);
@@ -85,6 +89,8 @@ private slots:
     void on_cb3DTextureScalingEdgeExtendUnusedMargins_stateChanged(int state);
     void on_cb3DTextureScalingLegacyAlphaHandling_stateChanged(int state);
     void on_cb3DTextureScalingQualityAlphaHandling_stateChanged(int state);
+    void on_cb3DTextureScalingAlphaXBRZ_stateChanged(int state);
+    void on_cb3DTextureScalingSpline36Alpha_stateChanged(int state);
     void on_cbWholeScene2DScale_stateChanged(int state);
     void on_cbWholeScene2DScaleSourceBoundaryGuard_stateChanged(int state);
     void on_cbxWholeScene2DScaleMode_currentIndexChanged(int idx);
@@ -116,6 +122,8 @@ private:
     void setVsyncControlEnable(bool hasOGL);
     void setEnabled();
     void updateLosslessRGB6RepackForTextureScalingFilteringConflict();
+    void applyTexture2DAtlasProtection(bool enabled);
+    void syncTexture2DAtlasProtectionCheckbox();
     void applyRecommendedAdvancedSettings();
     void applyRecommendedDefaults();
 
@@ -140,6 +148,9 @@ private:
         int BinaryAlphaHandling;
         int TopologyAwareMipHandling;
         int MipmapSubrectHandling;
+        int Smart2DFiltering;
+        int TranslucentTextureFilteringGuard;
+        int SpriteUVInset;
         int MipmapAlphaHandling;
         int MipDepth;
         int LosslessRGB6Repack;
@@ -156,6 +167,8 @@ private:
         int EdgeExtendUnusedMargins;
         int LegacyAlphaHandling;
         int QualityAlphaHandling;
+        int AlphaXBRZ;
+        int Spline36Alpha;
     } oldTextureScaling;
 
     struct WholeScene2DSnapshot

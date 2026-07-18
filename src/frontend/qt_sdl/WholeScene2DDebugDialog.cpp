@@ -26,6 +26,7 @@
 #include <QEventLoop>
 #include <QFile>
 #include <QFileDialog>
+#include <QFileInfo>
 #include <QGuiApplication>
 #include <QHBoxLayout>
 #include <QLabel>
@@ -121,6 +122,28 @@ const std::vector<DebugViewSpec>& DebugViewSpecs()
 
         {"Final output", "Final top", DebugView::FinalTop},
         {"Final output", "Final bottom", DebugView::FinalBottom},
+        {"Final output", "Main VRAM display raw", DebugView::MainVRAMDisplayRaw},
+
+        {"Capture banks", "Raw VRAM bank A", DebugView::MainVRAMDisplayRawBank0},
+        {"Capture banks", "Raw VRAM bank B", DebugView::MainVRAMDisplayRawBank1},
+        {"Capture banks", "Raw VRAM bank C", DebugView::MainVRAMDisplayRawBank2},
+        {"Capture banks", "Raw VRAM bank D", DebugView::MainVRAMDisplayRawBank3},
+        {"Capture banks", "Capture output bank A", DebugView::CaptureOutput256Bank0},
+        {"Capture banks", "Capture output bank B", DebugView::CaptureOutput256Bank1},
+        {"Capture banks", "Capture output bank C", DebugView::CaptureOutput256Bank2},
+        {"Capture banks", "Capture output bank D", DebugView::CaptureOutput256Bank3},
+        {"Capture banks", "Full product bank A", DebugView::HighResDisplayCaptureFullBank0},
+        {"Capture banks", "Full product bank B", DebugView::HighResDisplayCaptureFullBank1},
+        {"Capture banks", "Full product bank C", DebugView::HighResDisplayCaptureFullBank2},
+        {"Capture banks", "Full product bank D", DebugView::HighResDisplayCaptureFullBank3},
+        {"Capture banks", "Background product bank A", DebugView::HighResDisplayCaptureBackgroundBank0},
+        {"Capture banks", "Background product bank B", DebugView::HighResDisplayCaptureBackgroundBank1},
+        {"Capture banks", "Background product bank C", DebugView::HighResDisplayCaptureBackgroundBank2},
+        {"Capture banks", "Background product bank D", DebugView::HighResDisplayCaptureBackgroundBank3},
+        {"Capture banks", "Main VRAM epoch bank A", DebugView::MainVRAMDisplayEpochBank0},
+        {"Capture banks", "Main VRAM epoch bank B", DebugView::MainVRAMDisplayEpochBank1},
+        {"Capture banks", "Main VRAM epoch bank C", DebugView::MainVRAMDisplayEpochBank2},
+        {"Capture banks", "Main VRAM epoch bank D", DebugView::MainVRAMDisplayEpochBank3},
     };
 
     return views;
@@ -150,6 +173,77 @@ QString SafeExportName(QString text)
     return text;
 }
 
+bool SaveFinalDebugFrame(const melonDS::WholeScene2DFinalDebugFrame& frame,
+                         const QDir& dir,
+                         const QString& stem,
+                         QTextStream& manifestText,
+                         int& savedCount,
+                         int& failedCount)
+{
+    if (frame.Width <= 0 ||
+        frame.Height <= 0 ||
+        frame.TopRGBA.empty() ||
+        frame.BottomRGBA.empty())
+    {
+        manifestText << "  " << stem << ": unavailable\n";
+        return false;
+    }
+
+    const QString topName = stem + "-top.png";
+    const QString bottomName = stem + "-bottom.png";
+
+    QImage topImage(reinterpret_cast<const uchar*>(frame.TopRGBA.data()),
+                    frame.Width,
+                    frame.Height,
+                    QImage::Format_RGBA8888);
+    QImage bottomImage(reinterpret_cast<const uchar*>(frame.BottomRGBA.data()),
+                       frame.Width,
+                       frame.Height,
+                       QImage::Format_RGBA8888);
+
+    const bool topSaved = topImage.save(dir.filePath(topName), "PNG");
+    const bool bottomSaved = bottomImage.save(dir.filePath(bottomName), "PNG");
+    savedCount += topSaved ? 1 : 0;
+    savedCount += bottomSaved ? 1 : 0;
+    failedCount += topSaved ? 0 : 1;
+    failedCount += bottomSaved ? 0 : 1;
+
+    manifestText << "  " << stem << "\n";
+    manifestText << "    Serial: " << frame.Serial << "\n";
+    if (frame.TimingFrameValid)
+        manifestText << "    Timing frame: " << frame.TimingFrame << "\n";
+    else
+        manifestText << "    Timing frame: unavailable\n";
+    manifestText << "    Size: " << frame.Width << "x" << frame.Height << "\n";
+    manifestText << "    Final sources: top=" << frame.FinalTopSource
+                 << " bottom=" << frame.FinalBottomSource << "\n";
+    const auto writeEngine = [&manifestText](const char* label,
+                                             const melonDS::WholeScene2DEngineDebugIdentity& identity)
+    {
+        manifestText << "    " << label
+                     << ": path=" << identity.Path
+                     << " product_choice=" << identity.ProductChoice
+                     << " source_a_mode=" << identity.SourceAResolutionMode
+                     << " product_kind=" << identity.ChosenProductKind
+                     << " render_action=" << identity.ChosenProductRenderAction
+                     << " tex=" << identity.ChosenProductTex
+                     << " bank=" << identity.ChosenProductCaptureBank
+                     << " bg_epoch=" << identity.ChosenProductBackgroundEpochSerial
+                     << " source_3d=" << identity.ChosenProductSource3DSerial
+                     << " event=" << identity.ChosenProductCaptureEventSerial << "\n";
+        manifestText << "    " << label
+                     << " hashes: request_capture=" << identity.RequestCapturePresentationHash
+                     << " request_current=" << identity.RequestCurrentPresentationHash
+                     << " chosen_capture=" << identity.ChosenProductCapturePresentationHash
+                     << " chosen_current=" << identity.ChosenProductCurrentPresentationHash << "\n";
+    };
+    writeEngine("Engine A", frame.EngineA);
+    writeEngine("Engine B", frame.EngineB);
+    manifestText << "    Top: " << (topSaved ? "saved " + topName : "failed") << "\n";
+    manifestText << "    Bottom: " << (bottomSaved ? "saved " + bottomName : "failed") << "\n";
+    return topSaved && bottomSaved;
+}
+
 QString DebugViewDescription(melonDS::WholeScene2DDebugView view)
 {
     using DebugView = melonDS::WholeScene2DDebugView;
@@ -157,9 +251,9 @@ QString DebugViewDescription(melonDS::WholeScene2DDebugView view)
     switch (view)
     {
     case DebugView::NativeFinal:
-        return "Native prepass output before whole-scene scaling. This is not always the exact final-native upscale source.";
+        return "Native prepass output before whole-scene scaling. This is not always the exact postprocessing upscale source.";
     case DebugView::NativeExactFinal:
-        return "Exact native final texture generated by final-screen native upscale, or the black-underlay overlay endpoint in presentation overlay mode.";
+        return "Exact native final texture generated by postprocessing upscale, or the black-underlay overlay endpoint in presentation overlay mode.";
     case DebugView::Native3DResolve:
         return "Native-resolution Direct3D visual resolve generated from high-resolution Direct3D before final-native or overlay compositing. Alpha shows visual coverage.";
     case DebugView::Native3DSemantics:
@@ -258,6 +352,33 @@ QString DebugViewDescription(melonDS::WholeScene2DDebugView view)
         return "Final physical top-screen output after GL final pass, screen swap, brightness, and VRAM/capture routing. The Screen selector is ignored.";
     case DebugView::FinalBottom:
         return "Final physical bottom-screen output after GL final pass, screen swap, brightness, and VRAM/capture routing. The Screen selector is ignored.";
+    case DebugView::MainVRAMDisplayRaw:
+        return "Raw native-resolution CPU VRAM contents currently selected by main engine VRAM display, before high-resolution epoch replacement, native dirty-row overlay, final pass, screen swap, or brightness. The Screen selector is ignored.";
+    case DebugView::MainVRAMDisplayRawBank0:
+    case DebugView::MainVRAMDisplayRawBank1:
+    case DebugView::MainVRAMDisplayRawBank2:
+    case DebugView::MainVRAMDisplayRawBank3:
+        return "Raw native-resolution CPU VRAM contents for the selected fixed bank, interpreted as a 256x192 VRAM display image. The Screen selector is ignored.";
+    case DebugView::CaptureOutput256Bank0:
+    case DebugView::CaptureOutput256Bank1:
+    case DebugView::CaptureOutput256Bank2:
+    case DebugView::CaptureOutput256Bank3:
+        return "High-resolution 256x256 display-capture output layer for the selected fixed VRAM bank. This is the tracked GL capture buffer before any later consumer chooses a product. The Screen selector is ignored.";
+    case DebugView::HighResDisplayCaptureFullBank0:
+    case DebugView::HighResDisplayCaptureFullBank1:
+    case DebugView::HighResDisplayCaptureFullBank2:
+    case DebugView::HighResDisplayCaptureFullBank3:
+        return "High-resolution full-equivalent display-capture product for the selected fixed VRAM bank. The Screen selector is ignored.";
+    case DebugView::HighResDisplayCaptureBackgroundBank0:
+    case DebugView::HighResDisplayCaptureBackgroundBank1:
+    case DebugView::HighResDisplayCaptureBackgroundBank2:
+    case DebugView::HighResDisplayCaptureBackgroundBank3:
+        return "High-resolution background/3D-underlay display-capture product for the selected fixed VRAM bank. The Screen selector is ignored.";
+    case DebugView::MainVRAMDisplayEpochBank0:
+    case DebugView::MainVRAMDisplayEpochBank1:
+    case DebugView::MainVRAMDisplayEpochBank2:
+    case DebugView::MainVRAMDisplayEpochBank3:
+        return "Persistent main-VRAM-display epoch texture for the selected fixed VRAM bank, before dirty-row native fallback overlay. The Screen selector is ignored.";
     }
 
     return QString();
@@ -629,6 +750,472 @@ bool WholeScene2DDebugDialog::captureRefreshSnapshot(QString* errorText)
     mainWindow->releaseGL();
     emuThread->returnGL();
     return true;
+}
+
+bool WholeScene2DDebugDialog::dumpCurrentFrame(MainWindow* parent,
+                                               const QString& timingCsvPath,
+                                               qulonglong timingFrame,
+                                               QString* exportPath,
+                                               QString* errorText)
+{
+    if (exportPath)
+        exportPath->clear();
+    if (errorText)
+        errorText->clear();
+
+    if (!parent || !parent->getEmuInstance())
+    {
+        if (errorText)
+            *errorText = "No active emulator window.";
+        return false;
+    }
+
+    if (!parent->hasOpenGL())
+    {
+        if (errorText)
+            *errorText = "OpenGL is not active for this window.";
+        return false;
+    }
+
+    EmuThread* thread = parent->getEmuInstance()->getEmuThread();
+    auto* nds = parent->getEmuInstance()->getNDS();
+    if (!thread || !nds || !thread->emuIsActive())
+    {
+        if (errorText)
+            *errorText = "The emulator is not actively rendering.";
+        return false;
+    }
+
+    const QFileInfo csvInfo(timingCsvPath);
+    if (timingCsvPath.isEmpty() || csvInfo.absolutePath().isEmpty() || csvInfo.completeBaseName().isEmpty())
+    {
+        if (errorText)
+            *errorText = "No active whole-scene timing CSV path.";
+        return false;
+    }
+
+    const bool shouldDisableDebugViews = currentDlg == nullptr;
+    const bool poisonSource3D = currentDlg && currentDlg->cbPoisonSource3D->isChecked();
+    const bool poisonNative3DResolve = currentDlg && currentDlg->cbPoisonNative3DResolve->isChecked();
+    const bool poisonNative3DResolveAlpha = currentDlg && currentDlg->cbPoisonNative3DResolveAlpha->isChecked();
+    thread->borrowGL();
+    nds->GPU.GetRenderer().SetWholeScene2DDebugViewsActive(true);
+    nds->GPU.GetRenderer().SetWholeScene2DDebugPoison(poisonSource3D,
+                                                      poisonNative3DResolve,
+                                                      poisonNative3DResolveAlpha);
+    thread->returnGL();
+
+    if (thread->emuIsRunning())
+    {
+        QEventLoop waitForFrame;
+        QTimer timeout;
+        timeout.setSingleShot(true);
+        QObject::connect(&timeout, &QTimer::timeout, &waitForFrame, &QEventLoop::quit);
+        QObject::connect(thread, &EmuThread::windowUpdate, &waitForFrame, &QEventLoop::quit);
+        timeout.start(250);
+        waitForFrame.exec();
+    }
+
+    std::vector<CapturedView> snapshot;
+    const QString stamp = QDateTime::currentDateTime().toString("yyyyMMdd-HHmmss");
+
+    thread->borrowGL();
+    parent->makeCurrentGL();
+
+    melonDS::WholeScene2DFinalDebugFrame currentFinalFrame;
+    std::string currentFinalStatus;
+    const bool currentFinalAvailable =
+        nds->GPU.GetRenderer().ReadWholeScene2DCurrentFinalDebugFrame(currentFinalFrame, &currentFinalStatus);
+
+    std::vector<melonDS::WholeScene2DFinalDebugFrame> rollingFrames;
+    std::string rollingStatus;
+    const bool rollingFramesAvailable =
+        nds->GPU.GetRenderer().ReadWholeScene2DRollingDebugFrames(rollingFrames, &rollingStatus);
+
+    const struct
+    {
+        int Screen;
+        const char* Name;
+    } screens[] = {
+        {0, "main"},
+        {1, "sub"},
+    };
+
+    for (const auto& screen : screens)
+    {
+        int viewIndex = 0;
+        for (const DebugViewSpec& spec : DebugViewSpecs())
+        {
+            viewIndex++;
+
+            CapturedView captured;
+            captured.Index = viewIndex;
+            captured.Screen = screen.Screen;
+            captured.ScreenName = QString::fromUtf8(screen.Name);
+            captured.ViewValue = static_cast<int>(spec.View);
+            captured.Category = QString::fromUtf8(spec.Category);
+            captured.Label = QString::fromUtf8(spec.Label);
+            captured.FileStem = QString("%1-%2-%3-%4")
+                                    .arg(captured.ScreenName)
+                                    .arg(viewIndex, 2, 10, QChar('0'))
+                                    .arg(SafeExportName(captured.Category))
+                                    .arg(SafeExportName(captured.Label));
+
+            std::vector<melonDS::u32> pixels;
+            std::string status;
+            const bool ok = nds->GPU.GetRenderer().ReadWholeScene2DDebugView(screen.Screen,
+                                                                             spec.View,
+                                                                             captured.Width,
+                                                                             captured.Height,
+                                                                             pixels,
+                                                                             &status);
+            captured.Status = QString::fromStdString(status);
+            if (ok && captured.Width > 0 && captured.Height > 0 && !pixels.empty())
+            {
+                QImage image(reinterpret_cast<const uchar*>(pixels.data()),
+                             captured.Width, captured.Height,
+                             QImage::Format_RGBA8888);
+                captured.Image = image.copy();
+                captured.Available = true;
+            }
+
+            snapshot.push_back(std::move(captured));
+        }
+    }
+
+    parent->releaseGL();
+    thread->returnGL();
+
+    if (shouldDisableDebugViews)
+    {
+        thread->borrowGL();
+        nds->GPU.GetRenderer().SetWholeScene2DDebugViewsActive(false);
+        thread->returnGL();
+    }
+
+    QDir csvDir(csvInfo.absolutePath());
+    const QString capturesRootName = QString("%1-captures").arg(csvInfo.completeBaseName());
+    if (!csvDir.mkpath(capturesRootName))
+    {
+        if (errorText)
+            *errorText = QString("Failed to create capture directory in %1.").arg(csvDir.path());
+        return false;
+    }
+
+    QDir capturesRoot(csvDir.filePath(capturesRootName));
+    const QString frameName = QString("frame%1").arg(timingFrame, 6, 10, QChar('0'));
+    const QString dumpDirName = QString("%1-%2").arg(frameName, stamp);
+    if (!capturesRoot.mkpath(dumpDirName))
+    {
+        if (errorText)
+            *errorText = QString("Failed to create dump directory in %1.").arg(capturesRoot.path());
+        return false;
+    }
+
+    QDir dumpDir(capturesRoot.filePath(dumpDirName));
+    if (!dumpDir.mkpath("views"))
+    {
+        if (errorText)
+            *errorText = QString("Failed to create views directory in %1.").arg(dumpDir.path());
+        return false;
+    }
+    QDir viewsDir(dumpDir.filePath("views"));
+
+    if (currentFinalAvailable && !dumpDir.mkpath("current-final"))
+    {
+        if (errorText)
+            *errorText = QString("Failed to create current-final directory in %1.").arg(dumpDir.path());
+        return false;
+    }
+    QDir currentFinalDir(dumpDir.filePath("current-final"));
+
+    if (rollingFramesAvailable && !dumpDir.mkpath("rolling-final"))
+    {
+        if (errorText)
+            *errorText = QString("Failed to create rolling-final directory in %1.").arg(dumpDir.path());
+        return false;
+    }
+    QDir rollingDir(dumpDir.filePath("rolling-final"));
+
+    QFile manifest(dumpDir.filePath("manifest.txt"));
+    if (!manifest.open(QIODevice::WriteOnly | QIODevice::Text))
+    {
+        if (errorText)
+            *errorText = QString("Failed to write manifest in %1.").arg(dumpDir.path());
+        return false;
+    }
+
+    QTextStream manifestText(&manifest);
+    manifestText << "Whole-scene 2D hotkey debug dump\n";
+    manifestText << "Timestamp: " << stamp << "\n";
+    manifestText << "Timing CSV: " << timingCsvPath << "\n";
+    manifestText << "Timing frame: " << timingFrame << "\n";
+    manifestText << "Screens: main, sub\n";
+    manifestText << "Poison source 3D: " << (poisonSource3D ? "yes" : "no") << "\n";
+    manifestText << "Poison native 3D resolve: " << (poisonNative3DResolve ? "yes" : "no") << "\n";
+    manifestText << "Force native 3D resolve alpha: " << (poisonNative3DResolveAlpha ? "yes" : "no") << "\n";
+    manifestText << "Source: hotkey current-frame capture\n";
+    manifestText << "Note: current debug views are captured after the hotkey request; rolling final frames are read from the active ring when enabled.\n\n";
+    manifestText << "Current final capture: " << QString::fromStdString(currentFinalStatus) << "\n";
+    manifestText << "Rolling final capture: " << QString::fromStdString(rollingStatus) << "\n\n";
+
+    int savedCount = 0;
+    int skippedCount = 0;
+    int failedCount = 0;
+    int currentFinalSavedCount = 0;
+    int currentFinalFailedCount = 0;
+    int rollingSavedCount = 0;
+    int rollingFailedCount = 0;
+
+    if (currentFinalAvailable)
+    {
+        manifestText << "Current final frame:\n";
+        SaveFinalDebugFrame(currentFinalFrame,
+                            currentFinalDir,
+                            "current-final",
+                            manifestText,
+                            currentFinalSavedCount,
+                            currentFinalFailedCount);
+        manifestText << "\n";
+    }
+
+    if (rollingFramesAvailable)
+    {
+        manifestText << "Rolling final frames:\n";
+        int frameIndex = 0;
+        for (const auto& frame : rollingFrames)
+        {
+            const QString frameStem = QString("rolling-%1-serial%2")
+                                          .arg(frameIndex, 3, 10, QChar('0'))
+                                          .arg(frame.Serial, 6, 10, QChar('0'));
+            SaveFinalDebugFrame(frame,
+                                rollingDir,
+                                frameStem,
+                                manifestText,
+                                rollingSavedCount,
+                                rollingFailedCount);
+            frameIndex++;
+        }
+        manifestText << "\n";
+    }
+
+    for (const CapturedView& captured : snapshot)
+    {
+        manifestText << captured.FileStem << "\n";
+        manifestText << "  Screen: " << captured.ScreenName << "\n";
+        manifestText << "  Category: " << captured.Category << "\n";
+        manifestText << "  View: " << captured.Label << "\n";
+
+        if (!captured.Available)
+        {
+            skippedCount++;
+            manifestText << "  Result: skipped\n";
+            if (!captured.Status.isEmpty())
+            {
+                QString status = captured.Status;
+                manifestText << status.replace("\n", "\n  ") << "\n";
+            }
+            manifestText << "\n";
+            continue;
+        }
+
+        const QString pngName = captured.FileStem + ".png";
+        const bool saved = captured.Image.save(viewsDir.filePath(pngName), "PNG");
+        if (saved)
+        {
+            savedCount++;
+            manifestText << "  Result: saved views/" << pngName << " (" << captured.Width << "x" << captured.Height << ")\n";
+        }
+        else
+        {
+            failedCount++;
+            manifestText << "  Result: failed to save " << pngName << "\n";
+        }
+
+        if (!captured.Status.isEmpty())
+        {
+            QString status = captured.Status;
+            manifestText << status.replace("\n", "\n  ") << "\n";
+        }
+        manifestText << "\n";
+    }
+
+    manifestText << "Summary:\n";
+    manifestText << "  Saved views: " << savedCount << "\n";
+    manifestText << "  Skipped views: " << skippedCount << "\n";
+    manifestText << "  Failed views: " << failedCount << "\n";
+    manifestText << "  Saved current final images: " << currentFinalSavedCount << "\n";
+    manifestText << "  Failed current final images: " << currentFinalFailedCount << "\n";
+    manifestText << "  Saved rolling images: " << rollingSavedCount << "\n";
+    manifestText << "  Failed rolling images: " << rollingFailedCount << "\n";
+    manifestText.flush();
+
+    if (exportPath)
+        *exportPath = dumpDir.path();
+    return failedCount == 0 && currentFinalFailedCount == 0 && rollingFailedCount == 0;
+}
+
+bool WholeScene2DDebugDialog::dumpRollingFrames(MainWindow* parent,
+                                                const QString& timingCsvPath,
+                                                qulonglong timingFrame,
+                                                QString* exportPath,
+                                                QString* errorText)
+{
+    if (exportPath)
+        exportPath->clear();
+    if (errorText)
+        errorText->clear();
+
+    if (!parent || !parent->getEmuInstance())
+    {
+        if (errorText)
+            *errorText = "No active emulator window.";
+        return false;
+    }
+
+    if (!parent->hasOpenGL())
+    {
+        if (errorText)
+            *errorText = "OpenGL is not active for this window.";
+        return false;
+    }
+
+    EmuThread* thread = parent->getEmuInstance()->getEmuThread();
+    auto* nds = parent->getEmuInstance()->getNDS();
+    if (!thread || !nds || !thread->emuIsActive())
+    {
+        if (errorText)
+            *errorText = "The emulator is not actively rendering.";
+        return false;
+    }
+
+    const QFileInfo csvInfo(timingCsvPath);
+    if (timingCsvPath.isEmpty() || csvInfo.absolutePath().isEmpty() || csvInfo.completeBaseName().isEmpty())
+    {
+        if (errorText)
+            *errorText = "No active whole-scene timing CSV path.";
+        return false;
+    }
+
+    melonDS::WholeScene2DFinalDebugFrame currentFinalFrame;
+    std::string currentFinalStatus;
+    std::vector<melonDS::WholeScene2DFinalDebugFrame> rollingFrames;
+    std::string rollingStatus;
+
+    thread->borrowGL();
+    parent->makeCurrentGL();
+    const bool currentFinalAvailable =
+        nds->GPU.GetRenderer().ReadWholeScene2DCurrentFinalDebugFrame(currentFinalFrame, &currentFinalStatus);
+    const bool rollingFramesAvailable =
+        nds->GPU.GetRenderer().ReadWholeScene2DRollingDebugFrames(rollingFrames, &rollingStatus);
+    parent->releaseGL();
+    thread->returnGL();
+
+    if (!rollingFramesAvailable)
+    {
+        if (errorText)
+            *errorText = QString::fromStdString(rollingStatus);
+        return false;
+    }
+
+    QDir csvDir(csvInfo.absolutePath());
+    const QString capturesRootName = QString("%1-captures").arg(csvInfo.completeBaseName());
+    if (!csvDir.mkpath(capturesRootName))
+    {
+        if (errorText)
+            *errorText = QString("Failed to create capture directory in %1.").arg(csvDir.path());
+        return false;
+    }
+
+    QDir capturesRoot(csvDir.filePath(capturesRootName));
+    const QString stamp = QDateTime::currentDateTime().toString("yyyyMMdd-HHmmss");
+    const QString frameName = QString("rolling-frame%1").arg(timingFrame, 6, 10, QChar('0'));
+    const QString dumpDirName = QString("%1-%2").arg(frameName, stamp);
+    if (!capturesRoot.mkpath(dumpDirName))
+    {
+        if (errorText)
+            *errorText = QString("Failed to create dump directory in %1.").arg(capturesRoot.path());
+        return false;
+    }
+
+    QDir dumpDir(capturesRoot.filePath(dumpDirName));
+    if (currentFinalAvailable && !dumpDir.mkpath("current-final"))
+    {
+        if (errorText)
+            *errorText = QString("Failed to create current-final directory in %1.").arg(dumpDir.path());
+        return false;
+    }
+    if (!dumpDir.mkpath("rolling-final"))
+    {
+        if (errorText)
+            *errorText = QString("Failed to create rolling-final directory in %1.").arg(dumpDir.path());
+        return false;
+    }
+
+    QDir currentFinalDir(dumpDir.filePath("current-final"));
+    QDir rollingDir(dumpDir.filePath("rolling-final"));
+
+    QFile manifest(dumpDir.filePath("manifest.txt"));
+    if (!manifest.open(QIODevice::WriteOnly | QIODevice::Text))
+    {
+        if (errorText)
+            *errorText = QString("Failed to write manifest in %1.").arg(dumpDir.path());
+        return false;
+    }
+
+    QTextStream manifestText(&manifest);
+    manifestText << "Whole-scene 2D rolling debug dump\n";
+    manifestText << "Timestamp: " << stamp << "\n";
+    manifestText << "Timing CSV: " << timingCsvPath << "\n";
+    manifestText << "Timing frame: " << timingFrame << "\n";
+    manifestText << "Source: hotkey rolling capture\n";
+    manifestText << "Current final capture: " << QString::fromStdString(currentFinalStatus) << "\n";
+    manifestText << "Rolling final capture: " << QString::fromStdString(rollingStatus) << "\n\n";
+
+    int currentFinalSavedCount = 0;
+    int currentFinalFailedCount = 0;
+    int rollingSavedCount = 0;
+    int rollingFailedCount = 0;
+
+    if (currentFinalAvailable)
+    {
+        manifestText << "Current final frame:\n";
+        SaveFinalDebugFrame(currentFinalFrame,
+                            currentFinalDir,
+                            "current-final",
+                            manifestText,
+                            currentFinalSavedCount,
+                            currentFinalFailedCount);
+        manifestText << "\n";
+    }
+
+    manifestText << "Rolling final frames:\n";
+    int frameIndex = 0;
+    for (const auto& frame : rollingFrames)
+    {
+        const QString frameStem = QString("rolling-%1-serial%2")
+                                      .arg(frameIndex, 3, 10, QChar('0'))
+                                      .arg(frame.Serial, 6, 10, QChar('0'));
+        SaveFinalDebugFrame(frame,
+                            rollingDir,
+                            frameStem,
+                            manifestText,
+                            rollingSavedCount,
+                            rollingFailedCount);
+        frameIndex++;
+    }
+    manifestText << "\n";
+
+    manifestText << "Summary:\n";
+    manifestText << "  Saved current final images: " << currentFinalSavedCount << "\n";
+    manifestText << "  Failed current final images: " << currentFinalFailedCount << "\n";
+    manifestText << "  Saved rolling images: " << rollingSavedCount << "\n";
+    manifestText << "  Failed rolling images: " << rollingFailedCount << "\n";
+    manifestText.flush();
+
+    if (exportPath)
+        *exportPath = dumpDir.path();
+    return currentFinalFailedCount == 0 && rollingFailedCount == 0;
 }
 
 const WholeScene2DDebugDialog::CapturedView* WholeScene2DDebugDialog::findSnapshotView(int screen, int viewValue) const

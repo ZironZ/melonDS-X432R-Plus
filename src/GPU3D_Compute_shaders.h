@@ -259,6 +259,10 @@ struct Polygon
     uint Attr;
 
     float TextureLayer;
+    float TextureInsetU0;
+    float TextureInsetV0;
+    float TextureInsetU1;
+    float TextureInsetV1;
 };
 
 layout (std430, binding = 0) readonly buffer PolygonBuffer
@@ -1076,6 +1080,18 @@ layout (location = 2) uniform int TexIsCapture;
 layout (location = 3) uniform float CaptureYOffset;
 layout (location = 4) uniform int uBinaryAlphaTexture;
 
+vec2 ApplyTextureInset(Polygon polygon, vec2 uvf)
+{
+    if (polygon.TextureInsetU1 > polygon.TextureInsetU0 &&
+        polygon.TextureInsetV1 > polygon.TextureInsetV0)
+    {
+        uvf = clamp(uvf,
+                    vec2(polygon.TextureInsetU0, polygon.TextureInsetV0),
+                    vec2(polygon.TextureInsetU1, polygon.TextureInsetV1));
+    }
+    return uvf;
+}
+
 #if defined(FILTERABLE_TEXTURE_CACHE) && defined(Rasterise)
 int ClampSpanX(XSpanSetup span, int x)
 {
@@ -1365,8 +1381,9 @@ void main()
 #endif
             }
             else
-#ifdef FILTERABLE_TEXTURE_CACHE
             {
+                uvf = ApplyTextureInset(polygon, uvf);
+#ifdef FILTERABLE_TEXTURE_CACHE
                 texcolorf = SampleCurrentTextureFiltered(polygon, position, xspan, uvf);
                 if (uBinaryAlphaTexture != 0)
                 {
@@ -1374,10 +1391,10 @@ void main()
                     if (texcolorf.a == 0.0)
                         texcolorf.rgb = vec3(0.0);
                 }
-            }
 #else
                 texcolor = texture(CurrentTexture, vec3(uvf, polygon.TextureLayer));
 #endif
+            }
 
 #ifdef Decal
 #ifdef FILTERABLE_TEXTURE_CACHE

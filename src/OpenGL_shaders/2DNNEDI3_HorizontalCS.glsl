@@ -1,3 +1,47 @@
+// NNEDI3 nns16 8x4 - based on the mpv NNEDI3 prescaler shaders (LGPL):
+// https://github.com/bjin/mpv-prescalers
+// Original NNEDI3 algorithm and weights by tritical (GPL).
+// Ported to GLSL compute for melonDS X432R+.
+
+#version 430 core
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+layout(rgba16f, binding = 0) writeonly uniform image2D outImage;
+
+uniform sampler2D Source;
+uniform ivec2 uSrcSize;
+
+const int TILE_WIDTH = 11;
+const int TILE_HEIGHT = 15;
+const ivec2 TILE_HALO = ivec2(1, 3);
+
+shared vec4 sTile[TILE_HEIGHT][TILE_WIDTH];
+
+ivec2 nnedi3_clamp_coord(ivec2 coord)
+{
+    return clamp(coord, ivec2(0), uSrcSize - ivec2(1));
+}
+
+float nnedi3_tile_component(ivec2 localPixel, int dx, int dy, int component)
+{
+    ivec2 tilePixel = localPixel + TILE_HALO + ivec2(dx, dy);
+    return sTile[tilePixel.y][tilePixel.x][component];
+}
+
+void nnedi3_load_tile(ivec2 groupOrigin)
+{
+    ivec2 tileOrigin = groupOrigin - TILE_HALO;
+    for (uint tileIndex = gl_LocalInvocationIndex;
+         tileIndex < uint(TILE_WIDTH * TILE_HEIGHT);
+         tileIndex += uint(gl_WorkGroupSize.x * gl_WorkGroupSize.y))
+    {
+        int tileX = int(tileIndex % uint(TILE_WIDTH));
+        int tileY = int(tileIndex / uint(TILE_WIDTH));
+        ivec2 sourcePixel = nnedi3_clamp_coord(tileOrigin + ivec2(tileX, tileY));
+        sTile[tileY][tileX] = texelFetch(Source, sourcePixel, 0);
+    }
+    barrier();
+}
 float nnedi3_core(vec4 samples[8])
 {
 float sum = 0.0, sumsq = 0.0;
@@ -30,4 +74,45 @@ float sum = 0.0, sumsq = 0.0;
     sum1=W(0,1026357515,-1139718894,1044187583,-1105573131)+W(1,-1104526300,-1119529939,-1125768375,-1132776678)+W(2,-1119744955,-1125720471,-1092285679,1062437883)+W(3,1058460257,1022150135,1033366698,1009731342)+W(4,-1117075907,-1106102943,1048719011,1052836221)+W(5,-1089717563,-1123085499,-1114009838,-1112611206)+W(6,-1111407198,-1152407445,-1107209883,-1107292779)+W(7,-1122559055,-1119739267,-1119196243,-1129505495);sum2=W(0,-1110807022,-1129400032,-1105612607,-1123619892)+W(1,-1131262448,1016529300,-1129444600,-1136239801)+W(2,1025172792,-1117035240,1035443403,-1135427545)+W(3,-1111010692,-1115955576,-1117326476,-1121250556)+W(4,1033543849,999654946,1039345667,1053020794)+W(5,1047843748,-1135856481,1022819536,998047364)+W(6,-1123816828,-1144812946,-1120747576,-1113498942)+W(7,-1113301822,-1146605522,-1119691028,-1135792457);WS(-1107513792,1064663354);
     sum1=W(0,1030862455,-1161118946,1040244826,-1104300038)+W(1,-1102940181,-1135077628,-1135539484,1011863892)+W(2,-1113532308,1021510766,-1091621085,1046262406)+W(3,1054782000,1019068110,1036941280,-1128724830)+W(4,1032378968,-1127591630,1051734861,1034822530)+W(5,-1095483267,1031948820,-1172984259,-1120336759)+W(6,-1123071015,1009770420,-1107582956,-1108820108)+W(7,-1125175670,1025488559,-1126076542,1036426604);sum2=W(0,-1135206239,-1139065871,1026230428,1025917606)+W(1,1027050280,1013849783,1016077019,-1127829351)+W(2,-1140752647,-1123380440,988696695,-1092786651)+W(3,1049996339,1057784826,1033822297,1034470972)+W(4,1022777359,1021581075,-1122295168,-1085937537)+W(5,1032573953,-1130048007,1032545188,-1137094527)+W(6,974924014,-1133276463,1029689087,-1140169471)+W(7,-1135329695,-1124883951,1011238415,1001568686);WS(1058918200,-1121082995);
     return clamp(mstd0 + 5.0 * vsum / wsum * mstd1, 0.0, 1.0);
+}
+
+vec3 nnedi3_predict(ivec2 localPixel)
+{
+    vec3 result;
+    for (int component = 0; component < 3; component++)
+    {
+        vec4 samples[8];
+        samples[0] = vec4(nnedi3_tile_component(localPixel, -1, -3, component), nnedi3_tile_component(localPixel, -1, -2, component), nnedi3_tile_component(localPixel, -1, -1, component), nnedi3_tile_component(localPixel, -1, 0, component));
+        samples[1] = vec4(nnedi3_tile_component(localPixel, -1, 1, component), nnedi3_tile_component(localPixel, -1, 2, component), nnedi3_tile_component(localPixel, -1, 3, component), nnedi3_tile_component(localPixel, -1, 4, component));
+        samples[2] = vec4(nnedi3_tile_component(localPixel, 0, -3, component), nnedi3_tile_component(localPixel, 0, -2, component), nnedi3_tile_component(localPixel, 0, -1, component), nnedi3_tile_component(localPixel, 0, 0, component));
+        samples[3] = vec4(nnedi3_tile_component(localPixel, 0, 1, component), nnedi3_tile_component(localPixel, 0, 2, component), nnedi3_tile_component(localPixel, 0, 3, component), nnedi3_tile_component(localPixel, 0, 4, component));
+        samples[4] = vec4(nnedi3_tile_component(localPixel, 1, -3, component), nnedi3_tile_component(localPixel, 1, -2, component), nnedi3_tile_component(localPixel, 1, -1, component), nnedi3_tile_component(localPixel, 1, 0, component));
+        samples[5] = vec4(nnedi3_tile_component(localPixel, 1, 1, component), nnedi3_tile_component(localPixel, 1, 2, component), nnedi3_tile_component(localPixel, 1, 3, component), nnedi3_tile_component(localPixel, 1, 4, component));
+        samples[6] = vec4(nnedi3_tile_component(localPixel, 2, -3, component), nnedi3_tile_component(localPixel, 2, -2, component), nnedi3_tile_component(localPixel, 2, -1, component), nnedi3_tile_component(localPixel, 2, 0, component));
+        samples[7] = vec4(nnedi3_tile_component(localPixel, 2, 1, component), nnedi3_tile_component(localPixel, 2, 2, component), nnedi3_tile_component(localPixel, 2, 3, component), nnedi3_tile_component(localPixel, 2, 4, component));
+        result[component] = nnedi3_core(samples);
+    }
+    return result;
+}
+
+void main()
+{
+    ivec2 groupOrigin = ivec2(gl_WorkGroupID.xy) * ivec2(gl_WorkGroupSize.xy);
+    ivec2 localPixel = ivec2(gl_LocalInvocationID.xy);
+    ivec2 sourcePixel = groupOrigin + localPixel;
+
+    nnedi3_load_tile(groupOrigin);
+
+    if (sourcePixel.x >= uSrcSize.x || sourcePixel.y >= uSrcSize.y)
+        return;
+
+    vec4 copied = sTile[localPixel.y + TILE_HALO.y][localPixel.x + TILE_HALO.x];
+    vec3 predicted = nnedi3_predict(localPixel);
+    float predictedAlpha = 0.5 * (
+        copied.a +
+        sTile[localPixel.y + TILE_HALO.y][localPixel.x + TILE_HALO.x + 1].a);
+    ivec2 outputPixel = ivec2(sourcePixel.x * 2, sourcePixel.y);
+
+    imageStore(outImage, outputPixel, copied);
+    imageStore(outImage, outputPixel + ivec2(1, 0), vec4(predicted, predictedAlpha));
 }
