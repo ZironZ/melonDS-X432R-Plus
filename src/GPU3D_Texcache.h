@@ -299,7 +299,7 @@ public:
 
     void GetTexture(u32 texParam, u32 palBase, TexHandleT& textureHandle, u32& layer, u32*& helper,
                     bool* binaryAlphaTexture = nullptr, const TextureSamplingBounds* samplingBounds = nullptr,
-                    bool* cacheHit = nullptr)
+                    bool* cacheHit = nullptr, u32* actualScaleFactor = nullptr)
     {
         u32 rawTexParam = texParam;
         // remove sampling and texcoord gen params
@@ -418,7 +418,7 @@ public:
 
                 InFrequentChangeFallbackPromotion = true;
                 GetTexture(rawTexParam, palBase, textureHandle, layer, helper, binaryAlphaTexture, samplingBounds,
-                           cacheHit);
+                           cacheHit, actualScaleFactor);
                 InFrequentChangeFallbackPromotion = false;
                 return;
             }
@@ -439,6 +439,8 @@ public:
             helper = &it->second.LastVariant;
             if (binaryAlphaTexture)
                 *binaryAlphaTexture = it->second.BinaryAlphaTexture;
+            if (actualScaleFactor)
+                *actualScaleFactor = it->second.ScaleFactor;
             if (!InDeferredPromotion && Debug.IsFrameTextureCaptureActive())
             {
                 TextureScalingDebugFrameTexture frameTexture = MakeDebugFrameTextureRecord(
@@ -643,6 +645,8 @@ public:
         entry.ResultHeight = scaledHeight;
         entry.ScaleFactor = effectiveScaleFactor;
         entry.OutputFormat = outputFmt;
+        if (actualScaleFactor)
+            *actualScaleFactor = effectiveScaleFactor;
 
         {
             ScopedTextureCacheTiming timing(*this, TextureFrameTiming.TextureHash);
@@ -734,6 +738,7 @@ public:
                     (!TexLoader.UseFilterableMipTopologyHandling() || !conservativeAtlasFallback ||
                      useSubrectHandling) &&
                     binaryAlpha && hasTransparentAlpha;
+                bool sourceTransparentRGBPadded = false;
                 if (binaryAlpha && hasTransparentAlpha && !TexLoader.UseLegacyAlphaHandling() &&
                     (!useImprovedFilterableMipPath || effectiveScaleFactor > 1))
                 {
@@ -742,6 +747,7 @@ public:
                         PadTransparentTextureRGB(width, height, rgbaBuffer);
                     else
                         PadTransparentTextureRGBFast(width, height, rgbaBuffer);
+                    sourceTransparentRGBPadded = true;
                 }
                 sourceMipNativeRGBA8 = rgbaBuffer;
 
@@ -764,7 +770,8 @@ public:
                         outputFmt, binaryAlpha, storagePlace.TextureID, storagePlace.Layer,
                         capturePreviewImages ? &ScaledRGBA8Storage : nullptr,
                         useImprovedFilterableMipPath,
-                        useDefaultFilterableBinaryAlphaMips);
+                        useDefaultFilterableBinaryAlphaMips,
+                        useImprovedFilterableMipPath && sourceTransparentRGBPadded);
                 }
                 if (processedGPUDirect)
                 {

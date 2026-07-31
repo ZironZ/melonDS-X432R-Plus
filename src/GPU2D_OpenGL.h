@@ -141,13 +141,11 @@ private:
     GLint OverlayCompositeScaleULoc;
     GLint OverlayCompositeDebugTintULoc;
     GLint OverlayCompositeLegacyUnderlayULoc;
-    GLint OverlayCompositeCoverageAwareULoc;
     GLint OverlayCompositeDirect3DPresentationSpaceULoc;
     GLuint OverlayHybridCompositeShader;
     GLint OverlayHybridCompositeScaleULoc;
     GLint OverlayHybridCompositeDebugTintULoc;
     GLint OverlayHybridCompositeLegacyUnderlayULoc;
-    GLint OverlayHybridCompositeCoverageAwareULoc;
     GLint OverlayHybridCompositeDirect3DPresentationSpaceULoc;
     GLint OverlayHybridCompositeConservativeHybridULoc;
     GLint OverlayHybridCompositeWindowEdgeAssistULoc;
@@ -160,7 +158,6 @@ private:
     GLuint OverlayDebugShader;
     GLint OverlayDebugModeULoc;
     GLint OverlayDebugLegacyUnderlayULoc;
-    GLint OverlayDebugCoverageAwareULoc;
     GLuint MasterBrightnessShader;
     GLint MasterBrightnessModeULoc;
     GLint MasterBrightnessFactorULoc;
@@ -390,6 +387,7 @@ private:
         int CaptureBank = -1;
         bool MainEngineCapturedBGOnly = false;
         bool SubEngineCapturedSourceAOnly = false;
+        bool SubEngineCaptureBackedBGOnly = false;
         bool SubEngineCapturedOBJOnly = false;
         bool CanUseCurrentOverlay = false;
         GLRenderer2D* MainRenderer = nullptr;
@@ -402,6 +400,7 @@ private:
         u64 RouteProductSource3DSerial = 0;
         u32 RouteProductSource3DSceneHash = 0;
         u64 RouteProductCapturedEventSerial = 0;
+        u32 RouteProductCaptureBank = 0xFFFFFFFFu;
         u32 RouteProductCapturePresentationHash = 0;
         u32 RouteProductCurrentPresentationHash = 0;
         u32 RouteProductStableFrames = 0;
@@ -451,6 +450,7 @@ private:
         bool FullProductEventScreenSwap = false;
         bool FullProductEventMainFinalBottom = false;
         bool PreferExactFullProduct = false;
+        bool PreferExactRouteProduct = false;
         bool AllowExactFullProductCapturePresentation = false;
         bool DirectFinalDisplayConsumer = false;
         bool DirectFinalBottomConsumer = false;
@@ -805,6 +805,7 @@ private:
     void MarkLayerPrerenderDeferred(int layer, int firstRow = -1, int lastRow = -1);
     void ClearLayerPrerenderDeferred(u8 layerMask);
     void SyncPendingDisplayCapturesForFlatVRAMBGs();
+    bool FlatVRAMLayerHasFullWholeSceneCaptureProvenance(int layer) const;
     void RecordWholeSceneVisibleBitmapDirtyRows(int layer, int line, int firstRow, int lastRow);
     void UpdateCachedRegistersAndLayerConfig(u8 layerPreDirty);
     void UploadBGVRAM(NonStupidBitField<1024>& bgDirty, int line);

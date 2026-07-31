@@ -81,6 +81,7 @@ private slots:
     void on_cbx3DTextureFilterMipDepth_currentIndexChanged(int idx);
     void on_cb3DTextureLosslessRGB6Repack_stateChanged(int state);
     void on_cb3DTextureScaling_stateChanged(int state);
+    void on_cb3DHighPrecisionTextureCoordinates_stateChanged(int state);
     void on_cbx3DTextureScalingAlgorithm_currentIndexChanged(int idx);
     void on_cb3DTextureScalingFrequentChangePolicy_stateChanged(int state);
     void on_cb3DTextureScalingDeferred_stateChanged(int state);
@@ -124,7 +125,6 @@ private:
     void updateLosslessRGB6RepackForTextureScalingFilteringConflict();
     void applyTexture2DAtlasProtection(bool enabled);
     void syncTexture2DAtlasProtectionCheckbox();
-    void applyRecommendedAdvancedSettings();
     void applyRecommendedDefaults();
 
     Ui::VideoSettingsDialog* ui;
@@ -140,6 +140,7 @@ private:
     int oldGLScale;
     int oldGLBetterPolygons;
     int oldReadable3DTextureCache;
+    int oldHighPrecisionTextureCoordinates;
     int oldAdvancedVideoSettings;
 
     struct TextureFilterSnapshot

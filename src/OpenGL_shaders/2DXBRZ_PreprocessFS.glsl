@@ -1,8 +1,49 @@
-// xBRZ freescale - based on the RetroArch xbrz-freescale shader by hunterk:
-// https://github.com/libretro/glsl-shaders/blob/master/xbrz/shaders/xbrz-freescale.glsl
-// Uses Hyllian's xBR vertex/texel mapping code (MIT, Copyright 2011/2016 Hyllian)
-// and xBRZ code/concepts by Zenju from the DeSmuME source (GPLv3, via HqMAME).
-// Adapted to a two-pass GLSL path for melonDS X432R+.
+/*
+    xBRZ freescale, based on the RetroArch shader by hunterk:
+    https://github.com/libretro/glsl-shaders/blob/master/xbrz/shaders/xbrz-freescale.glsl
+
+    Hyllian's xBR vertex code and texel mapping
+    Copyright (C) 2011/2016 Hyllian - sergiogdb@gmail.com
+
+    Permission is hereby granted, free of charge, to any person obtaining a copy
+    of this software and associated documentation files (the "Software"), to deal
+    in the Software without restriction, including without limitation the rights
+    to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+    copies of the Software, and to permit persons to whom the Software is
+    furnished to do so, subject to the following conditions:
+
+    The above copyright notice and this permission notice shall be included in all
+    copies or substantial portions of the Software.
+
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+    AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+    OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+    SOFTWARE.
+
+    This shader also uses code and/or concepts from xBRZ as it appears in the
+    DeSmuME source code. The license for which is as follows:
+
+    ***************************************************************************
+    * This file is part of the HqMAME project. It is distributed under        *
+    * GNU General Public License: http://www.gnu.org/licenses/gpl-3.0         *
+    * Copyright (C) Zenju (zenju AT gmx DOT de) - All Rights Reserved         *
+    *                                                                         *
+    * Additionally and as a special exception, the author gives permission    *
+    * to link the code of this program with the MAME library (or with modified*
+    * versions of MAME that use the same license as MAME), and distribute     *
+    * linked combinations including the two. You must obey the GNU General    *
+    * Public License in all respects for all of the code used other than MAME.*
+    * If you modify this file, you may extend this exception to your version  *
+    * of the file, but you are not obligated to do so. If you do not wish to  *
+    * do so, delete this exception statement from your version.               *
+    ***************************************************************************
+
+    Two-pass melonDS adaptation Copyright 2026 ZironZ and distributed under
+    GPL-3.0-or-later.
+*/
 
 #version 140
 

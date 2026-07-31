@@ -1,5 +1,5 @@
 /*
-    Copyright 2016-2026 melonDS team
+    Copyright 2026 ZironZ
 
     This file is part of melonDS.
 

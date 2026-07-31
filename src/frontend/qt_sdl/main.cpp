@@ -61,6 +61,7 @@
 #include "Net.h"
 
 #include "CLI.h"
+#include "RendererTest.h"
 
 #include "Net_PCap.h"
 #include "Net_Slirp.h"
@@ -396,6 +397,20 @@ int main(int argc, char** argv)
 
     createEmuInstance();
 
+    RendererTestRunner* rendererTest = nullptr;
+    if (options->rendererTestPath.has_value())
+    {
+        QString errorstr;
+        rendererTest = RendererTestRunner::fromManifest(*options->rendererTestPath, errorstr);
+        if (!rendererTest)
+        {
+            printf("[renderer-test] %s\n", errorstr.toUtf8().constData());
+            deleteAllEmuInstances();
+            return 1;
+        }
+        emuInstances[0]->rendererTest = rendererTest;
+    }
+
     {
         MainWindow* win = emuInstances[0]->getMainWindow();
         bool memberSyntaxUsed = false;
@@ -413,12 +428,22 @@ int main(int argc, char** argv)
             return path;
         };
 
-        const QStringList dsfile = prepareRomPath(options->dsRomPath, options->dsRomArchivePath);
+        QStringList dsfile = prepareRomPath(options->dsRomPath, options->dsRomArchivePath);
         const QStringList gbafile = prepareRomPath(options->gbaRomPath, options->gbaRomArchivePath);
 
         if (memberSyntaxUsed) printf("Warning: use the a.zip|b.nds format at your own risk!\n");
 
-        win->preloadROMs(dsfile, gbafile, options->boot);
+        bool boot = options->boot;
+        if (rendererTest)
+        {
+            // The manifest's ROM overrides any positional argument, and the
+            // run always boots.
+            dsfile = QStringList{rendererTest->romPath()};
+            boot = true;
+            rendererTest->begin(emuInstances[0]);
+        }
+
+        win->preloadROMs(dsfile, gbafile, boot);
 
         if (options->fullscreen)
             win->toggleFullscreen();
@@ -426,11 +451,16 @@ int main(int argc, char** argv)
 
     int ret = melon.exec();
 
+    if (rendererTest && rendererTest->failed() && ret == 0)
+        ret = 2;
+
     delete options;
 
     // if we get here, all the existing emu instances should have been deleted already
     // but with this we make extra sure they are all deleted
     deleteAllEmuInstances();
+
+    delete rendererTest;
 
     delete camManager[0];
     delete camManager[1];

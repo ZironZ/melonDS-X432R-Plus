@@ -1,3 +1,6 @@
+// Copyright 2026 ZironZ
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 #version 140
 
 uniform sampler2D OverlayBlackTex;
@@ -12,7 +15,6 @@ uniform sampler2D Hybrid2DBaseTex;
 uniform sampler2D HybridLegacyCandidateTex;
 uniform bool uDebugTintBySource;
 uniform bool uLegacyUnderlayEndpoint;
-uniform bool uCoverageAwareUnderlay;
 uniform bool uDirect3DPresentationSpace;
 uniform bool uConservativeHybrid;
 uniform bool uHybridWindowEdgeAssist;
@@ -122,32 +124,7 @@ vec4 FetchDirect3DRaw(ivec2 directCoord)
 
 vec4 FetchDirect3D(ivec2 coord)
 {
-    ivec2 directCoord = Direct3DCoord(coord);
-    vec4 direct3D = FetchDirect3DRaw(directCoord);
-
-    if (!uCoverageAwareUnderlay || uLegacyUnderlayEndpoint || direct3D.a > 0.0001)
-        return direct3D;
-
-    ivec2 directSize = textureSize(Direct3DTexture, 0);
-    vec3 coveredRGB = vec3(0.0);
-    float coveredWeight = 0.0;
-    for (int y = -2; y <= 2; y++)
-    {
-        for (int x = -2; x <= 2; x++)
-        {
-            vec4 sampleColor = texelFetch(Direct3DTexture,
-                                          clamp(directCoord + ivec2(x, y), ivec2(0), directSize - ivec2(1)),
-                                          0);
-            float coverage = clamp(sampleColor.a, 0.0, 1.0);
-            coveredRGB += sampleColor.rgb * coverage;
-            coveredWeight += coverage;
-        }
-    }
-
-    if (coveredWeight > 0.0001)
-        direct3D.rgb = coveredRGB / coveredWeight;
-
-    return direct3D;
+    return FetchDirect3DRaw(Direct3DCoord(coord));
 }
 
 ivec2 NativeCoord(ivec2 coord)

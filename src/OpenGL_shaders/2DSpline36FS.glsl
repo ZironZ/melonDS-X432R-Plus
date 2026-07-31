@@ -1,3 +1,6 @@
+// Copyright 2026 ZironZ
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 #version 140
 
 uniform vec2 uOutputSize;

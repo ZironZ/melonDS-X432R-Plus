@@ -1,5 +1,5 @@
 /*
-    Copyright 2016-2026 melonDS team
+    Copyright 2026 ZironZ
 
     This file is part of melonDS.
 
@@ -136,6 +136,7 @@ enum class SourceAProductChoiceReason
     FallbackFinalImage,
     UsedFullProductRouteBridge,
     DeferredLiveScenePromotion,
+    UsedExactRouteProductSameEvent,
 };
 
 inline bool WholeSceneRenderPathUsesFullFrameFinalizer(WholeSceneRenderPath path)
@@ -365,6 +366,7 @@ struct WholeSceneRenderTrace
     u32 OutputPresentationEffectState = 0;
     int OutputPresentationTex = 0;
     bool SourceAFullProductKeyMatch = false;
+    bool SourceAPreferExactRouteProduct = false;
     int SourceAFullProductCaptureBank = -1;
     int SourceAFullProductTex = 0;
     bool SourceAFullProductEventValid = false;
@@ -488,6 +490,120 @@ struct HybridSourceDecisionInputs
 
 HybridSourceDecision ChooseHybridSourceDecision(
     const HybridSourceDecisionInputs& inputs);
+
+// Returns whether a zero-weight Direct3D target1 state needs the
+// presentation-overlay path rather than Conservative Hybrid. The caller has
+// already established a composited main-engine frame with visible Direct3D.
+// visibleNativeLayerMask uses the BLDCNT BG/OBJ bit layout; backdrop visibility
+// is implicit when it is selected as target2.
+bool ShouldUseSuppressedDirect3DPresentationOverlay(
+    u16 blendCnt,
+    u8 eva,
+    u8 evb,
+    u32 visibleNativeLayerMask);
+
+struct IncompleteFinalizerFallbackInputs
+{
+    int LastLine = 0;
+    bool EarlierCurrentChunksValid = false;
+};
+
+inline int ChooseIncompleteFinalizerCurrentStart(
+    const IncompleteFinalizerFallbackInputs& inputs)
+{
+    // Unsafe/fragmented frames have already committed their earlier ranges
+    // through the current compositor, so keep those chunks. Otherwise the
+    // incomplete native-product path has not populated a complete current
+    // output and the fallback must rebuild the frame from row zero.
+    return inputs.EarlierCurrentChunksValid ? inputs.LastLine : 0;
+}
+
+struct CaptureBackedBrightnessReleaseInputs
+{
+    bool WholeSceneScaleRequested = false;
+    int Line = 0;
+    u16 PreviousMasterBrightness = 0;
+    u16 CurrentMasterBrightness = 0;
+    u32 CrossingFullWholeSceneCaptureMask = 0;
+};
+
+inline bool ShouldHoldFullWhiteForCaptureBackedBrightnessRelease(
+    const CaptureBackedBrightnessReleaseInputs& inputs)
+{
+    if (!inputs.WholeSceneScaleRequested ||
+        inputs.Line <= 0 ||
+        inputs.CrossingFullWholeSceneCaptureMask == 0)
+    {
+        return false;
+    }
+
+    const u32 previousMode = (inputs.PreviousMasterBrightness >> 14) & 0x3u;
+    const u32 previousFactor =
+        std::min<u32>(inputs.PreviousMasterBrightness & 0x1Fu, 16u);
+    const u32 currentMode = (inputs.CurrentMasterBrightness >> 14) & 0x3u;
+    const u32 currentFactor =
+        std::min<u32>(inputs.CurrentMasterBrightness & 0x1Fu, 16u);
+
+    return previousMode == 1 &&
+           previousFactor == 16 &&
+           currentMode == 0 &&
+           currentFactor == 0;
+}
+
+// Frame-level admission gate for the hybrid clean-legacy candidate: the
+// high-resolution legacy compositor output offered to the per-pixel selector.
+// Each reason is one checklist item; the checklist is an (informal) channel
+// partition — a candidate is admissible only when every effect channel
+// downstream of it is either reproduced by the native-stack path or provably
+// inactive this frame.
+enum class HybridCleanLegacyBlockReason : u8
+{
+    None = 0,
+    PathModeOrSettingUnavailable,
+    SubEngine,
+    DisplayModeNotComposited,
+    NoVisibleDirect3D,
+    FinalUpscaleNative3D,
+    CaptureTransportActive,
+    OBJWindowActive,
+    UnsupportedAlphaBlendState,
+    CaptureBackedBGLayer,
+    CaptureBackedSprite,
+};
+
+struct HybridCleanLegacyEligibilityInputs
+{
+    bool ScalePathAvailable = false;
+    bool ConservativeHybridMode = false;
+    bool CandidateEnabled = false;
+    bool MainEngine = false;
+    u32 DispCnt = 0;
+    u32 LayerEnable = 0;
+    bool HasRenderedPolygons = false;
+    bool FinalUpscaleRender3DNative = false;
+    bool CaptureTransportActive = false;
+    u16 BlendCnt = 0;
+    u8 EVA = 0;
+    u8 EVB = 0;
+    // Any enabled BG layer classified as capture-backed (layer type >= 7) /
+    // any capture-classified sprite (type >= 3), computed by the renderer.
+    bool AnyEnabledCaptureBackedBGLayer = false;
+    bool AnyCaptureBackedSprite = false;
+};
+
+// The validated-alpha-states rule from the NSMB target1 case matrix: which
+// BLDCNT mode-1 states leave the clean-legacy candidate coherent.
+bool IsCleanLegacyAlphaBlendStateValidated(u16 blendCnt, u8 eva, u8 evb);
+
+HybridCleanLegacyBlockReason ChooseHybridCleanLegacyBlockReason(
+    const HybridCleanLegacyEligibilityInputs& inputs);
+
+inline bool CanUseHybridCleanLegacyCandidate(
+    const HybridCleanLegacyEligibilityInputs& inputs)
+{
+    return ChooseHybridCleanLegacyBlockReason(inputs) ==
+           HybridCleanLegacyBlockReason::None;
+}
 
 struct WholeSceneUpdatePhaseTiming
 {

@@ -81,11 +81,17 @@ enum
 bool isRightModKey(QKeyEvent* event);
 int getEventKeyVal(QKeyEvent* event);
 
+class RendererTestRunner;
+
 class EmuInstance
 {
 public:
     EmuInstance(int inst);
     ~EmuInstance();
+
+    // Replay harness for --renderer-test runs; drives frame-exact input and
+    // capture from the emu thread. Null in normal operation.
+    RendererTestRunner* rendererTest = nullptr;
 
     int getInstanceID() { return instanceID; }
     int getConsoleType() { return consoleType; }

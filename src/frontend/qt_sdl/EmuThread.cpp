@@ -59,6 +59,7 @@
 #include "Savestate.h"
 
 #include "EmuInstance.h"
+#include "RendererTest.h"
 #include "Screen.h"
 
 using namespace melonDS;
@@ -497,6 +498,11 @@ void EmuThread::run()
                 videoSettingsDirty = false;
                 emuInstance->renderLock.unlock();
             }
+
+            // renderer-test harness: advance the replay schedule before this
+            // frame's input is applied, so scripted touches are frame-exact
+            if (emuInstance->rendererTest)
+                emuInstance->rendererTest->onEmuFrame(emuInstance);
 
             // process input and hotkeys
             emuInstance->nds->SetKeyMask(emuInstance->inputMask);
@@ -1239,6 +1245,7 @@ void EmuThread::updateRenderer()
         },
         .Threaded = cfg.GetBool("3D.Soft.Threaded"),
         .HiresCoordinates = cfg.GetBool("3D.GL.HiresCoordinates"),
+        .HighPrecisionTextureCoordinates = cfg.GetBool("3D.GL.TextureScalingHighPrecisionCoordinates"),
         .MSAA = cfg.GetBool("3D.GL.MSAA"),
         .BetterPolygons = cfg.GetBool("3D.GL.BetterPolygons")
     };

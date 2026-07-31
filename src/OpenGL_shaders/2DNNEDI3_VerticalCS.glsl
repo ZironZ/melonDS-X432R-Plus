@@ -1,7 +1,24 @@
-// NNEDI3 nns16 8x4 - based on the mpv NNEDI3 prescaler shaders (LGPL):
-// https://github.com/bjin/mpv-prescalers
-// Original NNEDI3 algorithm and weights by tritical (GPL).
-// Ported to GLSL compute for melonDS X432R+.
+/*
+    NNEDI3 nns16 8x4, based on the mpv-prescalers generated shaders:
+    https://github.com/bjin/mpv-prescalers
+
+    The mpv-prescalers shader is free software: you can redistribute it and/or
+    modify it under the terms of the GNU Lesser General Public License as
+    published by the Free Software Foundation, either version 3 of the License,
+    or (at your option) any later version.
+
+    It is distributed in the hope that it will be useful, but WITHOUT ANY
+    WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+    FOR A PARTICULAR PURPOSE. See the GNU Lesser General Public License for more
+    details.
+
+    You should have received a copy of the GNU Lesser General Public License
+    along with it. If not, see <http://www.gnu.org/licenses/>.
+
+    Original NNEDI3 algorithm and weights by tritical (GPL).
+    GLSL compute port Copyright 2026 ZironZ. The port is part of melonDS and is
+    distributed under GPL-3.0-or-later.
+*/
 
 #version 430 core
 

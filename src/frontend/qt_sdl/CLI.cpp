@@ -43,6 +43,7 @@ CommandLineOptions* ManageArgs(QApplication& melon)
 
     parser.addOption(QCommandLineOption({"b", "boot"}, "Whether to boot firmware on startup. Defaults to \"auto\" (boot if NDS rom given)", "auto/always/never", "auto"));
     parser.addOption(QCommandLineOption({"f", "fullscreen"}, "Start melonDS in fullscreen mode"));
+    parser.addOption(QCommandLineOption("renderer-test", "Run a renderer replay-test case manifest and exit", "manifest"));
 
 #ifdef ARCHIVE_SUPPORT_ENABLED
     parser.addOption(QCommandLineOption({"a", "archive-file"}, "Specify file to load inside an archive given (NDS)", "rom"));
@@ -54,6 +55,9 @@ CommandLineOptions* ManageArgs(QApplication& melon)
     CommandLineOptions* options = new CommandLineOptions;
 
     options->fullscreen = parser.isSet("fullscreen");
+
+    if (parser.isSet("renderer-test"))
+        options->rendererTestPath = parser.value("renderer-test");
 
     QStringList posargs = parser.positionalArguments();
     switch (posargs.size())

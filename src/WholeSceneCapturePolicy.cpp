@@ -1,5 +1,5 @@
 /*
-    Copyright 2016-2026 melonDS team
+    Copyright 2026 ZironZ
 
     This file is part of melonDS.
 
@@ -87,6 +87,44 @@ bool CaptureBackedRouteProductIdentityMatchesEvent(
     }
 
     return identity.BackgroundEpochSerial == captureEventSerial;
+}
+
+CaptureEpochOverlayCurrentPlan MakeCaptureEpochOverlayCurrentPlan(
+    const CaptureEpochOverlayCurrentInputs& inputs)
+{
+    CaptureEpochOverlayCurrentPlan plan = {};
+    plan.Source3DSerial = inputs.CurrentSource3DSerial;
+    plan.Source3DSceneHash = inputs.CurrentSource3DSceneHash;
+    plan.PresentationHash = inputs.CurrentPresentationHash;
+
+    const bool hasCurrentIdentity =
+        plan.Source3DSerial != 0 &&
+        plan.Source3DSceneHash != 0 &&
+        plan.PresentationHash != 0;
+    if (!hasCurrentIdentity)
+        return plan;
+
+    if (inputs.CaptureRequestConsumesCurrentComposite &&
+        inputs.CaptureRequestBank < 4)
+    {
+        plan.CanPublishRouteProduct = true;
+        plan.CaptureBank = inputs.CaptureRequestBank;
+        return plan;
+    }
+
+    const bool currentMatchesEpoch =
+        inputs.EpochCaptureBank < 4 &&
+        inputs.EpochSource3DSerial != 0 &&
+        inputs.EpochSource3DSceneHash != 0 &&
+        inputs.CurrentSource3DSerial == inputs.EpochSource3DSerial &&
+        inputs.CurrentSource3DSceneHash == inputs.EpochSource3DSceneHash;
+    if (currentMatchesEpoch)
+    {
+        plan.CanPublishRouteProduct = true;
+        plan.CaptureBank = inputs.EpochCaptureBank;
+    }
+
+    return plan;
 }
 
 CaptureBackedRouteProductEventQuery MakeCaptureBackedRouteProductEventQuery(
@@ -269,6 +307,18 @@ u16 ConsumerFullScreenBrightnessColorEffect(u16 blendCnt, u8 evy)
     return static_cast<u16>((brightnessMode << 14) | factor);
 }
 
+bool IsGuaranteedFullScreenBrightnessEndpoint(
+    u16 blendCnt,
+    u8 evy,
+    bool windowingActive)
+{
+    const u32 secondTargets = (blendCnt >> 8) & 0x3F;
+    if (evy < 16 || windowingActive || secondTargets != 0)
+        return false;
+
+    return ConsumerFullScreenBrightnessColorEffect(blendCnt, 16) != 0;
+}
+
 bool DoesCaptureProductPresentationMatchRequest(
     u32 productPresentationHash,
     u32 requestPresentationHash)
@@ -445,6 +495,12 @@ SourceACaptureResolutionKind ChooseSourceACaptureResolutionKind(
         return SourceACaptureResolutionKind::FullProduct;
     }
 
+    if (inputs.PreferExactRouteProduct &&
+        inputs.HasRouteProduct)
+    {
+        return SourceACaptureResolutionKind::RouteProduct;
+    }
+
     if (inputs.HasRouteProduct &&
         inputs.RouteProductNeedsRePresentation &&
         inputs.AllowCurrentOverlay &&
@@ -463,6 +519,56 @@ SourceACaptureResolutionKind ChooseSourceACaptureResolutionKind(
         return SourceACaptureResolutionKind::RejectedFallback;
 
     return SourceACaptureResolutionKind::FullProduct;
+}
+
+bool ShouldPreferSourceAExactRouteProductForDirectBottom(
+    const SourceAExactRouteProductPreferenceInputs& inputs)
+{
+    if (!inputs.DirectFinalBottomConsumer ||
+        !inputs.SubEngineCaptureBackedBGOnly ||
+        !inputs.HasRouteProduct ||
+        inputs.RouteProductKind != WholeSceneCaptureProductKind::RouteEventProduct ||
+        inputs.RouteProductProof != WholeSceneCaptureProofKind::ExactCaptureEvent ||
+        !inputs.HasFullProduct ||
+        !inputs.FullProductEventValid ||
+        !inputs.FullProductEventFullEquivalent ||
+        !inputs.FullProductEventCleanEngineA2DOutput ||
+        !inputs.FullProductEventAccepted ||
+        inputs.FullProductEventSourceOBJVisible)
+    {
+        return false;
+    }
+
+    if (inputs.RouteProductEventSerial == 0 ||
+        inputs.RouteProductEventSerial != inputs.FullProductEventSerial ||
+        inputs.RouteProductCaptureBank >= 4 ||
+        inputs.RouteProductCaptureBank != inputs.FullProductCaptureBank ||
+        inputs.RouteProductCapturePresentationHash == 0 ||
+        inputs.RouteProductCapturePresentationHash !=
+            inputs.FullProductCapturePresentationHash)
+    {
+        return false;
+    }
+
+    const bool routeHasSource3D =
+        inputs.RouteProductSource3DSerial != 0 ||
+        inputs.RouteProductSource3DSceneHash != 0;
+    const bool fullHasSource3D =
+        inputs.FullProductSource3DSerial != 0 ||
+        inputs.FullProductSource3DSceneHash != 0;
+    if (routeHasSource3D != fullHasSource3D)
+        return false;
+
+    if (routeHasSource3D &&
+        (inputs.RouteProductSource3DSerial == 0 ||
+         inputs.RouteProductSource3DSceneHash == 0 ||
+         inputs.RouteProductSource3DSerial != inputs.FullProductSource3DSerial ||
+         inputs.RouteProductSource3DSceneHash != inputs.FullProductSource3DSceneHash))
+    {
+        return false;
+    }
+
+    return true;
 }
 
 bool ShouldPreferSourceAExactFullProductForDirectBottom(

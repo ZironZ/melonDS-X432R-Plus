@@ -355,7 +355,7 @@
            </property>
           </widget>
          </item>
-           </layout>
+         </layout>
           </widget>
          </item>
          <item>
@@ -476,7 +476,7 @@
            <item row="1" column="0">
             <widget class="QCheckBox" name="cb3DTextureScalingFrequentChangePolicy">
              <property name="whatsThis">
-              <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;Detects 3D texture slots that are being overwritten repeatedly. When enabled, the renderer can keep unstable textures unscaled temporarily and reuse archived scaled copies when the same contents cycle back. This can reduce hitches in palette-fade, animation, and movie-like scenes, but may leave rapidly changing textures pixelated while they are unstable.&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
+              <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;Detects 3D texture slots that are being overwritten repeatedly. When enabled, the renderer can temporarily use cheap nearest-neighbor expansion instead of the selected texture-scaling algorithm and reuse archived scaled copies when the same contents cycle back. This can reduce hitches in palette-fade, animation, and movie-like scenes, but may leave rapidly changing textures pixelated while they are unstable.&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
              </property>
              <property name="text">
               <string>Frequent-change protection</string>
@@ -529,19 +529,46 @@
          </widget>
         </item>
         <item>
-         <widget class="QCheckBox" name="cb3DTextureFilterSpriteUVInset">
-          <property name="whatsThis">
-           <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;Experimental sprite edge UV inset. For simple clamp-only sprite rectangles, slightly clips texture coordinates before sampling so filtering or scaled textures are less likely to pull neighboring atlas pixels into the sprite edge. This can crop exact texture edges, so leave it off unless a game shows atlas-edge lines or garbage around 3D-textured sprites.&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
-          </property>
-          <property name="text">
-           <string>Sprite edge UV inset</string>
-          </property>
-         </widget>
+         <layout class="QHBoxLayout" name="horizontalLayout3DTextureCoordinateEnhancements">
+          <item>
+           <widget class="QCheckBox" name="cb3DHighPrecisionTextureCoordinates">
+            <property name="whatsThis">
+             <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;Uses additional texture-coordinate interpolation precision in the compute renderer whenever 3D is rendered above native resolution. This keeps texture edges and perspective detail aligned with the high-resolution sample grid, whether or not 3D texture scaling is enabled.&lt;/p&gt;&lt;p&gt;At 1x, the original DS-oriented interpolation remains unchanged. This affects UV interpolation only; depth, vertex color, and polygon coverage retain their existing precision.&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
+            </property>
+            <property name="text">
+             <string>High-precision texture coordinates</string>
+            </property>
+           </widget>
+          </item>
+          <item>
+           <widget class="QCheckBox" name="cb3DTextureFilterSpriteUVInset">
+            <property name="whatsThis">
+             <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;Experimental sprite edge UV inset. For simple clamp-only sprite rectangles, slightly clips texture coordinates before sampling so filtering or scaled textures are less likely to pull neighboring atlas pixels into the sprite edge. This can crop exact texture edges, so leave it off unless a game shows atlas-edge lines or garbage around 3D-textured sprites.&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
+            </property>
+            <property name="text">
+             <string>Sprite edge UV inset</string>
+            </property>
+           </widget>
+          </item>
+          <item>
+           <spacer name="horizontalSpacer3DTextureCoordinateEnhancements">
+            <property name="orientation">
+             <enum>Qt::Horizontal</enum>
+            </property>
+            <property name="sizeHint" stdset="0">
+             <size>
+              <width>40</width>
+              <height>0</height>
+             </size>
+            </property>
+           </spacer>
+          </item>
+         </layout>
         </item>
         <item>
          <widget class="QCheckBox" name="cb3DTexture2DAtlasProtection">
           <property name="whatsThis">
-           <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;Try this if UI, sprites, or 2D backgrounds show thin lines, halos, or stray pixels after enabling texture filtering or texture scaling.&lt;/p&gt;&lt;p&gt;This can help games that draw 2D art as 3D textures, but it will not fix every game and can slightly change texture edges. Advanced settings show the individual fixes controlled by this option.&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
+           <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;Try this if UI, sprites, or 2D backgrounds show thin lines, halos, or stray pixels after enabling texture filtering or texture scaling.&lt;/p&gt;&lt;p&gt;This can help games that draw 2D art as 3D textures, but it will not fix every game and can slightly change texture edges. Advanced settings show the individual fixes controlled by this option. A partially checked box means only some of those individual fixes are enabled.&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
           </property>
           <property name="text">
            <string>Reduce 2D texture artifacts</string>

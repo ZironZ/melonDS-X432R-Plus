@@ -467,6 +467,10 @@ void GLRenderer::Reset()
     DispCntB = 0;
     MasterBrightnessA = 0;
     MasterBrightnessB = 0;
+    FrameStartMasterBrightnessA = 0;
+    FrameStartMasterBrightnessB = 0;
+    MasterBrightnessHoldEngineMask = 0;
+    MasterBrightnessHoldNextEngineMask = 0;
     CaptureCnt = 0;
 
     NeedPartialRender = false;
@@ -573,7 +577,8 @@ void GLRenderer::SetRenderSettings(RendererSettings& settings)
     if (IsCompute)
     {
         auto rend3d = dynamic_cast<ComputeRenderer3D *>(Rend3D.get());
-        rend3d->SetRenderSettings(scale3D, settings.HiresCoordinates, settings.MSAA,
+        rend3d->SetRenderSettings(scale3D, settings.HiresCoordinates,
+                                  settings.HighPrecisionTextureCoordinates, settings.MSAA,
                                   settings.TextureFilter, settings.TextureScaling);
     }
     else
@@ -678,6 +683,11 @@ void GLRenderer::SetScaleFactor(int scale)
         glFramebufferTextureLayer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, FPOutputTex[i], 0, 0);
         glFramebufferTextureLayer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1, FPOutputTex[i], 0, 1);
         glDrawBuffers(2, fbassign2);
+        glDisable(GL_SCISSOR_TEST);
+        glColorMaski(0, GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+        glColorMaski(1, GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+        glClearColor(0, 0, 0, 1);
+        glClear(GL_COLOR_BUFFER_BIT);
 
         glBindTexture(GL_TEXTURE_2D_ARRAY, NativeFPOutputTex[i]);
         glTexImage3D(GL_TEXTURE_2D_ARRAY, 0, GL_RGBA, 256, 192, 2, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
@@ -686,6 +696,7 @@ void GLRenderer::SetScaleFactor(int scale)
         glFramebufferTextureLayer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, NativeFPOutputTex[i], 0, 0);
         glFramebufferTextureLayer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1, NativeFPOutputTex[i], 0, 1);
         glDrawBuffers(2, fbassign2);
+        glClear(GL_COLOR_BUFFER_BIT);
     }
 
     for (int i = 0; i < 2; i++)
@@ -719,7 +730,16 @@ void GLRenderer::SetScaleFactor(int scale)
 void GLRenderer::DrawScanline(u32 line)
 {
     if (line == 0)
+    {
         ResetWholeSceneFrameTiming();
+        FrameStartMasterBrightnessA = MasterBrightnessA;
+        FrameStartMasterBrightnessB = MasterBrightnessB;
+        // A late split can be diagnosed after the current physical buffer has
+        // already reached its handoff boundary. Carry a newly armed
+        // presentation hold through exactly one following handoff.
+        MasterBrightnessHoldEngineMask = MasterBrightnessHoldNextEngineMask;
+        MasterBrightnessHoldNextEngineMask = 0;
+    }
     const auto phaseStart = std::chrono::steady_clock::now();
 
     u32 dispcnt_a_diff = DispCntA ^ GPU.GPU2D_A.DispCnt;
@@ -2130,6 +2150,48 @@ bool GLRenderer::GetFramebuffers(void** top, void** bottom)
 
 void GLRenderer::SwapBuffers()
 {
+    if (MasterBrightnessHoldEngineMask)
+    {
+        // The split may already have been emitted through several final-pass
+        // ranges before the late flat-VRAM rebuild exposes it. Full-white
+        // master brightness has a content-independent endpoint, so repair only
+        // the completed physical presentation at its handoff boundary. Engine
+        // output, capture input and VRAM remain untouched.
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, FPOutputFB[BackBuffer]);
+        glDisable(GL_DEPTH_TEST);
+        glDisable(GL_STENCIL_TEST);
+        glDisable(GL_BLEND);
+        glColorMaski(0, GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+        glColorMaski(1, GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+        glEnable(GL_SCISSOR_TEST);
+
+        const GLenum drawBuffers[2] = {
+            GL_COLOR_ATTACHMENT0,
+            GL_COLOR_ATTACHMENT1,
+        };
+        glDrawBuffers(2, drawBuffers);
+        // Match FinalPassFS's current full-white output (63 becomes 252),
+        // rather than making only the repaired handoffs three levels brighter.
+        constexpr GLfloat fullWhite = 252.f / 255.f;
+        const GLfloat white[4] = {fullWhite, fullWhite, fullWhite, 1.f};
+        for (int engine = 0; engine < 2; engine++)
+        {
+            if ((MasterBrightnessHoldEngineMask & (1u << engine)) == 0)
+                continue;
+
+            for (int line = 0; line < 192; line++)
+            {
+                const bool swapped = FinalPassConfig.uScreenSwap[line] != 0;
+                const bool engineOnTop = engine == 0 ? swapped : !swapped;
+                const int y0 = (line * ScreenH) / 192;
+                const int y1 = ((line + 1) * ScreenH) / 192;
+                glScissor(0, y0, ScreenW, y1 - y0);
+                glClearBufferfv(GL_COLOR, engineOnTop ? 0 : 1, white);
+            }
+        }
+        glDisable(GL_SCISSOR_TEST);
+    }
+
     CaptureRollingFinalDebugFrame(BackBuffer);
     Renderer::SwapBuffers();
 }
@@ -2672,6 +2734,16 @@ bool GLRenderer::CanUseMainVRAMDisplayHighResCaptureReplacement(u32 displayBank,
     {
         if (rejectReason)
             *rejectReason = 2;
+        return false;
+    }
+
+    const bool windowingActive = (rendA->DispCnt & 0xE000u) != 0;
+    if (IsGuaranteedFullScreenBrightnessEndpoint(rendA->BlendCnt,
+                                                  rendA->EVY,
+                                                  windowingActive))
+    {
+        if (rejectReason)
+            *rejectReason = 11;
         return false;
     }
 
@@ -4506,6 +4578,8 @@ void GLRenderer::AppendWholeSceneFrameTimingCSVHeader(std::string& header)
     add("final_screen_swap");
     add("final_master_brightness_a");
     add("final_master_brightness_b");
+    add("final_master_brightness_hold_mask");
+    add("final_master_brightness_hold_next_mask");
     add("final_bright_mode_a");
     add("final_bright_mode_b");
     add("final_bright_factor_a");
@@ -4780,7 +4854,8 @@ void GLRenderer::AppendWholeSceneFrameTimingCSVRow(std::string& row) const
     // 3 invalid tracked bank, 4 no matching full-display event,
     // 5 capture event itself rejected, 6 missing full-equivalent product,
     // 7 unsupported product source kind, 8 mixed/OBJ full-frame capture,
-    // 9 no valid main VRAM display epoch, 10 full native dirty-row coverage.
+    // 9 no valid main VRAM display epoch, 10 full native dirty-row coverage,
+    // 11 guaranteed full-screen black brightness endpoint.
     int finalVRAMDisplayCaptureBank = -1;
     int finalVRAMDisplayCaptureOffset = -1;
     int finalVRAMDisplayCaptureMatch = 0;
@@ -4916,6 +4991,8 @@ void GLRenderer::AppendWholeSceneFrameTimingCSVRow(std::string& row) const
     addInt(finalScreenSwap);
     addInt(MasterBrightnessA);
     addInt(MasterBrightnessB);
+    addInt(MasterBrightnessHoldEngineMask);
+    addInt(MasterBrightnessHoldNextEngineMask);
     addInt(FinalPassConfig.uBrightModeA);
     addInt(FinalPassConfig.uBrightModeB);
     addInt(FinalPassConfig.uBrightFactorA);

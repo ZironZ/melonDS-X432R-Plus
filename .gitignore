@@ -10,6 +10,7 @@ melon.rc
 cmake-build*
 cmake-build-debug
 compile_commands.json
+test/policy/replay-local/
 .idea
 .cache
 

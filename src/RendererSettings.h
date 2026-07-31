@@ -1,5 +1,5 @@
 /*
-    Copyright 2016-2026 melonDS team
+    Copyright 2026 ZironZ
 
     This file is part of melonDS.
 
@@ -416,7 +416,7 @@ struct RendererSettings
         bool SourceMips = false;
 
         // edge-extend unused texture margins before scaling
-        bool EdgeExtendUnusedMargins = true;
+        bool EdgeExtendUnusedMargins = false;
 
         // use the old GPU 3D texture alpha-edge handling with no transparent RGB padding
         bool LegacyAlphaHandling = false;
@@ -464,6 +464,10 @@ struct RendererSettings
 
     // whether to use hi-res vertex coordinates when applying upscaling
     bool HiresCoordinates;
+
+    // use higher-precision texture-coordinate interpolation whenever the
+    // compute renderer rasterizes above native resolution
+    bool HighPrecisionTextureCoordinates = true;
 
     // force 3D anti-aliasing in OpenGL renderers
     bool MSAA = false;

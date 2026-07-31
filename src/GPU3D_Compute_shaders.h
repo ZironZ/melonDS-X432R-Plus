@@ -98,7 +98,7 @@ struct XSpanSetup
 };
 
 #if defined(Rasterise)
-int CalcYFactorX(XSpanSetup span, int x)
+int CalcYFactorXShift(XSpanSetup span, int x, int factorShift)
 {
     x -= span.X0;
 
@@ -106,8 +106,8 @@ int CalcYFactorX(XSpanSetup span, int x)
     {
         uint numLo = uint(x) * uint(span.W0);
         uint numHi = 0U;
-        numHi |= numLo >> (32U-YFactorShift);
-        numLo <<= YFactorShift;
+        numHi |= numLo >> (32U-uint(factorShift));
+        numLo <<= uint(factorShift);
 
         uint den = uint(x) * uint(span.W0) + uint(span.X1 - span.X0 - x) * uint(span.W1);
 
@@ -120,6 +120,11 @@ int CalcYFactorX(XSpanSetup span, int x)
     {
         return 0;
     }
+}
+
+int CalcYFactorX(XSpanSetup span, int x)
+{
+    return CalcYFactorXShift(span, x, YFactorShift);
 }
 #endif
 
@@ -160,15 +165,15 @@ struct YSpanSetup
 };
 
 #if defined(InterpSpans)
-int CalcYFactorY(YSpanSetup span, int i)
+int CalcYFactorYShift(YSpanSetup span, int i, int factorShift)
 {
     /*
         maybe it would be better to do use a 32x32=64 multiplication?
     */
     uint numLo = uint(abs(i)) * uint(span.W0n);
     uint numHi = 0U;
-    numHi |= numLo >> (32U-YFactorShift);
-    numLo <<= YFactorShift;
+    numHi |= numLo >> (32U-uint(factorShift));
+    numLo <<= uint(factorShift);
 
     uint den = uint(abs(i)) * uint(span.W0d) + uint(abs(span.I1 - span.I0 - i)) * span.W1d;
 
@@ -180,6 +185,12 @@ int CalcYFactorY(YSpanSetup span, int i)
     {
         return int(Div64_32_32(numHi, numLo, den));
     }
+}
+
+
+int CalcYFactorY(YSpanSetup span, int i)
+{
+    return CalcYFactorYShift(span, i, YFactorShift);
 }
 
 int CalculateDx(int y, YSpanSetup span)
@@ -257,6 +268,7 @@ struct Polygon
     int Variant;
 
     uint Attr;
+    uint HighPrecisionTexcoords;
 
     float TextureLayer;
     float TextureInsetU0;
@@ -382,6 +394,9 @@ const int YFactorShift = 9;
 #else
 const int YFactorShift = 8;
 #endif
+// Texture scaling supports up to 16x, so four extra factor bits preserve each
+// generated sub-texel phase without changing DS precision for other attributes.
+const int TextureYFactorShift = YFactorShift + 4;
 
 #if defined(InterpSpans) || defined(Rasterise)
 uint Umulh(uint a, uint b)
@@ -478,15 +493,20 @@ uint Div64_32_32(uint numHi, uint numLo, uint den)
     return bitfieldInsert(qhat, q1, 16, 16);
 }
 
-int InterpolateAttrPersp(int y0, int y1, int ifactor)
+int InterpolateAttrPerspShift(int y0, int y1, int ifactor, int factorShift)
 {
     if (y0 == y1)
         return y0;
 
     if (y0 < y1)
-        return y0 + (((y1-y0) * ifactor) >> YFactorShift);
+        return y0 + (((y1-y0) * ifactor) >> factorShift);
     else
-        return y1 + (((y0-y1) * ((1<<YFactorShift)-ifactor)) >> YFactorShift);
+        return y1 + (((y0-y1) * ((1<<factorShift)-ifactor)) >> factorShift);
+}
+
+int InterpolateAttrPersp(int y0, int y1, int ifactor)
+{
+    return InterpolateAttrPerspShift(y0, y1, ifactor, YFactorShift);
 }
 
 int InterpolateAttrLinear(int y0, int y1, int i, int irecip, int idiff)
@@ -752,8 +772,17 @@ void main()
 
         if (!spanL.Linear)
         {
-            xspan.TexcoordU0 = InterpolateAttrPersp(spanL.TexcoordU0, spanL.TexcoordU1, ifactor);
-            xspan.TexcoordV0 = InterpolateAttrPersp(spanL.TexcoordV0, spanL.TexcoordV1, ifactor);
+            int textureIfactor = ifactor;
+            int textureFactorShift = YFactorShift;
+            if (polygon.HighPrecisionTexcoords != 0U)
+            {
+                textureIfactor = CalcYFactorYShift(spanL, i, TextureYFactorShift);
+                textureFactorShift = TextureYFactorShift;
+            }
+            xspan.TexcoordU0 = InterpolateAttrPerspShift(spanL.TexcoordU0, spanL.TexcoordU1,
+                                                        textureIfactor, textureFactorShift);
+            xspan.TexcoordV0 = InterpolateAttrPerspShift(spanL.TexcoordV0, spanL.TexcoordV1,
+                                                        textureIfactor, textureFactorShift);
 
             xspan.ColorR0 = InterpolateAttrPersp(spanL.ColorR0, spanL.ColorR1, ifactor);
             xspan.ColorG0 = InterpolateAttrPersp(spanL.ColorG0, spanL.ColorG1, ifactor);
@@ -799,8 +828,17 @@ void main()
 
         if (!spanR.Linear)
         {
-            xspan.TexcoordU1 = InterpolateAttrPersp(spanR.TexcoordU0, spanR.TexcoordU1, ifactor);
-            xspan.TexcoordV1 = InterpolateAttrPersp(spanR.TexcoordV0, spanR.TexcoordV1, ifactor);
+            int textureIfactor = ifactor;
+            int textureFactorShift = YFactorShift;
+            if (polygon.HighPrecisionTexcoords != 0U)
+            {
+                textureIfactor = CalcYFactorYShift(spanR, i, TextureYFactorShift);
+                textureFactorShift = TextureYFactorShift;
+            }
+            xspan.TexcoordU1 = InterpolateAttrPerspShift(spanR.TexcoordU0, spanR.TexcoordU1,
+                                                        textureIfactor, textureFactorShift);
+            xspan.TexcoordV1 = InterpolateAttrPerspShift(spanR.TexcoordV0, spanR.TexcoordV1,
+                                                        textureIfactor, textureFactorShift);
 
             xspan.ColorR1 = InterpolateAttrPersp(spanR.ColorR0, spanR.ColorR1, ifactor);
             xspan.ColorG1 = InterpolateAttrPersp(spanR.ColorG0, spanR.ColorG1, ifactor);
@@ -1103,7 +1141,7 @@ bool SpanContainsX(XSpanSetup span, int x)
     return x >= min(span.X0, span.X1) && x <= max(span.X0, span.X1);
 }
 
-vec2 EvaluateTextureUV(XSpanSetup span, int x)
+vec2 EvaluateTextureUV(Polygon polygon, XSpanSetup span, int x)
 {
     int u, v;
     if (span.X0 == span.X1)
@@ -1113,13 +1151,16 @@ vec2 EvaluateTextureUV(XSpanSetup span, int x)
     }
     else
     {
-        int ifactor = CalcYFactorX(span, x);
+        int factorShift = YFactorShift;
+        if (polygon.HighPrecisionTexcoords != 0U)
+            factorShift = TextureYFactorShift;
+        int ifactor = CalcYFactorXShift(span, x, factorShift);
         int idiff = span.X1 - span.X0;
         int i = x - span.X0;
         if ((span.Flags & XSpanSetup_Linear) == 0U)
         {
-            u = InterpolateAttrPersp(span.TexcoordU0, span.TexcoordU1, ifactor);
-            v = InterpolateAttrPersp(span.TexcoordV0, span.TexcoordV1, ifactor);
+            u = InterpolateAttrPerspShift(span.TexcoordU0, span.TexcoordU1, ifactor, factorShift);
+            v = InterpolateAttrPerspShift(span.TexcoordV0, span.TexcoordV1, ifactor, factorShift);
         }
         else
         {
@@ -1131,21 +1172,21 @@ vec2 EvaluateTextureUV(XSpanSetup span, int x)
     return vec2(ivec2(u, v)) * vec2(1.0 / 16.0) * InvTextureSize;
 }
 
-vec2 EvaluateTextureGradientX(XSpanSetup span, int x, vec2 baseUV)
+vec2 EvaluateTextureGradientX(Polygon polygon, XSpanSetup span, int x, vec2 baseUV)
 {
     bool hasPrev = x > min(span.X0, span.X1);
     bool hasNext = x < max(span.X0, span.X1);
 
     if (hasPrev && hasNext)
     {
-        vec2 prevUV = EvaluateTextureUV(span, x - 1);
-        vec2 nextUV = EvaluateTextureUV(span, x + 1);
+        vec2 prevUV = EvaluateTextureUV(polygon, span, x - 1);
+        vec2 nextUV = EvaluateTextureUV(polygon, span, x + 1);
         return 0.5 * (nextUV - prevUV);
     }
     if (hasNext)
-        return EvaluateTextureUV(span, x + 1) - baseUV;
+        return EvaluateTextureUV(polygon, span, x + 1) - baseUV;
     if (hasPrev)
-        return baseUV - EvaluateTextureUV(span, x - 1);
+        return baseUV - EvaluateTextureUV(polygon, span, x - 1);
     return vec2(0.0);
 }
 
@@ -1172,17 +1213,17 @@ vec2 EvaluateTextureGradientY(Polygon polygon, ivec2 position, vec2 baseUV)
 
     if (nextCoversX && prevCoversX)
     {
-        vec2 nextUV = EvaluateTextureUV(nextSpan, position.x);
-        vec2 prevUV = EvaluateTextureUV(prevSpan, position.x);
+        vec2 nextUV = EvaluateTextureUV(polygon, nextSpan, position.x);
+        vec2 prevUV = EvaluateTextureUV(polygon, prevSpan, position.x);
         return 0.5 * (nextUV - prevUV);
     }
     if (nextCoversX)
     {
-        return EvaluateTextureUV(nextSpan, position.x) - baseUV;
+        return EvaluateTextureUV(polygon, nextSpan, position.x) - baseUV;
     }
     if (prevCoversX)
     {
-        return baseUV - EvaluateTextureUV(prevSpan, position.x);
+        return baseUV - EvaluateTextureUV(polygon, prevSpan, position.x);
     }
     return vec2(0.0);
 }
@@ -1209,7 +1250,7 @@ vec4 SampleCurrentTextureWithGradients(Polygon polygon, vec2 uvf, vec2 dX, vec2 
 
 vec4 SampleCurrentTextureFiltered(Polygon polygon, ivec2 position, XSpanSetup xspan, vec2 uvf)
 {
-    vec2 dX = EvaluateTextureGradientX(xspan, position.x, uvf);
+    vec2 dX = EvaluateTextureGradientX(polygon, xspan, position.x, uvf);
     vec2 dY = EvaluateTextureGradientY(polygon, position, uvf);
     return SampleCurrentTextureWithGradients(polygon, uvf + 0.5 * (dX + dY), dX, dY);
 }
@@ -1295,8 +1336,17 @@ void main()
 #endif
                 if ((xspan.Flags & XSpanSetup_Linear) == 0U)
                 {
-                    u = InterpolateAttrPersp(xspan.TexcoordU0, xspan.TexcoordU1, ifactor);
-                    v = InterpolateAttrPersp(xspan.TexcoordV0, xspan.TexcoordV1, ifactor);
+                    int textureIfactor = ifactor;
+                    int textureFactorShift = YFactorShift;
+                    if (polygon.HighPrecisionTexcoords != 0U)
+                    {
+                        textureIfactor = CalcYFactorXShift(xspan, position.x, TextureYFactorShift);
+                        textureFactorShift = TextureYFactorShift;
+                    }
+                    u = InterpolateAttrPerspShift(xspan.TexcoordU0, xspan.TexcoordU1,
+                                                  textureIfactor, textureFactorShift);
+                    v = InterpolateAttrPerspShift(xspan.TexcoordV0, xspan.TexcoordV1,
+                                                  textureIfactor, textureFactorShift);
 
                     vr = InterpolateAttrPersp(xspan.ColorR0, xspan.ColorR1, ifactor);
                     vg = InterpolateAttrPersp(xspan.ColorG0, xspan.ColorG1, ifactor);

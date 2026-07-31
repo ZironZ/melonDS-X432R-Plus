@@ -1,8 +1,12 @@
+// Copyright 2026 ZironZ
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 #version 140
 
 uniform sampler2D Source;
 uniform int uOutputFormat;
 uniform int uBinaryAlpha;
+uniform int uPreserveTransparentRGB;
 uniform int uLosslessRGB6Repack;
 
 smooth in vec2 fTexcoord;
@@ -46,7 +50,7 @@ void main()
     if (uBinaryAlpha != 0)
     {
         color.a = color.a >= 0.5 ? 1.0 : 0.0;
-        if (color.a == 0.0)
+        if (color.a == 0.0 && uPreserveTransparentRGB == 0)
             color.rgb = vec3(0.0);
     }
 

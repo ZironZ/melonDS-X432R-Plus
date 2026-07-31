@@ -60,6 +60,9 @@ set(SOURCES_QT_SDL
     CLI.h
     CLI.cpp
 
+    RendererTest.h
+    RendererTest.cpp
+
     LANDialog.cpp
     NetplayDialog.cpp
 )

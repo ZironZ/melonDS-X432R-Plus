@@ -447,6 +447,9 @@ private:
 
     u32 DispCntA, DispCntB;
     u16 MasterBrightnessA, MasterBrightnessB;
+    u16 FrameStartMasterBrightnessA, FrameStartMasterBrightnessB;
+    u32 MasterBrightnessHoldEngineMask;
+    u32 MasterBrightnessHoldNextEngineMask;
     u32 CaptureCnt;
 
     bool NeedPartialRender;

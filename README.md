@@ -11,6 +11,10 @@ upscale 2D graphics and 3D textures.
 This is not the official melonDS release. If you want a stable emulator, 
 use the official melonDS builds.
 
+Nintendo DS games use many different graphics tricks, so some enhancements 
+can cause visual problems. In most games, though, you can turn on at least 
+some of the features and things will look noticeably better.
+
 ## Main Additions
 
 - Anisotropic filtering.
@@ -24,19 +28,14 @@ use the official melonDS builds.
 - `Postprocessing Upscale`, the other major mode, which scales up a downscaled
   3D image. This is less likely to have weird scaling issues than the Hybrid
   mode, but the 3D will look soft.
-- OpenGL MSAA options.
+- An OpenGL MSAA option.
 - A screen sharpening filter for blurry output.
 - Debug tools for whole-scene 2D, texture-scaling inspection, timings, 
-  and renderer comparison (useless for most people, but fun to look at).
+  replays, and renderer comparison.
 - FMV fixes. Some FMVs were broken in the beta build I forked.
 
 All the work in this fork targets the OpenGL renderers. The software
 renderer wasn't touched (besides the FMV fixes that apply to it too).
-
-This fork will not work well in certain games. Nintendo DS games mix 2D, 3D,
-transparency, display capture, windows, brightness effects, and mid-frame state
-changes, so lots can break. In most games though, you can turn on at least some
-of the features and things will look better.
 
 ## How It Looks
 
@@ -136,19 +135,17 @@ If the output looks too blurry, turn on `Screen sharpening`.
 - Hybrid Upscale is conservative on purpose. Native-looking output may be a
   fallback just because the alternative looks far worse. It is not automatically
   a bug.
-- Blending, windows, display capture, copied final-screen buffers, brightness
-  effects, and OBJ-only presentation tricks are all high-risk cases.
-- Scrolling/Affine scenes are often scaled poorly.
-- Most capture-backed cases are handled, but not every capture-backed frame
-  is safe to enhance.
+- Edge cases involving blending, screen masks, display capture, and brightness 
+  effects are all things that can cause the 2D scaling to fall back.
+- Scrolling and affine scenes are often scaled poorly.
 - Text may look darker after scaling with most algorithms except xBRZ. This is
   mostly unavoidable with how the scaling is done.
 - 3D texture scaling is optional and performance-sensitive. Deferred scaling and
-  frequent-change protection help, but you still might get hitches.
+  frequent-change protection help, but you may still get hitches.
 - You will see the edges of textures and get weird-looking UI at times with 
   anisotropic filtering and texture scaling. This is not easily fixed, but
   `Reduce 2D texture artifacts` helps in some games.
-- 3D MSAA will sometimes cause sporadic black lines to appear.
+- 3D MSAA will sometimes cause sporadic black or bright lines to appear.
 
 ## BIOS, Firmware, And Games
 

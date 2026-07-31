@@ -1,5 +1,5 @@
 /*
-    Copyright 2016-2026 melonDS team
+    Copyright 2026 ZironZ
 
     This file is part of melonDS.
 
@@ -1081,6 +1081,8 @@ void GLRenderer2D::RecordSourceACaptureChoiceDebug(const SourceACaptureReplaceme
     WholeSceneTrace.SourceAFullProductEventScreenSwap = choice.FullProductEventScreenSwap;
     WholeSceneTrace.SourceAFullProductEventMainFinalBottom =
         choice.FullProductEventMainFinalBottom;
+    WholeSceneTrace.SourceAPreferExactRouteProduct =
+        choice.PreferExactRouteProduct;
     WholeSceneTrace.RouteProductLookupAttempted = choice.RouteProductLookupAttempted;
     WholeSceneTrace.RouteProductLookupSuccess = choice.RouteProductLookupSuccess;
     WholeSceneTrace.RouteProductLookupResultSource = choice.RouteProductLookupResultSource;
@@ -1487,7 +1489,9 @@ GLRenderer2D::GLCaptureProductResolution GLRenderer2D::RecordSourceARouteProduct
                                      choice.BackgroundEpochSerial,
                                      choice.CapturePresentationHash,
                                      choice.CurrentPresentationHash,
-                                     SourceAProductChoiceReason::ReusedPreviousRouteProduct,
+                                     choice.PreferExactRouteProduct
+                                         ? SourceAProductChoiceReason::UsedExactRouteProductSameEvent
+                                         : SourceAProductChoiceReason::ReusedPreviousRouteProduct,
                                      choice.FullProductKeyMatch);
     RecordSourceARouteProductTrace(choice);
     const SourceACaptureResolution resolution =

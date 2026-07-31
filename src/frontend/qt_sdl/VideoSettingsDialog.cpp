@@ -108,6 +108,24 @@ void PopulateWholeScene2DScaleModeCombo(QComboBox* combo, bool advanced, int sel
         addMode("High-resolution Compositor", WholeScene2DScaleMode::HighResCompositor);
         addMode("Native Stack Upscale", WholeScene2DScaleMode::LegacyNativeUpscale);
     }
+    else
+    {
+        const auto selected = melonDS::RendererSettings::GetWholeScene2DScaleMode(selectedMode);
+        switch (selected)
+        {
+        case WholeScene2DScaleMode::OverlayOperatorUpscale:
+            addMode("Presentation Overlay Upscale (custom)", selected);
+            break;
+        case WholeScene2DScaleMode::HighResCompositor:
+            addMode("High-resolution Compositor (custom)", selected);
+            break;
+        case WholeScene2DScaleMode::LegacyNativeUpscale:
+            addMode("Native Stack Upscale (custom)", selected);
+            break;
+        default:
+            break;
+        }
+    }
 
     int comboIndex = combo->findData(selectedMode);
     combo->setCurrentIndex(comboIndex >= 0 ? comboIndex : 0);
@@ -245,17 +263,13 @@ void VideoSettingsDialog::setEnabled()
 {
     auto& cfg = emuInstance->getGlobalConfig();
     int renderer = cfg.GetInt("3D.Renderer");
-    if (!ui->cbAdvancedVideoSettings->isChecked())
-        applyRecommendedAdvancedSettings();
 
     bool softwareRenderer = renderer == renderer3D_Software;
     bool advancedSettings = UsesGL() && ui->cbAdvancedVideoSettings->isChecked();
     const int configuredWholeSceneMode = melonDS::RendererSettings::GetWholeScene2DScaleModeIndex(
         melonDS::RendererSettings::GetWholeScene2DScaleMode(cfg.GetInt("3D.GL.WholeScene2DScaleMode")));
     PopulateWholeScene2DScaleModeCombo(ui->cbxWholeScene2DScaleMode, advancedSettings, configuredWholeSceneMode);
-    const int wholeSceneModeIndex = ReadWholeScene2DScaleModeCombo(ui->cbxWholeScene2DScaleMode);
-    if (wholeSceneModeIndex != configuredWholeSceneMode)
-        cfg.SetInt("3D.GL.WholeScene2DScaleMode", wholeSceneModeIndex);
+    const int wholeSceneModeIndex = configuredWholeSceneMode;
 
     auto wholeSceneAlgorithm = melonDS::RendererSettings::GetGLScaleAlgorithm(ReadScaleAlgorithmCombo(ui->cbxWholeScene2DScaleAlgorithm));
     auto wholeSceneMode = melonDS::RendererSettings::GetWholeScene2DScaleMode(wholeSceneModeIndex);
@@ -271,7 +285,6 @@ void VideoSettingsDialog::setEnabled()
     bool anisotropicFiltering = UsesGL() && (ReadAnisotropyCombo(ui->cbx3DTextureAnisotropy) > 1);
     bool alphaAwareFiltering = anisotropicFiltering && ui->cb3DTextureFilterMipmapAlphaHandling->isChecked();
     bool textureScalingVisible = UsesGL() && ui->cb3DTextureScaling->isChecked();
-    bool texture2DAtlasProtection = ui->cb3DTexture2DAtlasProtection->isChecked();
     auto textureScalingAlgorithm = melonDS::RendererSettings::GetGLScaleAlgorithm(ReadScaleAlgorithmCombo(ui->cbx3DTextureScalingAlgorithm));
     bool alphaXBRZTextureAlgorithm =
         textureScalingAlgorithm == melonDS::RendererSettings::GLScaleAlgorithm::Spline36 ||
@@ -282,11 +295,10 @@ void VideoSettingsDialog::setEnabled()
     bool spriteUVInsetApplicable = UsesGL() && (anisotropicFiltering || textureScalingVisible);
     bool smart2DFilteringApplicable = UsesGL() && (anisotropicFiltering || textureScalingVisible);
     bool edgeExtendApplicable = UsesGL() && textureScalingVisible;
-    bool spriteUVInsetVisible = advancedSettings && UsesGL() && (spriteUVInsetApplicable || texture2DAtlasProtection);
-    bool smart2DFilteringVisible = advancedSettings && UsesGL() && (smart2DFilteringApplicable || texture2DAtlasProtection);
+    bool spriteUVInsetVisible = advancedSettings && spriteUVInsetApplicable;
+    bool smart2DFilteringVisible = advancedSettings && smart2DFilteringApplicable;
     bool translucentTextureGuardApplicable = UsesGL() && anisotropicFiltering;
-    bool translucentTextureGuardVisible =
-        advancedSettings && UsesGL() && (translucentTextureGuardApplicable || texture2DAtlasProtection);
+    bool translucentTextureGuardVisible = advancedSettings && translucentTextureGuardApplicable;
     bool highRes3D = ui->cbxGLResolution->currentIndex() > 0;
     bool wholeSceneFinal3DResolve =
         wholeSceneEnabled &&
@@ -327,6 +339,8 @@ void VideoSettingsDialog::setEnabled()
     ui->cb3DTextureFilterSmart2D->setVisible(smart2DFilteringVisible);
     ui->cb3DTextureFilterTranslucentGuard->setVisible(translucentTextureGuardVisible);
     ui->cb3DTextureFilterSpriteUVInset->setVisible(spriteUVInsetVisible);
+    ui->cb3DHighPrecisionTextureCoordinates->setVisible(
+        advancedSettings && renderer == renderer3D_OpenGLCompute);
     ui->cbx3DTextureFilterMipDepth->setEnabled(anisotropicFiltering);
     ui->lbl3DTextureFilterMipDepth->setEnabled(anisotropicFiltering);
     ui->cb3DTextureFilterBinaryAlphaHandling->setEnabled(anisotropicFiltering);
@@ -337,6 +351,8 @@ void VideoSettingsDialog::setEnabled()
     ui->cb3DTextureFilterSmart2D->setEnabled(smart2DFilteringApplicable);
     ui->cb3DTextureFilterTranslucentGuard->setEnabled(translucentTextureGuardApplicable);
     ui->cb3DTextureFilterSpriteUVInset->setEnabled(spriteUVInsetApplicable);
+    ui->cb3DHighPrecisionTextureCoordinates->setEnabled(
+        renderer == renderer3D_OpenGLCompute && highRes3D);
     ui->cb3DTextureScaling->setEnabled(UsesGL());
     SetLayoutVisible(ui->horizontalLayout3DTextureScalingAlgorithm, UsesGL() && ui->cb3DTextureScaling->isChecked());
     SetCompactGridOptions(ui->gridLayout3DTextureScalingOptions, {
@@ -348,7 +364,7 @@ void VideoSettingsDialog::setEnabled()
         {ui->cb3DTextureScalingSpline36Alpha, advancedSettings && textureScalingVisible && spline36AlphaTextureAlgorithm},
         {ui->cb3DTextureScalingNativeMipFloor, advancedSettings && textureScalingVisible && anisotropicFiltering},
         {ui->cb3DTextureScalingSourceMips, advancedSettings && textureScalingVisible && anisotropicFiltering},
-        {ui->cb3DTextureScalingEdgeExtendUnusedMargins, advancedSettings && (textureScalingVisible || texture2DAtlasProtection)},
+        {ui->cb3DTextureScalingEdgeExtendUnusedMargins, advancedSettings && edgeExtendApplicable},
     }, 3);
     ui->cbx3DTextureScalingAlgorithm->setEnabled(UsesGL() && ui->cb3DTextureScaling->isChecked());
     ui->lbl3DTextureScalingAlgorithm->setEnabled(UsesGL() && ui->cb3DTextureScaling->isChecked());
@@ -470,20 +486,25 @@ void VideoSettingsDialog::applyTexture2DAtlasProtection(bool enabled)
 
 void VideoSettingsDialog::syncTexture2DAtlasProtectionCheckbox()
 {
-    const bool enabled =
-        ui->cb3DTextureFilterSmart2D->isChecked() &&
-        ui->cb3DTextureFilterTranslucentGuard->isChecked() &&
-        ui->cb3DTextureFilterSpriteUVInset->isChecked() &&
-        ui->cb3DTextureScalingEdgeExtendUnusedMargins->isChecked();
+    const int enabledCount =
+        static_cast<int>(ui->cb3DTextureFilterSmart2D->isChecked()) +
+        static_cast<int>(ui->cb3DTextureFilterTranslucentGuard->isChecked()) +
+        static_cast<int>(ui->cb3DTextureFilterSpriteUVInset->isChecked()) +
+        static_cast<int>(ui->cb3DTextureScalingEdgeExtendUnusedMargins->isChecked());
+    const Qt::CheckState state =
+        enabledCount == 0 ? Qt::Unchecked :
+        enabledCount == 4 ? Qt::Checked :
+        Qt::PartiallyChecked;
 
     QSignalBlocker blocker(ui->cb3DTexture2DAtlasProtection);
-    ui->cb3DTexture2DAtlasProtection->setChecked(enabled);
+    ui->cb3DTexture2DAtlasProtection->setCheckState(state);
 }
 
 VideoSettingsDialog::VideoSettingsDialog(QWidget* parent) : QDialog(parent), ui(new Ui::VideoSettingsDialog)
 {
     ui->setupUi(this);
     setAttribute(Qt::WA_DeleteOnClose);
+    ui->cb3DTexture2DAtlasProtection->setTristate(true);
 
     QPushButton* whatsThisButton = ui->buttonBox->addButton("?", QDialogButtonBox::HelpRole);
     whatsThisButton->setAutoDefault(false);
@@ -545,6 +566,7 @@ VideoSettingsDialog::VideoSettingsDialog(QWidget* parent) : QDialog(parent), ui(
     oldGLScale = cfg.GetInt("3D.GL.ScaleFactor");
     oldGLBetterPolygons = cfg.GetBool("3D.GL.BetterPolygons");
     oldReadable3DTextureCache = cfg.GetBool("3D.GL.ReadableTextureCache");
+    oldHighPrecisionTextureCoordinates = cfg.GetBool("3D.GL.TextureScalingHighPrecisionCoordinates");
     oldTextureFilter.Anisotropy = cfg.GetInt("3D.GL.TextureAnisotropy");
     oldTextureFilter.BinaryAlphaHandling = cfg.GetBool("3D.GL.TextureFilterBinaryAlphaHandling");
     oldTextureFilter.TopologyAwareMipHandling = cfg.GetBool("3D.GL.TextureFilterMipmapPremultipliedAlphaHandling");
@@ -637,7 +659,16 @@ VideoSettingsDialog::VideoSettingsDialog(QWidget* parent) : QDialog(parent), ui(
     ui->cb3DTextureFilterMipmapAlphaHandling->setChecked(oldTextureFilter.MipmapAlphaHandling != 0);
     SetTextureFilterMipDepthCombo(ui->cbx3DTextureFilterMipDepth, oldTextureFilter.MipDepth);
     ui->cb3DTextureLosslessRGB6Repack->setChecked(oldTextureFilter.LosslessRGB6Repack != 0);
-    ui->cb3DTextureScaling->setChecked(oldTextureScaling.Enabled != 0);
+    {
+        // Loading a saved enabled state is not the same as the user turning
+        // texture scaling on. Preserve an explicit lossless-repack override
+        // across dialog reopenings; the state-change handler still applies the
+        // recommended unchecked state on a real off-to-on interaction.
+        QSignalBlocker blocker(ui->cb3DTextureScaling);
+        ui->cb3DTextureScaling->setChecked(oldTextureScaling.Enabled != 0);
+    }
+    ui->cb3DHighPrecisionTextureCoordinates->setChecked(
+        oldHighPrecisionTextureCoordinates != 0);
     SetScaleAlgorithmCombo(ui->cbx3DTextureScalingAlgorithm, oldTextureScaling.Algorithm);
     ui->cb3DTextureScalingFrequentChangePolicy->setChecked(oldTextureScaling.FrequentChangePolicy != 0);
     ui->cb3DTextureScalingDeferred->setChecked(oldTextureScaling.Deferred != 0);
@@ -648,14 +679,7 @@ VideoSettingsDialog::VideoSettingsDialog(QWidget* parent) : QDialog(parent), ui(
     ui->cb3DTextureScalingQualityAlphaHandling->setChecked(oldTextureScaling.QualityAlphaHandling != 0);
     ui->cb3DTextureScalingAlphaXBRZ->setChecked(oldTextureScaling.AlphaXBRZ != 0);
     ui->cb3DTextureScalingSpline36Alpha->setChecked(oldTextureScaling.Spline36Alpha != 0);
-    {
-        QSignalBlocker blocker(ui->cb3DTexture2DAtlasProtection);
-        ui->cb3DTexture2DAtlasProtection->setChecked(
-            oldTextureFilter.Smart2DFiltering ||
-            oldTextureFilter.TranslucentTextureFilteringGuard ||
-            oldTextureFilter.SpriteUVInset ||
-            oldTextureScaling.EdgeExtendUnusedMargins);
-    }
+    syncTexture2DAtlasProtectionCheckbox();
     ui->cbWholeScene2DScale->setChecked(oldWholeScene2D.Enabled != 0);
     ui->cbWholeScene2DScaleSourceBoundaryGuard->setChecked(oldWholeScene2D.SourceBoundaryGuard != 0);
     SetWholeScene2DScaleModeCombo(ui->cbxWholeScene2DScaleMode, oldWholeScene2D.Mode);
@@ -720,6 +744,7 @@ void VideoSettingsDialog::on_VideoSettingsDialog_rejected()
     cfg.SetInt("3D.GL.ScaleFactor", oldGLScale);
     cfg.SetBool("3D.GL.BetterPolygons", oldGLBetterPolygons);
     cfg.SetBool("3D.GL.ReadableTextureCache", oldReadable3DTextureCache);
+    cfg.SetBool("3D.GL.TextureScalingHighPrecisionCoordinates", oldHighPrecisionTextureCoordinates);
     cfg.SetBool("3D.GL.AdvancedVideoSettings", oldAdvancedVideoSettings);
     cfg.SetInt("3D.GL.TextureAnisotropy", oldTextureFilter.Anisotropy);
     cfg.SetBool("3D.GL.TextureFilterBinaryAlphaHandling", oldTextureFilter.BinaryAlphaHandling);
@@ -778,130 +803,11 @@ void VideoSettingsDialog::setVsyncControlEnable(bool hasOGL)
     ui->sbVSyncInterval->setEnabled(hasOGL);
 }
 
-void VideoSettingsDialog::applyRecommendedAdvancedSettings()
-{
-    const bool textureScaling = ui->cb3DTextureScaling->isChecked();
-    const bool wholeScene2DScaling = ui->cbWholeScene2DScale->isChecked();
-    const bool texture2DAtlasProtection = ui->cb3DTexture2DAtlasProtection->isChecked();
-
-    auto& cfg = emuInstance->getGlobalConfig();
-    const bool finalUpscaleRender3DNative =
-        melonDS::RendererSettings::GetWholeScene2DScaleMode(cfg.GetInt("3D.GL.WholeScene2DScaleMode")) ==
-            WholeScene2DScaleMode::FinalNativeUpscale &&
-        ui->cbWholeScene2DScaleFinalUpscaleRender3DNative->isChecked();
-
-    cfg.SetBool("3D.GL.ReadableTextureCache", false);
-    cfg.SetBool("3D.GL.HiresCoordinates", true);
-
-    cfg.SetInt("3D.GL.TextureFilterMipDepth",
-               melonDS::RendererSettings::GetTextureFilterMipDepthIndex(TextureFilterMipDepth::Min32));
-    cfg.SetBool("3D.GL.TextureFilterBinaryAlphaHandling", true);
-    cfg.SetBool("3D.GL.TextureFilterMipmapAlphaHandling", true);
-    cfg.SetBool("3D.GL.TextureFilterMipmapPremultipliedAlphaHandling", false);
-    cfg.SetBool("3D.GL.TextureFilterMipmapSubrectHandling", false);
-    cfg.SetBool("3D.GL.TextureFilterSmart2D", texture2DAtlasProtection);
-    cfg.SetBool("3D.GL.TextureFilterTranslucentGuard", texture2DAtlasProtection);
-    cfg.SetBool("3D.GL.TextureFilterSpriteUVInset", texture2DAtlasProtection);
-    cfg.SetBool("3D.GL.TextureLosslessRGB6Repack", !textureScaling);
-
-    cfg.SetBool("3D.GL.TextureScaling", textureScaling);
-    cfg.SetBool("3D.GL.TextureScalingLegacyAlphaHandling", false);
-    cfg.SetBool("3D.GL.TextureScalingQualityAlphaHandling", false);
-    cfg.SetBool("3D.GL.TextureScalingFrequentChangePolicy", true);
-    cfg.SetBool("3D.GL.TextureScalingSpline36Alpha", false);
-    cfg.SetBool("3D.GL.TextureScalingDeferred", false);
-    cfg.SetBool("3D.GL.TextureScalingNativeMipFloor", false);
-    cfg.SetBool("3D.GL.TextureScalingSourceMips", false);
-    cfg.SetBool("3D.GL.TextureScalingEdgeExtendUnusedMargins", texture2DAtlasProtection);
-
-    cfg.SetBool("3D.GL.WholeScene2DScale", wholeScene2DScaling);
-    cfg.SetBool("3D.GL.WholeScene2DScaleSourceBoundaryGuard", false);
-    cfg.SetBool("3D.GL.WholeScene2DScaleExactFinalFallback", false);
-    cfg.SetBool("3D.GL.WholeScene2DScaleForegroundOverlay", false);
-    cfg.SetBool("3D.GL.WholeScene2DScaleCaptureBacked", true);
-    cfg.SetBool("3D.GL.WholeScene2DScaleDebugTint", false);
-    cfg.SetBool("3D.GL.WholeScene2DScaleNoWrapFilterTaps", true);
-    cfg.SetBool("3D.GL.WholeScene2DScaleFinalUpscaleRender3DNative", finalUpscaleRender3DNative);
-    cfg.SetInt("3D.GL.WholeScene2DScaleFinalUpscale3DFilter",
-               melonDS::RendererSettings::GetFinalUpscale3DDownsampleFilterIndex(
-                   FinalUpscale3DDownsampleFilter::Area));
-    cfg.SetBool("3D.GL.WholeScene2DScaleFinalUpscale3DCoverageAware", true);
-    cfg.SetBool("3D.GL.WholeScene2DScaleFinalUpscale3DRepresentativeSemantics", false);
-    cfg.SetBool("3D.GL.WholeScene2DScaleFinalUpscale3DSplitSemantics", true);
-    cfg.SetBool("3D.GL.WholeScene2DScaleFinalUpscale3DSharpenSplitCoverage", false);
-    cfg.SetBool("3D.GL.WholeScene2DScaleOverlayLegacyUnderlay", false);
-    cfg.SetBool("3D.GL.WholeScene2DScaleHybridWindowEdgeAssist", true);
-    cfg.SetBool("3D.GL.WholeScene2DScaleHybridTarget2AlphaBlendAssist", true);
-    cfg.SetBool("3D.GL.WholeScene2DScaleHybridNativeEffectGuard", false);
-    cfg.SetBool("3D.GL.WholeScene2DScaleHybridForeground2DBase", true);
-    cfg.SetBool("3D.GL.WholeScene2DScaleHybridCleanLegacyCandidate", true);
-
-    auto setChecked = [](auto* widget, bool checked)
-    {
-        QSignalBlocker blocker(widget);
-        widget->setChecked(checked);
-    };
-
-    setChecked(ui->cbReadable3DTextureCache, false);
-    setChecked(ui->cbxComputeHiResCoords, true);
-    {
-        QSignalBlocker blocker(ui->cbx3DTextureFilterMipDepth);
-        SetTextureFilterMipDepthCombo(
-            ui->cbx3DTextureFilterMipDepth,
-            melonDS::RendererSettings::GetTextureFilterMipDepthIndex(TextureFilterMipDepth::Min32));
-    }
-    setChecked(ui->cb3DTextureFilterBinaryAlphaHandling, true);
-    setChecked(ui->cb3DTextureFilterMipmapAlphaHandling, true);
-    setChecked(ui->cb3DTextureFilterMipmapTopologyHandling, false);
-    setChecked(ui->cb3DTextureFilterMipmapSubrectHandling, false);
-    setChecked(ui->cb3DTextureFilterSmart2D, texture2DAtlasProtection);
-    setChecked(ui->cb3DTextureFilterTranslucentGuard, texture2DAtlasProtection);
-    setChecked(ui->cb3DTextureFilterSpriteUVInset, texture2DAtlasProtection);
-    setChecked(ui->cb3DTextureLosslessRGB6Repack, !textureScaling);
-
-    setChecked(ui->cb3DTextureScaling, textureScaling);
-    setChecked(ui->cb3DTextureScalingLegacyAlphaHandling, false);
-    setChecked(ui->cb3DTextureScalingQualityAlphaHandling, false);
-    setChecked(ui->cb3DTextureScalingFrequentChangePolicy, true);
-    setChecked(ui->cb3DTextureScalingSpline36Alpha, false);
-    setChecked(ui->cb3DTextureScalingDeferred, false);
-    setChecked(ui->cb3DTextureScalingNativeMipFloor, false);
-    setChecked(ui->cb3DTextureScalingSourceMips, false);
-    setChecked(ui->cb3DTextureScalingEdgeExtendUnusedMargins, texture2DAtlasProtection);
-
-    setChecked(ui->cbWholeScene2DScale, wholeScene2DScaling);
-    setChecked(ui->cbWholeScene2DScaleSourceBoundaryGuard, false);
-    setChecked(ui->cbWholeScene2DScaleExactFinalFallback, false);
-    setChecked(ui->cbWholeScene2DScaleForegroundOverlay, false);
-    setChecked(ui->cbWholeScene2DScaleCaptureBacked, true);
-    setChecked(ui->cbWholeScene2DScaleDebugTint, false);
-    setChecked(ui->cbWholeScene2DScaleNoWrapFilterTaps, true);
-    setChecked(ui->cbWholeScene2DScaleFinalUpscaleRender3DNative, finalUpscaleRender3DNative);
-    {
-        QSignalBlocker blocker(ui->cbxWholeScene2DScaleFinalUpscale3DFilter);
-        SetFinalUpscale3DFilterCombo(
-            ui->cbxWholeScene2DScaleFinalUpscale3DFilter,
-            melonDS::RendererSettings::GetFinalUpscale3DDownsampleFilterIndex(
-                FinalUpscale3DDownsampleFilter::Area));
-    }
-    setChecked(ui->cbWholeScene2DScaleFinalUpscale3DCoverageAware, true);
-    setChecked(ui->cbWholeScene2DScaleFinalUpscale3DRepresentativeSemantics, false);
-    setChecked(ui->cbWholeScene2DScaleFinalUpscale3DSplitSemantics, true);
-    setChecked(ui->cbWholeScene2DScaleFinalUpscale3DSharpenSplitCoverage, false);
-    setChecked(ui->cbWholeScene2DScaleOverlayLegacyUnderlay, false);
-    setChecked(ui->cbWholeScene2DScaleHybridWindowEdgeAssist, true);
-    setChecked(ui->cbWholeScene2DScaleHybridTarget2AlphaBlendAssist, true);
-    setChecked(ui->cbWholeScene2DScaleHybridNativeEffectGuard, false);
-    setChecked(ui->cbWholeScene2DScaleHybridForeground2DBase, true);
-    setChecked(ui->cbWholeScene2DScaleHybridCleanLegacyCandidate, true);
-}
-
 void VideoSettingsDialog::applyRecommendedDefaults()
 {
     const bool textureFiltering = ReadAnisotropyCombo(ui->cbx3DTextureAnisotropy) > 1;
     const bool textureScaling = ui->cb3DTextureScaling->isChecked();
     const bool wholeScene2DScaling = ui->cbWholeScene2DScale->isChecked();
-    const bool texture2DAtlasProtection = ui->cb3DTexture2DAtlasProtection->isChecked();
 
     auto& cfg = emuInstance->getGlobalConfig();
     const int renderer = cfg.GetInt("3D.Renderer");
@@ -920,9 +826,6 @@ void VideoSettingsDialog::applyRecommendedDefaults()
     cfg.SetBool("3D.GL.TextureFilterMipmapAlphaHandling", true);
     cfg.SetBool("3D.GL.TextureFilterMipmapPremultipliedAlphaHandling", false);
     cfg.SetBool("3D.GL.TextureFilterMipmapSubrectHandling", false);
-    cfg.SetBool("3D.GL.TextureFilterSmart2D", texture2DAtlasProtection);
-    cfg.SetBool("3D.GL.TextureFilterTranslucentGuard", texture2DAtlasProtection);
-    cfg.SetBool("3D.GL.TextureFilterSpriteUVInset", texture2DAtlasProtection);
     cfg.SetBool("3D.GL.TextureLosslessRGB6Repack", !textureScaling);
 
     cfg.SetBool("3D.GL.TextureScaling", textureScaling);
@@ -934,7 +837,6 @@ void VideoSettingsDialog::applyRecommendedDefaults()
     cfg.SetBool("3D.GL.TextureScalingDeferred", false);
     cfg.SetBool("3D.GL.TextureScalingNativeMipFloor", false);
     cfg.SetBool("3D.GL.TextureScalingSourceMips", false);
-    cfg.SetBool("3D.GL.TextureScalingEdgeExtendUnusedMargins", texture2DAtlasProtection);
 
     cfg.SetBool("3D.GL.WholeScene2DScale", wholeScene2DScaling);
     cfg.SetBool("3D.GL.WholeScene2DScaleSourceBoundaryGuard", false);
@@ -996,9 +898,6 @@ void VideoSettingsDialog::applyRecommendedDefaults()
     setChecked(ui->cb3DTextureFilterMipmapAlphaHandling, true);
     setChecked(ui->cb3DTextureFilterMipmapTopologyHandling, false);
     setChecked(ui->cb3DTextureFilterMipmapSubrectHandling, false);
-    setChecked(ui->cb3DTextureFilterSmart2D, texture2DAtlasProtection);
-    setChecked(ui->cb3DTextureFilterTranslucentGuard, texture2DAtlasProtection);
-    setChecked(ui->cb3DTextureFilterSpriteUVInset, texture2DAtlasProtection);
     setChecked(ui->cb3DTextureLosslessRGB6Repack, !textureScaling);
 
     setChecked(ui->cb3DTextureScaling, textureScaling);
@@ -1010,7 +909,6 @@ void VideoSettingsDialog::applyRecommendedDefaults()
     setChecked(ui->cb3DTextureScalingDeferred, false);
     setChecked(ui->cb3DTextureScalingNativeMipFloor, false);
     setChecked(ui->cb3DTextureScalingSourceMips, false);
-    setChecked(ui->cb3DTextureScalingEdgeExtendUnusedMargins, texture2DAtlasProtection);
 
     setChecked(ui->cbWholeScene2DScale, wholeScene2DScaling);
     setChecked(ui->cbWholeScene2DScaleSourceBoundaryGuard, false);
@@ -1241,6 +1139,14 @@ void VideoSettingsDialog::on_cb3DTextureScaling_stateChanged(int state)
     cfg.SetBool("3D.GL.TextureScaling", (state != 0));
     updateLosslessRGB6RepackForTextureScalingFilteringConflict();
     setEnabled();
+
+    emit updateVideoSettings(false);
+}
+
+void VideoSettingsDialog::on_cb3DHighPrecisionTextureCoordinates_stateChanged(int state)
+{
+    auto& cfg = emuInstance->getGlobalConfig();
+    cfg.SetBool("3D.GL.TextureScalingHighPrecisionCoordinates", (state != 0));
 
     emit updateVideoSettings(false);
 }
@@ -1542,9 +1448,6 @@ void VideoSettingsDialog::on_cbAdvancedVideoSettings_stateChanged(int state)
 {
     auto& cfg = emuInstance->getGlobalConfig();
     cfg.SetBool("3D.GL.AdvancedVideoSettings", state != 0);
-
-    if (state == 0)
-        applyRecommendedAdvancedSettings();
 
     setEnabled();
     emit updateVideoSettings(false);

@@ -614,6 +614,7 @@ bool ComputeRenderer3D::Init()
 
 ComputeRenderer3D::~ComputeRenderer3D()
 {
+    DeleteShaders();
     Texcache.Reset();
 
     glDeleteBuffers(1, &YSpanSetupMemory);
@@ -637,44 +638,49 @@ ComputeRenderer3D::~ComputeRenderer3D()
 
 void ComputeRenderer3D::DeleteShaders()
 {
-    std::initializer_list<GLuint> allPrograms =
+    std::initializer_list<GLuint*> allPrograms =
     {
-        ShaderInterpXSpans[0],
-        ShaderInterpXSpans[1],
-        ShaderBinCombined,
-        ShaderDepthBlend[0],
-        ShaderDepthBlend[1],
-        ShaderRasteriseNoTexture[0],
-        ShaderRasteriseNoTexture[1],
-        ShaderRasteriseNoTextureToon[0],
-        ShaderRasteriseNoTextureToon[1],
-        ShaderRasteriseNoTextureHighlight[0],
-        ShaderRasteriseNoTextureHighlight[1],
-        ShaderRasteriseUseTextureDecal[0],
-        ShaderRasteriseUseTextureDecal[1],
-        ShaderRasteriseUseTextureModulate[0],
-        ShaderRasteriseUseTextureModulate[1],
-        ShaderRasteriseUseTextureToon[0],
-        ShaderRasteriseUseTextureToon[1],
-        ShaderRasteriseUseTextureHighlight[0],
-        ShaderRasteriseUseTextureHighlight[1],
-        ShaderRasteriseShadowMask[0],
-        ShaderRasteriseShadowMask[1],
-        ShaderClearCoarseBinMask,
-        ShaderClearIndirectWorkCount,
-        ShaderCalculateWorkListOffset,
-        ShaderSortWork,
-        ShaderFinalPass[0],
-        ShaderFinalPass[1],
-        ShaderFinalPass[2],
-        ShaderFinalPass[3],
-        ShaderFinalPass[4],
-        ShaderFinalPass[5],
-        ShaderFinalPass[6],
-        ShaderFinalPass[7],
+        &ShaderInterpXSpans[0],
+        &ShaderInterpXSpans[1],
+        &ShaderBinCombined,
+        &ShaderDepthBlend[0],
+        &ShaderDepthBlend[1],
+        &ShaderRasteriseNoTexture[0],
+        &ShaderRasteriseNoTexture[1],
+        &ShaderRasteriseNoTextureToon[0],
+        &ShaderRasteriseNoTextureToon[1],
+        &ShaderRasteriseNoTextureHighlight[0],
+        &ShaderRasteriseNoTextureHighlight[1],
+        &ShaderRasteriseUseTextureDecal[0],
+        &ShaderRasteriseUseTextureDecal[1],
+        &ShaderRasteriseUseTextureModulate[0],
+        &ShaderRasteriseUseTextureModulate[1],
+        &ShaderRasteriseUseTextureToon[0],
+        &ShaderRasteriseUseTextureToon[1],
+        &ShaderRasteriseUseTextureHighlight[0],
+        &ShaderRasteriseUseTextureHighlight[1],
+        &ShaderRasteriseShadowMask[0],
+        &ShaderRasteriseShadowMask[1],
+        &ShaderClearCoarseBinMask,
+        &ShaderClearIndirectWorkCount,
+        &ShaderCalculateWorkListOffset,
+        &ShaderSortWork,
+        &ShaderFinalPass[0],
+        &ShaderFinalPass[1],
+        &ShaderFinalPass[2],
+        &ShaderFinalPass[3],
+        &ShaderFinalPass[4],
+        &ShaderFinalPass[5],
+        &ShaderFinalPass[6],
+        &ShaderFinalPass[7],
     };
-    for (GLuint program : allPrograms)
-        glDeleteProgram(program);
+    for (GLuint* program : allPrograms)
+    {
+        if (*program != 0)
+            glDeleteProgram(*program);
+        *program = 0;
+    }
+    ShaderStepIdx = 0;
 }
 
 void ComputeRenderer3D::Reset()
@@ -684,7 +690,8 @@ void ComputeRenderer3D::Reset()
     LastRenderFrameSkipped = false;
 }
 
-void ComputeRenderer3D::SetRenderSettings(int scale, bool highResolutionCoordinates, bool msaa,
+void ComputeRenderer3D::SetRenderSettings(int scale, bool highResolutionCoordinates,
+                                          bool highPrecisionTextureCoordinates, bool msaa,
                                           const RendererSettings::TextureFilterSettings& textureFilter,
                                           const RendererSettings::TextureScalingSettings& textureScaling)
 {
@@ -693,6 +700,7 @@ void ComputeRenderer3D::SetRenderSettings(int scale, bool highResolutionCoordina
     const bool anisotropyChanged = textureFilter.Anisotropy != TextureFilter.Anisotropy;
     const bool settingsChanged =
         highResolutionCoordinates != HiresCoordinates ||
+        highPrecisionTextureCoordinates != HighPrecisionTextureCoordinates ||
         msaa != MSAA ||
         textureFilter != TextureFilter ||
         textureScaling != TextureScaling;
@@ -719,6 +727,7 @@ void ComputeRenderer3D::SetRenderSettings(int scale, bool highResolutionCoordina
     const bool shadersChanged = rendererStorageChanged || anisotropyChanged;
 
     HiresCoordinates = highResolutionCoordinates;
+    HighPrecisionTextureCoordinates = highPrecisionTextureCoordinates;
     MSAA = msaa;
     TextureFilter = textureFilter;
     TextureScaling = textureScaling;
@@ -1019,6 +1028,7 @@ struct Variant
     GLuint Texture = 0, Sampler = 0;
     u16 Width = 0, Height = 0;
     u8 BlendMode = 0;
+    u32 TextureScaleFactor = 1;
     int CaptureYOffset = -1;
     bool BinaryAlphaTexture = false;
 
@@ -1026,7 +1036,8 @@ struct Variant
     {
         return Texture == other.Texture && Sampler == other.Sampler && BlendMode == other.BlendMode &&
                CaptureYOffset == other.CaptureYOffset && BinaryAlphaTexture == other.BinaryAlphaTexture &&
-               Width == other.Width && Height == other.Height;
+               Width == other.Width && Height == other.Height &&
+               TextureScaleFactor == other.TextureScaleFactor;
     }
 };
 
@@ -1212,6 +1223,7 @@ void ComputeRenderer3D::RenderFrame()
             variant.BinaryAlphaTexture = false;
             variant.Width = TextureWidth(polygon->TexParam);
             variant.Height = TextureHeight(polygon->TexParam);
+            variant.TextureScaleFactor = 1;
             u32* textureLastVariant = nullptr;
             // we always need to look up the texture to get the layer of the array texture
             u32 textype = polygonTextype;
@@ -1261,7 +1273,8 @@ void ComputeRenderer3D::RenderFrame()
                 else
                 {
                     Texcache.GetTexture(polygon->TexParam, polygon->TexPalette, variant.Texture, prevTexLayer, textureLastVariant,
-                                        &variant.BinaryAlphaTexture, samplingBounds.Valid ? &samplingBounds : nullptr);
+                                        &variant.BinaryAlphaTexture, samplingBounds.Valid ? &samplingBounds : nullptr,
+                                        nullptr, &variant.TextureScaleFactor);
                     variant.CaptureYOffset = -1;
                     if (TextureBoundsRemapCoordinates(samplingBounds))
                     {
@@ -1311,6 +1324,12 @@ void ComputeRenderer3D::RenderFrame()
             }
         }
         RenderPolygons[i].Variant = prevVariant;
+        // High-resolution raster samples benefit from the additional UV
+        // interpolation precision whether or not the cached texture itself
+        // was scaled. Keep native-resolution rendering on the DS-oriented
+        // interpolation path for exact 1x behavior.
+        RenderPolygons[i].HighPrecisionTexcoords =
+            HighPrecisionTextureCoordinates && ScaleFactor > 1 ? 1u : 0u;
         RenderPolygons[i].TextureLayer = (float)prevTexLayer;
         RenderPolygons[i].TextureInsetU0 = 0.0f;
         RenderPolygons[i].TextureInsetV0 = 0.0f;

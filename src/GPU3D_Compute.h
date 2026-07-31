@@ -48,7 +48,8 @@ public:
     bool Init() override;
     void Reset() override;
 
-    void SetRenderSettings(int scale, bool highResolutionCoordinates, bool msaa,
+    void SetRenderSettings(int scale, bool highResolutionCoordinates,
+                           bool highPrecisionTextureCoordinates, bool msaa,
                            const RendererSettings::TextureFilterSettings& textureFilter,
                            const RendererSettings::TextureScalingSettings& textureScaling);
 
@@ -70,22 +71,22 @@ private:
     GLRenderer& Parent;
     bool LastRenderFrameSkipped = false;
 
-    GLuint ShaderInterpXSpans[2];
-    GLuint ShaderBinCombined;
-    GLuint ShaderDepthBlend[2];
-    GLuint ShaderRasteriseNoTexture[2];
-    GLuint ShaderRasteriseNoTextureToon[2];
-    GLuint ShaderRasteriseNoTextureHighlight[2];
-    GLuint ShaderRasteriseUseTextureDecal[2];
-    GLuint ShaderRasteriseUseTextureModulate[2];
-    GLuint ShaderRasteriseUseTextureToon[2];
-    GLuint ShaderRasteriseUseTextureHighlight[2];
-    GLuint ShaderRasteriseShadowMask[2];
-    GLuint ShaderClearCoarseBinMask;
-    GLuint ShaderClearIndirectWorkCount;
-    GLuint ShaderCalculateWorkListOffset;
-    GLuint ShaderSortWork;
-    GLuint ShaderFinalPass[8];
+    GLuint ShaderInterpXSpans[2] {};
+    GLuint ShaderBinCombined {};
+    GLuint ShaderDepthBlend[2] {};
+    GLuint ShaderRasteriseNoTexture[2] {};
+    GLuint ShaderRasteriseNoTextureToon[2] {};
+    GLuint ShaderRasteriseNoTextureHighlight[2] {};
+    GLuint ShaderRasteriseUseTextureDecal[2] {};
+    GLuint ShaderRasteriseUseTextureModulate[2] {};
+    GLuint ShaderRasteriseUseTextureToon[2] {};
+    GLuint ShaderRasteriseUseTextureHighlight[2] {};
+    GLuint ShaderRasteriseShadowMask[2] {};
+    GLuint ShaderClearCoarseBinMask {};
+    GLuint ShaderClearIndirectWorkCount {};
+    GLuint ShaderCalculateWorkListOffset {};
+    GLuint ShaderSortWork {};
+    GLuint ShaderFinalPass[8] {};
 
     GLuint YSpanIndicesTextureMemory;
     GLuint YSpanIndicesTexture;
@@ -163,6 +164,7 @@ private:
 
         u32 Variant;
         u32 Attr;
+        u32 HighPrecisionTexcoords;
 
         float TextureLayer;
         float TextureInsetU0;
@@ -238,6 +240,7 @@ private:
     int ScaleFactor = -1;
     int MaxWorkTiles;
     bool HiresCoordinates;
+    bool HighPrecisionTextureCoordinates = true;
     bool MSAA = false;
     RendererSettings::TextureFilterSettings TextureFilter {};
     RendererSettings::TextureScalingSettings TextureScaling {};

@@ -1,5 +1,5 @@
 /*
-    Copyright 2016-2026 melonDS team
+    Copyright 2026 ZironZ
 
     This file is part of melonDS.
 
@@ -206,7 +206,33 @@ struct SourceACaptureResolutionInputs
     bool CanUseCurrentOverlay = false;
     bool HasFullProduct = false;
     bool PreferExactFullProduct = false;
+    bool PreferExactRouteProduct = false;
     bool AllowCurrentOverlay = true;
+};
+
+struct SourceAExactRouteProductPreferenceInputs
+{
+    bool DirectFinalBottomConsumer = false;
+    bool SubEngineCaptureBackedBGOnly = false;
+    bool HasRouteProduct = false;
+    WholeSceneCaptureProductKind RouteProductKind = WholeSceneCaptureProductKind::None;
+    WholeSceneCaptureProofKind RouteProductProof = WholeSceneCaptureProofKind::None;
+    u64 RouteProductEventSerial = 0;
+    u32 RouteProductCaptureBank = 0xFFFFFFFFu;
+    u32 RouteProductCapturePresentationHash = 0;
+    u64 RouteProductSource3DSerial = 0;
+    u32 RouteProductSource3DSceneHash = 0;
+    bool HasFullProduct = false;
+    bool FullProductEventValid = false;
+    u64 FullProductEventSerial = 0;
+    u32 FullProductCaptureBank = 0xFFFFFFFFu;
+    u32 FullProductCapturePresentationHash = 0;
+    u64 FullProductSource3DSerial = 0;
+    u32 FullProductSource3DSceneHash = 0;
+    bool FullProductEventFullEquivalent = false;
+    bool FullProductEventCleanEngineA2DOutput = false;
+    bool FullProductEventAccepted = false;
+    bool FullProductEventSourceOBJVisible = false;
 };
 
 struct SourceAExactFullProductPreferenceInputs
@@ -239,6 +265,33 @@ struct SourceACurrentOverlayEligibilityInputs
     bool RendererCanCompositeCurrentOverlay = false;
     bool SubEngineDirectFinalTopConsumer = false;
 };
+
+struct CaptureEpochOverlayCurrentInputs
+{
+    u64 CurrentSource3DSerial = 0;
+    u32 CurrentSource3DSceneHash = 0;
+    u32 CurrentPresentationHash = 0;
+    u32 EpochCaptureBank = 0xFFFFFFFFu;
+    u64 EpochSource3DSerial = 0;
+    u32 EpochSource3DSceneHash = 0;
+    bool CaptureRequestConsumesCurrentComposite = false;
+    u32 CaptureRequestBank = 0xFFFFFFFFu;
+};
+
+struct CaptureEpochOverlayCurrentPlan
+{
+    SourceABackgroundSource BackgroundSource =
+        SourceABackgroundSource::ParentOutputTex3D;
+    u64 BackgroundEpochSerial = 0;
+    u64 Source3DSerial = 0;
+    u32 Source3DSceneHash = 0;
+    u32 PresentationHash = 0;
+    bool CanPublishRouteProduct = false;
+    u32 CaptureBank = 0xFFFFFFFFu;
+};
+
+CaptureEpochOverlayCurrentPlan MakeCaptureEpochOverlayCurrentPlan(
+    const CaptureEpochOverlayCurrentInputs& inputs);
 
 struct WholeSceneCaptureProductUseInputs
 {
@@ -273,6 +326,15 @@ bool IsMasterBrightnessEffectActive(u16 masterBrightness);
 // consuming engine's compositor, which is the stage that natively applies
 // this effect, so the blit must reproduce it.
 u16 ConsumerFullScreenBrightnessColorEffect(u16 blendCnt, u8 evy);
+
+// Main-VRAM display bypasses the 2D compositor's BLDCNT brightness effect.
+// Either full-screen endpoint may reject a one-frame-late high-resolution
+// substitute, but this predicate never authorizes changing the native VRAM
+// display's physical color.
+bool IsGuaranteedFullScreenBrightnessEndpoint(
+    u16 blendCnt,
+    u8 evy,
+    bool windowingActive);
 
 struct MainVRAMDisplayCaptureScaleInputs
 {
@@ -572,6 +634,9 @@ WholeSceneCaptureProofKind CaptureProofKindForBackgroundSource(
 
 SourceACaptureResolutionKind ChooseSourceACaptureResolutionKind(
     const SourceACaptureResolutionInputs& inputs);
+
+bool ShouldPreferSourceAExactRouteProductForDirectBottom(
+    const SourceAExactRouteProductPreferenceInputs& inputs);
 
 bool ShouldPreferSourceAExactFullProductForDirectBottom(
     const SourceAExactFullProductPreferenceInputs& inputs);

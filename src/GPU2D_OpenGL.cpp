@@ -987,7 +987,6 @@ bool GLRenderer2D::InitShaders()
     OverlayCompositeScaleULoc = glGetUniformLocation(OverlayCompositeShader, "uScaleFactor");
     OverlayCompositeDebugTintULoc = glGetUniformLocation(OverlayCompositeShader, "uDebugTintBySource");
     OverlayCompositeLegacyUnderlayULoc = glGetUniformLocation(OverlayCompositeShader, "uLegacyUnderlayEndpoint");
-    OverlayCompositeCoverageAwareULoc = glGetUniformLocation(OverlayCompositeShader, "uCoverageAwareUnderlay");
     OverlayCompositeDirect3DPresentationSpaceULoc = glGetUniformLocation(OverlayCompositeShader, "uDirect3DPresentationSpace");
 
     glUseProgram(OverlayHybridCompositeShader);
@@ -1021,7 +1020,6 @@ bool GLRenderer2D::InitShaders()
     OverlayHybridCompositeScaleULoc = glGetUniformLocation(OverlayHybridCompositeShader, "uScaleFactor");
     OverlayHybridCompositeDebugTintULoc = glGetUniformLocation(OverlayHybridCompositeShader, "uDebugTintBySource");
     OverlayHybridCompositeLegacyUnderlayULoc = glGetUniformLocation(OverlayHybridCompositeShader, "uLegacyUnderlayEndpoint");
-    OverlayHybridCompositeCoverageAwareULoc = glGetUniformLocation(OverlayHybridCompositeShader, "uCoverageAwareUnderlay");
     OverlayHybridCompositeDirect3DPresentationSpaceULoc = glGetUniformLocation(OverlayHybridCompositeShader, "uDirect3DPresentationSpace");
     OverlayHybridCompositeConservativeHybridULoc = glGetUniformLocation(OverlayHybridCompositeShader, "uConservativeHybrid");
     OverlayHybridCompositeWindowEdgeAssistULoc = glGetUniformLocation(OverlayHybridCompositeShader, "uHybridWindowEdgeAssist");
@@ -1048,7 +1046,6 @@ bool GLRenderer2D::InitShaders()
 
     OverlayDebugModeULoc = glGetUniformLocation(OverlayDebugShader, "uDebugMode");
     OverlayDebugLegacyUnderlayULoc = glGetUniformLocation(OverlayDebugShader, "uLegacyUnderlayEndpoint");
-    OverlayDebugCoverageAwareULoc = glGetUniformLocation(OverlayDebugShader, "uCoverageAwareUnderlay");
 
     glUseProgram(MasterBrightnessShader);
     uniloc = glGetUniformLocation(MasterBrightnessShader, "SourceTex");
@@ -1172,12 +1169,10 @@ bool GLRenderer2D::InitShaders(GLRenderer2D& other)
     OverlayCompositeScaleULoc = other.OverlayCompositeScaleULoc;
     OverlayCompositeDebugTintULoc = other.OverlayCompositeDebugTintULoc;
     OverlayCompositeLegacyUnderlayULoc = other.OverlayCompositeLegacyUnderlayULoc;
-    OverlayCompositeCoverageAwareULoc = other.OverlayCompositeCoverageAwareULoc;
     OverlayCompositeDirect3DPresentationSpaceULoc = other.OverlayCompositeDirect3DPresentationSpaceULoc;
     OverlayHybridCompositeScaleULoc = other.OverlayHybridCompositeScaleULoc;
     OverlayHybridCompositeDebugTintULoc = other.OverlayHybridCompositeDebugTintULoc;
     OverlayHybridCompositeLegacyUnderlayULoc = other.OverlayHybridCompositeLegacyUnderlayULoc;
-    OverlayHybridCompositeCoverageAwareULoc = other.OverlayHybridCompositeCoverageAwareULoc;
     OverlayHybridCompositeDirect3DPresentationSpaceULoc = other.OverlayHybridCompositeDirect3DPresentationSpaceULoc;
     OverlayHybridCompositeConservativeHybridULoc = other.OverlayHybridCompositeConservativeHybridULoc;
     OverlayHybridCompositeWindowEdgeAssistULoc = other.OverlayHybridCompositeWindowEdgeAssistULoc;
@@ -1189,7 +1184,6 @@ bool GLRenderer2D::InitShaders(GLRenderer2D& other)
     OverlayHybridCompositeDebugModeULoc = other.OverlayHybridCompositeDebugModeULoc;
     OverlayDebugModeULoc = other.OverlayDebugModeULoc;
     OverlayDebugLegacyUnderlayULoc = other.OverlayDebugLegacyUnderlayULoc;
-    OverlayDebugCoverageAwareULoc = other.OverlayDebugCoverageAwareULoc;
     MasterBrightnessModeULoc = other.MasterBrightnessModeULoc;
     MasterBrightnessFactorULoc = other.MasterBrightnessFactorULoc;
 
@@ -3355,6 +3349,7 @@ void GLRenderer2D::AppendWholeSceneTimingCSVHeader(std::string& header, const ch
     add("source_a_chosen_product_kind");
     add("source_a_chosen_product_render_action");
     add("source_a_chosen_product_class");
+    add("source_a_prefer_exact_route_product");
     add("source_a_full_product_candidate_presentation_match");
     add("source_a_full_product_candidate_capture_bank");
     add("source_a_full_product_candidate_tex");
@@ -3738,6 +3733,7 @@ void GLRenderer2D::AppendWholeSceneTimingCSVRow(std::string& row) const
     addInt(WholeSceneTrace.SourceAChosenProductKind);
     addInt(WholeSceneTrace.SourceAChosenProductRenderAction);
     addInt(WholeSceneTrace.SourceAChosenProductPresentationClass);
+    addInt(WholeSceneTrace.SourceAPreferExactRouteProduct);
     addInt(WholeSceneTrace.SourceAFullProductKeyMatch);
     addInt(WholeSceneTrace.SourceAFullProductCaptureBank);
     addInt(WholeSceneTrace.SourceAFullProductTex);
@@ -4087,31 +4083,18 @@ bool GLRenderer2D::ShouldUseWholeSceneHybridOverlayForSuppressedDirect3DAlphaBle
     const u32 direct3DMask = 1u << 0;
     const u32 bg2DLayerMask = (1u << 1) | (1u << 2) | (1u << 3);
     const u32 objMask = 1u << 4;
-    const u32 backdropMask = 1u << 5;
-
     if (!(DispCnt & (1 << 3)) || !(LayerEnable & direct3DMask))
         return false;
 
-    const u32 blendEffect = (BlendCnt >> 6) & 0x3u;
-    if (blendEffect != 1 || EVA != 0)
-        return false;
-
-    const u32 blendTarget1 = BlendCnt & 0x3Fu;
-    const u32 blendTarget2 = (BlendCnt >> 8) & 0x3Fu;
     u32 visibleNativeLayers = LayerEnable & bg2DLayerMask;
     if ((LayerEnable & objMask) && OBJEnable && NumSprites > 0)
         visibleNativeLayers |= objMask;
 
-    const bool direct3DTarget1 = (blendTarget1 & direct3DMask) != 0;
-    const bool visibleNativeTarget1 = (blendTarget1 & visibleNativeLayers) != 0;
-    if (!direct3DTarget1 || visibleNativeTarget1 || (blendTarget2 & direct3DMask))
-        return false;
-
-    u32 visibleNativeTarget2 = visibleNativeLayers;
-    if (blendTarget2 & backdropMask)
-        visibleNativeTarget2 |= backdropMask;
-
-    return (blendTarget2 & visibleNativeTarget2) != 0;
+    return ShouldUseSuppressedDirect3DPresentationOverlay(
+        BlendCnt,
+        EVA,
+        EVB,
+        visibleNativeLayers);
 }
 
 bool GLRenderer2D::IsWholeSceneCaptureBackedHandoffGuardActive() const
@@ -5106,6 +5089,55 @@ void GLRenderer2D::SyncPendingDisplayCapturesForFlatVRAMBGs()
 
     if (syncedLayerMask)
         WholeSceneCurrentUpdateDebugTrace.FlatVRAMCaptureSyncLayerMask |= syncedLayerMask;
+}
+
+bool GLRenderer2D::FlatVRAMLayerHasFullWholeSceneCaptureProvenance(int layer) const
+{
+    // The recorded Infinite Space case is specifically Engine B BG2 using an
+    // ordinary direct-color bitmap after bank C's capture has been flattened.
+    // Do not infer provenance for unrelated flat-VRAM layer shapes.
+    if (GPU2D.Num == 0 || layer != 2)
+        return false;
+
+    const auto& cfg = LayerConfig.uBGConfig[layer];
+    if (cfg.Type != 5)
+        return false;
+
+    // A completed capture may have been synchronized into flat VRAM before
+    // this bitmap rebuild, so capture flags are no longer sufficient. Retain
+    // the event only when BG2's current VRAM mapping still reads its bank.
+    const auto* mainRenderer =
+        dynamic_cast<const GLRenderer2D*>(Parent.Rend2D_A.get());
+    const auto& lastEvent = Parent.LastHighResDisplayCaptureEvent;
+    if (!mainRenderer ||
+        !mainRenderer->WholeSceneScaleRequested ||
+        !lastEvent.Valid ||
+        lastEvent.DstBlock >= 4 ||
+        lastEvent.DstOffset != 0 ||
+        lastEvent.YStart != 0 ||
+        lastEvent.YEnd != 192 ||
+        lastEvent.SrcA != 0 ||
+        lastEvent.RejectReason != GLRenderer::HighResCaptureRejectReason::None ||
+        !(lastEvent.ProductMask & GLRenderer::HighResCaptureProductFullEquivalent) ||
+        !lastEvent.SourceRenderedFullWholeScene)
+        return false;
+
+    const u32* rangeinfo = BGVRAMRange[layer];
+    for (int r = 0; r < 4; r += 2)
+    {
+        if (rangeinfo[r] == 0xFFFFFFFF)
+            continue;
+
+        const u32 start = rangeinfo[r] >> 14;
+        const u32 end = (rangeinfo[r] + rangeinfo[r + 1] + 0x3FFF) >> 14;
+        for (u32 block = start; block < end; block++)
+        {
+            if (GPU.VRAMMap_BBG[block & 0x7] & (1u << lastEvent.DstBlock))
+                return true;
+        }
+    }
+
+    return false;
 }
 
 void GLRenderer2D::RecordWholeSceneVisibleBitmapDirtyRows(int layer, int line, int firstRow, int lastRow)
@@ -7832,92 +7864,36 @@ bool GLRenderer2D::CanUsePhysicalFinalPostprocessNativeInputPath() const
 
 bool GLRenderer2D::CanUseWholeSceneHybridCleanLegacyCandidatePath() const
 {
-    if (!CanUseWholeSceneScalePath() ||
-        WholeSceneScaleMode != RendererSettings::WholeScene2DScaleMode::ConservativeHybridUpscale ||
-        !WholeSceneScaleHybridCleanLegacyCandidate)
-        return false;
-
-    if (GPU2D.Num != 0)
-        return false;
-
-    const u32 dispmode = (DispCnt >> 16) & 0x3u;
-    if (dispmode != 1)
-        return false;
-
-    const bool visibleDirect3DLayer = (DispCnt & (1 << 3)) && (LayerEnable & (1 << 0));
-    if (!visibleDirect3DLayer || GPU.GPU3D.RenderNumPolygons == 0)
-        return false;
-
-    if (WholeSceneScaleFinalUpscaleRender3DNative)
-        return false;
-
-    // Normal WIN0/WIN1 state should not disqualify the whole frame: the hybrid
-    // selector already has per-cell window metadata and can avoid candidate use
-    // in excluded regions. OBJ window is less predictable, so keep blocking it.
-    if (GPU.CaptureEnable || (DispCnt & (1 << 15)))
-        return false;
-
-    // Brightness effects are allowed because the native-stack path already handles
-    // them as a native compositor transform before resolving high-res 3D.
-    // Simple BG0/Direct3D-as-target1 alpha blends are also allowed here: the
-    // native-stack candidate has already resolved the native blend coherently, which
-    // avoids high-resolution target1 reconstruction artifacts.
-    const u32 blendEffect = (BlendCnt >> 6) & 0x3u;
-    if (blendEffect == 1)
-    {
-        const u32 direct3DMask = 1u << 0;
-        const u32 twoDLayerMask = (1u << 1) | (1u << 2) | (1u << 3) | (1u << 4);
-        const u32 backdropMask = 1u << 5;
-        const u32 target1AllowedMask = direct3DMask | twoDLayerMask;
-        const u32 target2AllowedMask = direct3DMask | twoDLayerMask | backdropMask;
-        const u32 blendTarget1 = BlendCnt & 0x3Fu;
-        const u32 blendTarget2 = (BlendCnt >> 8) & 0x3Fu;
-        const bool alphaBlendHasNoTarget1 = blendTarget1 == 0;
-        const bool direct3DTarget1With2DTarget2 =
-            (blendTarget1 & direct3DMask) != 0 &&
-            (blendTarget1 & ~target1AllowedMask) == 0 &&
-            (blendTarget2 & target2AllowedMask) != 0 &&
-            (blendTarget2 & ~target2AllowedMask) == 0;
-        const bool direct3DTarget1Zeroed =
-            direct3DTarget1With2DTarget2 &&
-            EVA == 0 &&
-            EVB == 16;
-        const bool direct3DTarget1Contributing =
-            direct3DTarget1With2DTarget2 &&
-            EVA > 0 &&
-            EVB > 0;
-        const bool direct3DTarget1ZeroCoefficient =
-            direct3DTarget1With2DTarget2 &&
-            EVA == 0 &&
-            EVB == 0;
-        const bool direct3DTarget2Contributing =
-            (blendTarget1 & direct3DMask) == 0 &&
-            (blendTarget1 & twoDLayerMask) != 0 &&
-            (blendTarget2 & direct3DMask) != 0 &&
-            EVA > 0 &&
-            EVB > 0;
-
-        if (!alphaBlendHasNoTarget1 &&
-            !direct3DTarget1Zeroed &&
-            !direct3DTarget1Contributing &&
-            !direct3DTarget1ZeroCoefficient &&
-            !direct3DTarget2Contributing)
-            return false;
-    }
+    // Decision logic lives in ChooseHybridCleanLegacyBlockReason
+    // (WholeSceneScalePolicy.cpp); this wrapper only gathers frame facts.
+    HybridCleanLegacyEligibilityInputs inputs = {};
+    inputs.ScalePathAvailable = CanUseWholeSceneScalePath();
+    inputs.ConservativeHybridMode =
+        WholeSceneScaleMode == RendererSettings::WholeScene2DScaleMode::ConservativeHybridUpscale;
+    inputs.CandidateEnabled = WholeSceneScaleHybridCleanLegacyCandidate;
+    inputs.MainEngine = GPU2D.Num == 0;
+    inputs.DispCnt = DispCnt;
+    inputs.LayerEnable = LayerEnable;
+    inputs.HasRenderedPolygons = GPU.GPU3D.RenderNumPolygons != 0;
+    inputs.FinalUpscaleRender3DNative = WholeSceneScaleFinalUpscaleRender3DNative;
+    inputs.CaptureTransportActive = GPU.CaptureEnable;
+    inputs.BlendCnt = BlendCnt;
+    inputs.EVA = EVA;
+    inputs.EVB = EVB;
 
     for (int layer = 0; layer < 4; layer++)
     {
         if ((LayerEnable & (1 << layer)) && LayerConfig.uBGConfig[layer].Type >= 7)
-            return false;
+            inputs.AnyEnabledCaptureBackedBGLayer = true;
     }
 
     for (int i = 0; i < NumSprites; i++)
     {
         if (SpriteConfig.uOAM[i].Type >= 3)
-            return false;
+            inputs.AnyCaptureBackedSprite = true;
     }
 
-    return true;
+    return CanUseHybridCleanLegacyCandidate(inputs);
 }
 
 bool GLRenderer2D::CanUseWholeSceneFullFrameFinalizerPath() const
@@ -8320,6 +8296,7 @@ void GLRenderer2D::UpdateAndRender(int line)
     const u8 non_vram_layer_pre_dirty =
         register_layer_pre_dirty | palette_layer_pre_dirty | deferred_layer_pre_dirty;
     u8 row_limited_bitmap_prerender = 0;
+    u8 crossing_full_whole_scene_capture = 0;
     int row_limited_bitmap_first[4] = {-1, -1, -1, -1};
     int row_limited_bitmap_last[4] = {-1, -1, -1, -1};
     for (int layer = 0; layer < 4; layer++)
@@ -8333,6 +8310,10 @@ void GLRenderer2D::UpdateAndRender(int line)
         if (DirtyBitmapSourceRowsForLayer(layer, bgDirty, firstRow, lastRow))
         {
             RecordWholeSceneVisibleBitmapDirtyRows(layer, line, firstRow, lastRow);
+            if (firstRow < line &&
+                lastRow > line &&
+                FlatVRAMLayerHasFullWholeSceneCaptureProvenance(layer))
+                crossing_full_whole_scene_capture |= layer_mask;
 
             if ((non_vram_layer_pre_dirty & layer_mask) == 0 &&
                 VisibleBitmapDirtyRowsCoveredByOpaqueUpperLayer(layer, firstRow, lastRow, bgvram, bgvrammask))
@@ -8385,6 +8366,27 @@ void GLRenderer2D::UpdateAndRender(int line)
     WholeSceneScaleState = ClassifyWholeSceneScalePath();
     RecordWholeSceneNativeProductEligibility(WholeSceneScaleState);
     UpdateWholeSceneCaptureBackedHandoffGuard();
+    const u16 previousMasterBrightness =
+        GPU2D.Num ? Parent.FrameStartMasterBrightnessB
+                  : Parent.FrameStartMasterBrightnessA;
+    const u16 currentMasterBrightness =
+        GPU2D.Num ? Parent.GPU.MasterBrightnessB : Parent.GPU.MasterBrightnessA;
+    // A full-whole-scene capture can expose an intermediate bitmap generation
+    // that the ordinary capture source does not. If that generation becomes
+    // visible exactly as the game releases a full-white mask, retain the mask
+    // for this physical frame. Capture data and product provenance stay raw.
+    if (ShouldHoldFullWhiteForCaptureBackedBrightnessRelease({
+            WholeSceneScaleRequested,
+            line,
+            previousMasterBrightness,
+            currentMasterBrightness,
+            crossing_full_whole_scene_capture,
+        }))
+    {
+        const u32 engineMask = 1u << GPU2D.Num;
+        Parent.MasterBrightnessHoldEngineMask |= engineMask;
+        Parent.MasterBrightnessHoldNextEngineMask |= engineMask;
+    }
     if (line > 0 && register_layer_pre_dirty && CanUseWholeSceneFullFrameFinalizerPath())
     {
         WholeSceneFullFrameFinalizerUnsafeFrame = true;
@@ -11735,14 +11737,12 @@ void GLRenderer2D::RenderOverlayComposite(GLuint overlayBlackTex,
     const GLint scaleULoc = conservativeHybrid ? OverlayHybridCompositeScaleULoc : OverlayCompositeScaleULoc;
     const GLint debugTintULoc = conservativeHybrid ? OverlayHybridCompositeDebugTintULoc : OverlayCompositeDebugTintULoc;
     const GLint legacyUnderlayULoc = conservativeHybrid ? OverlayHybridCompositeLegacyUnderlayULoc : OverlayCompositeLegacyUnderlayULoc;
-    const GLint coverageAwareULoc = conservativeHybrid ? OverlayHybridCompositeCoverageAwareULoc : OverlayCompositeCoverageAwareULoc;
     const GLint direct3DPresentationSpaceULoc = conservativeHybrid ? OverlayHybridCompositeDirect3DPresentationSpaceULoc : OverlayCompositeDirect3DPresentationSpaceULoc;
 
     glUseProgram(shader);
     glUniform1i(scaleULoc, ScaleFactor);
     glUniform1i(debugTintULoc, forceDebugTint || WholeSceneScaleDebugTint);
     glUniform1i(legacyUnderlayULoc, WholeSceneScaleOverlayLegacyUnderlay);
-    glUniform1i(coverageAwareULoc, WholeSceneScaleFinalUpscale3DCoverageAware);
     glUniform1i(direct3DPresentationSpaceULoc, direct3DPresentationSpace);
     if (conservativeHybrid)
     {
@@ -11830,7 +11830,6 @@ void GLRenderer2D::RenderOverlayDebugTexture(GLuint targetTex,
     glUseProgram(OverlayDebugShader);
     glUniform1i(OverlayDebugModeULoc, debugMode);
     glUniform1i(OverlayDebugLegacyUnderlayULoc, WholeSceneScaleOverlayLegacyUnderlay);
-    glUniform1i(OverlayDebugCoverageAwareULoc, WholeSceneScaleFinalUpscale3DCoverageAware);
     glBindBufferBase(GL_UNIFORM_BUFFER, 22, ScanlineConfigUBO);
 
     glActiveTexture(GL_TEXTURE0);
@@ -11905,6 +11904,7 @@ void GLRenderer2D::ApplyRouteProductLookupToSourceAChoice(SourceACaptureReplacem
     choice.RouteProductSource3DSerial = lookup.Identity.Source3DSerial;
     choice.RouteProductSource3DSceneHash = lookup.Identity.Source3DSceneHash;
     choice.RouteProductCapturedEventSerial = lookup.CapturedEventSerial;
+    choice.RouteProductCaptureBank = lookup.Identity.CaptureBank;
     choice.RouteProductCapturePresentationHash = lookup.Identity.CapturePresentationHash;
     choice.RouteProductCurrentPresentationHash = lookup.Identity.CurrentOverlayPresentationHash;
     choice.RouteProductStableFrames = lookup.StableFrames;
@@ -11982,6 +11982,7 @@ GLRenderer2D::SourceACaptureReplacementChoice GLRenderer2D::ChooseSourceACapture
     const bool subEngineCapturedBGOnly =
         subEngineFullFrameCaptureConsumer &&
         (LayerEnable & (1 << 4)) == 0;
+    choice.SubEngineCaptureBackedBGOnly = subEngineCapturedBGOnly;
     const VisibleOBJCaptureDebug objCaptureDebug = BuildVisibleOBJCaptureDebug();
     const bool fullFrameRange = ystart == 0 && yend == 192;
     const bool trackedVRAMDisplayRoute =
@@ -12048,6 +12049,52 @@ GLRenderer2D::SourceACaptureReplacementChoice GLRenderer2D::ChooseSourceACapture
                                      event.Source3DSceneHash,
                                      ystart,
                                      yend);
+
+    SourceAExactRouteProductPreferenceInputs routePreferenceInputs = {};
+    routePreferenceInputs.DirectFinalBottomConsumer =
+        choice.DirectFinalBottomConsumer;
+    routePreferenceInputs.SubEngineCaptureBackedBGOnly =
+        choice.SubEngineCaptureBackedBGOnly;
+    routePreferenceInputs.HasRouteProduct = choice.RouteProductTex != 0;
+    routePreferenceInputs.RouteProductKind = choice.RouteProductKind;
+    routePreferenceInputs.RouteProductProof = choice.RouteProductProof;
+    routePreferenceInputs.RouteProductEventSerial =
+        choice.RouteProductCapturedEventSerial;
+    routePreferenceInputs.RouteProductCaptureBank =
+        choice.RouteProductCaptureBank;
+    routePreferenceInputs.RouteProductCapturePresentationHash =
+        choice.RouteProductCapturePresentationHash;
+    routePreferenceInputs.RouteProductSource3DSerial =
+        choice.RouteProductSource3DSerial;
+    routePreferenceInputs.RouteProductSource3DSceneHash =
+        choice.RouteProductSource3DSceneHash;
+    routePreferenceInputs.HasFullProduct = choice.FullProductTex != 0;
+    routePreferenceInputs.FullProductEventValid =
+        choice.FullProductEventValid;
+    routePreferenceInputs.FullProductEventSerial =
+        choice.FullProductEventSerial;
+    routePreferenceInputs.FullProductCaptureBank =
+        static_cast<u32>(choice.FullProductCaptureBank);
+    routePreferenceInputs.FullProductCapturePresentationHash =
+        choice.FullProductEventSourcePresentationHash;
+    routePreferenceInputs.FullProductSource3DSerial =
+        choice.FullProductEventSource3DSerial;
+    routePreferenceInputs.FullProductSource3DSceneHash =
+        choice.FullProductEventSource3DSceneHash;
+    routePreferenceInputs.FullProductEventFullEquivalent =
+        (choice.FullProductEventProductMask &
+         GLRenderer::HighResCaptureProductFullEquivalent) != 0;
+    routePreferenceInputs.FullProductEventCleanEngineA2DOutput =
+        choice.FullProductEventSourceKind ==
+            static_cast<u32>(GLRenderer::HighResCaptureSourceKind::CleanEngineA2DOutput);
+    routePreferenceInputs.FullProductEventAccepted =
+        choice.FullProductEventRejectReason ==
+            static_cast<u32>(GLRenderer::HighResCaptureRejectReason::None);
+    routePreferenceInputs.FullProductEventSourceOBJVisible =
+        choice.FullProductEventSourceOBJ;
+    choice.PreferExactRouteProduct =
+        ShouldPreferSourceAExactRouteProductForDirectBottom(
+            routePreferenceInputs);
 
     SourceAExactFullProductPreferenceInputs preferenceInputs = {};
     bool currentScreenSwap = GPU.ScreenSwap;
@@ -12273,6 +12320,7 @@ void GLRenderer2D::RenderScreenWholeSceneSourceACaptureReplacement(int ystart, i
         inputs.CanUseCurrentOverlay = choice.CanUseCurrentOverlay;
         inputs.HasFullProduct = choice.FullProductTex != 0;
         inputs.PreferExactFullProduct = choice.PreferExactFullProduct;
+        inputs.PreferExactRouteProduct = choice.PreferExactRouteProduct;
         inputs.AllowCurrentOverlay = allowCurrentOverlay;
         return inputs;
     };
@@ -12366,46 +12414,55 @@ void GLRenderer2D::RenderScreenWholeSceneCaptureEpochOverlay(int ystart, int yen
 
     const auto& epoch = Parent.ActiveCaptureBackgroundEpoch[routeSlot];
     const u32 currentPresentationHash = CapturePresentationHash();
-    const bool useCurrentDirect3DBackground =
-        currentPresentationHash != epoch.SourcePresentationHash;
-    const SourceABackgroundSource backgroundSource =
-        useCurrentDirect3DBackground
-            ? SourceABackgroundSource::ParentOutputTex3D
-            : SourceABackgroundSource::ActiveCaptureEpochTex;
-    const GLuint backgroundTex =
-        useCurrentDirect3DBackground ? Parent.OutputTex3D : Parent.ActiveCaptureBackgroundEpochTex[routeSlot];
-    const u64 routeProductBackgroundSerial =
-        useCurrentDirect3DBackground ? 0 : epoch.Serial;
-    const u64 routeProductSource3DSerial =
-        useCurrentDirect3DBackground ? Parent.Output3DSerial : epoch.Source3DSerial;
-    const u32 routeProductSource3DSceneHash =
-        useCurrentDirect3DBackground ? Parent.Output3DSceneHash : epoch.Source3DSceneHash;
-    const u32 routeProductPresentationHash =
-        useCurrentDirect3DBackground ? currentPresentationHash : epoch.SourcePresentationHash;
-    const u16 backgroundStoredMasterBrightness =
-        useCurrentDirect3DBackground ? 0 : epoch.StoredMasterBrightness;
-    const bool backgroundHasStoredEffectState =
-        !useCurrentDirect3DBackground && epoch.HasStoredEffectState;
+    const u32 captureRequest = GPU.CaptureCnt;
+    CaptureEpochOverlayCurrentInputs planInputs = {};
+    planInputs.CurrentSource3DSerial = Parent.Output3DSerial;
+    planInputs.CurrentSource3DSceneHash = Parent.Output3DSceneHash;
+    planInputs.CurrentPresentationHash = currentPresentationHash;
+    planInputs.EpochCaptureBank = epoch.CaptureBank;
+    planInputs.EpochSource3DSerial = epoch.Source3DSerial;
+    planInputs.EpochSource3DSceneHash = epoch.Source3DSceneHash;
+    planInputs.CaptureRequestConsumesCurrentComposite =
+        !GPU2D.Num &&
+        (captureRequest & (1u << 31)) &&
+        Parent.IsSourceAOnlyFullDisplayCapture(captureRequest);
+    planInputs.CaptureRequestBank = (captureRequest >> 16) & 0x3u;
+    const CaptureEpochOverlayCurrentPlan plan =
+        MakeCaptureEpochOverlayCurrentPlan(planInputs);
+
+    const SourceABackgroundSource backgroundSource = plan.BackgroundSource;
+    const GLuint backgroundTex = Parent.OutputTex3D;
+    const u64 routeProductBackgroundSerial = plan.BackgroundEpochSerial;
+    const u64 routeProductSource3DSerial = plan.Source3DSerial;
+    const u32 routeProductSource3DSceneHash = plan.Source3DSceneHash;
+    const u32 routeProductPresentationHash = plan.PresentationHash;
+    const u16 backgroundStoredMasterBrightness = 0;
+    const bool backgroundHasStoredEffectState = false;
     const auto& previousRoutePresentation = CaptureBackedRoute[routeSlot].Presentation;
     const bool canPromoteLiveRouteProduct =
-        !useCurrentDirect3DBackground ||
-        (routeProductSource3DSceneHash != 0 &&
+        plan.CanPublishRouteProduct &&
+        routeProductSource3DSceneHash != 0 &&
          previousRoutePresentation.Valid &&
          previousRoutePresentation.Source3DSceneHash == routeProductSource3DSceneHash &&
          previousRoutePresentation.SourcePresentationHash == routeProductPresentationHash &&
-         previousRoutePresentation.CurrentOverlayPresentationHash == currentPresentationHash);
+         previousRoutePresentation.CurrentOverlayPresentationHash == currentPresentationHash;
 
-    UpdateCaptureBackedRoutePresentation(routeSlot,
-                                         CaptureBackedRoutePresentationMode::BackgroundCurrentOverlay,
-                                         routeProductBackgroundSerial,
-                                         epoch.CaptureBank,
-                                         routeProductSource3DSceneHash,
-                                         routeProductPresentationHash,
-                                         currentPresentationHash);
+    if (plan.CanPublishRouteProduct)
+    {
+        UpdateCaptureBackedRoutePresentation(routeSlot,
+                                             CaptureBackedRoutePresentationMode::BackgroundCurrentOverlay,
+                                             routeProductBackgroundSerial,
+                                             plan.CaptureBank,
+                                             routeProductSource3DSceneHash,
+                                             routeProductPresentationHash,
+                                             currentPresentationHash);
+    }
 
     const GLCaptureProductResolution product =
         RecordCaptureEpochOverlayTrace(routeSlot,
-                                       epoch.CaptureBank,
+                                       plan.CanPublishRouteProduct
+                                           ? plan.CaptureBank
+                                           : epoch.CaptureBank,
                                        backgroundSource,
                                        backgroundTex,
                                        epoch.Serial,
@@ -12440,16 +12497,19 @@ void GLRenderer2D::RenderScreenWholeSceneCaptureEpochOverlay(int ystart, int yen
             RecordOutputPresentationMasterBrightness(WholeSceneCaptureEffectOwner::CurrentEngine,
                                                      masterBrightness);
         }
-        StoreCurrentOverlayCaptureBackedRouteProduct(routeSlot,
-                                                     rawRouteProductTex,
-                                                     routeProductBackgroundSerial,
-                                                     routeProductSource3DSerial,
-                                                     routeProductSource3DSceneHash,
-                                                     epoch.CaptureBank,
-                                                     routeProductPresentationHash,
-                                                     currentPresentationHash,
-                                                     ystart,
-                                                     yend);
+        if (plan.CanPublishRouteProduct)
+        {
+            StoreCurrentOverlayCaptureBackedRouteProduct(routeSlot,
+                                                         rawRouteProductTex,
+                                                         routeProductBackgroundSerial,
+                                                         routeProductSource3DSerial,
+                                                         routeProductSource3DSceneHash,
+                                                         plan.CaptureBank,
+                                                         routeProductPresentationHash,
+                                                         currentPresentationHash,
+                                                         ystart,
+                                                         yend);
+        }
         if (!canPromoteLiveRouteProduct)
         {
             WholeSceneTrace.SourceAProductChoice =
@@ -13163,8 +13223,15 @@ void GLRenderer2D::RenderScreenWholeSceneFinalizeFullFrame()
         if (capturePlan.Stage == WholeSceneCaptureBackedPlanStage::AfterGeneralFallbacks)
             RenderScreenWholeSceneCaptureBackedPlan(capturePlan, LastLine, 192);
         else
-            RenderScreenCurrent(LastLine, 192, true,
+        {
+            const int currentStart = ChooseIncompleteFinalizerCurrentStart({
+                LastLine,
+                WholeSceneFullFrameFinalizerUnsafeFrame ||
+                    IsWholeSceneCurrentFragmentationGuardActive(),
+            });
+            RenderScreenCurrent(currentStart, 192, true,
                                 WholeSceneCurrentPathReason::NativeProductFinalizerIncomplete);
+        }
 
         const auto end = std::chrono::steady_clock::now();
         WholeSceneTrace.RenderTimeUS +=

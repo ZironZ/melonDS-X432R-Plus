@@ -146,7 +146,8 @@ public:
                                             GLuint targetArrayTexture, u32 targetLayer,
                                             std::vector<u32>* outputPreviewRGBA = nullptr,
                                             bool alphaAwareMipChain = false,
-                                            bool allowFilterableBinaryAlphaDefaultMips = false);
+                                            bool allowFilterableBinaryAlphaDefaultMips = false,
+                                            bool preserveTransparentRGB = false);
     bool ProcessTextureGPUScale(u32 width, u32 height, u32 scaleFactor, const u32* sourceRGBA, std::vector<u32>& outputRGBA);
     bool ReadTextureLayerPreviewRGBA8(GLuint sourceArrayTexture, u32 layer, u32 width, u32 height,
                                       int outputFmt, std::vector<u32>& outputRGBA);
@@ -181,9 +182,10 @@ private:
     void QueueMipmapGeneration(GLuint handle);
     void RenderArtCNNRepackToArrayLayer(GLuint sourceTex, GLuint targetArrayTexture, u32 targetLayer,
                                         u32 mipLevel, int width, int height, int outputFmt, bool binaryAlpha,
-                                        bool queueMipmapGeneration);
+                                        bool queueMipmapGeneration, bool preserveTransparentRGB = false);
     bool RenderGPUAlphaAwareMipChain(GLuint level0Texture, GLuint targetArrayTexture, u32 targetLayer,
-                                     u32 width, u32 height, u32 scaleFactor, int outputFmt);
+                                     u32 width, u32 height, u32 scaleFactor, int outputFmt,
+                                     bool preserveTransparentRGB);
     bool ReadTextureArrayLayerPreviewRGBA8(GLuint sourceArrayTexture, u32 layer, u32 width, u32 height,
                                            int outputFmt, std::vector<u32>& outputRGBA);
 
