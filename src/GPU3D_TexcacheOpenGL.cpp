@@ -416,9 +416,15 @@ std::string TexcacheOpenGLLoader::BuildTexcacheRepackShaderSource(bool filterabl
         return k3DTexcacheRepackFS;
 
     std::string source = k3DTexcacheRepackFS;
-    auto pos = source.find('\n');
-    if (pos == std::string::npos)
+    // GLSL requires #version to precede every other preprocessor directive;
+    // shader sources may carry license comments before it.
+    const auto version = source.find("#version");
+    if (version == std::string::npos)
         return "#define FILTERABLE_TEXTURE_CACHE\n" + source;
+
+    auto pos = source.find('\n', version);
+    if (pos == std::string::npos)
+        return source + "\n#define FILTERABLE_TEXTURE_CACHE\n";
 
     pos += 1;
     source.insert(pos, "#define FILTERABLE_TEXTURE_CACHE\n");
@@ -1547,7 +1553,8 @@ bool TexcacheOpenGLLoader::ReadScaledTextureRGBA8(GLuint sourceTex, u32 width, u
 
 void TexcacheOpenGLLoader::RenderArtCNNRepackToArrayLayer(GLuint sourceTex, GLuint targetArrayTexture, u32 targetLayer,
                                                           u32 mipLevel, int width, int height, int outputFmt,
-                                                          bool binaryAlpha, bool queueMipmapGeneration,
+                                                          RGB6RepackPolicy repackPolicy, bool binaryAlpha,
+                                                          bool queueMipmapGeneration,
                                                           bool preserveTransparentRGB)
 {
     glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
@@ -1571,7 +1578,7 @@ void TexcacheOpenGLLoader::RenderArtCNNRepackToArrayLayer(GLuint sourceTex, GLui
     glUniform1i(glGetUniformLocation(repackShader, "uBinaryAlpha"), binaryAlpha ? 1 : 0);
     glUniform1i(glGetUniformLocation(repackShader, "uPreserveTransparentRGB"),
                 preserveTransparentRGB ? 1 : 0);
-    glUniform1i(glGetUniformLocation(repackShader, "uLosslessRGB6Repack"), 0);
+    glUniform1i(glGetUniformLocation(repackShader, "uRGB6RepackPolicy"), static_cast<GLint>(repackPolicy));
 
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, sourceTex);
@@ -1586,6 +1593,7 @@ void TexcacheOpenGLLoader::RenderArtCNNRepackToArrayLayer(GLuint sourceTex, GLui
 
 bool TexcacheOpenGLLoader::RenderGPUAlphaAwareMipChain(GLuint level0Texture, GLuint targetArrayTexture, u32 targetLayer,
                                                        u32 width, u32 height, u32 scaleFactor, int outputFmt,
+                                                       RGB6RepackPolicy repackPolicy,
                                                        bool preserveTransparentRGB)
 {
     if (!FilterableSampling || !FilterableMipAlphaHandling || level0Texture == 0 ||
@@ -1627,7 +1635,7 @@ bool TexcacheOpenGLLoader::RenderGPUAlphaAwareMipChain(GLuint level0Texture, GLu
                                  static_cast<int>(targetWidth), static_cast<int>(targetHeight));
         RenderArtCNNRepackToArrayLayer(targetScratch, targetArrayTexture, targetLayer, static_cast<u32>(level),
                                        static_cast<int>(targetWidth), static_cast<int>(targetHeight),
-                                       outputFmt, true, false, preserveTransparentRGB);
+                                       outputFmt, repackPolicy, true, false, preserveTransparentRGB);
 
         sourceTex = targetScratch;
         sourceWidth = targetWidth;
@@ -1691,7 +1699,8 @@ bool TexcacheOpenGLLoader::ReadTextureLayerPreviewRGBA8(GLuint sourceArrayTextur
 }
 
 bool TexcacheOpenGLLoader::ProcessTextureGPUScaleToCacheLayer(u32 width, u32 height, u32 scaleFactor, const u32* sourceRGBA,
-                                                              int outputFmt, bool binaryAlpha,
+                                                              int outputFmt, RGB6RepackPolicy repackPolicy,
+                                                              bool binaryAlpha,
                                                               GLuint targetArrayTexture, u32 targetLayer,
                                                               std::vector<u32>* outputPreviewRGBA,
                                                               bool alphaAwareMipChain,
@@ -1793,7 +1802,7 @@ bool TexcacheOpenGLLoader::ProcessTextureGPUScaleToCacheLayer(u32 width, u32 hei
 
     if (alphaAwareMipChain &&
         !RenderGPUAlphaAwareMipChain(outputTexture, targetArrayTexture, targetLayer,
-                                     width * scaleFactor, height * scaleFactor, scaleFactor, outputFmt,
+                                     width * scaleFactor, height * scaleFactor, scaleFactor, outputFmt, repackPolicy,
                                      preserveTransparentRGB))
     {
         restoreState();
@@ -1801,7 +1810,8 @@ bool TexcacheOpenGLLoader::ProcessTextureGPUScaleToCacheLayer(u32 width, u32 hei
     }
 
     RenderArtCNNRepackToArrayLayer(outputTexture, targetArrayTexture, targetLayer, 0,
-                                   width * scaleFactor, height * scaleFactor, outputFmt, binaryAlpha,
+                                   width * scaleFactor, height * scaleFactor, outputFmt, repackPolicy,
+                                   binaryAlpha,
                                    !alphaAwareMipChain, preserveTransparentRGB);
 
     if (outputPreviewRGBA != nullptr)

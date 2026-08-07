@@ -79,7 +79,6 @@ private slots:
     void on_cb3DTextureFilterSpriteUVInset_stateChanged(int state);
     void on_cb3DTextureFilterMipmapAlphaHandling_stateChanged(int state);
     void on_cbx3DTextureFilterMipDepth_currentIndexChanged(int idx);
-    void on_cb3DTextureLosslessRGB6Repack_stateChanged(int state);
     void on_cb3DTextureScaling_stateChanged(int state);
     void on_cb3DHighPrecisionTextureCoordinates_stateChanged(int state);
     void on_cbx3DTextureScalingAlgorithm_currentIndexChanged(int idx);
@@ -122,7 +121,6 @@ private slots:
 private:
     void setVsyncControlEnable(bool hasOGL);
     void setEnabled();
-    void updateLosslessRGB6RepackForTextureScalingFilteringConflict();
     void applyTexture2DAtlasProtection(bool enabled);
     void syncTexture2DAtlasProtectionCheckbox();
     void applyRecommendedDefaults();
@@ -154,7 +152,6 @@ private:
         int SpriteUVInset;
         int MipmapAlphaHandling;
         int MipDepth;
-        int LosslessRGB6Repack;
     } oldTextureFilter;
 
     struct TextureScalingSnapshot

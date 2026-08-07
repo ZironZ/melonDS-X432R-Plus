@@ -87,13 +87,16 @@ inline void TextureScalePackRGBA8ToOutput(int outputFmt,
     switch (outputFmt)
     {
     case outputFmt_RGB6A5:
-        ConvertRGBA8BufferToOutput<outputFmt_RGB6A5>(width, height, srcRGBA8, dst, binaryAlpha);
+        ConvertRGBA8BufferToOutput<outputFmt_RGB6A5>(width, height, srcRGBA8, dst, binaryAlpha,
+                                                     RGB6RepackPolicy::NativeRGB5Expansion);
         break;
     case outputFmt_RGBA8:
-        ConvertRGBA8BufferToOutput<outputFmt_RGBA8>(width, height, srcRGBA8, dst, binaryAlpha);
+        ConvertRGBA8BufferToOutput<outputFmt_RGBA8>(width, height, srcRGBA8, dst, binaryAlpha,
+                                                    RGB6RepackPolicy::NativeRGB5Expansion);
         break;
     case outputFmt_BGRA8:
-        ConvertRGBA8BufferToOutput<outputFmt_BGRA8>(width, height, srcRGBA8, dst, binaryAlpha);
+        ConvertRGBA8BufferToOutput<outputFmt_BGRA8>(width, height, srcRGBA8, dst, binaryAlpha,
+                                                    RGB6RepackPolicy::NativeRGB5Expansion);
         break;
     }
 }

@@ -28,19 +28,32 @@
 namespace melonDS
 {
 
+struct TexcacheMipLevel
+{
+    TexcacheMipLevel(u32 width, u32 height, RGB6RepackPolicy repackPolicy)
+        : Width(width), Height(height), RepackPolicy(repackPolicy)
+    {}
+
+    std::vector<u32> PreviewRGBA8;
+    std::vector<u32> Packed;
+    u32 Width;
+    u32 Height;
+    RGB6RepackPolicy RepackPolicy;
+};
+
 struct TexcacheMipChain
 {
-    std::vector<std::vector<u32>> PreviewLevels;
-    std::vector<std::vector<u32>> PackedLevels;
-    std::vector<u32> Widths;
-    std::vector<u32> Heights;
+    std::vector<TexcacheMipLevel> Levels;
+
+    TexcacheMipLevel& AddLevel(u32 width, u32 height, RGB6RepackPolicy repackPolicy)
+    {
+        Levels.emplace_back(width, height, repackPolicy);
+        return Levels.back();
+    }
 
     void Clear()
     {
-        PreviewLevels.clear();
-        PackedLevels.clear();
-        Widths.clear();
-        Heights.clear();
+        Levels.clear();
     }
 };
 
@@ -151,27 +164,27 @@ inline void TextureMipApplyBinaryAlphaCutout(std::vector<u32>& level)
     }
 }
 
-inline void TextureMipPackLevels(TexcacheMipChain& chain, int outputFmt, bool losslessRGB6Repack)
+inline void TextureMipPackLevels(TexcacheMipChain& chain, int outputFmt)
 {
-    chain.PackedLevels.resize(chain.PreviewLevels.size());
-    for (size_t level = 0; level < chain.PreviewLevels.size(); level++)
+    for (auto& level : chain.Levels)
     {
-        auto& packedLevel = chain.PackedLevels[level];
-        packedLevel.resize(static_cast<size_t>(chain.Widths[level]) * static_cast<size_t>(chain.Heights[level]));
+        level.Packed.resize(static_cast<size_t>(level.Width) * static_cast<size_t>(level.Height));
         switch (outputFmt)
         {
         case outputFmt_RGB6A5:
-            ConvertRGBA8BufferToOutput<outputFmt_RGB6A5>(chain.Widths[level], chain.Heights[level],
-                                                         chain.PreviewLevels[level].data(), packedLevel.data(),
-                                                         false, losslessRGB6Repack);
+            ConvertRGBA8BufferToOutput<outputFmt_RGB6A5>(level.Width, level.Height,
+                                                         level.PreviewRGBA8.data(), level.Packed.data(),
+                                                         false, level.RepackPolicy);
             break;
         case outputFmt_RGBA8:
-            ConvertRGBA8BufferToOutput<outputFmt_RGBA8>(chain.Widths[level], chain.Heights[level],
-                                                        chain.PreviewLevels[level].data(), packedLevel.data(), false);
+            ConvertRGBA8BufferToOutput<outputFmt_RGBA8>(level.Width, level.Height,
+                                                        level.PreviewRGBA8.data(), level.Packed.data(), false,
+                                                        level.RepackPolicy);
             break;
         case outputFmt_BGRA8:
-            ConvertRGBA8BufferToOutput<outputFmt_BGRA8>(chain.Widths[level], chain.Heights[level],
-                                                        chain.PreviewLevels[level].data(), packedLevel.data(), false);
+            ConvertRGBA8BufferToOutput<outputFmt_BGRA8>(level.Width, level.Height,
+                                                        level.PreviewRGBA8.data(), level.Packed.data(), false,
+                                                        level.RepackPolicy);
             break;
         }
     }
@@ -186,7 +199,9 @@ bool TextureMipBuildSourceScaledChain(TexcacheMipChain& chain,
                                       u32 scaledHeight,
                                       u32 effectiveScaleFactor,
                                       const u32* mipRGBA8,
+                                      RGB6RepackPolicy mipRepackPolicy,
                                       const u32* sourceMipNativeRGBA8,
+                                      RGB6RepackPolicy sourceMipNativeRepackPolicy,
                                       bool sourceScaledMipLevels,
                                       bool sourceBinaryAlphaTextureKnown,
                                       bool sourceBinaryAlphaTextureValue,
@@ -196,14 +211,13 @@ bool TextureMipBuildSourceScaledChain(TexcacheMipChain& chain,
         return false;
 
     chain.Clear();
-    chain.PreviewLevels.emplace_back(
+    auto& topLevel = chain.AddLevel(scaledWidth, scaledHeight, mipRepackPolicy);
+    topLevel.PreviewRGBA8.assign(
         mipRGBA8,
         mipRGBA8 + (static_cast<size_t>(scaledWidth) * static_cast<size_t>(scaledHeight)));
-    chain.Widths.push_back(scaledWidth);
-    chain.Heights.push_back(scaledHeight);
 
     if (sourceBinaryAlphaTextureKnown && sourceBinaryAlphaTextureValue && texLoader.UseFilterableMipAlphaHandling())
-        TextureMipPadTransparentRGB(scaledWidth, scaledHeight, chain.PreviewLevels.back().data(),
+        TextureMipPadTransparentRGB(scaledWidth, scaledHeight, chain.Levels.back().PreviewRGBA8.data(),
                                     texLoader.UseQualityAlphaHandling());
 
     std::vector<u32> scaledMipRGBA8;
@@ -220,25 +234,24 @@ bool TextureMipBuildSourceScaledChain(TexcacheMipChain& chain,
             if (!texLoader.ProcessTextureGPUScale(width, height, levelScale, sourceMipNativeRGBA8, scaledMipRGBA8))
                 return false;
 
-            chain.PreviewLevels.emplace_back(scaledMipRGBA8);
-            chain.Widths.push_back(nextWidth);
-            chain.Heights.push_back(nextHeight);
+            auto& level = chain.AddLevel(nextWidth, nextHeight, sourceMipNativeRepackPolicy);
+            level.PreviewRGBA8 = scaledMipRGBA8;
         }
         else
         {
-            chain.PreviewLevels.emplace_back(
+            auto& level = chain.AddLevel(width, height, sourceMipNativeRepackPolicy);
+            level.PreviewRGBA8.assign(
                 sourceMipNativeRGBA8,
                 sourceMipNativeRGBA8 + (static_cast<size_t>(width) * static_cast<size_t>(height)));
-            chain.Widths.push_back(width);
-            chain.Heights.push_back(height);
         }
 
         if (sourceBinaryAlphaTextureKnown && sourceBinaryAlphaTextureValue)
         {
-            TextureMipApplyBinaryAlphaCutout(chain.PreviewLevels.back());
+            TextureMipApplyBinaryAlphaCutout(chain.Levels.back().PreviewRGBA8);
 
             if (texLoader.UseFilterableMipAlphaHandling())
-                TextureMipPadTransparentRGB(chain.Widths.back(), chain.Heights.back(), chain.PreviewLevels.back().data(),
+                TextureMipPadTransparentRGB(chain.Levels.back().Width, chain.Levels.back().Height,
+                                            chain.Levels.back().PreviewRGBA8.data(),
                                             texLoader.UseQualityAlphaHandling());
         }
 
@@ -246,7 +259,7 @@ bool TextureMipBuildSourceScaledChain(TexcacheMipChain& chain,
             break;
     }
 
-    TextureMipPackLevels(chain, outputFmt, texLoader.UseLosslessRGB6Repack());
+    TextureMipPackLevels(chain, outputFmt);
     return true;
 }
 
@@ -647,22 +660,22 @@ void TextureMipBuildAlphaAwareChain(TexcacheMipChain& chain,
                                     u32 scaledHeight,
                                     u32 effectiveScaleFactor,
                                     const u32* mipRGBA8,
+                                    RGB6RepackPolicy repackPolicy,
                                     int outputFmt,
                                     bool useImprovedMipColors)
 {
     chain.Clear();
     std::vector<std::vector<int>> islandLabels;
 
-    chain.PreviewLevels.emplace_back(
+    auto& topLevel = chain.AddLevel(scaledWidth, scaledHeight, repackPolicy);
+    topLevel.PreviewRGBA8.assign(
         mipRGBA8,
         mipRGBA8 + (static_cast<size_t>(scaledWidth) * static_cast<size_t>(scaledHeight)));
-    chain.Widths.push_back(scaledWidth);
-    chain.Heights.push_back(scaledHeight);
     if (useImprovedMipColors)
     {
         islandLabels.emplace_back();
-        TextureMipBuildAlphaIslands(scaledWidth, scaledHeight, chain.PreviewLevels.back(), islandLabels.back());
-        TextureMipApplyIslandAwareFringe(scaledWidth, scaledHeight, chain.PreviewLevels.back(), islandLabels.back());
+        TextureMipBuildAlphaIslands(scaledWidth, scaledHeight, chain.Levels.back().PreviewRGBA8, islandLabels.back());
+        TextureMipApplyIslandAwareFringe(scaledWidth, scaledHeight, chain.Levels.back().PreviewRGBA8, islandLabels.back());
     }
 
     size_t mipLevelLimit = static_cast<size_t>(-1);
@@ -676,34 +689,32 @@ void TextureMipBuildAlphaAwareChain(TexcacheMipChain& chain,
             mipLevelLimit++;
         }
     }
-    while ((chain.Widths.back() > 1 || chain.Heights.back() > 1) &&
-           chain.PreviewLevels.size() < mipLevelLimit)
+    while ((chain.Levels.back().Width > 1 || chain.Levels.back().Height > 1) &&
+           chain.Levels.size() < mipLevelLimit)
     {
-        u32 nextWidth = std::max<u32>(1, chain.Widths.back() >> 1);
-        u32 nextHeight = std::max<u32>(1, chain.Heights.back() >> 1);
+        u32 nextWidth = std::max<u32>(1, chain.Levels.back().Width >> 1);
+        u32 nextHeight = std::max<u32>(1, chain.Levels.back().Height >> 1);
         const u32 minMipDimension = texLoader.FilterableMipMinDimension();
         if (minMipDimension > 1 && (nextWidth < minMipDimension || nextHeight < minMipDimension))
             break;
 
-        chain.PreviewLevels.emplace_back();
+        auto& nextLevel = chain.AddLevel(nextWidth, nextHeight, repackPolicy);
         if (useImprovedMipColors)
             islandLabels.emplace_back();
         TextureMipBuildBinaryAlphaLevel(
-            chain.Widths.back(),
-            chain.Heights.back(),
-            chain.PreviewLevels[chain.PreviewLevels.size() - 2],
+            chain.Levels[chain.Levels.size() - 2].Width,
+            chain.Levels[chain.Levels.size() - 2].Height,
+            chain.Levels[chain.Levels.size() - 2].PreviewRGBA8,
             useImprovedMipColors ? &islandLabels[islandLabels.size() - 2] : nullptr,
             nextWidth,
             nextHeight,
-            chain.PreviewLevels.back(),
+            nextLevel.PreviewRGBA8,
             useImprovedMipColors ? &islandLabels.back() : nullptr,
             useImprovedMipColors,
             texLoader.UseQualityAlphaHandling());
-        chain.Widths.push_back(nextWidth);
-        chain.Heights.push_back(nextHeight);
     }
 
-    TextureMipPackLevels(chain, outputFmt, texLoader.UseLosslessRGB6Repack());
+    TextureMipPackLevels(chain, outputFmt);
 }
 
 }

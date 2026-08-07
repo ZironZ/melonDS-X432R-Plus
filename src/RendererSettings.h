@@ -372,9 +372,6 @@ struct RendererSettings
         // stop filterable mipmap generation before levels smaller than this policy allows
         TextureFilterMipDepth MipDepth = TextureFilterMipDepth::Full;
 
-        // use an unbiased RGB8->RGB6 inverse when repacking expanded 3D texture-cache colors
-        bool LosslessRGB6Repack = false;
-
         bool operator==(const TextureFilterSettings& other) const
         {
             return Anisotropy == other.Anisotropy &&
@@ -385,8 +382,7 @@ struct RendererSettings
                 TranslucentTextureFilteringGuard == other.TranslucentTextureFilteringGuard &&
                 SpriteUVInset == other.SpriteUVInset &&
                 MipmapAlphaHandling == other.MipmapAlphaHandling &&
-                MipDepth == other.MipDepth &&
-                LosslessRGB6Repack == other.LosslessRGB6Repack;
+                MipDepth == other.MipDepth;
         }
 
         bool operator!=(const TextureFilterSettings& other) const

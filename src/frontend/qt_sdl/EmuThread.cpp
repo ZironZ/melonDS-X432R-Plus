@@ -1228,7 +1228,6 @@ void EmuThread::updateRenderer()
             .SpriteUVInset = cfg.GetBool("3D.GL.TextureFilterSpriteUVInset"),
             .MipmapAlphaHandling = cfg.GetBool("3D.GL.TextureFilterMipmapAlphaHandling"),
             .MipDepth = melonDS::RendererSettings::GetTextureFilterMipDepth(cfg.GetInt("3D.GL.TextureFilterMipDepth")),
-            .LosslessRGB6Repack = cfg.GetBool("3D.GL.TextureLosslessRGB6Repack"),
         },
         .TextureScaling = {
             .Enabled = cfg.GetBool("3D.GL.TextureScaling"),

@@ -124,7 +124,6 @@ DefaultList<bool> DefaultBools =
     {"3D.GL.TextureFilterTranslucentGuard", false},
     {"3D.GL.TextureFilterSpriteUVInset", false},
     {"3D.GL.TextureFilterMipmapAlphaHandling", true},
-    {"3D.GL.TextureLosslessRGB6Repack", true},
     {"3D.GL.TextureScaling", false},
     {"3D.GL.TextureScalingHighPrecisionCoordinates", true},
     {"3D.GL.TextureScalingFrequentChangePolicy", false},

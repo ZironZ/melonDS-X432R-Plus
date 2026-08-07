@@ -124,14 +124,6 @@ public:
         return true;
     }
     bool UseSpline36Alpha() const { return Spline36Alpha; }
-    bool SetLosslessRGB6Repack(bool losslessRGB6Repack)
-    {
-        if (LosslessRGB6Repack == losslessRGB6Repack)
-            return false;
-        LosslessRGB6Repack = losslessRGB6Repack;
-        return true;
-    }
-    bool UseLosslessRGB6Repack() const { return LosslessRGB6Repack; }
     bool SetLegacyAlphaHandling(bool legacyAlphaHandling)
     {
         if (LegacyAlphaHandling == legacyAlphaHandling)
@@ -142,7 +134,8 @@ public:
     bool UseLegacyAlphaHandling() const { return LegacyAlphaHandling; }
     bool ProcessTextureGPUScaleToTexture(u32 width, u32 height, u32 scaleFactor, const u32* sourceRGBA, GLuint& outputTexture);
     bool ProcessTextureGPUScaleToCacheLayer(u32 width, u32 height, u32 scaleFactor, const u32* sourceRGBA,
-                                            int outputFmt, bool binaryAlpha,
+                                            int outputFmt, RGB6RepackPolicy repackPolicy,
+                                            bool binaryAlpha,
                                             GLuint targetArrayTexture, u32 targetLayer,
                                             std::vector<u32>* outputPreviewRGBA = nullptr,
                                             bool alphaAwareMipChain = false,
@@ -181,10 +174,12 @@ private:
     bool ReadScaledTextureRGBA8(GLuint sourceTex, u32 width, u32 height, std::vector<u32>& outputRGBA);
     void QueueMipmapGeneration(GLuint handle);
     void RenderArtCNNRepackToArrayLayer(GLuint sourceTex, GLuint targetArrayTexture, u32 targetLayer,
-                                        u32 mipLevel, int width, int height, int outputFmt, bool binaryAlpha,
+                                        u32 mipLevel, int width, int height, int outputFmt,
+                                        RGB6RepackPolicy repackPolicy, bool binaryAlpha,
                                         bool queueMipmapGeneration, bool preserveTransparentRGB = false);
     bool RenderGPUAlphaAwareMipChain(GLuint level0Texture, GLuint targetArrayTexture, u32 targetLayer,
                                      u32 width, u32 height, u32 scaleFactor, int outputFmt,
+                                     RGB6RepackPolicy repackPolicy,
                                      bool preserveTransparentRGB);
     bool ReadTextureArrayLayerPreviewRGBA8(GLuint sourceArrayTexture, u32 layer, u32 width, u32 height,
                                            int outputFmt, std::vector<u32>& outputRGBA);
@@ -203,7 +198,6 @@ private:
     bool QualityAlphaHandling = false;
     bool AlphaXBRZ = false;
     bool Spline36Alpha = false;
-    bool LosslessRGB6Repack = false;
     bool ArtCNNProgramsReady = false;
     bool ArtCNNProgramsFailed = false;
     bool ArtCNNComputeProgramsReady = false;

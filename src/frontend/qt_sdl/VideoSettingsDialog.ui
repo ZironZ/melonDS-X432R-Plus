@@ -325,16 +325,6 @@
            </property>
          </widget>
          </item>
-         <item row="3" column="1">
-          <widget class="QCheckBox" name="cb3DTextureLosslessRGB6Repack">
-           <property name="whatsThis">
-            <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;Alternate RGB repack for expanded RGB6A5 texture-cache data. Uses an unbiased RGB8-to-RGB6 inverse when alpha-aware mipmaps repack decoded DS texture colors, avoiding systematic color shifts from the older DS-like midpoint quantizer. 3D texture scaling keeps the older generated-color quantizer.&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
-           </property>
-           <property name="text">
-            <string>Lossless RGB6 repack</string>
-           </property>
-          </widget>
-         </item>
          <item row="4" column="0">
           <widget class="QCheckBox" name="cb3DTextureFilterSmart2D">
            <property name="whatsThis">
@@ -456,7 +446,7 @@
            <item row="0" column="2">
             <widget class="QCheckBox" name="cb3DTextureScalingAlphaXBRZ">
              <property name="whatsThis">
-              <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;Uses xBRZ for texture transparency on supported GPU scalers while texture colors stay on the selected scaler. This can make cutout edges cleaner and less blocky.&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
+              <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;Uses xBRZ for texture transparency on supported GPU scalers while texture colors stay on the selected scaler. This can make cutout edges cleaner and less blocky. Enabling this disables Spline36 Alpha.&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
              </property>
              <property name="text">
               <string>Cleaner transparent edges</string>
@@ -466,7 +456,7 @@
            <item row="0" column="3">
             <widget class="QCheckBox" name="cb3DTextureScalingSpline36Alpha">
              <property name="whatsThis">
-              <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;Uses Spline36 for texture alpha on GPU texture scalers. When unchecked, texture alpha uses conservative center-aligned linear scaling to avoid ringing and tiny holes in alpha-tested textures. Cleaner transparent edges still overrides this with xBRZ alpha when enabled.&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
+              <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;Uses Spline36 for texture alpha on GPU texture scalers. When unchecked, texture alpha uses conservative center-aligned linear scaling to avoid ringing and tiny holes in alpha-tested textures. Enabling this disables Cleaner transparent edges.&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
              </property>
              <property name="text">
               <string>Spline36 Alpha</string>
@@ -1138,7 +1128,6 @@
   <tabstop>cb3DTextureFilterMipmapAlphaHandling</tabstop>
   <tabstop>cb3DTextureFilterMipmapTopologyHandling</tabstop>
   <tabstop>cb3DTextureFilterMipmapSubrectHandling</tabstop>
-  <tabstop>cb3DTextureLosslessRGB6Repack</tabstop>
   <tabstop>cb3DTexture2DAtlasProtection</tabstop>
   <tabstop>cb3DTextureFilterSmart2D</tabstop>
   <tabstop>cb3DTextureFilterTranslucentGuard</tabstop>

@@ -5,6 +5,7 @@ add_executable(policy-tests
     CleanLegacyEligibilityTests.cpp
     RecordedCaseTests.cpp
     ScalePolicyTests.cpp
+    TextureRepackPolicyTests.cpp
     "${CMAKE_SOURCE_DIR}/src/WholeSceneCapturePolicy.cpp"
     "${CMAKE_SOURCE_DIR}/src/WholeSceneScalePolicy.cpp")
 

@@ -7,7 +7,7 @@ uniform sampler2D Source;
 uniform int uOutputFormat;
 uniform int uBinaryAlpha;
 uniform int uPreserveTransparentRGB;
-uniform int uLosslessRGB6Repack;
+uniform int uRGB6RepackPolicy;
 
 smooth in vec2 fTexcoord;
 #ifdef FILTERABLE_TEXTURE_CACHE
@@ -33,7 +33,7 @@ uint QuantizeRGB8ToRGB6Roundtrip(float value)
 
 uint QuantizeRGB8ToRGB6(float value)
 {
-    return uLosslessRGB6Repack != 0
+    return uRGB6RepackPolicy == 1
         ? QuantizeRGB8ToRGB6Roundtrip(value)
         : QuantizeRGB8ToRGB6LikeDS(value);
 }

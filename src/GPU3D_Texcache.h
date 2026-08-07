@@ -697,7 +697,9 @@ public:
         bool conservativeAtlasFallback = false;
         bool conservativeAtlasFallbackKnown = false;
         const u32* filterableMipSourceRGBA8 = nullptr;
+        RGB6RepackPolicy filterableMipSourceRepackPolicy = RGB6RepackPolicy::NativeRGB5Expansion;
         const u32* sourceMipNativeRGBA8 = nullptr;
+        RGB6RepackPolicy sourceMipNativeRepackPolicy = RGB6RepackPolicy::NativeRGB5Expansion;
         std::vector<u32> sourceMipNativeRGBA8Storage;
         TexcacheMipChain filterableMipChain;
         if (effectiveScaleFactor > 1)
@@ -750,7 +752,7 @@ public:
                     sourceTransparentRGBPadded = true;
                 }
                 sourceMipNativeRGBA8 = rgbaBuffer;
-
+                sourceMipNativeRepackPolicy = RGB6RepackPolicy::NativeRGB5Expansion;
                 bool processedGPUDirect = false;
                 const bool useDefaultFilterableBinaryAlphaMips =
                     TexLoader.FilterableSamplingEnabled() &&
@@ -767,7 +769,8 @@ public:
                 {
                     ScopedTextureCacheTiming timing(*this, TextureFrameTiming.GPUScale);
                     processedGPUDirect = TexLoader.ProcessTextureGPUScaleToCacheLayer(width, height, effectiveScaleFactor, rgbaBuffer,
-                        outputFmt, binaryAlpha, storagePlace.TextureID, storagePlace.Layer,
+                        outputFmt, RGB6RepackPolicy::NativeRGB5Expansion, binaryAlpha,
+                        storagePlace.TextureID, storagePlace.Layer,
                         capturePreviewImages ? &ScaledRGBA8Storage : nullptr,
                         useImprovedFilterableMipPath,
                         useDefaultFilterableBinaryAlphaMips,
@@ -809,6 +812,7 @@ public:
                         uploadData = scaledBuffer;
                         resultPreviewData = ScaledRGBA8Storage.data();
                         filterableMipSourceRGBA8 = ScaledRGBA8Storage.data();
+                        filterableMipSourceRepackPolicy = RGB6RepackPolicy::NativeRGB5Expansion;
                         usedCustomScaler = true;
                         lastMiss.UsedGPUScaler = true;
                         lastMiss.UsedXBRZ = scalingAlgorithm == RendererSettings::GLScaleAlgorithm::XBRZ;
@@ -839,6 +843,7 @@ public:
                             uploadData = scaledBuffer;
                             resultPreviewData = ScaledRGBA8Storage.data();
                             filterableMipSourceRGBA8 = ScaledRGBA8Storage.data();
+                            filterableMipSourceRepackPolicy = RGB6RepackPolicy::NativeRGB5Expansion;
                             usedCustomScaler = true;
                             lastMiss.UsedXBRZ = true;
                             Debug.CountEvent(&TextureScalingDebugFrameStats::ScaledUploads);
@@ -906,11 +911,14 @@ public:
                     break;
                 }
                 sourceMipNativeRGBA8 = sourceMipNativeRGBA8Storage.data();
+                sourceMipNativeRepackPolicy = RGB6RepackPolicy::PreserveExpandedRGB6;
             }
 
             u32* mipRGBA8 = PreviewBuffer(static_cast<size_t>(scaledWidth) * static_cast<size_t>(scaledHeight));
+            RGB6RepackPolicy mipRepackPolicy = RGB6RepackPolicy::PreserveExpandedRGB6;
             if (filterableMipSourceRGBA8)
             {
+                mipRepackPolicy = filterableMipSourceRepackPolicy;
                 const size_t pixelCount = static_cast<size_t>(scaledWidth) * static_cast<size_t>(scaledHeight);
                 std::copy(filterableMipSourceRGBA8, filterableMipSourceRGBA8 + pixelCount, mipRGBA8);
                 if (sourceBinaryAlphaTextureKnown && sourceBinaryAlphaTextureValue)
@@ -964,17 +972,19 @@ public:
                     scaledHeight,
                     effectiveScaleFactor,
                     mipRGBA8,
+                    mipRepackPolicy,
                     sourceMipNativeRGBA8,
+                    sourceMipNativeRepackPolicy,
                     sourceScaledMipLevels,
                     sourceBinaryAlphaTextureKnown,
                     sourceBinaryAlphaTextureValue,
                     outputFmt))
             {
-                uploadData = filterableMipChain.PackedLevels[0].data();
+                uploadData = filterableMipChain.Levels[0].Packed.data();
                 uploadedCustomMipChain = true;
 
                 if (capturePreviewImages)
-                    resultPreviewData = filterableMipChain.PreviewLevels[0].data();
+                    resultPreviewData = filterableMipChain.Levels[0].PreviewRGBA8.data();
             }
 
             if (!uploadedCustomMipChain && binaryAlphaTextureValue)
@@ -1006,13 +1016,14 @@ public:
                         scaledHeight,
                         effectiveScaleFactor,
                         mipRGBA8,
+                        mipRepackPolicy,
                         outputFmt,
                         useImprovedMipColors);
-                    uploadData = filterableMipChain.PackedLevels[0].data();
+                    uploadData = filterableMipChain.Levels[0].Packed.data();
                     uploadedCustomMipChain = true;
 
                     if (capturePreviewImages)
-                        resultPreviewData = filterableMipChain.PreviewLevels[0].data();
+                        resultPreviewData = filterableMipChain.Levels[0].PreviewRGBA8.data();
                 }
             }
         }
@@ -1093,14 +1104,15 @@ public:
             ScopedTextureCacheTiming timing(*this, TextureFrameTiming.Upload);
             if (uploadedCustomMipChain)
             {
-                for (size_t level = 0; level < filterableMipChain.PackedLevels.size(); level++)
+                for (size_t level = 0; level < filterableMipChain.Levels.size(); level++)
                 {
+                    auto& mipLevel = filterableMipChain.Levels[level];
                     TexLoader.UploadTextureLevel(storagePlace.TextureID,
-                                                 filterableMipChain.Widths[level],
-                                                 filterableMipChain.Heights[level],
+                                                 mipLevel.Width,
+                                                 mipLevel.Height,
                                                  storagePlace.Layer,
                                                  static_cast<u32>(level),
-                                                 filterableMipChain.PackedLevels[level].data());
+                                                 mipLevel.Packed.data());
                 }
             }
             else
@@ -1340,7 +1352,6 @@ public:
         changed |= SetQualityAlphaHandling(scaling.QualityAlphaHandling);
         changed |= SetAlphaXBRZ(scaling.AlphaXBRZ);
         changed |= SetSpline36Alpha(scaling.Spline36Alpha);
-        changed |= SetLosslessRGB6Repack(filter.LosslessRGB6Repack);
         changed |= SetFilterableMipTopologyHandling(filter.TopologyAwareMipHandling);
         changed |= SetFilterableMipSubrectHandling(filter.MipmapSubrectHandling);
         changed |= SetFilterableMipAlphaHandling(filter.MipmapAlphaHandling);
@@ -1421,10 +1432,6 @@ public:
     bool SetSpline36Alpha(bool spline36Alpha)
     {
         return TexLoader.SetSpline36Alpha(spline36Alpha);
-    }
-    bool SetLosslessRGB6Repack(bool losslessRGB6Repack)
-    {
-        return TexLoader.SetLosslessRGB6Repack(losslessRGB6Repack);
     }
     bool SetLegacyAlphaHandling(bool legacyAlphaHandling)
     {

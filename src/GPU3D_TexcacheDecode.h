@@ -38,6 +38,15 @@ enum
     outputFmt_BGRA8
 };
 
+enum class RGB6RepackPolicy : u8
+{
+    NativeRGB5Expansion,
+    PreserveExpandedRGB6,
+};
+
+static_assert(static_cast<u8>(RGB6RepackPolicy::NativeRGB5Expansion) == 0);
+static_assert(static_cast<u8>(RGB6RepackPolicy::PreserveExpandedRGB6) == 1);
+
 inline float Spline36Weight(float x)
 {
     x = std::abs(x);
@@ -223,9 +232,8 @@ inline u8 QuantizeRGB8ToRGB6Roundtrip(float value)
     return (u8)std::clamp((int)std::lround(value * (63.0f / 255.0f)), 0, 63);
 }
 
-template <int outputFmt>
-inline void ConvertRGBA8BufferToOutput(u32 width, u32 height, const u32* src, u32* dst, bool binaryAlpha,
-                                       bool losslessRGB6Repack = false)
+template <int outputFmt, RGB6RepackPolicy repackPolicy>
+inline void ConvertRGBA8BufferToOutputWithPolicy(u32 width, u32 height, const u32* src, u32* dst, bool binaryAlpha)
 {
     u8 channelMax[4];
     if constexpr (outputFmt == outputFmt_RGB6A5)
@@ -262,7 +270,7 @@ inline void ConvertRGBA8BufferToOutput(u32 width, u32 height, const u32* src, u3
 
         if constexpr (outputFmt == outputFmt_RGB6A5)
         {
-            if (losslessRGB6Repack)
+            if constexpr (repackPolicy == RGB6RepackPolicy::PreserveExpandedRGB6)
             {
                 channels[0] = (float)QuantizeRGB8ToRGB6Roundtrip(channels[0]);
                 channels[1] = (float)QuantizeRGB8ToRGB6Roundtrip(channels[1]);
@@ -282,6 +290,31 @@ inline void ConvertRGBA8BufferToOutput(u32 width, u32 height, const u32* src, u3
         }
 
         dst[i] = PackTextureColor(channels, channelMax);
+    }
+}
+
+template <int outputFmt>
+inline void ConvertRGBA8BufferToOutput(u32 width, u32 height, const u32* src, u32* dst, bool binaryAlpha,
+                                       RGB6RepackPolicy repackPolicy)
+{
+    if constexpr (outputFmt == outputFmt_RGB6A5)
+    {
+        switch (repackPolicy)
+        {
+        case RGB6RepackPolicy::NativeRGB5Expansion:
+            ConvertRGBA8BufferToOutputWithPolicy<outputFmt, RGB6RepackPolicy::NativeRGB5Expansion>(
+                width, height, src, dst, binaryAlpha);
+            break;
+        case RGB6RepackPolicy::PreserveExpandedRGB6:
+            ConvertRGBA8BufferToOutputWithPolicy<outputFmt, RGB6RepackPolicy::PreserveExpandedRGB6>(
+                width, height, src, dst, binaryAlpha);
+            break;
+        }
+    }
+    else
+    {
+        ConvertRGBA8BufferToOutputWithPolicy<outputFmt, RGB6RepackPolicy::NativeRGB5Expansion>(
+            width, height, src, dst, binaryAlpha);
     }
 }
 
