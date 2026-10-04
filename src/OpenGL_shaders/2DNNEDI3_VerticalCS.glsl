@@ -27,6 +27,12 @@ layout(rgba16f, binding = 0) writeonly uniform image2D outImage;
 
 uniform sampler2D Source;
 uniform ivec2 uSrcSize;
+// Zero for full-plane/2D callers; retain global coordinates for partial work.
+uniform ivec2 uWorkOrigin;
+uniform bool uPredictAlpha;
+uniform bool uAlphaOnly;
+uniform bool uBoundedCoverageAlpha;
+uniform bool uPremultiplyInput;
 
 const int TILE_WIDTH = 15;
 const int TILE_HEIGHT = 11;
@@ -56,6 +62,8 @@ void nnedi3_load_tile(ivec2 groupOrigin)
         int tileY = int(tileIndex / uint(TILE_WIDTH));
         ivec2 sourcePixel = nnedi3_clamp_coord(tileOrigin + ivec2(tileX, tileY));
         sTile[tileY][tileX] = texelFetch(Source, sourcePixel, 0);
+        if (uPremultiplyInput)
+            sTile[tileY][tileX].rgb *= sTile[tileY][tileX].a;
     }
     barrier();
 }
@@ -93,10 +101,12 @@ float sum = 0.0, sumsq = 0.0;
     return clamp(mstd0 + 5.0 * vsum / wsum * mstd1, 0.0, 1.0);
 }
 
-vec3 nnedi3_predict(ivec2 localPixel)
+vec4 nnedi3_predict(ivec2 localPixel)
 {
-    vec3 result;
-    for (int component = 0; component < 3; component++)
+    vec4 result = vec4(0.0);
+    int firstComponent = uAlphaOnly ? 3 : 0;
+    int componentCount = uPredictAlpha ? 4 : 3;
+    for (int component = firstComponent; component < componentCount; component++)
     {
         vec4 samples[8];
         samples[0] = vec4(nnedi3_tile_component(localPixel, -3, -1, component), nnedi3_tile_component(localPixel, -2, -1, component), nnedi3_tile_component(localPixel, -1, -1, component), nnedi3_tile_component(localPixel, 0, -1, component));
@@ -114,7 +124,7 @@ vec3 nnedi3_predict(ivec2 localPixel)
 
 void main()
 {
-    ivec2 groupOrigin = ivec2(gl_WorkGroupID.xy) * ivec2(gl_WorkGroupSize.xy);
+    ivec2 groupOrigin = uWorkOrigin + ivec2(gl_WorkGroupID.xy) * ivec2(gl_WorkGroupSize.xy);
     ivec2 localPixel = ivec2(gl_LocalInvocationID.xy);
     ivec2 sourcePixel = groupOrigin + localPixel;
 
@@ -124,12 +134,22 @@ void main()
         return;
 
     vec4 copied = sTile[localPixel.y + TILE_HALO.y][localPixel.x + TILE_HALO.x];
-    vec3 predicted = nnedi3_predict(localPixel);
-    float predictedAlpha = 0.5 * (
-        copied.a +
-        sTile[localPixel.y + TILE_HALO.y + 1][localPixel.x + TILE_HALO.x].a);
+    vec4 predicted = nnedi3_predict(localPixel);
+    float predictedAlpha = uPredictAlpha
+        ? predicted.a
+        : 0.5 * (
+            copied.a +
+            sTile[localPixel.y + TILE_HALO.y + 1][localPixel.x + TILE_HALO.x].a);
     ivec2 outputPixel = ivec2(sourcePixel.x, sourcePixel.y * 2);
+    if (uBoundedCoverageAlpha)
+    {
+        // Bound coverage interpolation by its source interval, not by a
+        // fixed opacity threshold. Keep the predictor's fractional edge.
+        float nextAlpha = sTile[localPixel.y + TILE_HALO.y + 1][localPixel.x + TILE_HALO.x].a;
+        predictedAlpha = clamp(predictedAlpha, min(copied.a, nextAlpha), max(copied.a, nextAlpha));
+    }
 
     imageStore(outImage, outputPixel, copied);
-    imageStore(outImage, outputPixel + ivec2(0, 1), vec4(predicted, predictedAlpha));
+    imageStore(outImage, outputPixel + ivec2(0, 1),
+               vec4(uAlphaOnly ? copied.rgb : predicted.rgb, predictedAlpha));
 }

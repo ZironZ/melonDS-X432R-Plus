@@ -43,6 +43,12 @@ add_library(core STATIC
     GPU3D_Texcache.h
     WholeSceneCapturePolicy.cpp
     WholeSceneCapturePolicy.h
+    WholeSceneCompositorInput.cpp
+    WholeSceneCompositorInput.h
+    WholeSceneOutputPlan.cpp
+    WholeSceneOutputPlan.h
+    WholeSceneOBJBandPolicy.cpp
+    WholeSceneOBJBandPolicy.h
     WholeSceneScalePolicy.cpp
     WholeSceneScalePolicy.h
     Mic.cpp
@@ -167,7 +173,6 @@ endif()
 
 target_include_directories(core INTERFACE "${CMAKE_CURRENT_SOURCE_DIR}")
 
-set(MELONDS_VERSION_SUFFIX "$ENV{MELONDS_VERSION_SUFFIX}" CACHE STRING "Suffix to add to displayed melonDS version")
 option(MELONDS_EMBED_BUILD_INFO "Embed detailed build info into the binary" OFF)
 set(MELONDS_GIT_BRANCH "$ENV{MELONDS_GIT_BRANCH}" CACHE STRING "The Git branch used for this build")
 set(MELONDS_GIT_HASH "$ENV{MELONDS_GIT_HASH}" CACHE STRING "The hash of the Git commit")

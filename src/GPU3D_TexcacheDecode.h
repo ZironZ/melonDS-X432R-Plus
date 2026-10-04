@@ -24,6 +24,7 @@
 #include "types.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstring>
 #include <vector>
@@ -134,64 +135,37 @@ inline void PadTransparentTextureRGBIterations(u32 width, u32 height, u32* src, 
     if (pixels == 0 || maxIterations == 0)
         return;
 
-    std::vector<u32> current(src, src + pixels);
-    std::vector<u32> next = current;
-
-    bool changed = true;
-    for (u32 iter = 0; iter < maxIterations && changed; iter++)
+    // Only nontransparent pixels contribute, and their color and alpha never
+    // change. Repeating this pass cannot propagate padding any further. Writes
+    // to transparent pixels are safe in place for the same reason.
+    for (u32 y = 0; y < height; y++)
     {
-        changed = false;
-
-        for (u32 y = 0; y < height; y++)
+        for (u32 x = 0; x < width; x++)
         {
-            for (u32 x = 0; x < width; x++)
+            size_t index = static_cast<size_t>(y) * width + x;
+            if ((src[index] >> 24) != 0)
+                continue;
+
+            u32 r = 0, g = 0, b = 0, count = 0;
+            for (s32 ny = std::max<s32>(0, static_cast<s32>(y) - 1);
+                 ny <= std::min<s32>(static_cast<s32>(height) - 1, static_cast<s32>(y) + 1); ny++)
             {
-                size_t index = static_cast<size_t>(y) * static_cast<size_t>(width) + static_cast<size_t>(x);
-                if (((current[index] >> 24) & 0xFF) != 0)
-                    continue;
-
-                u32 r = 0;
-                u32 g = 0;
-                u32 b = 0;
-                u32 count = 0;
-
-                for (s32 ny = std::max<s32>(0, static_cast<s32>(y) - 1);
-                     ny <= std::min<s32>(static_cast<s32>(height) - 1, static_cast<s32>(y) + 1); ny++)
+                for (s32 nx = std::max<s32>(0, static_cast<s32>(x) - 1);
+                     nx <= std::min<s32>(static_cast<s32>(width) - 1, static_cast<s32>(x) + 1); nx++)
                 {
-                    for (s32 nx = std::max<s32>(0, static_cast<s32>(x) - 1);
-                         nx <= std::min<s32>(static_cast<s32>(width) - 1, static_cast<s32>(x) + 1); nx++)
-                    {
-                        if (nx == static_cast<s32>(x) && ny == static_cast<s32>(y))
-                            continue;
-
-                        u32 neighbor = current[static_cast<size_t>(ny) * static_cast<size_t>(width) + static_cast<size_t>(nx)];
-                        if (((neighbor >> 24) & 0xFF) == 0)
-                            continue;
-
-                        r += neighbor & 0xFF;
-                        g += (neighbor >> 8) & 0xFF;
-                        b += (neighbor >> 16) & 0xFF;
-                        count++;
-                    }
+                    u32 neighbor = src[static_cast<size_t>(ny) * width + nx];
+                    if ((neighbor >> 24) == 0)
+                        continue;
+                    r += neighbor & 0xFF;
+                    g += (neighbor >> 8) & 0xFF;
+                    b += (neighbor >> 16) & 0xFF;
+                    count++;
                 }
-
-                if (count == 0)
-                    continue;
-
-                next[index] =
-                    (current[index] & 0xFF000000) |
-                    ((r / count) & 0xFF) |
-                    (((g / count) & 0xFF) << 8) |
-                    (((b / count) & 0xFF) << 16);
-                changed = true;
             }
+            if (count != 0)
+                src[index] = (r / count) | ((g / count) << 8) | ((b / count) << 16);
         }
-
-        current.swap(next);
-        next = current;
     }
-
-    std::memcpy(src, current.data(), pixels * sizeof(u32));
 }
 
 inline void PadTransparentTextureRGBFast(u32 width, u32 height, u32* src)
@@ -230,6 +204,60 @@ inline u8 QuantizeRGB8ToRGB6Roundtrip(float value)
 {
     value = std::clamp(value, 0.0f, 255.0f);
     return (u8)std::clamp((int)std::lround(value * (63.0f / 255.0f)), 0, 63);
+}
+
+// Match the existing per-channel rounding, including native RGB5 expansion.
+// The three byte tables are shared by all mip chains and initialized once.
+struct TextureRepackLookupTables
+{
+    std::array<u8, 256> NativeRGB, PreservedRGB, Alpha;
+
+    TextureRepackLookupTables()
+    {
+        for (size_t i = 0; i < 256; i++)
+        {
+            NativeRGB[i] = QuantizeRGB8ToRGB6LikeDS(static_cast<float>(i));
+            PreservedRGB[i] = QuantizeRGB8ToRGB6Roundtrip(static_cast<float>(i));
+            Alpha[i] = static_cast<u8>(std::lround(static_cast<float>(i) * (31.0f / 255.0f)));
+        }
+    }
+};
+
+inline const TextureRepackLookupTables& TextureRepackTables()
+{
+    static const TextureRepackLookupTables tables;
+    return tables;
+}
+
+template <int outputFmt>
+inline void ConvertRGBA8BufferToOutputLUT(u32 width, u32 height, const u32* src, u32* dst, bool binaryAlpha,
+                                          RGB6RepackPolicy repackPolicy)
+{
+    const size_t pixels = static_cast<size_t>(width) * height;
+    const auto& tables = TextureRepackTables();
+    const auto& rgb = repackPolicy == RGB6RepackPolicy::PreserveExpandedRGB6 ? tables.PreservedRGB : tables.NativeRGB;
+    for (size_t i = 0; i < pixels; i++)
+    {
+        const u32 color = src[i];
+        u32 alpha = color >> 24;
+        if (binaryAlpha)
+        {
+            if (alpha < 128)
+            {
+                dst[i] = 0;
+                continue;
+            }
+            alpha = 255;
+        }
+        if constexpr (outputFmt == outputFmt_RGB6A5)
+            dst[i] = rgb[color & 255] | (static_cast<u32>(rgb[(color >> 8) & 255]) << 8) |
+                (static_cast<u32>(rgb[(color >> 16) & 255]) << 16) |
+                (static_cast<u32>(tables.Alpha[alpha]) << 24);
+        else if constexpr (outputFmt == outputFmt_BGRA8)
+            dst[i] = ((color >> 16) & 255) | (color & 0xFF00) | ((color & 255) << 16) | (alpha << 24);
+        else
+            dst[i] = (color & 0xFFFFFF) | (alpha << 24);
+    }
 }
 
 template <int outputFmt, RGB6RepackPolicy repackPolicy>

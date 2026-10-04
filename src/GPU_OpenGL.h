@@ -19,6 +19,7 @@
 #ifndef GPU_OPENGL_H
 #define GPU_OPENGL_H
 
+#include <array>
 #include <atomic>
 #include <vector>
 
@@ -64,7 +65,8 @@ public:
                                    int& width,
                                    int& height,
                                    std::vector<u32>& rgba,
-                                   std::string* status = nullptr) override;
+                                   std::string* status = nullptr,
+                                   WholeScene2DDebugReadContext* context = nullptr) override;
     bool SetWholeScene2DDebugPoison(bool source3D,
                                     bool native3DResolve,
                                     bool native3DResolveAlpha,
@@ -99,6 +101,7 @@ public:
     void ShaderCompileStep(int& current, int& count) override;
 
 private:
+    friend struct GLRendererLifetimeTestAccess;
     friend class GLRenderer2D;
     friend class GLRenderer3D;
     friend class ComputeRenderer3D;
@@ -109,11 +112,47 @@ private:
     int ScreenW, ScreenH;
     bool PhysicalFinalUpscale;
 
-    GLuint RectVtxBuffer;
-    GLuint RectVtxArray;
+    GLuint RectVtxBuffer {};
+    GLuint RectVtxArray {};
 
-    GLuint OutputTex3D;
-    GLuint OutputTex2D[2];
+    GLuint OutputTex3D {};
+    GLuint WideOutputTex3D = 0;
+    GLuint WideShader = 0;
+    GLuint WideVerticalShader = 0;
+    GLuint WideCaptureShader = 0;
+    GLuint WideScratchTex = 0, WideScratchFB = 0;
+    u64 WideFeedbackSerial[4] = {};
+    GLuint WideWindowUBO = 0;
+    struct WideWindowRow
+    {
+        u32 Current[4]; // engine A left/right, engine B left/right
+        u32 Captured[4];
+    };
+    GLuint WideOutputTex[2] = {};
+    GLuint WideOutputFB[2] = {};
+    GLuint WideCaptureTex[4] = {};
+    GLuint WideCaptureFB[4] = {};
+    GLuint WideCaptureReadFB = 0;
+    int WideSourceScale = 1;
+    u8 WideNarrowBorderRows[192][2] = {}; // Per-display side bits, final presentation only.
+    u8 WideNarrowBorderColumns[256][2] = {}; // Top/bottom side bits for rotated output.
+    struct WideCaptureState
+    {
+        u64 Serial = 0;
+        bool FullWidth = false;
+        std::array<std::array<u32, 2>, 192> EdgePolicy = {};
+        // Source-A-only copies defer 2D composition until presentation or the
+        // first feedback read. Feedback products already contain those effects.
+        std::array<std::array<u32, 2>, 192> BackdropPolicy = {};
+        bool NeedsComposition = false;
+        std::array<u8, 256> VerticalBorders = {};
+    } WideCapture[4];
+    void RenderWideWings(int ystart, int yend);
+    void RenderVerticalWings(int ystart, int yend);
+    int FindWideCapture(const GLRenderer2D& renderer, int ystart, int yend, int& layer) const;
+    int FindWideVRAMDisplay(u32 dispCnt) const;
+    void CopyWideCenter();
+    GLuint OutputTex2D[2] {}; // Borrowed from the two 2D renderers.
 
     struct sFinalPassConfig
     {
@@ -130,28 +169,28 @@ private:
         u32 __pad0[3];
     } FinalPassConfig;
 
-    GLuint FPShader;
-    GLuint FPConfigUBO;
+    GLuint FPShader {};
+    GLuint FPConfigUBO {};
 
-    GLuint FPVertexBufferID;
-    GLuint FPVertexArrayID;
+    GLuint FPVertexBufferID {};
+    GLuint FPVertexArrayID {};
 
-    GLuint AuxInputTex;                 // aux input (VRAM and mainmem FIFO)
+    GLuint AuxInputTex {};                 // aux input (VRAM and mainmem FIFO)
 
     // texture/fb for display capture VRAM input
-    GLuint CaptureVRAMTex;
-    GLuint CaptureVRAMFB;
+    GLuint CaptureVRAMTex {};
+    GLuint CaptureVRAMFB {};
 
-    GLuint FPOutputTex[2];               // final output
-    GLuint FPOutputFB[2];
-    GLuint NativeFPOutputTex[2];         // native physical final output before postprocess upscale
-    GLuint NativeFPOutputFB[2];
-    GLuint NativeFPOutputLayerReadFB[2];
-    GLuint PhysicalFinalNativeTex[2];    // temporary 2D top/bottom sources for postprocess upscale
-    GLuint PhysicalFinalNativeFB[2];
-    GLuint PhysicalFinalScaledTex[2];    // temporary 2D top/bottom scaled results
-    GLuint PhysicalFinalScaledFB[2];
-    GLuint PhysicalFinalOutputLayerFB[2];
+    GLuint FPOutputTex[2] {};               // final output
+    GLuint FPOutputFB[2] {};
+    GLuint NativeFPOutputTex[2] {};         // native physical final output before postprocess upscale
+    GLuint NativeFPOutputFB[2] {};
+    GLuint NativeFPOutputLayerReadFB[2] {};
+    GLuint PhysicalFinalNativeTex[2] {};    // temporary 2D top/bottom sources for postprocess upscale
+    GLuint PhysicalFinalNativeFB[2] {};
+    GLuint PhysicalFinalScaledTex[2] {};    // temporary 2D top/bottom scaled results
+    GLuint PhysicalFinalScaledFB[2] {};
+    GLuint PhysicalFinalOutputLayerFB[2] {};
 
     struct RollingFinalDebugSlot
     {
@@ -166,8 +205,11 @@ private:
     u64 RollingFinalDebugSerial;
     bool WholeSceneTimingFrameValid;
     u64 WholeSceneTimingFrame;
-    GLuint RollingFinalDebugTex;
-    GLuint RollingFinalDebugFB;
+    WholeScenePhysicalPresentationLedger PhysicalPresentationLedger;
+    u64 PhysicalPresentationSequence;
+    u64 PhysicalPresentationFrame;
+    GLuint RollingFinalDebugTex {};
+    GLuint RollingFinalDebugFB {};
     int RollingFinalDebugWidth;
     int RollingFinalDebugHeight;
     std::vector<RollingFinalDebugSlot> RollingFinalDebugSlots;
@@ -298,8 +340,6 @@ private:
         bool SourceTextBGFullEquivalent;
         bool SourceOBJOnlyDirtyOrPartial;
         u32 SourcePresentationHash;
-        u16 SourceMasterBrightness;
-        bool HasSourceEffectState;
         HighResCaptureSourceKind SourceKind;
         u32 ProductMask;
         HighResCaptureRejectReason RejectReason;
@@ -309,12 +349,12 @@ private:
     u64 HighResDisplayCaptureEventSerial;
     u64 Output3DSerial;
     u32 Output3DSceneHash;
-    GLuint HighResDisplayCaptureBackgroundTex[4];
-    GLuint HighResDisplayCaptureBackgroundFB[4];
-    GLuint HighResDisplayCaptureBackgroundReadFB;
-    GLuint HighResDisplayCaptureFullTex[4];
-    GLuint HighResDisplayCaptureFullFB[4];
-    GLuint HighResDisplayCaptureFullReadFB;
+    GLuint HighResDisplayCaptureBackgroundTex[4] {};
+    GLuint HighResDisplayCaptureBackgroundFB[4] {};
+    GLuint HighResDisplayCaptureBackgroundReadFB {};
+    GLuint HighResDisplayCaptureFullTex[4] {};
+    GLuint HighResDisplayCaptureFullFB[4] {};
+    GLuint HighResDisplayCaptureFullReadFB {};
 
     struct sCaptureBackgroundEpoch
     {
@@ -336,12 +376,10 @@ private:
         bool SourceDirect3DVisible;
         bool SourceOBJVisible;
         u32 SourcePresentationHash;
-        u16 StoredMasterBrightness;
-        bool HasStoredEffectState;
     };
     sCaptureBackgroundEpoch ActiveCaptureBackgroundEpoch[2];
-    GLuint ActiveCaptureBackgroundEpochTex[2];
-    GLuint ActiveCaptureBackgroundEpochFB[2];
+    GLuint ActiveCaptureBackgroundEpochTex[2] {};
+    GLuint ActiveCaptureBackgroundEpochFB[2] {};
 
     struct sMainVRAMDisplayEpoch
     {
@@ -367,8 +405,8 @@ private:
         u32 DirtyYEnd;
     };
     sMainVRAMDisplayEpoch MainVRAMDisplayEpoch[4];
-    GLuint MainVRAMDisplayEpochTex[4];
-    GLuint MainVRAMDisplayEpochFB[4];
+    GLuint MainVRAMDisplayEpochTex[4] {};
+    GLuint MainVRAMDisplayEpochFB[4] {};
     struct sMainVRAMDisplayEpochInvalidationDebug
     {
         u32 Reason;
@@ -398,31 +436,31 @@ private:
     } VRAMDisplayWriteDebug;
     std::atomic_bool WholeSceneDebugViewsActive;
 
-    GLuint CaptureShader;
-    GLuint CaptureConfigUBO;
+    GLuint CaptureShader {};
+    GLuint CaptureConfigUBO {};
 
-    GLuint CaptureVtxBuffer;
-    GLuint CaptureVtxArray;
+    GLuint CaptureVtxBuffer {};
+    GLuint CaptureVtxArray {};
 
-    GLuint CaptureOutput256FB[4];
-    GLuint CaptureOutput256Tex;
+    GLuint CaptureOutput256FB[4] {};
+    GLuint CaptureOutput256Tex {};
     bool CaptureOutput256Valid[4];
-    GLuint CaptureOutput128FB[16];
-    GLuint CaptureOutput128Tex;
+    GLuint CaptureOutput128FB[16] {};
+    GLuint CaptureOutput128Tex {};
 
-    GLuint CapDownShader;
+    GLuint CapDownShader {};
     GLint CapDownInputLayerULoc;
 
-    GLuint CaptureSyncFB;
-    GLuint CaptureSyncTex;
+    GLuint CaptureSyncFB {};
+    GLuint CaptureSyncTex {};
 
     // Native-size scratch target for the capture-content luma probe. Only
     // touched while the whole-scene timing CSV is being read.
-    GLuint CaptureLumaProbeFB;
-    GLuint CaptureLumaProbeTex;
+    GLuint CaptureLumaProbeFB {};
+    GLuint CaptureLumaProbeTex {};
     int WholeSceneTimingCSVActiveFrames = 0;
 
-    u16* AuxInputBuffer[2];
+    u16* AuxInputBuffer[2] {};
     u8 AuxUsageMask;
 
     struct sPhaseTiming
@@ -448,8 +486,6 @@ private:
     u32 DispCntA, DispCntB;
     u16 MasterBrightnessA, MasterBrightnessB;
     u16 FrameStartMasterBrightnessA, FrameStartMasterBrightnessB;
-    u32 MasterBrightnessHoldEngineMask;
-    u32 MasterBrightnessHoldNextEngineMask;
     u32 CaptureCnt;
 
     bool NeedPartialRender;
@@ -531,7 +567,6 @@ private:
     bool GetFinalPassScreenSwapForRange(int ystart, int yend, bool& screenSwap) const;
     void UpdateFinalPresentationTransitionGuard();
     bool IsFinalPresentationTransitionGuardActiveForRange(int ystart, int yend) const;
-    bool IsFinalPresentationScreenSwapExcursionActiveForRange(int ystart, int yend) const;
     bool IsEngineRoutedToFinalBottom(u32 engine) const;
     bool IsEngineRoutedToFinalBottom(u32 engine, int ystart, int yend) const;
     bool IsMainVRAMDisplayFinalRouteForRange(int ystart, int yend) const;
@@ -572,6 +607,7 @@ private:
                                       int framebufferScale,
                                       GLuint mainInputTex,
                                       GLuint subInputTex,
+                                      WholeSceneFinalPassPurpose purpose,
                                       bool mainInputReplacesVRAMDisplay = false);
     void RenderMainVRAMDisplayNativeFallbackUpscale(int backbuf, int ystart, int yend);
     bool EnsureRollingFinalDebugStorage();
@@ -583,6 +619,17 @@ private:
                                             WholeScene2DFinalDebugFrame& frame,
                                             std::string* status = nullptr);
     bool RenderPhysicalFinalUpscale();
+    void RecordPhysicalPresentation(
+        const GLRenderer2D* renderer,
+        WholeScenePhysicalSourceEngine sourceEngine,
+        const WholeScenePresentationTrace& presentation,
+        bool completionValid);
+    void RecordMixedPhysicalPresentation(
+        WholeSceneFinalPassPurpose purpose,
+        int ystart,
+        int yend,
+        bool completionValid);
+    void RecordPhysicalPostprocessPresentation(bool completionValid);
     void RecordDisplayCaptureDebug(const sLastDisplayCaptureDebug& capture);
     void RecordHighResDisplayCaptureEvent(const sLastDisplayCaptureDebug& capture);
     sHighResDisplayCaptureEvent BuildHighResDisplayCaptureEventMetadata(const sLastDisplayCaptureDebug& capture,
@@ -601,6 +648,10 @@ private:
     void PublishHighResDisplayCaptureEvent(const sLastDisplayCaptureDebug& capture,
                                            const sHighResDisplayCaptureEvent& event,
                                            bool fullDisplay);
+    void StoreVerticalCapture(const sLastDisplayCaptureDebug& capture, const sHighResDisplayCaptureEvent& event);
+    void StoreWideFeedbackCapture(const sLastDisplayCaptureDebug& capture, const sHighResDisplayCaptureEvent& event);
+    void StoreWideCapture(const sLastDisplayCaptureDebug& capture,
+                          const sHighResDisplayCaptureEvent& event);
     bool StoreHighResDisplayCaptureBackgroundProduct(u32 captureBank, GLuint sourceTex);
     bool StoreHighResDisplayCaptureFullProduct(u32 captureBank, GLuint sourceTex);
     bool StoreHighResDisplayCaptureBackgroundProductFromCaptureOutput(u32 captureBank);

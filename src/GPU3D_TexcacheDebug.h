@@ -1,20 +1,5 @@
-/*
-    Copyright 2026 ZironZ
-
-    This file is part of melonDS.
-
-    melonDS is free software: you can redistribute it and/or modify it under
-    the terms of the GNU General Public License as published by the Free
-    Software Foundation, either version 3 of the License, or (at your option)
-    any later version.
-
-    melonDS is distributed in the hope that it will be useful, but WITHOUT ANY
-    WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
-    FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
-
-    You should have received a copy of the GNU General Public License along
-    with melonDS. If not, see http://www.gnu.org/licenses/.
-*/
+// Copyright 2026 ZironZ
+// SPDX-License-Identifier: GPL-3.0-or-later
 
 #ifndef GPU3D_TEXCACHE_DEBUG_H
 #define GPU3D_TEXCACHE_DEBUG_H
@@ -194,8 +179,7 @@ public:
                   bool deferredScalingEnabled,
                   bool legacyAlphaHandling,
                   bool qualityAlphaHandling,
-                  bool alphaXBRZ,
-                  bool spline36Alpha,
+                  int alphaAlgorithmIndex,
                   int algorithmIndex,
                   u32 scaleFactor,
                   u32 cacheEntries,
@@ -214,8 +198,7 @@ public:
         stats.DeferredScalingEnabled = deferredScalingEnabled;
         stats.LegacyAlphaHandling = legacyAlphaHandling;
         stats.QualityAlphaHandling = qualityAlphaHandling;
-        stats.AlphaXBRZ = alphaXBRZ;
-        stats.Spline36Alpha = spline36Alpha;
+        stats.AlphaAlgorithmIndex = alphaAlgorithmIndex;
         stats.ReadableTextureCache = readableTextureCache;
         stats.AlgorithmIndex = algorithmIndex;
         stats.ScaleFactor = scaleFactor;

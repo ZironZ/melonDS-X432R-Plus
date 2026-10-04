@@ -1,20 +1,5 @@
-/*
-    Copyright 2026 ZironZ
-
-    This file is part of melonDS.
-
-    melonDS is free software: you can redistribute it and/or modify it under
-    the terms of the GNU General Public License as published by the Free
-    Software Foundation, either version 3 of the License, or (at your option)
-    any later version.
-
-    melonDS is distributed in the hope that it will be useful, but WITHOUT ANY
-    WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
-    FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
-
-    You should have received a copy of the GNU General Public License along
-    with melonDS. If not, see http://www.gnu.org/licenses/.
-*/
+// Copyright 2026 ZironZ
+// SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <QCheckBox>
 #include <QComboBox>
@@ -23,7 +8,6 @@
 #include <QDateTime>
 #include <QDir>
 #include <QElapsedTimer>
-#include <QEventLoop>
 #include <QFile>
 #include <QFileDialog>
 #include <QFileInfo>
@@ -101,6 +85,22 @@ const std::vector<DebugViewSpec>& DebugViewSpecs()
         {"High-res compositor", "Compositor OBJ flags", DebugView::HighResOBJFlags},
         {"High-res compositor", "Compositor OBJ coverage", DebugView::HighResOBJCoverage},
 
+        {"Strict affine", "Candidate color", DebugView::StrictAffineCandidate},
+        {"Strict affine", "Native reference", DebugView::StrictAffineNativeReference},
+        {"Strict affine", "Downsample difference", DebugView::StrictAffineDownsampleDifference},
+        {"Strict affine", "Enhanced BG2 source", DebugView::StrictAffineEnhancedBG2Source},
+        {"Strict affine", "Enhanced BG3 source", DebugView::StrictAffineEnhancedBG3Source},
+        {"Strict affine", "Enhanced transformed OBJ source", DebugView::StrictAffineEnhancedOBJSource},
+        {"Strict affine", "Native OBJ source atlas (RGB / alpha)", DebugView::NativeOBJSourceAtlas},
+        {"Strict affine", "Enhanced OBJ source atlas (RGB / alpha)", DebugView::StrictAffineEnhancedOBJSourceAtlas},
+        {"Strict affine", "Assembled OBJ source atlas (RGB / alpha)", DebugView::StrictAffineAssembledOBJSourceAtlas},
+        {"Strict affine", "Transformed OBJ color", DebugView::StrictAffineTransformedOBJColor},
+        {"Strict affine", "Transformed OBJ coverage", DebugView::StrictAffineTransformedOBJCoverage},
+        {"Strict affine", "Ordinary OBJ band 0 color", DebugView::StrictAffineOrdinaryOBJBand0Color},
+        {"Strict affine", "Ordinary OBJ band 0 coverage", DebugView::StrictAffineOrdinaryOBJBand0Coverage},
+        {"Strict affine", "Ordinary OBJ band 0 scaled", DebugView::StrictAffineOrdinaryOBJBand0Scaled},
+        {"Strict affine", "Unified ordinary OBJ reconstruction", DebugView::StrictAffineResolvedOrdinaryOBJ},
+
         {"Overlay operator", "Overlay operator color", DebugView::OverlayOperatorColor},
         {"Overlay operator", "Overlay underlay weight", DebugView::OverlayUnderlayWeight},
         {"Overlay operator", "Overlay reconstructed native", DebugView::OverlayReconstructedNative},
@@ -144,6 +144,12 @@ const std::vector<DebugViewSpec>& DebugViewSpecs()
         {"Capture banks", "Main VRAM epoch bank B", DebugView::MainVRAMDisplayEpochBank1},
         {"Capture banks", "Main VRAM epoch bank C", DebugView::MainVRAMDisplayEpochBank2},
         {"Capture banks", "Main VRAM epoch bank D", DebugView::MainVRAMDisplayEpochBank3},
+        {"Affine overlap", "Overlap semantic scene", DebugView::StrictAffineOverlapSemantic},
+        {"Affine overlap", "Overlap exposed underlay", DebugView::StrictAffineOverlapUnderlay},
+        {"Affine overlap", "Overlap tap decisions", DebugView::StrictAffineOverlapDecisions},
+        {"Affine overlap", "Overlap subpixel RGBA", DebugView::StrictAffineOverlapSubpixelColor},
+        {"Affine overlap", "Overlap subpixel flags", DebugView::StrictAffineOverlapSubpixelFlags},
+        {"Affine overlap", "Overlap subpixel coverage", DebugView::StrictAffineOverlapSubpixelCoverage},
     };
 
     return views;
@@ -171,77 +177,6 @@ QString SafeExportName(QString text)
         return "view";
 
     return text;
-}
-
-bool SaveFinalDebugFrame(const melonDS::WholeScene2DFinalDebugFrame& frame,
-                         const QDir& dir,
-                         const QString& stem,
-                         QTextStream& manifestText,
-                         int& savedCount,
-                         int& failedCount)
-{
-    if (frame.Width <= 0 ||
-        frame.Height <= 0 ||
-        frame.TopRGBA.empty() ||
-        frame.BottomRGBA.empty())
-    {
-        manifestText << "  " << stem << ": unavailable\n";
-        return false;
-    }
-
-    const QString topName = stem + "-top.png";
-    const QString bottomName = stem + "-bottom.png";
-
-    QImage topImage(reinterpret_cast<const uchar*>(frame.TopRGBA.data()),
-                    frame.Width,
-                    frame.Height,
-                    QImage::Format_RGBA8888);
-    QImage bottomImage(reinterpret_cast<const uchar*>(frame.BottomRGBA.data()),
-                       frame.Width,
-                       frame.Height,
-                       QImage::Format_RGBA8888);
-
-    const bool topSaved = topImage.save(dir.filePath(topName), "PNG");
-    const bool bottomSaved = bottomImage.save(dir.filePath(bottomName), "PNG");
-    savedCount += topSaved ? 1 : 0;
-    savedCount += bottomSaved ? 1 : 0;
-    failedCount += topSaved ? 0 : 1;
-    failedCount += bottomSaved ? 0 : 1;
-
-    manifestText << "  " << stem << "\n";
-    manifestText << "    Serial: " << frame.Serial << "\n";
-    if (frame.TimingFrameValid)
-        manifestText << "    Timing frame: " << frame.TimingFrame << "\n";
-    else
-        manifestText << "    Timing frame: unavailable\n";
-    manifestText << "    Size: " << frame.Width << "x" << frame.Height << "\n";
-    manifestText << "    Final sources: top=" << frame.FinalTopSource
-                 << " bottom=" << frame.FinalBottomSource << "\n";
-    const auto writeEngine = [&manifestText](const char* label,
-                                             const melonDS::WholeScene2DEngineDebugIdentity& identity)
-    {
-        manifestText << "    " << label
-                     << ": path=" << identity.Path
-                     << " product_choice=" << identity.ProductChoice
-                     << " source_a_mode=" << identity.SourceAResolutionMode
-                     << " product_kind=" << identity.ChosenProductKind
-                     << " render_action=" << identity.ChosenProductRenderAction
-                     << " tex=" << identity.ChosenProductTex
-                     << " bank=" << identity.ChosenProductCaptureBank
-                     << " bg_epoch=" << identity.ChosenProductBackgroundEpochSerial
-                     << " source_3d=" << identity.ChosenProductSource3DSerial
-                     << " event=" << identity.ChosenProductCaptureEventSerial << "\n";
-        manifestText << "    " << label
-                     << " hashes: request_capture=" << identity.RequestCapturePresentationHash
-                     << " request_current=" << identity.RequestCurrentPresentationHash
-                     << " chosen_capture=" << identity.ChosenProductCapturePresentationHash
-                     << " chosen_current=" << identity.ChosenProductCurrentPresentationHash << "\n";
-    };
-    writeEngine("Engine A", frame.EngineA);
-    writeEngine("Engine B", frame.EngineB);
-    manifestText << "    Top: " << (topSaved ? "saved " + topName : "failed") << "\n";
-    manifestText << "    Bottom: " << (bottomSaved ? "saved " + bottomName : "failed") << "\n";
-    return topSaved && bottomSaved;
 }
 
 QString DebugViewDescription(melonDS::WholeScene2DDebugView view)
@@ -314,6 +249,48 @@ QString DebugViewDescription(melonDS::WholeScene2DDebugView view)
         return "OBJ flags used by high-resolution compositor mode. Red = alpha/blend mode, green = mosaic, blue = OBJ window/priority.";
     case DebugView::HighResOBJCoverage:
         return "OBJ coverage used by high-resolution compositor mode. Native OBJ fallback shows source alpha.";
+    case DebugView::StrictAffineCandidate:
+        return "Complete output-resolution image produced by the strict affine path. Affine source RGB may be nearest, filtered inline, or sampled from a reconstructed cache; native source presence remains authoritative.";
+    case DebugView::StrictAffineNativeReference:
+        return "Independent native-resolution compositor result generated from the same accepted strict-affine frame.";
+    case DebugView::StrictAffineDownsampleDifference:
+        return "Unamplified absolute RGB difference after box-downsampling the strict affine candidate to the independent native reference. Black is exact.";
+    case DebugView::StrictAffineEnhancedBG2Source:
+        return "Spline36/ArtCNN/CuNNy/NNEDI3/xBRZ-enhanced logical BG2 source product at its generated resolution, before screen-space sampling and placement. RGB forced opaque is shown on the left and reconstructed alpha on the right.";
+    case DebugView::StrictAffineEnhancedBG3Source:
+        return "Spline36/ArtCNN/CuNNy/NNEDI3/xBRZ-enhanced logical BG3 source product at its generated resolution, before screen-space sampling and placement. RGB forced opaque is shown on the left and reconstructed alpha on the right.";
+    case DebugView::NativeOBJSourceAtlas:
+        return "Decoded native sprite atlas: 16 columns of 64x64 compact slots. RGB is forced opaque on the left; native alpha is shown on the right. Unused cells are not meaningful. Slot metadata is in the view status.";
+    case DebugView::StrictAffineAssembledOBJSourceAtlas:
+        return "Current assembled normal-source cache. RGB is on the left and reconstructed alpha on the right. Status lists each slot's root and member OAM indices. Shadows are not included; this view reads existing products.";
+    case DebugView::StrictAffineEnhancedOBJSourceAtlas:
+        return "Existing enhanced sprite cache atlas: same compact slots multiplied by the cache scale. RGB is on the left, alpha on the right. Only slots marked cache_valid in the status are current; this view does not rebuild products.";
+    case DebugView::StrictAffineEnhancedOBJSource:
+        return "Selected active strict-path affine OBJ cache tile after source reconstruction but before OAM sampling. RGB forced opaque is shown on the left and source alpha on the right, so hidden fringe color remains inspectable.";
+    case DebugView::StrictAffineTransformedOBJColor:
+        return "Output-resolution RGB for genuinely transformed affine OBJ after OAM sampling, before priority composition and masked edge AA. Alpha is forced opaque for diagnosis; compare the separate coverage view.";
+    case DebugView::StrictAffineTransformedOBJCoverage:
+        return "Output-resolution transformed affine-OBJ support before final composition. Red is reconstructed source coverage; green is affine semantic presence.";
+    case DebugView::StrictAffineOrdinaryOBJBand0Color:
+        return "Native-resolution color for the first admitted assembled ordinary-OBJ band. It is rendered directly from the band member set, so ordinary pixels hidden by affine OBJ or BG at the native final sample remain available.";
+    case DebugView::StrictAffineOrdinaryOBJBand0Coverage:
+        return "Native-resolution source coverage for the first admitted assembled ordinary-OBJ band. This is a diagnostic compositor input, not final scene ownership or reconstructed alpha.";
+    case DebugView::StrictAffineOrdinaryOBJBand0Scaled:
+        return "Selected-scaler reconstruction of the first admitted assembled ordinary-OBJ band. Every member is reconstructed together as one surface; this diagnostic product is not consumed by final composition.";
+    case DebugView::StrictAffineResolvedOrdinaryOBJ:
+        return "Selected-scaler reconstruction of the complete native OAM-resolved ordinary-OBJ surface consumed by the unified strict-affine OBJ merge.";
+    case DebugView::StrictAffineOverlapSemantic:
+        return "Completed semantic scene before localized 2x replacement in the immediate compositor.";
+    case DebugView::StrictAffineOverlapUnderlay:
+        return "Completed second/third-layer resolve. A tap uses this when replacing the same semantic affine winner; otherwise it uses the semantic scene.";
+    case DebugView::StrictAffineOverlapDecisions:
+        return "Raw decision bytes: R/G/B/A are GL offsets (0,0)/(1,0)/(0,1)/(1,1). 0 inactive; 1 absent/lower; 2 absent/semantic; 3 unsupported material (aborts all taps); 4 zero alpha; 5 blocked OBJ; 6 blocked BG; 7 accepted/lower; 8 accepted/semantic. Alpha is data, not opacity.";
+    case DebugView::StrictAffineOverlapSubpixelColor:
+        return "Exact RGBA8 snapshot consumed by immediate 2x composition. RGB may be premultiplied; alpha is retained. See renderer status for the premultiplication mode.";
+    case DebugView::StrictAffineOverlapSubpixelFlags:
+        return "Raw flags snapshot: R material, G mosaic, B window, A BG priority. Alpha is data, not opacity.";
+    case DebugView::StrictAffineOverlapSubpixelCoverage:
+        return "Raw coverage snapshot: R coverage, G affine presence, B rendered sprite index, A native presence. Alpha is data, not opacity.";
     case DebugView::Direct3D:
         return "Direct 3D texture sampled by the 2D resolve path on the main screen.";
     case DebugView::OverlayOperatorColor:
@@ -329,11 +306,11 @@ QString DebugViewDescription(melonDS::WholeScene2DDebugView view)
     case DebugView::OverlayOwnershipReason:
         return "Presentation overlay ownership/reason. Blue = enhanced underlay passes through, cyan = underlay plus added overlay color, magenta = overlay-owned/opaque, yellow = partial/translucent overlay, green = per-channel/tinted underlay response.";
     case DebugView::HybridSelector:
-        return "Conservative hybrid selector. Magenta = high-resolution foreground compositor, cyan = overlay assist. Teal marks safe window-excluded fallback; it becomes overlay assist only when Hybrid window-edge assist is enabled. Other colors identify native fallback reasons; bright fallback pixels have visible overlay-operator contribution.";
+        return "Selector for the active presentation path. Conservative hybrid mode shows high-resolution/overlay/native selection. Strict high-resolution affine mode shows semantic layer ownership and fractional presentation coverage before ordered operands and masked output AA.";
     case DebugView::HybridCoverageMiss:
         return "Hybrid coverage miss debug. Red = high-resolution Direct3D coverage exists but the hybrid selector falls back to native presentation; magenta = selected high-resolution foreground; cyan = overlay assist.";
     case DebugView::HybridForegroundAlpha:
-        return "Hybrid foreground alpha debug. Magenta = selected opaque high-resolution foreground; yellow/orange = selected fractional Direct3D alpha; red = selected foreground with zero Direct3D alpha.";
+        return "Coverage for the active presentation path. Conservative hybrid mode shows Direct3D foreground alpha. Strict high-resolution affine mode shows effective post-MLAA enhanced text-BG selector coverage: white selected, black underlay, gray fractional.";
     case DebugView::HybridFinalSource:
         return "Hybrid final source debug. Cyan = overlay operator result, pink = hybrid foreground compositor texture, blue = high-resolution foreground-boundary 2D base, gray = native fallback.";
     case DebugView::SandwichLower2D:
@@ -349,9 +326,9 @@ QString DebugViewDescription(melonDS::WholeScene2DDebugView view)
     case DebugView::OverlayFinalResult:
         return "Final per-engine presentation overlay result before the GL physical-screen final pass.";
     case DebugView::FinalTop:
-        return "Final physical top-screen output after GL final pass, screen swap, brightness, and VRAM/capture routing. The Screen selector is ignored.";
+        return "Completed top display at internal resolution, including widescreen, brightness, routing, sharpening, and LCD ghosting. Unused side padding is cropped. Window layout and OSD are excluded. The Screen selector is ignored.";
     case DebugView::FinalBottom:
-        return "Final physical bottom-screen output after GL final pass, screen swap, brightness, and VRAM/capture routing. The Screen selector is ignored.";
+        return "Completed bottom display at internal resolution, including widescreen, brightness, routing, sharpening, and LCD ghosting. Unused side padding is cropped. Window layout and OSD are excluded. The Screen selector is ignored.";
     case DebugView::MainVRAMDisplayRaw:
         return "Raw native-resolution CPU VRAM contents currently selected by main engine VRAM display, before high-resolution epoch replacement, native dirty-row overlay, final pass, screen swap, or brightness. The Screen selector is ignored.";
     case DebugView::MainVRAMDisplayRawBank0:
@@ -635,11 +612,14 @@ void WholeScene2DDebugDialog::setRendererDebugViewsActive(bool active)
     if (!mainWindow || !mainWindow->getEmuInstance())
         return;
 
+    // Availability markers are renderer-owned along with the textures. Dialog
+    // open/close must synchronize too, not just the later image readback.
+    const bool borrow = emuThread && emuThread->isRunning();
+    if (borrow) emuThread->borrowGL();
     auto* nds = mainWindow->getEmuInstance()->getNDS();
-    if (!nds)
-        return;
-
-    nds->GPU.GetRenderer().SetWholeScene2DDebugViewsActive(active);
+    if (nds)
+        nds->GPU.GetRenderer().SetWholeScene2DDebugViewsActive(active);
+    if (borrow) emuThread->returnGL();
 }
 
 bool WholeScene2DDebugDialog::captureRefreshSnapshot(QString* errorText)
@@ -680,158 +660,28 @@ bool WholeScene2DDebugDialog::captureRefreshSnapshot(QString* errorText)
     nds->GPU.GetRenderer().SetWholeScene2DDebugPoison(refreshSnapshotPoisonSource3D,
                                                       refreshSnapshotPoisonNative3DResolve,
                                                       refreshSnapshotPoisonNative3DResolveAlpha);
-    emuThread->returnGL();
-
     if (emuThread->emuIsRunning())
-    {
-        QEventLoop waitForFrame;
-        QTimer timeout;
-        timeout.setSingleShot(true);
-        connect(&timeout, &QTimer::timeout, &waitForFrame, &QEventLoop::quit);
-        connect(emuThread, &EmuThread::windowUpdate, &waitForFrame, &QEventLoop::quit);
-        timeout.start(250);
-        waitForFrame.exec();
-    }
+        emuThread->borrowNextFrameGL();
 
-    emuThread->borrowGL();
     mainWindow->makeCurrentGL();
 
-    const struct
-    {
-        int Screen;
-        const char* Name;
-    } screens[] = {
-        {0, "main"},
-        {1, "sub"},
-    };
-
-    for (const auto& screen : screens)
-    {
-        int viewIndex = 0;
-        for (const DebugViewSpec& spec : DebugViewSpecs())
-        {
-            viewIndex++;
-
-            CapturedView captured;
-            captured.Index = viewIndex;
-            captured.Screen = screen.Screen;
-            captured.ScreenName = QString::fromUtf8(screen.Name);
-            captured.ViewValue = static_cast<int>(spec.View);
-            captured.Category = QString::fromUtf8(spec.Category);
-            captured.Label = QString::fromUtf8(spec.Label);
-            captured.FileStem = QString("%1-%2-%3-%4")
-                                    .arg(captured.ScreenName)
-                                    .arg(viewIndex, 2, 10, QChar('0'))
-                                    .arg(SafeExportName(captured.Category))
-                                    .arg(SafeExportName(captured.Label));
-
-            std::vector<melonDS::u32> pixels;
-            std::string status;
-            const bool ok = nds->GPU.GetRenderer().ReadWholeScene2DDebugView(screen.Screen,
-                                                                             spec.View,
-                                                                             captured.Width,
-                                                                             captured.Height,
-                                                                             pixels,
-                                                                             &status);
-            captured.Status = QString::fromStdString(status);
-            if (ok && captured.Width > 0 && captured.Height > 0 && !pixels.empty())
-            {
-                QImage image(reinterpret_cast<const uchar*>(pixels.data()),
-                             captured.Width, captured.Height,
-                             QImage::Format_RGBA8888);
-                captured.Image = image.copy();
-                captured.Available = true;
-            }
-
-            refreshSnapshot.push_back(std::move(captured));
-        }
-    }
+    refreshSnapshot = captureViews(nds->GPU.GetRenderer(), mainWindow);
 
     mainWindow->releaseGL();
     emuThread->returnGL();
     return true;
 }
 
-bool WholeScene2DDebugDialog::dumpCurrentFrame(MainWindow* parent,
-                                               const QString& timingCsvPath,
-                                               qulonglong timingFrame,
-                                               QString* exportPath,
-                                               QString* errorText)
+std::vector<WholeScene2DDebugDialog::CapturedView> WholeScene2DDebugDialog::captureViews(melonDS::Renderer& renderer, MainWindow* window)
 {
-    if (exportPath)
-        exportPath->clear();
-    if (errorText)
-        errorText->clear();
-
-    if (!parent || !parent->getEmuInstance())
-    {
-        if (errorText)
-            *errorText = "No active emulator window.";
-        return false;
-    }
-
-    if (!parent->hasOpenGL())
-    {
-        if (errorText)
-            *errorText = "OpenGL is not active for this window.";
-        return false;
-    }
-
-    EmuThread* thread = parent->getEmuInstance()->getEmuThread();
-    auto* nds = parent->getEmuInstance()->getNDS();
-    if (!thread || !nds || !thread->emuIsActive())
-    {
-        if (errorText)
-            *errorText = "The emulator is not actively rendering.";
-        return false;
-    }
-
-    const QFileInfo csvInfo(timingCsvPath);
-    if (timingCsvPath.isEmpty() || csvInfo.absolutePath().isEmpty() || csvInfo.completeBaseName().isEmpty())
-    {
-        if (errorText)
-            *errorText = "No active whole-scene timing CSV path.";
-        return false;
-    }
-
-    const bool shouldDisableDebugViews = currentDlg == nullptr;
-    const bool poisonSource3D = currentDlg && currentDlg->cbPoisonSource3D->isChecked();
-    const bool poisonNative3DResolve = currentDlg && currentDlg->cbPoisonNative3DResolve->isChecked();
-    const bool poisonNative3DResolveAlpha = currentDlg && currentDlg->cbPoisonNative3DResolveAlpha->isChecked();
-    thread->borrowGL();
-    nds->GPU.GetRenderer().SetWholeScene2DDebugViewsActive(true);
-    nds->GPU.GetRenderer().SetWholeScene2DDebugPoison(poisonSource3D,
-                                                      poisonNative3DResolve,
-                                                      poisonNative3DResolveAlpha);
-    thread->returnGL();
-
-    if (thread->emuIsRunning())
-    {
-        QEventLoop waitForFrame;
-        QTimer timeout;
-        timeout.setSingleShot(true);
-        QObject::connect(&timeout, &QTimer::timeout, &waitForFrame, &QEventLoop::quit);
-        QObject::connect(thread, &EmuThread::windowUpdate, &waitForFrame, &QEventLoop::quit);
-        timeout.start(250);
-        waitForFrame.exec();
-    }
-
+    using DebugView = melonDS::WholeScene2DDebugView;
     std::vector<CapturedView> snapshot;
-    const QString stamp = QDateTime::currentDateTime().toString("yyyyMMdd-HHmmss");
-
-    thread->borrowGL();
-    parent->makeCurrentGL();
-
-    melonDS::WholeScene2DFinalDebugFrame currentFinalFrame;
-    std::string currentFinalStatus;
-    const bool currentFinalAvailable =
-        nds->GPU.GetRenderer().ReadWholeScene2DCurrentFinalDebugFrame(currentFinalFrame, &currentFinalStatus);
-
-    std::vector<melonDS::WholeScene2DFinalDebugFrame> rollingFrames;
-    std::string rollingStatus;
-    const bool rollingFramesAvailable =
-        nds->GPU.GetRenderer().ReadWholeScene2DRollingDebugFrames(rollingFrames, &rollingStatus);
-
+    // Capture once for both engine selectors. Final views are physical displays,
+    // with presentation effects applied by the same shader as the live window.
+    std::array<QImage, 2> finalDisplays;
+    QString finalError;
+    const bool finalAvailable = window->captureFinalDisplays(finalDisplays, &finalError);
+    melonDS::WholeScene2DDebugReadContext context;
     const struct
     {
         int Screen;
@@ -861,14 +711,30 @@ bool WholeScene2DDebugDialog::dumpCurrentFrame(MainWindow* parent,
                                     .arg(SafeExportName(captured.Category))
                                     .arg(SafeExportName(captured.Label));
 
+            QElapsedTimer readTimer;
+            readTimer.start();
+            if (spec.View == DebugView::FinalTop || spec.View == DebugView::FinalBottom)
+            {
+                const int display = spec.View == DebugView::FinalTop ? 0 : 1;
+                captured.Available = finalAvailable;
+                captured.Image = finalDisplays[display];
+                captured.Width = captured.Image.width();
+                captured.Height = captured.Image.height();
+                captured.Status = finalAvailable
+                    ? QString("Completed %1 display, including presentation effects. Internal resolution; side padding cropped; no window layout or OSD.")
+                        .arg(display == 0 ? "top" : "bottom")
+                    : finalError;
+                snapshot.push_back(std::move(captured));
+                continue;
+            }
             std::vector<melonDS::u32> pixels;
             std::string status;
-            const bool ok = nds->GPU.GetRenderer().ReadWholeScene2DDebugView(screen.Screen,
+            const bool ok = renderer.ReadWholeScene2DDebugView(screen.Screen,
                                                                              spec.View,
                                                                              captured.Width,
                                                                              captured.Height,
                                                                              pixels,
-                                                                             &status);
+                                                                             &status, &context);
             captured.Status = QString::fromStdString(status);
             if (ok && captured.Width > 0 && captured.Height > 0 && !pixels.empty())
             {
@@ -879,187 +745,31 @@ bool WholeScene2DDebugDialog::dumpCurrentFrame(MainWindow* parent,
                 captured.Available = true;
             }
 
+            captured.ReadMilliseconds = readTimer.elapsed();
             snapshot.push_back(std::move(captured));
         }
     }
 
-    parent->releaseGL();
-    thread->returnGL();
+    return snapshot;
+}
 
-    if (shouldDisableDebugViews)
-    {
-        thread->borrowGL();
-        nds->GPU.GetRenderer().SetWholeScene2DDebugViewsActive(false);
-        thread->returnGL();
-    }
-
-    QDir csvDir(csvInfo.absolutePath());
-    const QString capturesRootName = QString("%1-captures").arg(csvInfo.completeBaseName());
-    if (!csvDir.mkpath(capturesRootName))
-    {
-        if (errorText)
-            *errorText = QString("Failed to create capture directory in %1.").arg(csvDir.path());
-        return false;
-    }
-
-    QDir capturesRoot(csvDir.filePath(capturesRootName));
-    const QString frameName = QString("frame%1").arg(timingFrame, 6, 10, QChar('0'));
-    const QString dumpDirName = QString("%1-%2").arg(frameName, stamp);
-    if (!capturesRoot.mkpath(dumpDirName))
-    {
-        if (errorText)
-            *errorText = QString("Failed to create dump directory in %1.").arg(capturesRoot.path());
-        return false;
-    }
-
-    QDir dumpDir(capturesRoot.filePath(dumpDirName));
-    if (!dumpDir.mkpath("views"))
-    {
-        if (errorText)
-            *errorText = QString("Failed to create views directory in %1.").arg(dumpDir.path());
-        return false;
-    }
-    QDir viewsDir(dumpDir.filePath("views"));
-
-    if (currentFinalAvailable && !dumpDir.mkpath("current-final"))
-    {
-        if (errorText)
-            *errorText = QString("Failed to create current-final directory in %1.").arg(dumpDir.path());
-        return false;
-    }
-    QDir currentFinalDir(dumpDir.filePath("current-final"));
-
-    if (rollingFramesAvailable && !dumpDir.mkpath("rolling-final"))
-    {
-        if (errorText)
-            *errorText = QString("Failed to create rolling-final directory in %1.").arg(dumpDir.path());
-        return false;
-    }
-    QDir rollingDir(dumpDir.filePath("rolling-final"));
-
-    QFile manifest(dumpDir.filePath("manifest.txt"));
-    if (!manifest.open(QIODevice::WriteOnly | QIODevice::Text))
-    {
-        if (errorText)
-            *errorText = QString("Failed to write manifest in %1.").arg(dumpDir.path());
-        return false;
-    }
-
-    QTextStream manifestText(&manifest);
-    manifestText << "Whole-scene 2D hotkey debug dump\n";
-    manifestText << "Timestamp: " << stamp << "\n";
-    manifestText << "Timing CSV: " << timingCsvPath << "\n";
-    manifestText << "Timing frame: " << timingFrame << "\n";
-    manifestText << "Screens: main, sub\n";
-    manifestText << "Poison source 3D: " << (poisonSource3D ? "yes" : "no") << "\n";
-    manifestText << "Poison native 3D resolve: " << (poisonNative3DResolve ? "yes" : "no") << "\n";
-    manifestText << "Force native 3D resolve alpha: " << (poisonNative3DResolveAlpha ? "yes" : "no") << "\n";
-    manifestText << "Source: hotkey current-frame capture\n";
-    manifestText << "Note: current debug views are captured after the hotkey request; rolling final frames are read from the active ring when enabled.\n\n";
-    manifestText << "Current final capture: " << QString::fromStdString(currentFinalStatus) << "\n";
-    manifestText << "Rolling final capture: " << QString::fromStdString(rollingStatus) << "\n\n";
-
-    int savedCount = 0;
-    int skippedCount = 0;
-    int failedCount = 0;
-    int currentFinalSavedCount = 0;
-    int currentFinalFailedCount = 0;
-    int rollingSavedCount = 0;
-    int rollingFailedCount = 0;
-
-    if (currentFinalAvailable)
-    {
-        manifestText << "Current final frame:\n";
-        SaveFinalDebugFrame(currentFinalFrame,
-                            currentFinalDir,
-                            "current-final",
-                            manifestText,
-                            currentFinalSavedCount,
-                            currentFinalFailedCount);
-        manifestText << "\n";
-    }
-
-    if (rollingFramesAvailable)
-    {
-        manifestText << "Rolling final frames:\n";
-        int frameIndex = 0;
-        for (const auto& frame : rollingFrames)
-        {
-            const QString frameStem = QString("rolling-%1-serial%2")
-                                          .arg(frameIndex, 3, 10, QChar('0'))
-                                          .arg(frame.Serial, 6, 10, QChar('0'));
-            SaveFinalDebugFrame(frame,
-                                rollingDir,
-                                frameStem,
-                                manifestText,
-                                rollingSavedCount,
-                                rollingFailedCount);
-            frameIndex++;
-        }
-        manifestText << "\n";
-    }
-
-    for (const CapturedView& captured : snapshot)
-    {
-        manifestText << captured.FileStem << "\n";
-        manifestText << "  Screen: " << captured.ScreenName << "\n";
-        manifestText << "  Category: " << captured.Category << "\n";
-        manifestText << "  View: " << captured.Label << "\n";
-
-        if (!captured.Available)
-        {
-            skippedCount++;
-            manifestText << "  Result: skipped\n";
-            if (!captured.Status.isEmpty())
-            {
-                QString status = captured.Status;
-                manifestText << status.replace("\n", "\n  ") << "\n";
-            }
-            manifestText << "\n";
-            continue;
-        }
-
-        const QString pngName = captured.FileStem + ".png";
-        const bool saved = captured.Image.save(viewsDir.filePath(pngName), "PNG");
-        if (saved)
-        {
-            savedCount++;
-            manifestText << "  Result: saved views/" << pngName << " (" << captured.Width << "x" << captured.Height << ")\n";
-        }
-        else
-        {
-            failedCount++;
-            manifestText << "  Result: failed to save " << pngName << "\n";
-        }
-
-        if (!captured.Status.isEmpty())
-        {
-            QString status = captured.Status;
-            manifestText << status.replace("\n", "\n  ") << "\n";
-        }
-        manifestText << "\n";
-    }
-
-    manifestText << "Summary:\n";
-    manifestText << "  Saved views: " << savedCount << "\n";
-    manifestText << "  Skipped views: " << skippedCount << "\n";
-    manifestText << "  Failed views: " << failedCount << "\n";
-    manifestText << "  Saved current final images: " << currentFinalSavedCount << "\n";
-    manifestText << "  Failed current final images: " << currentFinalFailedCount << "\n";
-    manifestText << "  Saved rolling images: " << rollingSavedCount << "\n";
-    manifestText << "  Failed rolling images: " << rollingFailedCount << "\n";
-    manifestText.flush();
-
-    if (exportPath)
-        *exportPath = dumpDir.path();
-    return failedCount == 0 && currentFinalFailedCount == 0 && rollingFailedCount == 0;
+bool WholeScene2DDebugDialog::dumpCurrentFrame(MainWindow* parent,
+    const QString& timingCsvPath, qulonglong timingFrame,
+    QString* exportPath, QString* errorText)
+{
+    return dumpFrame(parent, timingCsvPath, timingFrame, true, exportPath, errorText);
 }
 
 bool WholeScene2DDebugDialog::dumpRollingFrames(MainWindow* parent,
-                                                const QString& timingCsvPath,
-                                                qulonglong timingFrame,
-                                                QString* exportPath,
-                                                QString* errorText)
+    const QString& timingCsvPath, qulonglong timingFrame,
+    QString* exportPath, QString* errorText)
+{
+    return dumpFrame(parent, timingCsvPath, timingFrame, false, exportPath, errorText);
+}
+
+bool WholeScene2DDebugDialog::dumpFrame(MainWindow* parent,
+    const QString& timingCsvPath, qulonglong timingFrame, bool includeViews,
+    QString* exportPath, QString* errorText)
 {
     if (exportPath)
         exportPath->clear();
@@ -1097,125 +807,84 @@ bool WholeScene2DDebugDialog::dumpRollingFrames(MainWindow* parent,
         return false;
     }
 
-    melonDS::WholeScene2DFinalDebugFrame currentFinalFrame;
-    std::string currentFinalStatus;
-    std::vector<melonDS::WholeScene2DFinalDebugFrame> rollingFrames;
-    std::string rollingStatus;
-
+    WholeSceneDebugExport::Job job;
+    if (!job)
+    {
+        if (errorText) *errorText = "A debug export is already in progress.";
+        return false;
+    }
+    WholeSceneDebugExport::Snapshot snapshot;
+    snapshot.ViewsInSubdirectory = true;
+    snapshot.IncludeFinalEvidence = true;
+    QElapsedTimer elapsed;
+    elapsed.start();
+    const bool shouldDisableDebugViews = includeViews && currentDlg == nullptr;
+    const bool poisonSource3D = currentDlg && currentDlg->cbPoisonSource3D->isChecked();
+    const bool poisonNative3DResolve = currentDlg && currentDlg->cbPoisonNative3DResolve->isChecked();
+    const bool poisonNative3DResolveAlpha = currentDlg && currentDlg->cbPoisonNative3DResolveAlpha->isChecked();
     thread->borrowGL();
+    if (includeViews)
+    {
+        nds->GPU.GetRenderer().SetWholeScene2DDebugViewsActive(true);
+        nds->GPU.GetRenderer().SetWholeScene2DDebugPoison(
+            poisonSource3D, poisonNative3DResolve, poisonNative3DResolveAlpha);
+        if (thread->emuIsRunning())
+            thread->borrowNextFrameGL();
+    }
+    const qint64 prepareMs = elapsed.elapsed();
+    std::string currentStatus, rollingStatus;
     parent->makeCurrentGL();
-    const bool currentFinalAvailable =
-        nds->GPU.GetRenderer().ReadWholeScene2DCurrentFinalDebugFrame(currentFinalFrame, &currentFinalStatus);
-    const bool rollingFramesAvailable =
-        nds->GPU.GetRenderer().ReadWholeScene2DRollingDebugFrames(rollingFrames, &rollingStatus);
+    snapshot.CurrentFinalAvailable = nds->GPU.GetRenderer()
+        .ReadWholeScene2DCurrentFinalDebugFrame(snapshot.CurrentFinal, &currentStatus);
+    const qint64 currentMs = elapsed.elapsed() - prepareMs;
+    const bool rollingAvailable = nds->GPU.GetRenderer()
+        .ReadWholeScene2DRollingDebugFrames(snapshot.RollingFrames, &rollingStatus);
+    const qint64 rollingMs = elapsed.elapsed() - prepareMs - currentMs;
+    if (includeViews)
+        snapshot.Views = captureViews(nds->GPU.GetRenderer(), parent);
+    if (shouldDisableDebugViews)
+        nds->GPU.GetRenderer().SetWholeScene2DDebugViewsActive(false);
     parent->releaseGL();
     thread->returnGL();
-
-    if (!rollingFramesAvailable)
+    const qint64 viewsMs = elapsed.elapsed() - prepareMs - currentMs - rollingMs;
+    if (!includeViews && !rollingAvailable)
     {
-        if (errorText)
-            *errorText = QString::fromStdString(rollingStatus);
+        if (errorText) *errorText = QString::fromStdString(rollingStatus);
         return false;
     }
-
-    QDir csvDir(csvInfo.absolutePath());
-    const QString capturesRootName = QString("%1-captures").arg(csvInfo.completeBaseName());
-    if (!csvDir.mkpath(capturesRootName))
-    {
-        if (errorText)
-            *errorText = QString("Failed to create capture directory in %1.").arg(csvDir.path());
-        return false;
-    }
-
-    QDir capturesRoot(csvDir.filePath(capturesRootName));
-    const QString stamp = QDateTime::currentDateTime().toString("yyyyMMdd-HHmmss");
-    const QString frameName = QString("rolling-frame%1").arg(timingFrame, 6, 10, QChar('0'));
-    const QString dumpDirName = QString("%1-%2").arg(frameName, stamp);
-    if (!capturesRoot.mkpath(dumpDirName))
-    {
-        if (errorText)
-            *errorText = QString("Failed to create dump directory in %1.").arg(capturesRoot.path());
-        return false;
-    }
-
-    QDir dumpDir(capturesRoot.filePath(dumpDirName));
-    if (currentFinalAvailable && !dumpDir.mkpath("current-final"))
-    {
-        if (errorText)
-            *errorText = QString("Failed to create current-final directory in %1.").arg(dumpDir.path());
-        return false;
-    }
-    if (!dumpDir.mkpath("rolling-final"))
-    {
-        if (errorText)
-            *errorText = QString("Failed to create rolling-final directory in %1.").arg(dumpDir.path());
-        return false;
-    }
-
-    QDir currentFinalDir(dumpDir.filePath("current-final"));
-    QDir rollingDir(dumpDir.filePath("rolling-final"));
-
-    QFile manifest(dumpDir.filePath("manifest.txt"));
-    if (!manifest.open(QIODevice::WriteOnly | QIODevice::Text))
-    {
-        if (errorText)
-            *errorText = QString("Failed to write manifest in %1.").arg(dumpDir.path());
-        return false;
-    }
-
-    QTextStream manifestText(&manifest);
-    manifestText << "Whole-scene 2D rolling debug dump\n";
-    manifestText << "Timestamp: " << stamp << "\n";
-    manifestText << "Timing CSV: " << timingCsvPath << "\n";
-    manifestText << "Timing frame: " << timingFrame << "\n";
-    manifestText << "Source: hotkey rolling capture\n";
-    manifestText << "Current final capture: " << QString::fromStdString(currentFinalStatus) << "\n";
-    manifestText << "Rolling final capture: " << QString::fromStdString(rollingStatus) << "\n\n";
-
-    int currentFinalSavedCount = 0;
-    int currentFinalFailedCount = 0;
-    int rollingSavedCount = 0;
-    int rollingFailedCount = 0;
-
-    if (currentFinalAvailable)
-    {
-        manifestText << "Current final frame:\n";
-        SaveFinalDebugFrame(currentFinalFrame,
-                            currentFinalDir,
-                            "current-final",
-                            manifestText,
-                            currentFinalSavedCount,
-                            currentFinalFailedCount);
-        manifestText << "\n";
-    }
-
-    manifestText << "Rolling final frames:\n";
-    int frameIndex = 0;
-    for (const auto& frame : rollingFrames)
-    {
-        const QString frameStem = QString("rolling-%1-serial%2")
-                                      .arg(frameIndex, 3, 10, QChar('0'))
-                                      .arg(frame.Serial, 6, 10, QChar('0'));
-        SaveFinalDebugFrame(frame,
-                            rollingDir,
-                            frameStem,
-                            manifestText,
-                            rollingSavedCount,
-                            rollingFailedCount);
-        frameIndex++;
-    }
-    manifestText << "\n";
-
-    manifestText << "Summary:\n";
-    manifestText << "  Saved current final images: " << currentFinalSavedCount << "\n";
-    manifestText << "  Failed current final images: " << currentFinalFailedCount << "\n";
-    manifestText << "  Saved rolling images: " << rollingSavedCount << "\n";
-    manifestText << "  Failed rolling images: " << rollingFailedCount << "\n";
-    manifestText.flush();
-
-    if (exportPath)
-        *exportPath = dumpDir.path();
-    return currentFinalFailedCount == 0 && rollingFailedCount == 0;
+    const QString stamp = QDateTime::currentDateTime().toString("yyyyMMdd-HHmmss-zzz");
+    // Name the frame actually captured, preserving the hotkey's earlier frame
+    // separately. Debug preparation can advance emulation after the request.
+    const auto& current = snapshot.CurrentFinal;
+    const qulonglong capturedFrame = snapshot.CurrentFinalAvailable && current.TimingFrameValid
+        ? current.TimingFrame : timingFrame;
+    const QString name = QString("%1frame%2-%3").arg(includeViews ? "" : "rolling-")
+        .arg(capturedFrame, 6, 10, QChar('0')).arg(stamp);
+    snapshot.Directory = QDir(csvInfo.absolutePath()).filePath(
+        csvInfo.completeBaseName() + "-captures/" + name);
+    QTextStream text(&snapshot.Header);
+    text << (includeViews ? "Whole-scene 2D hotkey debug dump\n" : "Whole-scene 2D rolling debug dump\n")
+         << "Timestamp: " << stamp << "\nTiming CSV: " << timingCsvPath
+         << "\nTiming frame: " << capturedFrame << "\nRequested timing frame: " << timingFrame
+         << "\nScreens: main, sub\n"
+         << "Poison source 3D: " << (poisonSource3D ? "yes" : "no")
+         << "\nPoison native 3D resolve: " << (poisonNative3DResolve ? "yes" : "no")
+         << "\nForce native 3D resolve alpha: " << (poisonNative3DResolveAlpha ? "yes" : "no")
+         << "\nSource: " << (includeViews ? "hotkey current-frame capture" : "hotkey rolling capture")
+         << "\nCurrent final capture: " << QString::fromStdString(currentStatus)
+         << "\nRolling final capture: " << QString::fromStdString(rollingStatus)
+         << "\nCapture timings (CPU wall ms; readbacks may include GPU waits):\n"
+         << "  Debug preparation/frame handoff: " << prepareMs
+         << "\n  Current final: " << currentMs
+         << "\n  Rolling final: " << rollingMs
+         << "\n  Views/read/decode: " << viewsMs << "\n";
+    text.flush();
+    if (exportPath) *exportPath = snapshot.Directory;
+    job.start(std::move(snapshot), parent, [parent](const WholeSceneDebugExport::Result& result) {
+        if (auto* instance = parent->getEmuInstance())
+            instance->osdAddMessage(0, "%s", result.Message.toUtf8().constData());
+    });
+    return true; // Accepted for background writing, not a claim of successful saving.
 }
 
 const WholeScene2DDebugDialog::CapturedView* WholeScene2DDebugDialog::findSnapshotView(int screen, int viewValue) const
@@ -1397,97 +1066,29 @@ void WholeScene2DDebugDialog::exportAllViews()
         setStatusText("Refresh a frame before exporting all views.");
         return;
     }
-
-    int skippedCount = 0;
-    for (const CapturedView& captured : refreshSnapshot)
+    WholeSceneDebugExport::Job job;
+    if (!job)
     {
-        if (!captured.Available)
-            skippedCount++;
-    }
-
-    const QString basePath = QFileDialog::getExistingDirectory(this,
-                                                               "Export all whole-scene 2D debug views");
-    if (basePath.isEmpty())
-    {
-        setStatusText("Export canceled; last refreshed frame is still cached.");
+        setStatusText("A debug export is already in progress.");
         return;
     }
-
-    QDir baseDir(basePath);
-    const QString exportDirName = QString("whole-scene-2d-%1-%2")
-                                      .arg(refreshSnapshotScreenName)
-                                      .arg(refreshSnapshotStamp);
-    if (!baseDir.mkpath(exportDirName))
-    {
-        setStatusText(QString("Failed to create export directory in %1").arg(basePath));
-        return;
-    }
-
-    QDir exportDir(baseDir.filePath(exportDirName));
-    QFile manifest(exportDir.filePath("manifest.txt"));
-    if (!manifest.open(QIODevice::WriteOnly | QIODevice::Text))
-    {
-        setStatusText(QString("Failed to write manifest in %1").arg(exportDir.path()));
-        return;
-    }
-
-    QTextStream manifestText(&manifest);
-    manifestText << "Whole-scene 2D debug export\n";
-    manifestText << "Timestamp: " << refreshSnapshotStamp << "\n";
-    manifestText << "Screens: main, sub\n";
-    manifestText << "Poison source 3D: " << (refreshSnapshotPoisonSource3D ? "yes" : "no") << "\n";
-    manifestText << "Poison native 3D resolve: " << (refreshSnapshotPoisonNative3DResolve ? "yes" : "no") << "\n";
-    manifestText << "Force native 3D resolve alpha: " << (refreshSnapshotPoisonNative3DResolveAlpha ? "yes" : "no") << "\n";
-    manifestText << "Source: last refreshed snapshot\n\n";
-
-    int savedCount = 0;
-    int failedCount = 0;
-    for (const CapturedView& captured : refreshSnapshot)
-    {
-        manifestText << captured.FileStem << "\n";
-        manifestText << "  Screen: " << captured.ScreenName << "\n";
-        manifestText << "  Category: " << captured.Category << "\n";
-        manifestText << "  View: " << captured.Label << "\n";
-
-        if (!captured.Available)
-        {
-            manifestText << "  Result: skipped\n";
-            if (!captured.Status.isEmpty())
-            {
-                QString status = captured.Status;
-                manifestText << status.replace("\n", "\n  ") << "\n";
-            }
-            manifestText << "\n";
-            continue;
-        }
-
-        const QString pngName = captured.FileStem + ".png";
-        const bool saved = captured.Image.save(exportDir.filePath(pngName), "PNG");
-        if (saved)
-        {
-            savedCount++;
-            manifestText << "  Result: saved " << pngName << " (" << captured.Width << "x" << captured.Height << ")\n";
-        }
-        else
-        {
-            failedCount++;
-            manifestText << "  Result: failed to save " << pngName << "\n";
-        }
-
-        if (!captured.Status.isEmpty())
-        {
-            QString status = captured.Status;
-            manifestText << status.replace("\n", "\n  ") << "\n";
-        }
-        manifestText << "\n";
-    }
-
-    manifestText.flush();
-    setStatusText(QString("Exported %1 views to %2 (%3 skipped, %4 failed).")
-                      .arg(savedCount)
-                      .arg(exportDir.path())
-                      .arg(skippedCount)
-                      .arg(failedCount));
+    const QString basePath = QFileDialog::getExistingDirectory(this, "Export Whole-Scene Debug Views");
+    if (basePath.isEmpty()) return;
+    WholeSceneDebugExport::Snapshot snapshot;
+    snapshot.Directory = QDir(basePath).filePath(QString("whole-scene-2d-%1-%2")
+        .arg(refreshSnapshotScreenName).arg(refreshSnapshotStamp));
+    snapshot.Views = refreshSnapshot; // QImages share immutable storage with the preview.
+    QTextStream text(&snapshot.Header);
+    text << "Whole-scene 2D debug export\nTimestamp: " << refreshSnapshotStamp
+         << "\nScreens: main, sub\nPoison source 3D: " << (refreshSnapshotPoisonSource3D ? "yes" : "no")
+         << "\nPoison native 3D resolve: " << (refreshSnapshotPoisonNative3DResolve ? "yes" : "no")
+         << "\nForce native 3D resolve alpha: " << (refreshSnapshotPoisonNative3DResolveAlpha ? "yes" : "no")
+         << "\nSource: last refreshed snapshot\n";
+    text.flush();
+    job.start(std::move(snapshot), this, [this](const WholeSceneDebugExport::Result& result) {
+        setStatusText(result.Message);
+    });
+    setStatusText("Saving debug export in the background...");
 }
 
 void WholeScene2DDebugDialog::updatePreviewPixmap()

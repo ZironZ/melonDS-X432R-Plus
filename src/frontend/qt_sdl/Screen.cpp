@@ -32,6 +32,7 @@
 #include "duckstation/gl/context.h"
 
 #include "main.h"
+#include "WideMelon.h"
 #include "EmuInstance.h"
 
 #include "NDS.h"
@@ -42,6 +43,7 @@
 #include "Config.h"
 
 #include "main_shaders.h"
+#include "ScreenCapture.h"
 #include "OSD_shaders.h"
 #include "font.h"
 #include "version.h"
@@ -142,6 +144,13 @@ ScreenPanel::ScreenPanel(QWidget* parent) : QWidget(parent)
     if (configuredSharpenStrength == 0 && mainWindow->getWindowConfig().GetBool("ScreenSharpen"))
         configuredSharpenStrength = 2;
     setSharpenStrength(configuredSharpenStrength);
+    int configuredLCDGhostingMode = mainWindow->getWindowConfig().GetInt("ScreenLCDGhostingMode");
+    if (configuredLCDGhostingMode == screenLCDGhosting_Off &&
+        mainWindow->getWindowConfig().GetBool("ScreenLCDGhosting"))
+    {
+        configuredLCDGhostingMode = screenLCDGhosting_Smart;
+    }
+    setLCDGhostingMode(configuredLCDGhostingMode);
 
     splashLogo = QPixmap(":/melon-logo");
 
@@ -199,6 +208,13 @@ void ScreenPanel::setSharpenStrength(int strength)
     this->sharpenStrength = strength;
 }
 
+void ScreenPanel::setLCDGhostingMode(int mode)
+{
+    lcdGhostingMode = std::clamp(mode,
+                                 static_cast<int>(screenLCDGhosting_Off),
+                                 static_cast<int>(screenLCDGhosting_MAX) - 1);
+}
+
 void ScreenPanel::setMouseHide(bool enable, int delay)
 {
     mouseHide = enable;
@@ -231,6 +247,11 @@ void ScreenPanel::setupScreenLayout()
     if (aspectBot == 0)
         aspectBot = ((float) w / h) / (4.f / 3.f);
 
+    if (WideMelon::Enabled())
+    {
+        aspectTop = WideMelon::DisplayAspect(0);
+        aspectBot = WideMelon::DisplayAspect(1);
+    }
     layout.Setup(w, h,
                 static_cast<ScreenLayoutType>(screenLayout),
                 static_cast<ScreenRotation>(screenRotation),
@@ -239,7 +260,8 @@ void ScreenPanel::setupScreenLayout()
                 integerScaling != 0,
                 screenSwap != 0,
                 aspectTop,
-                aspectBot);
+                aspectBot, WideMelon::Enabled(),
+                WideMelon::DisplayHeightAspect(0), WideMelon::DisplayHeightAspect(1));
 
     numScreens = layout.GetScreenTransforms(screenMatrix[0], screenKind);
 
@@ -322,7 +344,7 @@ void ScreenPanel::mousePressEvent(QMouseEvent* event)
     int x = event->pos().x();
     int y = event->pos().y();
 
-    if (layout.GetTouchCoords(x, y, false))
+    if (layout.GetTouchCoords(x, y, false, WideMelon::DisplayWidth(1), WideMelon::DisplayHeight(1)))
     {
         touching = true;
         emuInstance->touchScreen(x, y);
@@ -355,7 +377,7 @@ void ScreenPanel::mouseMoveEvent(QMouseEvent* event)
     int x = event->pos().x();
     int y = event->pos().y();
 
-    if (layout.GetTouchCoords(x, y, true))
+    if (layout.GetTouchCoords(x, y, true, WideMelon::DisplayWidth(1), WideMelon::DisplayHeight(1)))
     {
         emuInstance->touchScreen(x, y);
     }
@@ -379,7 +401,7 @@ void ScreenPanel::tabletEvent(QTabletEvent* event)
             int y = event->y();
 #endif
 
-            if (layout.GetTouchCoords(x, y, event->type()==QEvent::TabletMove))
+            if (layout.GetTouchCoords(x, y, event->type()==QEvent::TabletMove, WideMelon::DisplayWidth(1), WideMelon::DisplayHeight(1)))
             {
                 touching = true;
                 emuInstance->touchScreen(x, y);
@@ -424,7 +446,7 @@ void ScreenPanel::touchEvent(QTouchEvent* event)
             int x = (int)lastPosition.x();
             int y = (int)lastPosition.y();
 
-            if (layout.GetTouchCoords(x, y, event->type()==QEvent::TouchUpdate))
+            if (layout.GetTouchCoords(x, y, event->type()==QEvent::TouchUpdate, WideMelon::DisplayWidth(1), WideMelon::DisplayHeight(1)))
             {
                 touching = true;
                 emuInstance->touchScreen(x, y);
@@ -994,12 +1016,15 @@ void ScreenPanelGL::initOpenGL()
 
     glUseProgram(screenShaderProgram);
     glUniform1i(glGetUniformLocation(screenShaderProgram, "ScreenTex"), 0);
+    glUniform1i(glGetUniformLocation(screenShaderProgram, "LCDGhostingHistoryTex"), 1);
     glUniform1i(glGetUniformLocation(screenShaderProgram, "TopScreenTex"), 0);
     glUniform1i(glGetUniformLocation(screenShaderProgram, "BottomScreenTex"), 1);
 
     screenShaderScreenSizeULoc = glGetUniformLocation(screenShaderProgram, "uScreenSize");
     screenShaderTransformULoc = glGetUniformLocation(screenShaderProgram, "uTransform");
     screenShaderSharpenAmountULoc = glGetUniformLocation(screenShaderProgram, "uSharpenAmount");
+    screenShaderLCDGhostingModeULoc = glGetUniformLocation(screenShaderProgram, "uLCDGhostingMode");
+    screenShaderLCDGhostingHistorySlotsULoc = glGetUniformLocation(screenShaderProgram, "uLCDGhostingHistorySlots");
 
     const float vertices[] =
     {
@@ -1037,6 +1062,18 @@ void ScreenPanelGL::initOpenGL()
     glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
     glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
     glTexImage3D(GL_TEXTURE_2D_ARRAY, 0, GL_RGBA, 256, 192, 2, 0, GL_BGRA, GL_UNSIGNED_BYTE, nullptr);
+
+    glGenTextures(1, &lcdGhostingHistoryTexture);
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D_ARRAY, lcdGhostingHistoryTexture);
+    glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glActiveTexture(GL_TEXTURE0);
+
+    glGenFramebuffers(1, &lcdGhostingReadFramebuffer);
+    glGenFramebuffers(1, &lcdGhostingDrawFramebuffer);
 
 
     OpenGL::CompileVertexFragmentProgram(osdShader,
@@ -1097,6 +1134,9 @@ void ScreenPanelGL::deinitOpenGL()
     glContext->MakeCurrent();
 
     glDeleteTextures(1, &screenTexture);
+    glDeleteTextures(1, &lcdGhostingHistoryTexture);
+    glDeleteFramebuffers(1, &lcdGhostingReadFramebuffer);
+    glDeleteFramebuffers(1, &lcdGhostingDrawFramebuffer);
 
     glDeleteVertexArrays(1, &screenVertexArray);
     glDeleteBuffers(1, &screenVertexBuffer);
@@ -1121,7 +1161,99 @@ void ScreenPanelGL::deinitOpenGL()
     glContext->DoneCurrent();
 
     lastScreenWidth = lastScreenHeight = -1;
+    lcdGhostingHistoryWidth = lcdGhostingHistoryHeight = 0;
+    lcdGhostingHistorySlotCount = 0;
+    resetLCDGhostingHistory();
     glInited = false;
+}
+
+void ScreenPanelGL::resetLCDGhostingHistory()
+{
+    lcdGhostingCurrentSlot = -1;
+    lcdGhostingStoredFrames = 0;
+    lcdGhostingLastFrame = 0;
+    lcdGhostingLastFrameValid = false;
+}
+
+bool ScreenPanelGL::updateLCDGhostingHistory(GLuint sourceTexture, u32 frameNumber)
+{
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D_ARRAY, sourceTexture);
+
+    GLint sourceWidth = 0;
+    GLint sourceHeight = 0;
+    GLint sourceLayers = 0;
+    glGetTexLevelParameteriv(GL_TEXTURE_2D_ARRAY, 0, GL_TEXTURE_WIDTH, &sourceWidth);
+    glGetTexLevelParameteriv(GL_TEXTURE_2D_ARRAY, 0, GL_TEXTURE_HEIGHT, &sourceHeight);
+    glGetTexLevelParameteriv(GL_TEXTURE_2D_ARRAY, 0, GL_TEXTURE_DEPTH, &sourceLayers);
+    if (sourceWidth <= 0 || sourceHeight <= 0 || sourceLayers < 2)
+        return false;
+
+    bool storageChanged = sourceWidth != lcdGhostingHistoryWidth ||
+                          sourceHeight != lcdGhostingHistoryHeight;
+    int requiredSlotCount = lcdGhostingMode == screenLCDGhosting_Accurate ? 5 : 4;
+    storageChanged = storageChanged || requiredSlotCount != lcdGhostingHistorySlotCount;
+    if (storageChanged)
+    {
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_2D_ARRAY, lcdGhostingHistoryTexture);
+        glTexImage3D(GL_TEXTURE_2D_ARRAY, 0, GL_RGB8,
+                     sourceWidth, sourceHeight, requiredSlotCount * 2, 0,
+                     GL_RGB, GL_UNSIGNED_BYTE, nullptr);
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D_ARRAY, sourceTexture);
+
+        lcdGhostingHistoryWidth = sourceWidth;
+        lcdGhostingHistoryHeight = sourceHeight;
+        lcdGhostingHistorySlotCount = requiredSlotCount;
+        resetLCDGhostingHistory();
+    }
+
+    if (lcdGhostingLastFrameValid && frameNumber == lcdGhostingLastFrame)
+        return true;
+
+    if (lcdGhostingLastFrameValid &&
+        static_cast<u32>(frameNumber - lcdGhostingLastFrame) != 1)
+    {
+        resetLCDGhostingHistory();
+    }
+
+    int nextSlot = (lcdGhostingCurrentSlot + 1) % lcdGhostingHistorySlotCount;
+    bool copied = true;
+    for (int screen = 0; screen < 2; screen++)
+    {
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, lcdGhostingReadFramebuffer);
+        glFramebufferTextureLayer(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                  sourceTexture, 0, screen);
+        glReadBuffer(GL_COLOR_ATTACHMENT0);
+
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, lcdGhostingDrawFramebuffer);
+        glFramebufferTextureLayer(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                  lcdGhostingHistoryTexture, 0, nextSlot * 2 + screen);
+        glDrawBuffer(GL_COLOR_ATTACHMENT0);
+
+        if (glCheckFramebufferStatus(GL_READ_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE ||
+            glCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
+        {
+            copied = false;
+            break;
+        }
+
+        glBlitFramebuffer(0, 0, sourceWidth, sourceHeight,
+                          0, 0, sourceWidth, sourceHeight,
+                          GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    }
+
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    if (!copied)
+        return false;
+
+    lcdGhostingCurrentSlot = nextSlot;
+    lcdGhostingStoredFrames = std::min(lcdGhostingStoredFrames + 1,
+                                       lcdGhostingHistorySlotCount);
+    lcdGhostingLastFrame = frameNumber;
+    lcdGhostingLastFrameValid = true;
+    return true;
 }
 
 void ScreenPanelGL::makeCurrentGL()
@@ -1166,6 +1298,101 @@ void ScreenPanelGL::osdDeleteItem(OSDItem* item)
     ScreenPanel::osdDeleteItem(item);
 }
 
+void ScreenPanelGL::prepareScreenShader(GLuint currentScreenTexture, u32 frameNumber)
+{
+    glUseProgram(screenShaderProgram);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D_ARRAY, currentScreenTexture);
+    GLint filter = this->filter ? GL_LINEAR : GL_NEAREST;
+    glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MIN_FILTER, filter);
+    glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAG_FILTER, filter);
+    glUniform1f(screenShaderSharpenAmountULoc, screenSharpenAmount(this->sharpenStrength));
+
+    bool lcdGhostingReady = false;
+    if (this->lcdGhostingMode != screenLCDGhosting_Off)
+    {
+        lcdGhostingReady = updateLCDGhostingHistory(currentScreenTexture, frameNumber) &&
+                           lcdGhostingStoredFrames == lcdGhostingHistorySlotCount;
+    }
+    else
+    {
+        resetLCDGhostingHistory();
+    }
+
+    glUseProgram(screenShaderProgram);
+    glUniform1i(screenShaderLCDGhostingModeULoc,
+                lcdGhostingReady ? this->lcdGhostingMode : screenLCDGhosting_Off);
+    if (lcdGhostingReady)
+    {
+        int previous1 = (lcdGhostingCurrentSlot + lcdGhostingHistorySlotCount - 1) %
+                        lcdGhostingHistorySlotCount;
+        int previous2 = (lcdGhostingCurrentSlot + lcdGhostingHistorySlotCount - 2) %
+                        lcdGhostingHistorySlotCount;
+        int previous3 = (lcdGhostingCurrentSlot + lcdGhostingHistorySlotCount - 3) %
+                        lcdGhostingHistorySlotCount;
+        int previous4 = (lcdGhostingCurrentSlot + lcdGhostingHistorySlotCount - 4) %
+                        lcdGhostingHistorySlotCount;
+        glUniform4i(screenShaderLCDGhostingHistorySlotsULoc,
+                    previous1, previous2, previous3, previous4);
+
+        glActiveTexture(GL_TEXTURE1);
+        glBindTexture(GL_TEXTURE_2D_ARRAY, lcdGhostingHistoryTexture);
+        glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MIN_FILTER, filter);
+        glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAG_FILTER, filter);
+    }
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D_ARRAY, currentScreenTexture);
+}
+
+bool ScreenPanelGL::captureFinalDisplays(std::array<QImage, 2>& images, QString* error)
+{
+    images = {};
+    auto* nds = emuInstance->getNDS();
+    if (!glInited || !nds)
+    {
+        if (error) *error = "The display is not initialized.";
+        return false;
+    }
+    void* top = nullptr;
+    void* bottom = nullptr;
+    if (nds->GPU.GetFramebuffers(&top, &bottom) || !top)
+    {
+        if (error) *error = "Final display capture requires the GPU renderer.";
+        return false;
+    }
+
+    GLint readFB, drawFB, program, active, arrays[2];
+    glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &readFB);
+    glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &drawFB);
+    glGetIntegerv(GL_CURRENT_PROGRAM, &program);
+    glGetIntegerv(GL_ACTIVE_TEXTURE, &active);
+    for (int i = 0; i < 2; i++)
+    {
+        glActiveTexture(GL_TEXTURE0 + i);
+        glGetIntegerv(GL_TEXTURE_BINDING_2D_ARRAY, &arrays[i]);
+    }
+    const GLboolean scissor = glIsEnabled(GL_SCISSOR_TEST);
+    glDisable(GL_SCISSOR_TEST);
+    screenSettingsLock.lock();
+    const GLuint source = *static_cast<GLuint*>(top);
+    // The same frame number does not advance the temporal history twice.
+    prepareScreenShader(source, nds->NumFrames);
+    const bool ok = ReadScreenPresentation(screenShaderProgram, screenVertexArray,
+                                           source, images, error);
+    screenSettingsLock.unlock();
+    if (scissor) glEnable(GL_SCISSOR_TEST);
+    for (int i = 0; i < 2; i++)
+    {
+        glActiveTexture(GL_TEXTURE0 + i);
+        glBindTexture(GL_TEXTURE_2D_ARRAY, arrays[i]);
+    }
+    glActiveTexture(active);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, readFB);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, drawFB);
+    glUseProgram(program);
+    return ok;
+}
+
 void ScreenPanelGL::drawScreen()
 {
     if (!glContext) return;
@@ -1197,6 +1424,7 @@ void ScreenPanelGL::drawScreen()
         glUniform2f(screenShaderScreenSizeULoc, w / factor, h / factor);
 
         void* topbuf; void* bottombuf;
+        GLuint currentScreenTexture;
         if (nds->GPU.GetFramebuffers(&topbuf, &bottombuf))
         {
             // if we're doing a regular render, use the provided framebuffers
@@ -1209,6 +1437,7 @@ void ScreenPanelGL::drawScreen()
                             GL_UNSIGNED_BYTE, topbuf);
             glTexSubImage3D(GL_TEXTURE_2D_ARRAY, 0, 0, 0, 1, 256, 192, 1, GL_BGRA,
                             GL_UNSIGNED_BYTE, bottombuf);
+            currentScreenTexture = screenTexture;
         }
         else
         {
@@ -1216,25 +1445,32 @@ void ScreenPanelGL::drawScreen()
 
             glActiveTexture(GL_TEXTURE0);
             glBindTexture(GL_TEXTURE_2D_ARRAY, texid);
+            currentScreenTexture = texid;
         }
 
         screenSettingsLock.lock();
 
-        GLint filter = this->filter ? GL_LINEAR : GL_NEAREST;
-        glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MIN_FILTER, filter);
-        glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAG_FILTER, filter);
-        glUniform1f(screenShaderSharpenAmountULoc, screenSharpenAmount(this->sharpenStrength));
+        prepareScreenShader(currentScreenTexture, nds->NumFrames);
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        glViewport(0, 0, w, h);
 
         glBindBuffer(GL_ARRAY_BUFFER, screenVertexBuffer);
         glBindVertexArray(screenVertexArray);
 
         for (int i = 0; i < numScreens; i++)
         {
+            glUniform1f(glGetUniformLocation(screenShaderProgram, "uContentWidth"),
+                WideMelon::ContentWidth(screenKind[i]));
+            glUniform1f(glGetUniformLocation(screenShaderProgram, "uContentHeight"), WideMelon::ContentHeight(screenKind[i]));
             glUniformMatrix2x3fv(screenShaderTransformULoc, 1, GL_TRUE, screenMatrix[i]);
             glDrawArrays(GL_TRIANGLES, screenKind[i] == 0 ? 0 : 2 * 3, 2 * 3);
         }
 
         screenSettingsLock.unlock();
+    }
+    else
+    {
+        resetLCDGhostingHistory();
     }
 
     osdUpdate();

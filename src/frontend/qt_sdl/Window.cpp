@@ -17,6 +17,7 @@
 */
 
 #include "NDS.h"
+#include "WideMelon.h"
 #include <stdlib.h>
 #include <time.h>
 #include <stdio.h>
@@ -224,7 +225,7 @@ MainWindow::MainWindow(int id, EmuInstance* inst, QWidget* parent) :
 
     showOSD = windowCfg.GetBool("ShowOSD");
 
-    setWindowTitle("melonDS 1.1 X432R+");
+    setWindowTitle("melonDS " MELONDS_VERSION);
     setAttribute(Qt::WA_DeleteOnClose);
     setAcceptDrops(true);
     setFocusPolicy(Qt::ClickFocus);
@@ -589,6 +590,28 @@ MainWindow::MainWindow(int id, EmuInstance* inst, QWidget* parent) :
                         this, &MainWindow::onChangeScreenSharpening);
             }
 
+            {
+                QMenu* submenu = menu->addMenu("LCD ghosting blur");
+                grpLCDGhosting = new QActionGroup(submenu);
+                const char* labels[] = {"Off", "Smart", "Natural Blur"};
+                const char* descriptions[] =
+                {
+                    "Show raw digital frames without temporal blending",
+                    "Blend only pixels that alternate between two colors on consecutive frames",
+                    "Mimic LCD response with four progressively weaker previous-frame samples"
+                };
+                for (int i = 0; i < screenLCDGhosting_MAX; i++)
+                {
+                    actLCDGhosting[i] = submenu->addAction(labels[i]);
+                    actLCDGhosting[i]->setActionGroup(grpLCDGhosting);
+                    actLCDGhosting[i]->setData(QVariant(i));
+                    actLCDGhosting[i]->setCheckable(true);
+                    actLCDGhosting[i]->setStatusTip(descriptions[i]);
+                }
+                connect(grpLCDGhosting, &QActionGroup::triggered,
+                        this, &MainWindow::onChangeLCDGhosting);
+            }
+
             actShowOSD = menu->addAction("Show OSD");
             actShowOSD->setCheckable(true);
             connect(actShowOSD, &QAction::triggered, this, &MainWindow::onChangeShowOSD);
@@ -781,6 +804,12 @@ MainWindow::MainWindow(int id, EmuInstance* inst, QWidget* parent) :
             screenSharpenStrength = 2;
         screenSharpenStrength = std::clamp(screenSharpenStrength, 0, 4);
         actScreenSharpening[screenSharpenStrength]->setChecked(true);
+        int lcdGhostingMode = windowCfg.GetInt("ScreenLCDGhostingMode");
+        if (lcdGhostingMode == screenLCDGhosting_Off && windowCfg.GetBool("ScreenLCDGhosting"))
+            lcdGhostingMode = screenLCDGhosting_Smart;
+        lcdGhostingMode = std::clamp(lcdGhostingMode, 0,
+                                     static_cast<int>(screenLCDGhosting_MAX) - 1);
+        actLCDGhosting[lcdGhostingMode]->setChecked(true);
         actShowOSD->setChecked(showOSD);
 
         actLimitFramerate->setChecked(emuInstance->doLimitFPS);
@@ -867,8 +896,7 @@ void MainWindow::createScreenPanel()
     panel = nullptr;
     if (oldpanel) delete oldpanel;
 
-    hasOGL = globalCfg.GetBool("Screen.UseGL") ||
-            (globalCfg.GetInt("3D.Renderer") != renderer3D_Software);
+    hasOGL = emuInstance->usesOpenGL();
 
     if (hasOGL)
     {
@@ -883,6 +911,13 @@ void MainWindow::createScreenPanel()
         // Check that creating the context hasn't failed
         if (panelGL->createContext() == false)
         {
+            if (WideMelon::Enabled())
+            {
+                QMessageBox::critical(this, tr("Widescreen requires OpenGL"),
+                    tr("Could not create the OpenGL context required by widescreen. "
+                       "Start with WIDEMELON_VIEW_WIDTH=256 and WIDEMELON_VIEW_HEIGHT=192 to turn widescreen off."));
+                std::exit(EXIT_FAILURE);
+            }
             Log(Platform::LogLevel::Error, "Failed to create OpenGL context, falling back to Software Renderer.\n");
             hasOGL = false;
 
@@ -912,6 +947,8 @@ void MainWindow::createScreenPanel()
         actScreenFiltering->setEnabled(hasOGL);
         for (int i = 0; i < 5; i++)
             actScreenSharpening[i]->setEnabled(hasOGL);
+        for (int i = 0; i < screenLCDGhosting_MAX; i++)
+            actLCDGhosting[i]->setEnabled(hasOGL);
         actWholeScene2DDebugView->setEnabled(hasOGL);
         actTextureScalingDebugView->setEnabled(hasOGL);
         actWholeScene2DTimingLog->setEnabled(hasOGL);
@@ -933,6 +970,17 @@ GL::Context* MainWindow::getOGLContext()
 
     ScreenPanelGL* glpanel = static_cast<ScreenPanelGL*>(panel);
     return glpanel->getContext();
+}
+
+bool MainWindow::supportsComputeShaders() const
+{
+#if defined(__APPLE__) || !defined(OGLRENDERER_ENABLED)
+    return false;
+#else
+    // Software display may not have created a context yet. Do not rewrite
+    // saved GPU settings until capabilities are known.
+    return !hasOGL || GLVersion.major == 0 || GLAD_GL_VERSION_4_3;
+#endif
 }
 
 void MainWindow::initOpenGL()
@@ -982,6 +1030,16 @@ void MainWindow::drawScreen()
 {
     if (!panel) return;
     return panel->drawScreen();
+}
+
+bool MainWindow::captureFinalDisplays(std::array<QImage, 2>& images, QString* error)
+{
+    if (!hasOGL || !panel)
+    {
+        if (error) *error = "Final display capture requires an OpenGL window.";
+        return false;
+    }
+    return static_cast<ScreenPanelGL*>(panel)->captureFinalDisplays(images, error);
 }
 
 void MainWindow::keyPressEvent(QKeyEvent* event)
@@ -2012,7 +2070,7 @@ void MainWindow::onDumpWholeScene2DDebugFrame()
     }
 
     emuInstance->osdAddMessage(0,
-                               "Whole-scene debug dump saved: %s",
+                               "Saving whole-scene debug dump: %s",
                                exportPath.toUtf8().constData());
 }
 
@@ -2053,7 +2111,7 @@ void MainWindow::onDumpWholeScene2DRollingDebugFrames()
     }
 
     emuInstance->osdAddMessage(0,
-                               "Whole-scene rolling dump saved: %s",
+                               "Saving whole-scene rolling dump: %s",
                                exportPath.toUtf8().constData());
 }
 
@@ -2337,9 +2395,25 @@ void MainWindow::onOpenNewWindow()
 void MainWindow::onChangeScreenFiltering(bool checked)
 {
     windowCfg.SetBool("ScreenFilter", checked);
+    refreshScreenPresentationSettings();
+}
 
-    //emit screenLayoutChange();
-    panel->setFilter(checked);
+void MainWindow::refreshScreenPresentationSettings()
+{
+    const bool filter = windowCfg.GetBool("ScreenFilter");
+    int sharpen = windowCfg.GetInt("ScreenSharpenStrength");
+    if (sharpen == 0 && windowCfg.GetBool("ScreenSharpen")) sharpen = 2;
+    sharpen = std::clamp(sharpen, 0, 4);
+    int ghosting = windowCfg.GetInt("ScreenLCDGhostingMode");
+    if (ghosting == 0 && windowCfg.GetBool("ScreenLCDGhosting")) ghosting = screenLCDGhosting_Smart;
+    ghosting = std::clamp(ghosting, 0, static_cast<int>(screenLCDGhosting_MAX) - 1);
+    actScreenFiltering->setChecked(filter);
+    actScreenSharpening[sharpen]->setChecked(true);
+    actLCDGhosting[ghosting]->setChecked(true);
+    panel->setFilter(filter);
+    panel->setSharpenStrength(sharpen);
+    panel->setLCDGhostingMode(ghosting);
+    emit screenPresentationSettingsChanged(filter, sharpen, ghosting);
 }
 
 void MainWindow::onChangeScreenSharpening(QAction* act)
@@ -2348,7 +2422,16 @@ void MainWindow::onChangeScreenSharpening(QAction* act)
     windowCfg.SetInt("ScreenSharpenStrength", strength);
     windowCfg.SetBool("ScreenSharpen", strength != 0);
 
-    panel->setSharpenStrength(strength);
+    refreshScreenPresentationSettings();
+}
+
+void MainWindow::onChangeLCDGhosting(QAction* act)
+{
+    int mode = std::clamp(act->data().toInt(), 0,
+                          static_cast<int>(screenLCDGhosting_MAX) - 1);
+    windowCfg.SetInt("ScreenLCDGhostingMode", mode);
+    windowCfg.SetBool("ScreenLCDGhosting", mode != screenLCDGhosting_Off);
+    refreshScreenPresentationSettings();
 }
 
 void MainWindow::onChangeShowOSD(bool checked)

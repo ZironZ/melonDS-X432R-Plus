@@ -127,7 +127,7 @@ void ScreenLayout::Setup(int screenWidth, int screenHeight,
     int screenGap,
     bool integerScale,
     bool swapScreens,
-    float topAspect, float botAspect)
+    float topAspect, float botAspect, bool preserveHybridAspect, float topHeight, float botHeight)
 {
     HybEnable = screenLayout == 3;
     if (HybEnable)
@@ -136,7 +136,7 @@ void ScreenLayout::Setup(int screenWidth, int screenHeight,
         sizing = screenSizing_Even;
         HybScreen = swapScreens ? 1 : 0;
         swapScreens = false;
-        topAspect = botAspect = 1;
+        if (!preserveHybridAspect) topAspect = botAspect = topHeight = botHeight = 1;
         HybPrevTouchScreen = 0;
     }
 
@@ -153,6 +153,8 @@ void ScreenLayout::Setup(int screenWidth, int screenHeight,
 
     float botScale = 1;
     float hybScale = 1;
+    const float hybAspect = HybEnable ? (HybScreen == 0 ? topAspect : botAspect) : 1.f;
+    const float hybHeight = HybEnable ? (HybScreen == 0 ? topHeight : botHeight) : 1.f;
     float botTrans[4] = {0};
     float hybTrans[2] = {0};
 
@@ -163,8 +165,9 @@ void ScreenLayout::Setup(int screenWidth, int screenHeight,
     M23_Translate(TopScreenMtx, -256/2, -192/2);
     M23_Translate(BotScreenMtx, -256/2, -192/2);
 
-    M23_Scale(TopScreenMtx, topAspect, 1);
-    M23_Scale(BotScreenMtx, botAspect, 1);
+    M23_Scale(TopScreenMtx, topAspect, topHeight);
+    M23_Scale(BotScreenMtx, botAspect, botHeight);
+    M23_Scale(HybScreenMtx, hybAspect, hybHeight);
 
     // rotation
     {
@@ -221,8 +224,8 @@ void ScreenLayout::Setup(int screenWidth, int screenHeight,
 
             bool moveV = rotation % 2 == layout;
 
-            float offsetBot = (moveV ? 192.0 : 256.0 * botAspect) / 2.0 + screenGap / 2.0;
-            float offsetTop = -((moveV ? 192.0 : 256.0 * topAspect) / 2.0 + screenGap / 2.0);
+            float offsetBot = (moveV ? 192.0 * botHeight : 256.0 * botAspect) / 2.0 + screenGap / 2.0;
+            float offsetTop = -((moveV ? 192.0 * topHeight : 256.0 * topAspect) / 2.0 + screenGap / 2.0);
 
             if ((rotation == 1 || rotation == 2) ^ swapScreens)
             {
@@ -264,10 +267,12 @@ void ScreenLayout::Setup(int screenWidth, int screenHeight,
                     hybScale = layout == 0
                         ? (4 * vSize) / (3 * hSize)
                         : (4 * hSize) / (3 * vSize);
+                    if (preserveHybridAspect)
+                        hybScale = (layout == 0 ? vSize : hSize) / (192.f * hybHeight);
                     if (layout == 0)
-                        hSize += (vSize * 4) / 3;
+                        hSize += (vSize * 4 * hybAspect) / (3 * hybHeight);
                     else
-                        vSize += (hSize * 4) / 3;
+                        vSize += (hSize * 4 * hybAspect) / (3 * hybHeight);
                 }
 
                 // scale evenly
@@ -294,8 +299,8 @@ void ScreenLayout::Setup(int screenWidth, int screenHeight,
                 if (HybEnable)
                 {
                     float hybWidth = layout == 0
-                        ? (scale * vSize * 4) / 3
-                        : (scale * hSize * 4) / 3;
+                        ? (scale * vSize * 4 * hybAspect) / (3 * hybHeight)
+                        : (scale * hSize * 4 * hybAspect) / (3 * hybHeight);
 
                     if (rotation > screenRot_90Deg)
                         hybWidth *= -1;
@@ -432,7 +437,7 @@ void ScreenLayout::Setup(int screenWidth, int screenHeight,
         M23_RotateFast(rotmtx, (4-rotation) & 3);
         M23_Multiply(TouchMtx, rotmtx, TouchMtx);
 
-        M23_Scale(TouchMtx, 1.f/botAspect, 1);
+        M23_Scale(TouchMtx, 1.f/botAspect, 1.f/botHeight);
         M23_Translate(TouchMtx, 256/2, 192/2);
 
         if (HybEnable && HybScreen == 1)
@@ -442,6 +447,7 @@ void ScreenLayout::Setup(int screenWidth, int screenHeight,
             M23_Translate(HybTouchMtx, -hybTrans[0], -hybTrans[1]);
             M23_Scale(HybTouchMtx, 1.f/hybScale);
             M23_Multiply(HybTouchMtx, rotmtx, HybTouchMtx);
+            M23_Scale(HybTouchMtx, 1.f/hybAspect, 1.f/hybHeight);
         }
     }
 }
@@ -467,7 +473,7 @@ int ScreenLayout::GetScreenTransforms(float* out, int* kind)
     return num;
 }
 
-bool ScreenLayout::GetTouchCoords(int& x, int& y, bool clamp)
+bool ScreenLayout::GetTouchCoords(int& x, int& y, bool clamp, int sourceWidth, int sourceHeight)
 {
     if (HybEnable && HybScreen == 1)
     {
@@ -478,7 +484,14 @@ bool ScreenLayout::GetTouchCoords(int& x, int& y, bool clamp)
 
         M23_Transform(TouchMtx, vx, vy);
         M23_Transform(HybTouchMtx, hvx, hvy);
+        if (sourceWidth != 256)
+        {
+            vx = (vx - 128.f) * (sourceWidth / 256.f) + 128.f;
+            hvx = (hvx - 128.f) * (sourceWidth / 256.f) + 128.f;
+        }
 
+        vy = (vy - 96.f) * (sourceHeight / 192.f) + 96.f;
+        hvy = (hvy - 96.f) * (sourceHeight / 192.f) + 96.f;
         if (clamp)
         {
             if (HybPrevTouchScreen == 1)
@@ -524,7 +537,10 @@ bool ScreenLayout::GetTouchCoords(int& x, int& y, bool clamp)
         float vy = y;
 
         M23_Transform(TouchMtx, vx, vy);
+        if (sourceWidth != 256)
+            vx = (vx - 128.f) * (sourceWidth / 256.f) + 128.f;
 
+        vy = (vy - 96.f) * (sourceHeight / 192.f) + 96.f;
         if (clamp)
         {
             x = std::clamp((int)vx, 0, 255);

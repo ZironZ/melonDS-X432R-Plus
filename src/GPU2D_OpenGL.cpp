@@ -22,11 +22,17 @@
 #include <cstdio>
 #include <cstdlib>
 #include <string>
+#include <type_traits>
 #include <vector>
 #include "GPU_OpenGL.h"
 #include "GPU2D_OpenGL.h"
+#include "WholeSceneOpaqueAssemblyPolicy.h"
+#include "WideWindowPolicy.h"
+#include "WideCoverPolicy.h"
 #include "GPU.h"
 #include "GPU3D.h"
+#include "OpenGLSupport.h"
+#include "WholeSceneCompositorInput.h"
 #include "OpenGL_shaders/2DNNEDI3_VerticalCS.h"
 #include "OpenGL_shaders/2DNNEDI3_HorizontalCS.h"
 
@@ -71,6 +77,13 @@ using Platform::LogLevel;
 #include "OpenGL_shaders/2DNativeUpscaleFS.h"
 #include "OpenGL_shaders/2DNativeBoundaryGuardFS.h"
 #include "OpenGL_shaders/2DNativeResolveFS.h"
+#include "OpenGL_shaders/2DOrdinaryOBJBandPresentationFS.h"
+#include "OpenGL_shaders/2DOrdinaryOBJSpecialCompositeFS.h"
+#include "OpenGL_shaders/2DResolvedOBJMergeFS.h"
+#include "OpenGL_shaders/2DStrictAffineOrdinaryOBJCompositeFS.h"
+#include "OpenGL_shaders/2DStrictAffineMaskedOBJMaskFS.h"
+#include "OpenGL_shaders/2DStrictAffineMaskedOBJMLAAFS.h"
+#include "OpenGL_shaders/2DAffineOBJPresentationCompositeFS.h"
 #include "OpenGL_shaders/2DNative3DResolveFS.h"
 #include "OpenGL_shaders/2DOverlayEndpointFS.h"
 #include "OpenGL_shaders/2DOverlayBaselineCompositeFS.h"
@@ -82,6 +95,10 @@ using Platform::LogLevel;
 #include "OpenGL_shaders/2DSpline36FS.h"
 #include "OpenGL_shaders/2DArtCNN_YUVAToRGBA2xFS.h"
 #include "OpenGL_shaders/2DAlphaReplaceFS.h"
+#include "OpenGL_shaders/2DMidpointAlphaFS.h"
+#include "OpenGL_shaders/2DReconstructionAlphaFS.h"
+#include "OpenGL_shaders/2DTransparentRGBPadFS.h"
+#include "OpenGL_shaders/2DOpaqueOBJAssemblyFS.h"
 #include "OpenGL_shaders/2DXBRZ_PreprocessFS.h"
 #include "OpenGL_shaders/2DXBRZ_FreescaleFS.h"
 
@@ -104,6 +121,31 @@ constexpr u32 kWholeSceneMiscEVA = 1u << 3;
 constexpr u32 kWholeSceneMiscEVB = 1u << 4;
 constexpr u32 kWholeSceneMiscEVY = 1u << 5;
 constexpr u32 kWholeSceneMiscParentPartial = 1u << 6;
+
+// Keep these values synchronized with AffineOBJCoverage_* in 2DSpriteFS.
+constexpr int kAffineOBJCoverageScalerAlpha = 1;
+constexpr int kAffineOBJCoverageNativeAlpha = 5;
+constexpr int kAffineOBJCoverageScalerContour = 6;
+constexpr int kAffineOBJCoverageSpline36Contour = 7;
+
+int ChooseAffineOBJOutputGridCoverageMode(bool xbrzSource)
+{
+    // xBRZ's RGB and alpha are one coherent edge-directed reconstruction.
+    // Other scaler families require an explicit presentation option before
+    // reconstructed alpha may replace native DS silhouette authority.
+    return xbrzSource ? kAffineOBJCoverageScalerAlpha
+                      : kAffineOBJCoverageNativeAlpha;
+}
+
+int ChooseAffineOBJSubpixelCoverageMode(bool scalerAlpha)
+{
+    // Spline36 reconstructs a continuous source-mask signal, not transformed
+    // output-pixel area coverage. Its positive exterior lobes become a dark
+    // ridge when they are blended and DS-quantized before the 2x box resolve.
+    // Use the reconstructed 0.5 contour as binary subpixel support instead;
+    // the four completed subpixels then own the final area integration.
+    return scalerAlpha ? 0 : kAffineOBJCoverageSpline36Contour;
+}
 
 enum class CaptureRepresentationEffectOwner : u8
 {
@@ -200,15 +242,13 @@ CaptureRepresentationFallbackClass CaptureRepresentationFallbackForTrace(
 {
     if (trace.Path == WholeSceneRenderPath::Current)
         return CaptureRepresentationFallbackClass::NativeCurrent;
-    if (trace.Path == WholeSceneRenderPath::PhysicalFinalPostprocessInput ||
-        trace.SourceAProductChoice == SourceAProductChoiceReason::FallbackFinalImage)
+    if (trace.Path == WholeSceneRenderPath::PhysicalFinalPostprocessInput)
         return CaptureRepresentationFallbackClass::PostprocessFinal;
     if (trace.Path == WholeSceneRenderPath::OverlayOperatorUpscale)
         return CaptureRepresentationFallbackClass::Overlay;
     if (trace.CaptureProductKind == WholeSceneCaptureProductKind::FullCaptureProduct)
         return CaptureRepresentationFallbackClass::ExactFullCapture;
-    if (trace.CaptureRenderAction == WholeSceneCaptureRenderAction::RenderNormalHybridFallback ||
-        trace.SourceAProductChoice == SourceAProductChoiceReason::FallbackNormalHybrid)
+    if (trace.CaptureRenderAction == WholeSceneCaptureRenderAction::RenderNormalHybridFallback)
         return CaptureRepresentationFallbackClass::NormalHybrid;
     if (trace.CaptureProductKind == WholeSceneCaptureProductKind::None &&
         (trace.Path == WholeSceneRenderPath::SourceACaptureReplacement ||
@@ -222,14 +262,8 @@ CaptureRepresentationFallbackClass CaptureRepresentationFallbackForTrace(
 WholeSceneCaptureProductPresentationClass CaptureRepresentationProductClassForTrace(
     const WholeSceneRenderTrace& trace)
 {
-    const auto chosenProductClass =
-        static_cast<WholeSceneCaptureProductPresentationClass>(
-            trace.SourceAChosenProductPresentationClass);
-    if (chosenProductClass != WholeSceneCaptureProductPresentationClass::None)
-        return chosenProductClass;
-
-    return CaptureProductPresentationClassForProduct(trace.CaptureProductKind,
-                                                     trace.CaptureRenderAction);
+    return static_cast<WholeSceneCaptureProductPresentationClass>(
+        trace.SourceAChosenProductPresentationClass);
 }
 
 u32 HashPresentationValue(u32 hash, u32 value)
@@ -438,6 +472,8 @@ void SetNNEDI3ComputeProgramDefaults(GLuint shader)
 {
     glUseProgram(shader);
     SetUniform1iIfPresent(shader, "Source", 0);
+    SetUniform1iIfPresent(shader, "uPredictAlpha", false);
+    SetUniform1iIfPresent(shader, "uAlphaOnly", false);
 }
 
 void SetArtCNNSizeUniform(GLuint shader, const char* sizeName, const char* pointName, GLfloat width, GLfloat height)
@@ -474,6 +510,35 @@ std::string FormatHex(u32 value, int digits)
     char text[16];
     snprintf(text, sizeof(text), "0x%0*X", digits, value);
     return text;
+}
+
+std::string StrictAffineUnderlayProofSummary(bool candidate, u32 reasons)
+{
+    if (!candidate)
+        return "not-candidate";
+    if (reasons == StrictAffineUnderlayRejectNone)
+        return "proven";
+
+    std::string summary;
+    auto add = [&summary](const char* reason)
+    {
+        if (!summary.empty())
+            summary += ",";
+        summary += reason;
+    };
+    if (reasons & StrictAffineUnderlayRejectInvalidRange)
+        add("invalid-range");
+    if (reasons & StrictAffineUnderlayRejectLowerBG)
+        add("lower-bg");
+    if (reasons & StrictAffineUnderlayRejectLowerOBJ)
+        add("lower-obj");
+    if (reasons & StrictAffineUnderlayRejectBackdropVaries)
+        add("varying-backdrop");
+    if (reasons & StrictAffineUnderlayRejectTarget1Mismatch)
+        add("target1-mismatch");
+    if (reasons & StrictAffineUnderlayRejectTarget2Mismatch)
+        add("target2-mismatch");
+    return summary;
 }
 
 u64 ElapsedUS(std::chrono::steady_clock::time_point start)
@@ -584,12 +649,25 @@ GLRenderer2D::GLRenderer2D(melonDS::GPU2D& gpu2D, GLRenderer& parent)
     WholeSceneScaleHybridNativeEffectGuard = true;
     WholeSceneScaleHybridForeground2DBase = false;
     WholeSceneScaleHybridCleanLegacyCandidate = false;
+    WholeSceneScaleHybridStrictAffineHighRes = false;
+    WholeSceneScaleHybridStrictAffineSourceEnhancement = false;
+    WholeSceneScaleHybridStrictAffineOBJSubpixel2x = false;
+    WholeSceneScaleHybridStrictAffineTopTextBG = false;
+    WholeSceneScaleHybridStrictAffineMaskedOBJMLAA = false;
+    ResetStrictAffineGeometryDemand();
     CuNNyShaderOwner = this;
     ArtCNNShaderOwner = this;
     NNEDI3ComputeShaderOwner = this;
     WholeSceneDebugViewsActive.store(false, std::memory_order_relaxed);
     WholeSceneScaleState = WholeSceneScaleEligibility::ScreenUnavailable;
     WholeSceneTrace = {};
+    WholeScenePlan = {};
+    WholeSceneExecutionTrace = {};
+    StrictAffineOrderedAssessment = {};
+    WholeScenePhysicalPresentationBrightnessActive = false;
+    WholeScenePhysicalPresentationBrightnessNextActive = false;
+    WholeScenePhysicalPresentationBrightnessState = 0;
+    WholeScenePhysicalPresentationBrightnessNextState = 0;
     WholeSceneDebugPoison = {};
     WholeSceneUpdateTiming = {};
     WholeSceneCurrentUpdateDebugTrace = {};
@@ -607,6 +685,13 @@ GLRenderer2D::GLRenderer2D(melonDS::GPU2D& gpu2D, GLRenderer& parent)
     WholeSceneNativeProductValidRows = 0;
     WholeSceneNativeProductsFrameComplete = false;
     memset(WholeSceneNativeProductRowValid, 0, sizeof(WholeSceneNativeProductRowValid));
+    for (auto& identity : WholeSceneNativeProductRowIdentities)
+        identity = {};
+    WholeSceneNativeProductRowIdentityValid = true;
+    WholeSceneNativeProductRowIdentityFailure =
+        WholeSceneNativeProductRowIdentityInvalidReason::None;
+    WholeSceneNativeProductIdentityRows = 0;
+    WholeSceneNativeProductFrameIdentity = 0;
     WholeSceneNativeProductEpochValid = true;
     WholeSceneNativeProductEpochInvalidReason = 0;
     WholeSceneNativeProductEligibilityInitialized = false;
@@ -674,7 +759,12 @@ bool GLRenderer2D::InitShaders()
                                               k2DCompositorVS, k2DCompositorFS,
                                               "2DCompositorShader",
                                               {{"vPosition", 0}},
-                                              {{"oColor", 0}}))
+                                              {{"oColor", 0},
+                                               {"oPresentation", 1},
+                                               {"oPresentationUnderlay", 2},
+                                               {"oOverlapSemantic", 3},
+                                               {"oOverlapUnderlay", 4},
+                                               {"oOverlapDecisions", 5}}))
         return false;
 
     if (!OpenGL::CompileVertexFragmentProgram(NativePrepassShader,
@@ -704,6 +794,69 @@ bool GLRenderer2D::InitShaders()
                                               "2DNativeResolveShader",
                                               {{"vPosition", 0}},
                                               {{"oColor", 0}}))
+        return false;
+
+    if (!OpenGL::CompileVertexFragmentProgram(
+            OrdinaryOBJBandPresentationShader,
+            k2DFullscreenPassVS,
+            k2DOrdinaryOBJBandPresentationFS,
+            "2DOrdinaryOBJBandPresentationShader",
+            {{"vPosition", 0}},
+            {{"oColor", 0}}))
+        return false;
+
+    if (!OpenGL::CompileVertexFragmentProgram(
+            OrdinaryOBJSpecialCompositeShader,
+            k2DFullscreenPassVS,
+            k2DOrdinaryOBJSpecialCompositeFS,
+            "2DOrdinaryOBJSpecialCompositeShader",
+            {{"vPosition", 0}},
+            {{"oColor", 0}}))
+        return false;
+
+    if (!OpenGL::CompileVertexFragmentProgram(
+            ResolvedOBJMergeShader,
+            k2DFullscreenPassVS,
+            k2DResolvedOBJMergeFS,
+            "2DResolvedOBJMergeShader",
+            {{"vPosition", 0}},
+            {{"oColor", 0}, {"oFlags", 1}, {"oCoverage", 2}}))
+        return false;
+
+    if (!OpenGL::CompileVertexFragmentProgram(
+            StrictAffineOrdinaryOBJCompositeShader,
+            k2DFullscreenPassVS,
+            k2DStrictAffineOrdinaryOBJCompositeFS,
+            "2DStrictAffineOrdinaryOBJCompositeShader",
+            {{"vPosition", 0}},
+            {{"oColor", 0}}))
+        return false;
+
+    if (!OpenGL::CompileVertexFragmentProgram(
+            AffineOBJPresentationCompositeShader,
+            k2DFullscreenPassVS,
+            k2DAffineOBJPresentationCompositeFS,
+            "2DAffineOBJPresentationCompositeShader",
+            {{"vPosition", 0}},
+            {{"oColor", 0}}))
+        return false;
+
+    if (!OpenGL::CompileVertexFragmentProgram(
+            StrictAffineMaskedOBJMaskShader,
+            k2DFullscreenPassVS,
+            k2DStrictAffineMaskedOBJMaskFS,
+            "2DStrictAffineMaskedOBJMaskShader",
+            {{"vPosition", 0}},
+            {{"oColor", 0}}))
+        return false;
+
+    if (!OpenGL::CompileVertexFragmentProgram(
+            StrictAffineMaskedOBJMLAAShader,
+            k2DFullscreenPassVS,
+            k2DStrictAffineMaskedOBJMLAAFS,
+            "2DStrictAffineMaskedOBJMLAAShader",
+            {{"vPosition", 0}},
+            {{"oColor", 0}}))
         return false;
 
     if (!OpenGL::CompileVertexFragmentProgram(Native3DResolveShader,
@@ -776,6 +929,28 @@ bool GLRenderer2D::InitShaders()
                                               {{"oColor", 0}}))
         return false;
 
+    if (!OpenGL::CompileVertexFragmentProgram(ReconstructionAlphaShader,
+            k2DFullscreenPassVS, k2DReconstructionAlphaFS, "2DReconstructionAlphaShader",
+            {{"vPosition", 0}}, {{"oColor", 0}})) return false;
+
+    if (!OpenGL::CompileVertexFragmentProgram(MidpointAlphaShader,
+                                              k2DFullscreenPassVS, k2DMidpointAlphaFS,
+                                              "2DMidpointAlphaShader",
+                                              {{"vPosition", 0}},
+                                              {{"oColor", 0}}))
+        return false;
+
+    if (!OpenGL::CompileVertexFragmentProgram(OpaqueOBJAssemblyShader,
+            k2DFullscreenPassVS, k2DOpaqueOBJAssemblyFS, "2DOpaqueOBJAssemblyShader",
+            {{"vPosition", 0}}, {{"oColor", 0}})) return false;
+
+    if (!OpenGL::CompileVertexFragmentProgram(TransparentRGBPadShader,
+                                              k2DFullscreenPassVS, k2DTransparentRGBPadFS,
+                                              "2DTransparentRGBPadShader",
+                                              {{"vPosition", 0}},
+                                              {{"oColor", 0}}))
+        return false;
+
     if (!OpenGL::CompileVertexFragmentProgram(XBRZPreprocessShader,
                                               k2DFullscreenPassVS, k2DXBRZ_PreprocessFS,
                                               "2DXBRZPreprocessShader",
@@ -824,6 +999,11 @@ bool GLRenderer2D::InitShaders()
     glUniform1i(uniloc, 1);
     uniloc = glGetUniformLocation(SpriteShader, "Capture256Tex");
     glUniform1i(uniloc, 2);
+    uniloc = glGetUniformLocation(SpriteShader, "EnhancedSpriteTex");
+    glUniform1i(uniloc, 3);
+    glUniform1i(glGetUniformLocation(SpriteShader, "AssembledSpriteTex"), 4);
+    SpriteUseAssembledSourceULoc = glGetUniformLocation(SpriteShader, "uUseAssembledSource");
+    SpriteAssembledSlotsULoc = glGetUniformLocation(SpriteShader, "uAssembledSlots");
 
     uniloc = glGetUniformBlockIndex(SpriteShader, "ubSpriteConfig");
     glUniformBlockBinding(SpriteShader, uniloc, 21);
@@ -832,6 +1012,21 @@ bool GLRenderer2D::InitShaders()
 
     SpriteRenderTransULoc = glGetUniformLocation(SpriteShader, "uRenderTransparent");
     SpriteFilterModeULoc = glGetUniformLocation(SpriteShader, "uSpriteFilterMode");
+    SpriteAffineSourceEnhancementOnlyULoc =
+        glGetUniformLocation(SpriteShader, "uAffineSourceEnhancementOnly");
+    SpriteUseEnhancedSourceULoc =
+        glGetUniformLocation(SpriteShader, "uUseEnhancedSpriteSource");
+    SpriteEnhancedSourceScaleULoc =
+        glGetUniformLocation(SpriteShader, "uEnhancedSpriteSourceScale");
+    SpriteLinearEnhancedSourceULoc =
+        glGetUniformLocation(SpriteShader, "uLinearEnhancedSpriteSource");
+    SpriteXBRZPresentationOnlyULoc =
+        glGetUniformLocation(SpriteShader, "uXBRZPresentationOnly");
+    SpriteAffineOBJPresentationCoverageModeULoc =
+        glGetUniformLocation(SpriteShader,
+                             "uAffineOBJPresentationCoverageMode");
+    SpriteOrderedPresentationBandULoc =
+        glGetUniformLocation(SpriteShader, "uOrderedPresentationBand");
 
 
     glUseProgram(CompositorShader);
@@ -862,6 +1057,17 @@ bool GLRenderer2D::InitShaders()
     glUniform1i(uniloc, 11);
     uniloc = glGetUniformLocation(CompositorShader, "Direct3DCoverageTex");
     glUniform1i(uniloc, 12);
+    uniloc = glGetUniformLocation(CompositorShader, "EnhancedBGLayerTex[0]");
+    glUniform1i(uniloc, 13);
+    uniloc = glGetUniformLocation(CompositorShader, "EnhancedBGLayerTex[1]");
+    glUniform1i(uniloc, 14);
+    uniloc = glGetUniformLocation(CompositorShader, "EnhancedBGLayerTex[2]");
+    glUniform1i(uniloc, 15);
+    uniloc = glGetUniformLocation(CompositorShader, "EnhancedBGLayerTex[3]");
+    glUniform1i(uniloc, 16);
+    uniloc = glGetUniformLocation(CompositorShader,
+                                 "XBRZPresentationOBJLayerTex");
+    glUniform1i(uniloc, 17);
 
     uniloc = glGetUniformBlockIndex(CompositorShader, "ubBGConfig");
     glUniformBlockBinding(CompositorShader, uniloc, 20);
@@ -874,9 +1080,41 @@ bool GLRenderer2D::InitShaders()
     CompositorOBJNativeResolutionULoc = glGetUniformLocation(CompositorShader, "uOBJNativeResolution");
     CompositorLayerFilterModeULoc = glGetUniformLocation(CompositorShader, "uLayerFilterMode");
     CompositorLayerFilterNoWrapULoc = glGetUniformLocation(CompositorShader, "uLayerFilterNoWrap");
+    CompositorAffineSourceEnhancementOnlyULoc =
+        glGetUniformLocation(CompositorShader, "uAffineSourceEnhancementOnly");
+    CompositorEnhancedBGMaskULoc =
+        glGetUniformLocation(CompositorShader, "uEnhancedBGMask");
     CompositorDebugTintULoc = glGetUniformLocation(CompositorShader, "uDebugTintBySource");
     CompositorSplit3DSemanticsULoc = glGetUniformLocation(CompositorShader, "uSplit3DSemantics");
     CompositorSharpenSplit3DCoverageULoc = glGetUniformLocation(CompositorShader, "uSharpenSplit3DCoverage");
+    CompositorUseEnhancedOBJPresentationCoverageULoc =
+        glGetUniformLocation(CompositorShader,
+                             "uUseEnhancedOBJPresentationCoverage");
+    CompositorUseXBRZPresentationContourULoc =
+        glGetUniformLocation(CompositorShader,
+                             "uUseXBRZPresentationContour");
+    CompositorPresentationContourPremultipliedULoc =
+        glGetUniformLocation(CompositorShader,
+                             "uPresentationContourPremultiplied");
+    CompositorBilinearAffineBGPresentationULoc =
+        glGetUniformLocation(CompositorShader,
+                             "uBilinearAffineBGPresentation");
+    CompositorEnhancedBGCoverageMaskULoc =
+        glGetUniformLocation(CompositorShader,
+                             "uEnhancedBGCoverageMask");
+    CompositorReconstructedBGCandidateMaskULoc =
+        glGetUniformLocation(CompositorShader,
+                             "uReconstructedBGCandidateMask");
+    CompositorAffineConstantBackdropProofMaskULoc =
+        glGetUniformLocation(CompositorShader,
+                             "uAffineConstantBackdropProofMask");
+    CompositorDirect3DEndpointModeULoc =
+        glGetUniformLocation(CompositorShader, "uDirect3DEndpointMode");
+    CompositorUseScanlineStateULoc =
+        glGetUniformLocation(CompositorShader,
+                             "uUseScanlineCompositorState");
+    CompositorForceOBJDisabledULoc =
+        glGetUniformLocation(CompositorShader, "uForceOBJDisabled");
 
     glUseProgram(NativePrepassShader);
 
@@ -956,6 +1194,152 @@ bool GLRenderer2D::InitShaders()
     NativeResolveDebugTintULoc = glGetUniformLocation(NativeResolveShader, "uDebugTintBySource");
     NativeResolveNativeExactOutputULoc = glGetUniformLocation(NativeResolveShader, "uNativeExactOutput");
 
+    glUseProgram(StrictAffineOrdinaryOBJCompositeShader);
+
+    uniloc = glGetUniformLocation(StrictAffineOrdinaryOBJCompositeShader,
+                                 "StrictAffineBaseTex");
+    glUniform1i(uniloc, 0);
+    uniloc = glGetUniformLocation(StrictAffineOrdinaryOBJCompositeShader,
+                                 "UpscaledTopColorTex");
+    glUniform1i(uniloc, 1);
+    uniloc = glGetUniformLocation(StrictAffineOrdinaryOBJCompositeShader,
+                                 "UpscaledSecondColorTex");
+    glUniform1i(uniloc, 2);
+    uniloc = glGetUniformLocation(StrictAffineOrdinaryOBJCompositeShader,
+                                 "UpscaledMetaTex");
+    glUniform1i(uniloc, 3);
+    uniloc = glGetUniformLocation(StrictAffineOrdinaryOBJCompositeShader,
+                                 "UpscaledCoverageTex");
+    glUniform1i(uniloc, 4);
+    uniloc = glGetUniformLocation(StrictAffineOrdinaryOBJCompositeShader,
+                                 "NativeOBJLayerTex");
+    glUniform1i(uniloc, 5);
+    uniloc = glGetUniformLocation(StrictAffineOrdinaryOBJCompositeShader,
+                                 "StrictAffineOBJLayerTex");
+    glUniform1i(uniloc, 6);
+    uniloc = glGetUniformBlockIndex(StrictAffineOrdinaryOBJCompositeShader,
+                                   "ubCompositorConfig");
+    glUniformBlockBinding(StrictAffineOrdinaryOBJCompositeShader, uniloc, 23);
+    StrictAffineOrdinaryOBJCompositeScaleULoc = glGetUniformLocation(
+        StrictAffineOrdinaryOBJCompositeShader, "uScaleFactor");
+    StrictAffineOrdinaryOBJCompositeNativeStackBGMaskULoc =
+        glGetUniformLocation(StrictAffineOrdinaryOBJCompositeShader,
+                             "uNativeStackBGMask");
+    StrictAffineOrdinaryOBJCompositeDebugTintULoc = glGetUniformLocation(
+        StrictAffineOrdinaryOBJCompositeShader, "uDebugTintBySource");
+    StrictAffineOrdinaryOBJCompositeBuildUnderlayULoc = glGetUniformLocation(
+        StrictAffineOrdinaryOBJCompositeShader, "uBuildAffineUnderlay");
+    StrictAffineOrdinaryOBJCompositeOrdinaryEquivalentMaskULoc =
+        glGetUniformLocation(StrictAffineOrdinaryOBJCompositeShader,
+                             "uOrdinaryEquivalentAffineMask");
+    glUseProgram(OrdinaryOBJBandPresentationShader);
+    uniloc = glGetUniformLocation(OrdinaryOBJBandPresentationShader,
+                                 "BaseTex");
+    glUniform1i(uniloc, 0);
+    uniloc = glGetUniformLocation(OrdinaryOBJBandPresentationShader,
+                                 "ScaledBandTex");
+    glUniform1i(uniloc, 1);
+    uniloc = glGetUniformLocation(OrdinaryOBJBandPresentationShader,
+                                 "UpscaledMetaTex");
+    glUniform1i(uniloc, 2);
+    uniloc = glGetUniformBlockIndex(OrdinaryOBJBandPresentationShader,
+                                   "ubCompositorConfig");
+    glUniformBlockBinding(OrdinaryOBJBandPresentationShader, uniloc, 23);
+    uniloc = glGetUniformBlockIndex(OrdinaryOBJBandPresentationShader,
+                                   "ubScanlineConfig");
+    glUniformBlockBinding(OrdinaryOBJBandPresentationShader, uniloc, 22);
+
+    glUseProgram(ResolvedOBJMergeShader);
+    uniloc = glGetUniformLocation(ResolvedOBJMergeShader,
+                                 "SemanticOBJLayerTex");
+    glUniform1i(uniloc, 0);
+    uniloc = glGetUniformLocation(ResolvedOBJMergeShader,
+                                 "OrdinaryPresentationTex");
+    glUniform1i(uniloc, 1);
+    uniloc = glGetUniformLocation(ResolvedOBJMergeShader,
+                                 "NativeOrdinaryOBJLayerTex");
+    glUniform1i(uniloc, 2);
+    ResolvedOBJMergeScaleULoc = glGetUniformLocation(
+        ResolvedOBJMergeShader, "uScaleFactor");
+
+    glUseProgram(OrdinaryOBJSpecialCompositeShader);
+    uniloc = glGetUniformLocation(OrdinaryOBJSpecialCompositeShader,
+                                 "BaseTex");
+    glUniform1i(uniloc, 0);
+    uniloc = glGetUniformLocation(OrdinaryOBJSpecialCompositeShader,
+                                 "SpecialOBJLayerTex");
+    glUniform1i(uniloc, 1);
+    uniloc = glGetUniformLocation(OrdinaryOBJSpecialCompositeShader,
+                                 "ScaledPresentationTex");
+    glUniform1i(uniloc, 2);
+    uniloc = glGetUniformLocation(OrdinaryOBJSpecialCompositeShader,
+                                 "UpscaledMetaTex");
+    glUniform1i(uniloc, 3);
+    uniloc = glGetUniformBlockIndex(OrdinaryOBJSpecialCompositeShader,
+                                   "ubScanlineConfig");
+    glUniformBlockBinding(OrdinaryOBJSpecialCompositeShader, uniloc, 22);
+
+    glUseProgram(StrictAffineMaskedOBJMaskShader);
+    uniloc = glGetUniformLocation(StrictAffineMaskedOBJMaskShader,
+                                 "UpscaledMetaTex");
+    glUniform1i(uniloc, 0);
+    uniloc = glGetUniformLocation(StrictAffineMaskedOBJMaskShader,
+                                 "NativeOBJLayerTex");
+    glUniform1i(uniloc, 1);
+    uniloc = glGetUniformLocation(StrictAffineMaskedOBJMaskShader,
+                                 "StrictAffineOBJLayerTex");
+    glUniform1i(uniloc, 2);
+    StrictAffineMaskedOBJMaskScaleULoc = glGetUniformLocation(
+        StrictAffineMaskedOBJMaskShader, "uScaleFactor");
+    StrictAffineMaskedOBJMaskOwnerULoc = glGetUniformLocation(
+        StrictAffineMaskedOBJMaskShader, "uOwnerMask");
+
+    glUseProgram(StrictAffineMaskedOBJMLAAShader);
+    uniloc = glGetUniformLocation(StrictAffineMaskedOBJMLAAShader,
+                                 "FinalColorTex");
+    glUniform1i(uniloc, 0);
+    uniloc = glGetUniformLocation(StrictAffineMaskedOBJMLAAShader,
+                                 "OBJMaskTex");
+    glUniform1i(uniloc, 1);
+    StrictAffineMaskedOBJMLAAScaleULoc = glGetUniformLocation(
+        StrictAffineMaskedOBJMLAAShader, "uScaleFactor");
+    StrictAffineMaskedOBJMLAADebugCoverageULoc = glGetUniformLocation(
+        StrictAffineMaskedOBJMLAAShader, "uDebugCoverage");
+
+    glUseProgram(AffineOBJPresentationCompositeShader);
+    uniloc = glGetUniformLocation(AffineOBJPresentationCompositeShader,
+                                 "BaseTex");
+    glUniform1i(uniloc, 0);
+    uniloc = glGetUniformLocation(AffineOBJPresentationCompositeShader,
+                                 "PresentationOBJLayerTex");
+    glUniform1i(uniloc, 1);
+    uniloc = glGetUniformLocation(AffineOBJPresentationCompositeShader,
+                                 "UpscaledMetaTex");
+    glUniform1i(uniloc, 2);
+    uniloc = glGetUniformLocation(AffineOBJPresentationCompositeShader,
+                                 "NativeOBJLayerTex");
+    glUniform1i(uniloc, 3);
+    uniloc = glGetUniformLocation(AffineOBJPresentationCompositeShader,
+                                 "StrictAffineOBJLayerTex");
+    glUniform1i(uniloc, 4);
+    uniloc = glGetUniformLocation(AffineOBJPresentationCompositeShader,
+                                 "AffineUnderlayTex");
+    glUniform1i(uniloc, 5);
+    uniloc = glGetUniformLocation(AffineOBJPresentationCompositeShader,
+                                 "SubpixelPresentationOBJLayerTex");
+    glUniform1i(uniloc, 6);
+    uniloc = glGetUniformBlockIndex(AffineOBJPresentationCompositeShader,
+                                   "ubCompositorConfig");
+    glUniformBlockBinding(AffineOBJPresentationCompositeShader, uniloc, 23);
+    AffineOBJPresentationCompositeScaleULoc = glGetUniformLocation(
+        AffineOBJPresentationCompositeShader, "uScaleFactor");
+    AffineOBJPresentationCompositeSubpixelCoverageULoc =
+        glGetUniformLocation(AffineOBJPresentationCompositeShader,
+                             "uSubpixelPresentationCoverage");
+    AffineOBJPresentationCompositePremultipliedSubpixelULoc =
+        glGetUniformLocation(AffineOBJPresentationCompositeShader,
+                             "uPremultipliedSubpixelPresentation");
+
     glUseProgram(Native3DResolveShader);
 
     uniloc = glGetUniformLocation(Native3DResolveShader, "Source3DTex");
@@ -980,6 +1364,15 @@ bool GLRenderer2D::InitShaders()
     glUniform1i(uniloc, 1);
     uniloc = glGetUniformLocation(OverlayCompositeShader, "Direct3DTexture");
     glUniform1i(uniloc, 2);
+    uniloc = glGetUniformLocation(OverlayCompositeShader,
+                                 "OverlayOpaqueWhiteTex");
+    glUniform1i(uniloc, 3);
+    uniloc = glGetUniformLocation(OverlayCompositeShader,
+                                 "Native3DSemanticsTex");
+    glUniform1i(uniloc, 4);
+    uniloc = glGetUniformLocation(OverlayCompositeShader,
+                                 "Native3DOperatorTex");
+    glUniform1i(uniloc, 5);
 
     uniloc = glGetUniformBlockIndex(OverlayCompositeShader, "ubScanlineConfig");
     glUniformBlockBinding(OverlayCompositeShader, uniloc, 22);
@@ -988,6 +1381,10 @@ bool GLRenderer2D::InitShaders()
     OverlayCompositeDebugTintULoc = glGetUniformLocation(OverlayCompositeShader, "uDebugTintBySource");
     OverlayCompositeLegacyUnderlayULoc = glGetUniformLocation(OverlayCompositeShader, "uLegacyUnderlayEndpoint");
     OverlayCompositeDirect3DPresentationSpaceULoc = glGetUniformLocation(OverlayCompositeShader, "uDirect3DPresentationSpace");
+    OverlayCompositeStraightDirect3DColorULoc = glGetUniformLocation(OverlayCompositeShader, "uStraightDirect3DColor");
+    OverlayCompositeExplicit3DOperatorULoc =
+        glGetUniformLocation(OverlayCompositeShader,
+                             "uExplicit3DOperator");
 
     glUseProgram(OverlayHybridCompositeShader);
 
@@ -1077,6 +1474,16 @@ bool GLRenderer2D::InitShaders()
     uniloc = glGetUniformLocation(AlphaReplaceShader, "AlphaSource");
     glUniform1i(uniloc, 1);
 
+    glUseProgram(MidpointAlphaShader);
+    uniloc = glGetUniformLocation(MidpointAlphaShader, "Source");
+    glUniform1i(uniloc, 0);
+    uniloc = glGetUniformLocation(MidpointAlphaShader, "AlphaSource");
+    glUniform1i(uniloc, 1);
+
+    glUseProgram(TransparentRGBPadShader);
+    uniloc = glGetUniformLocation(TransparentRGBPadShader, "Source");
+    glUniform1i(uniloc, 0);
+
     glUseProgram(XBRZPreprocessShader);
     uniloc = glGetUniformLocation(XBRZPreprocessShader, "Source");
     glUniform1i(uniloc, 0);
@@ -1123,6 +1530,18 @@ bool GLRenderer2D::InitShaders(GLRenderer2D& other)
     NativeUpscaleShader = other.NativeUpscaleShader;
     NativeBoundaryGuardShader = other.NativeBoundaryGuardShader;
     NativeResolveShader = other.NativeResolveShader;
+    OrdinaryOBJBandPresentationShader =
+        other.OrdinaryOBJBandPresentationShader;
+    OrdinaryOBJSpecialCompositeShader =
+        other.OrdinaryOBJSpecialCompositeShader;
+    ResolvedOBJMergeShader = other.ResolvedOBJMergeShader;
+    ResolvedOBJMergeScaleULoc = other.ResolvedOBJMergeScaleULoc;
+    StrictAffineOrdinaryOBJCompositeShader =
+        other.StrictAffineOrdinaryOBJCompositeShader;
+    StrictAffineMaskedOBJMaskShader = other.StrictAffineMaskedOBJMaskShader;
+    StrictAffineMaskedOBJMLAAShader = other.StrictAffineMaskedOBJMLAAShader;
+    AffineOBJPresentationCompositeShader =
+        other.AffineOBJPresentationCompositeShader;
     Native3DResolveShader = other.Native3DResolveShader;
     OverlayEndpointShader = other.OverlayEndpointShader;
     OverlayCompositeShader = other.OverlayCompositeShader;
@@ -1135,6 +1554,10 @@ bool GLRenderer2D::InitShaders(GLRenderer2D& other)
     Spline36Shader = other.Spline36Shader;
     ArtCNNYUVAToRGBA2xShader = other.ArtCNNYUVAToRGBA2xShader;
     AlphaReplaceShader = other.AlphaReplaceShader;
+    ReconstructionAlphaShader = other.ReconstructionAlphaShader;
+    MidpointAlphaShader = other.MidpointAlphaShader;
+    TransparentRGBPadShader = other.TransparentRGBPadShader;
+    OpaqueOBJAssemblyShader = other.OpaqueOBJAssemblyShader;
     NNEDI3ComputeShaderOwner = &other;
     CopyNNEDI3ComputeProgramsFrom(other);
     XBRZPreprocessShader = other.XBRZPreprocessShader;
@@ -1145,13 +1568,71 @@ bool GLRenderer2D::InitShaders(GLRenderer2D& other)
     LayerPreCurBGULoc = other.LayerPreCurBGULoc;
     SpriteRenderTransULoc = other.SpriteRenderTransULoc;
     SpriteFilterModeULoc = other.SpriteFilterModeULoc;
+    SpriteAffineSourceEnhancementOnlyULoc = other.SpriteAffineSourceEnhancementOnlyULoc;
+    SpriteUseEnhancedSourceULoc = other.SpriteUseEnhancedSourceULoc;
+    SpriteEnhancedSourceScaleULoc = other.SpriteEnhancedSourceScaleULoc;
+    SpriteLinearEnhancedSourceULoc = other.SpriteLinearEnhancedSourceULoc;
+    SpriteUseAssembledSourceULoc = other.SpriteUseAssembledSourceULoc;
+    SpriteAssembledSlotsULoc = other.SpriteAssembledSlotsULoc;
+    SpriteXBRZPresentationOnlyULoc =
+        other.SpriteXBRZPresentationOnlyULoc;
+    SpriteAffineOBJPresentationCoverageModeULoc =
+        other.SpriteAffineOBJPresentationCoverageModeULoc;
+    SpriteOrderedPresentationBandULoc =
+        other.SpriteOrderedPresentationBandULoc;
+    StrictAffineOrdinaryOBJCompositeScaleULoc =
+        other.StrictAffineOrdinaryOBJCompositeScaleULoc;
+    StrictAffineOrdinaryOBJCompositeNativeStackBGMaskULoc =
+        other.StrictAffineOrdinaryOBJCompositeNativeStackBGMaskULoc;
+    StrictAffineOrdinaryOBJCompositeDebugTintULoc =
+        other.StrictAffineOrdinaryOBJCompositeDebugTintULoc;
+    StrictAffineOrdinaryOBJCompositeBuildUnderlayULoc =
+        other.StrictAffineOrdinaryOBJCompositeBuildUnderlayULoc;
+    StrictAffineOrdinaryOBJCompositeOrdinaryEquivalentMaskULoc =
+        other.StrictAffineOrdinaryOBJCompositeOrdinaryEquivalentMaskULoc;
+    StrictAffineMaskedOBJMaskScaleULoc =
+        other.StrictAffineMaskedOBJMaskScaleULoc;
+    StrictAffineMaskedOBJMaskOwnerULoc =
+        other.StrictAffineMaskedOBJMaskOwnerULoc;
+    StrictAffineMaskedOBJMLAAScaleULoc =
+        other.StrictAffineMaskedOBJMLAAScaleULoc;
+    StrictAffineMaskedOBJMLAADebugCoverageULoc =
+        other.StrictAffineMaskedOBJMLAADebugCoverageULoc;
+    AffineOBJPresentationCompositeScaleULoc =
+        other.AffineOBJPresentationCompositeScaleULoc;
+    AffineOBJPresentationCompositeSubpixelCoverageULoc =
+        other.AffineOBJPresentationCompositeSubpixelCoverageULoc;
+    AffineOBJPresentationCompositePremultipliedSubpixelULoc =
+        other.AffineOBJPresentationCompositePremultipliedSubpixelULoc;
     CompositorScaleULoc = other.CompositorScaleULoc;
     CompositorOBJNativeResolutionULoc = other.CompositorOBJNativeResolutionULoc;
     CompositorLayerFilterModeULoc = other.CompositorLayerFilterModeULoc;
     CompositorLayerFilterNoWrapULoc = other.CompositorLayerFilterNoWrapULoc;
+    CompositorAffineSourceEnhancementOnlyULoc = other.CompositorAffineSourceEnhancementOnlyULoc;
+    CompositorEnhancedBGMaskULoc = other.CompositorEnhancedBGMaskULoc;
     CompositorDebugTintULoc = other.CompositorDebugTintULoc;
     CompositorSplit3DSemanticsULoc = other.CompositorSplit3DSemanticsULoc;
     CompositorSharpenSplit3DCoverageULoc = other.CompositorSharpenSplit3DCoverageULoc;
+    CompositorUseEnhancedOBJPresentationCoverageULoc =
+        other.CompositorUseEnhancedOBJPresentationCoverageULoc;
+    CompositorUseXBRZPresentationContourULoc =
+        other.CompositorUseXBRZPresentationContourULoc;
+    CompositorPresentationContourPremultipliedULoc =
+        other.CompositorPresentationContourPremultipliedULoc;
+    CompositorBilinearAffineBGPresentationULoc =
+        other.CompositorBilinearAffineBGPresentationULoc;
+    CompositorEnhancedBGCoverageMaskULoc =
+        other.CompositorEnhancedBGCoverageMaskULoc;
+    CompositorReconstructedBGCandidateMaskULoc =
+        other.CompositorReconstructedBGCandidateMaskULoc;
+    CompositorAffineConstantBackdropProofMaskULoc =
+        other.CompositorAffineConstantBackdropProofMaskULoc;
+    CompositorDirect3DEndpointModeULoc =
+        other.CompositorDirect3DEndpointModeULoc;
+    CompositorUseScanlineStateULoc =
+        other.CompositorUseScanlineStateULoc;
+    CompositorForceOBJDisabledULoc =
+        other.CompositorForceOBJDisabledULoc;
     NativePrepassScaleULoc = other.NativePrepassScaleULoc;
     NativePrepassDebugLayerULoc = other.NativePrepassDebugLayerULoc;
     NativeUpscaleScaleULoc = other.NativeUpscaleScaleULoc;
@@ -1170,6 +1651,9 @@ bool GLRenderer2D::InitShaders(GLRenderer2D& other)
     OverlayCompositeDebugTintULoc = other.OverlayCompositeDebugTintULoc;
     OverlayCompositeLegacyUnderlayULoc = other.OverlayCompositeLegacyUnderlayULoc;
     OverlayCompositeDirect3DPresentationSpaceULoc = other.OverlayCompositeDirect3DPresentationSpaceULoc;
+    OverlayCompositeStraightDirect3DColorULoc = other.OverlayCompositeStraightDirect3DColorULoc;
+    OverlayCompositeExplicit3DOperatorULoc =
+        other.OverlayCompositeExplicit3DOperatorULoc;
     OverlayHybridCompositeScaleULoc = other.OverlayHybridCompositeScaleULoc;
     OverlayHybridCompositeDebugTintULoc = other.OverlayHybridCompositeDebugTintULoc;
     OverlayHybridCompositeLegacyUnderlayULoc = other.OverlayHybridCompositeLegacyUnderlayULoc;
@@ -1216,7 +1700,6 @@ bool GLRenderer2D::Init()
 
     // sprite prerender vertex data: 2x position, 1x sprite index
     int sprdatasize = (3 * 6) * 128;
-    SpritePreVtxData = new u16[sprdatasize];
 
     glGenBuffers(1, &SpritePreVtxBuffer);
     glBindBuffer(GL_ARRAY_BUFFER, SpritePreVtxBuffer);
@@ -1231,7 +1714,6 @@ bool GLRenderer2D::Init()
 
     // sprite vertex data: 2x position, 2x texcoord, 1x index
     sprdatasize = (5 * 6) * 256;
-    SpriteVtxData = new u16[sprdatasize];
 
     glGenBuffers(1, &SpriteVtxBuffer);
     glBindBuffer(GL_ARRAY_BUFFER, SpriteVtxBuffer);
@@ -1318,6 +1800,123 @@ bool GLRenderer2D::Init()
         }
     }
 
+    glGenTextures(4, EnhancedBGLayerTex);
+    glGenFramebuffers(4, EnhancedBGLayerFB);
+    constexpr int historicalTextureCount =
+        DeferredScanlineStrictAffineInputs::MaxHistoricalSourceEpochs * 4;
+    glGenTextures(
+        historicalTextureCount,
+        &DeferredStrictAffineHistoricalBGLayerTex[0][0]);
+    glGenTextures(
+        historicalTextureCount,
+        &DeferredStrictAffineHistoricalBGLayerMetaTex[0][0]);
+    glGenFramebuffers(
+        historicalTextureCount,
+        &DeferredStrictAffineHistoricalBGLayerFB[0][0]);
+    glGenTextures(
+        historicalTextureCount,
+        &DeferredStrictAffineHistoricalEnhancedBGLayerTex[0][0]);
+    glGenFramebuffers(
+        historicalTextureCount,
+        &DeferredStrictAffineHistoricalEnhancedBGLayerFB[0][0]);
+    for (int i = 0; i < 4; i++)
+    {
+        glBindTexture(GL_TEXTURE_2D, EnhancedBGLayerTex[i]);
+        glDefaultTexParams(GL_TEXTURE_2D);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, 1, 1, 0, GL_RGBA,
+                     GL_HALF_FLOAT, nullptr);
+        EnhancedBGLayerWidth[i] = 1;
+        EnhancedBGLayerHeight[i] = 1;
+
+        glBindFramebuffer(GL_FRAMEBUFFER, EnhancedBGLayerFB[i]);
+        glFramebufferTexture(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                             EnhancedBGLayerTex[i], 0);
+        glDrawBuffer(GL_COLOR_ATTACHMENT0);
+
+        for (u32 epoch = 0;
+             epoch < DeferredScanlineStrictAffineInputs::
+                         MaxHistoricalSourceEpochs;
+             epoch++)
+        {
+            glBindTexture(
+                GL_TEXTURE_2D,
+                DeferredStrictAffineHistoricalBGLayerTex[epoch][i]);
+            glDefaultTexParams(GL_TEXTURE_2D);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 1, 1, 0, GL_RGBA,
+                         GL_UNSIGNED_BYTE, nullptr);
+            glBindTexture(
+                GL_TEXTURE_2D,
+                DeferredStrictAffineHistoricalBGLayerMetaTex[epoch][i]);
+            glDefaultTexParams(GL_TEXTURE_2D);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 1, 1, 0, GL_RGBA,
+                         GL_UNSIGNED_BYTE, nullptr);
+            DeferredStrictAffineHistoricalBGLayerWidth[epoch][i] = 1;
+            DeferredStrictAffineHistoricalBGLayerHeight[epoch][i] = 1;
+            glBindFramebuffer(
+                GL_FRAMEBUFFER,
+                DeferredStrictAffineHistoricalBGLayerFB[epoch][i]);
+            glFramebufferTexture(
+                GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                DeferredStrictAffineHistoricalBGLayerTex[epoch][i], 0);
+            glFramebufferTexture(
+                GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1,
+                DeferredStrictAffineHistoricalBGLayerMetaTex[epoch][i], 0);
+            glDrawBuffers(2, fbassign2);
+
+            glBindTexture(
+                GL_TEXTURE_2D,
+                DeferredStrictAffineHistoricalEnhancedBGLayerTex[epoch][i]);
+            glDefaultTexParams(GL_TEXTURE_2D);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, 1, 1, 0, GL_RGBA,
+                         GL_HALF_FLOAT, nullptr);
+            DeferredStrictAffineHistoricalEnhancedBGLayerWidth[epoch][i] = 1;
+            DeferredStrictAffineHistoricalEnhancedBGLayerHeight[epoch][i] = 1;
+            glBindFramebuffer(
+                GL_FRAMEBUFFER,
+                DeferredStrictAffineHistoricalEnhancedBGLayerFB[epoch][i]);
+            glFramebufferTexture(
+                GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                DeferredStrictAffineHistoricalEnhancedBGLayerTex[epoch][i], 0);
+            glDrawBuffer(GL_COLOR_ATTACHMENT0);
+        }
+    }
+
+    glGenTextures(1, &EnhancedBGInputTex);
+    glBindTexture(GL_TEXTURE_2D, EnhancedBGInputTex);
+    glDefaultTexParams(GL_TEXTURE_2D);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 1, 1, 0, GL_RGBA,
+                 GL_UNSIGNED_BYTE, nullptr);
+    glGenFramebuffers(1, &EnhancedBGInputFB);
+    glBindFramebuffer(GL_FRAMEBUFFER, EnhancedBGInputFB);
+    glFramebufferTexture(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                         EnhancedBGInputTex, 0);
+    glDrawBuffer(GL_COLOR_ATTACHMENT0);
+
+    glGenTextures(1, &EnhancedBGPreparedTex);
+    glBindTexture(GL_TEXTURE_2D, EnhancedBGPreparedTex);
+    glDefaultTexParams(GL_TEXTURE_2D);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 1, 1, 0, GL_RGBA,
+                 GL_UNSIGNED_BYTE, nullptr);
+    glGenFramebuffers(1, &EnhancedBGPreparedFB);
+    glBindFramebuffer(GL_FRAMEBUFFER, EnhancedBGPreparedFB);
+    glFramebufferTexture(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                         EnhancedBGPreparedTex, 0);
+    glDrawBuffer(GL_COLOR_ATTACHMENT0);
+
+    glGenTextures(1, &EnhancedBGScaledTex);
+    glBindTexture(GL_TEXTURE_2D, EnhancedBGScaledTex);
+    glDefaultTexParams(GL_TEXTURE_2D);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, 2, 2, 0, GL_RGBA,
+                 GL_HALF_FLOAT, nullptr);
+    glGenFramebuffers(1, &EnhancedBGScaledFB);
+    glBindFramebuffer(GL_FRAMEBUFFER, EnhancedBGScaledFB);
+    glFramebufferTexture(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                         EnhancedBGScaledTex, 0);
+    glDrawBuffer(GL_COLOR_ATTACHMENT0);
+    EnhancedBGScratchWidth = 1;
+    EnhancedBGScratchHeight = 1;
+    EnhancedBGScratchScale = 2;
+
     // generate texture to hold pre-rendered sprites
 
     glGenTextures(1, &SpriteTex);
@@ -1329,6 +1928,71 @@ bool GLRenderer2D::Init()
     glBindFramebuffer(GL_FRAMEBUFFER, SpriteFB);
     glFramebufferTexture(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, SpriteTex, 0);
     glDrawBuffer(GL_COLOR_ATTACHMENT0);
+
+    // Cached source-art products for affine OBJ enhancement. At output scale
+    // four, CuNNy completes its product with Spline36 after the neural two-
+    // times pass, while NNEDI3 runs its second reconstruction pair. The atlas
+    // keeps the existing 128 OAM-slot topology, and the scratch textures
+    // isolate one slot while a multipass scaler runs so neighboring sprite
+    // art can never enter its reconstruction footprint.
+    glGenTextures(1, &EnhancedSpriteTex);
+    glBindTexture(GL_TEXTURE_2D, EnhancedSpriteTex);
+    glDefaultTexParams(GL_TEXTURE_2D);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 2048, 1024, 0, GL_RGBA,
+                 GL_UNSIGNED_BYTE, nullptr);
+
+    glGenFramebuffers(1, &EnhancedSpriteFB);
+    glBindFramebuffer(GL_FRAMEBUFFER, EnhancedSpriteFB);
+    glFramebufferTexture(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                         EnhancedSpriteTex, 0);
+    glDrawBuffer(GL_COLOR_ATTACHMENT0);
+
+    glGenTextures(1, &EnhancedSpriteInputTex);
+    glBindTexture(GL_TEXTURE_2D, EnhancedSpriteInputTex);
+    glDefaultTexParams(GL_TEXTURE_2D);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 64, 64, 0, GL_RGBA,
+                 GL_UNSIGNED_BYTE, nullptr);
+
+    glGenFramebuffers(1, &EnhancedSpriteInputFB);
+    glBindFramebuffer(GL_FRAMEBUFFER, EnhancedSpriteInputFB);
+    glFramebufferTexture(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                         EnhancedSpriteInputTex, 0);
+    glDrawBuffer(GL_COLOR_ATTACHMENT0);
+
+    glGenTextures(1, &EnhancedSpritePreparedTex);
+    glBindTexture(GL_TEXTURE_2D, EnhancedSpritePreparedTex);
+    glDefaultTexParams(GL_TEXTURE_2D);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 64, 64, 0, GL_RGBA,
+                 GL_UNSIGNED_BYTE, nullptr);
+
+    glGenFramebuffers(1, &EnhancedSpritePreparedFB);
+    glBindFramebuffer(GL_FRAMEBUFFER, EnhancedSpritePreparedFB);
+    glFramebufferTexture(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                         EnhancedSpritePreparedTex, 0);
+    glDrawBuffer(GL_COLOR_ATTACHMENT0);
+
+    glGenTextures(1, &EnhancedSpriteScaledRGBTex);
+    glBindTexture(GL_TEXTURE_2D, EnhancedSpriteScaledRGBTex);
+    glDefaultTexParams(GL_TEXTURE_2D);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, 128, 128, 0, GL_RGBA,
+                 GL_HALF_FLOAT, nullptr);
+
+    glGenFramebuffers(1, &EnhancedSpriteScaledRGBFB);
+    glBindFramebuffer(GL_FRAMEBUFFER, EnhancedSpriteScaledRGBFB);
+    glFramebufferTexture(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                         EnhancedSpriteScaledRGBTex, 0);
+    glDrawBuffer(GL_COLOR_ATTACHMENT0);
+
+    glGenTextures(1, &EnhancedSpriteScaledRGBATex);
+    glBindTexture(GL_TEXTURE_2D, EnhancedSpriteScaledRGBATex);
+    glDefaultTexParams(GL_TEXTURE_2D);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, 128, 128, 0, GL_RGBA,
+                 GL_HALF_FLOAT, nullptr);
+
+    glGenFramebuffers(1, &EnhancedSpriteScaledRGBAFB);
+    glBindFramebuffer(GL_FRAMEBUFFER, EnhancedSpriteScaledRGBAFB);
+    glFramebufferTexture(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                         EnhancedSpriteScaledRGBATex, 0);
 
     // generate texture to hold final (upscaled) sprites
 
@@ -1352,12 +2016,55 @@ bool GLRenderer2D::Init()
 
     Parent.OutputTex2D[GPU2D.Num] = OutputTex;
 
+    glGenTextures(1, &StrictAffineCandidateTex);
+    glBindTexture(GL_TEXTURE_2D, StrictAffineCandidateTex);
+    glDefaultTexParams(GL_TEXTURE_2D);
+
+    glGenFramebuffers(1, &StrictAffineCandidateFB);
+
+    glGenTextures(1, &StrictAffineMaskedOBJMaskTex);
+    glBindTexture(GL_TEXTURE_2D, StrictAffineMaskedOBJMaskTex);
+    glDefaultTexParams(GL_TEXTURE_2D);
+
+    glGenFramebuffers(1, &StrictAffineMaskedOBJMaskFB);
+
+    // Private output-resolution OBJ product used by the strict-affine split:
+    // affine sprites and OBJ-window semantics are rendered here without the
+    // ordinary sprites that the native-stack branch will reconstruct.
+    glGenTextures(1, &StrictAffineOBJLayerTex);
+    glBindTexture(GL_TEXTURE_2D_ARRAY, StrictAffineOBJLayerTex);
+    glDefaultTexParams(GL_TEXTURE_2D_ARRAY);
+
+    glGenTextures(1, &StrictAffineOBJDepthTex);
+    glBindTexture(GL_TEXTURE_2D, StrictAffineOBJDepthTex);
+    glDefaultTexParams(GL_TEXTURE_2D);
+
+    glGenFramebuffers(1, &StrictAffineOBJLayerFB);
+
+    // Private presentation operand for recovered affine-OBJ fringe coverage.
+    // It is never sampled by the semantic compositor.
+    glGenTextures(1, &AffinePresentationOBJLayerTex);
+    glBindTexture(GL_TEXTURE_2D_ARRAY, AffinePresentationOBJLayerTex);
+    glDefaultTexParams(GL_TEXTURE_2D_ARRAY);
+
+    glGenTextures(1, &AffinePresentationOBJDepthTex);
+    glBindTexture(GL_TEXTURE_2D, AffinePresentationOBJDepthTex);
+    glDefaultTexParams(GL_TEXTURE_2D);
+
+    glGenFramebuffers(1, &AffinePresentationOBJLayerFB);
+
+    glGenTextures(1, &AffinePresentationUnderlayTex);
+    glBindTexture(GL_TEXTURE_2D, AffinePresentationUnderlayTex);
+    glDefaultTexParams(GL_TEXTURE_2D);
+
+    glGenFramebuffers(1, &AffinePresentationUnderlayFB);
+
     // generate native-resolution textures for the whole-scene prepass path
 
     glGenTextures(1, &NativeOBJLayerTex);
     glBindTexture(GL_TEXTURE_2D_ARRAY, NativeOBJLayerTex);
     glDefaultTexParams(GL_TEXTURE_2D_ARRAY);
-    glTexImage3D(GL_TEXTURE_2D_ARRAY, 0, GL_RGBA, 256, 192, 2, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+    glTexImage3D(GL_TEXTURE_2D_ARRAY, 0, GL_RGBA, 256, 192, 3, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
 
     glGenTextures(1, &NativeOBJDepthTex);
     glBindTexture(GL_TEXTURE_2D, NativeOBJDepthTex);
@@ -1368,8 +2075,37 @@ bool GLRenderer2D::Init()
     glBindFramebuffer(GL_FRAMEBUFFER, NativeOBJLayerFB);
     glFramebufferTextureLayer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, NativeOBJLayerTex, 0, 0);
     glFramebufferTextureLayer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1, NativeOBJLayerTex, 0, 1);
+    glFramebufferTextureLayer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT2, NativeOBJLayerTex, 0, 2);
     glFramebufferTexture(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, NativeOBJDepthTex, 0);
-    glDrawBuffers(2, fbassign2);
+    glDrawBuffers(3, fbassign3);
+
+    // Native-resolution OBJ stack with the ordered presentation suffix that
+    // begins at the first strict affine operand removed. It feeds black/white
+    // endpoint finals while retaining the ordinary prefix as one completed
+    // whole-scene scaler input; the removed suffix is reinserted in order.
+    glGenTextures(1, &NativeOperandExcludedOBJLayerTex);
+    glBindTexture(GL_TEXTURE_2D_ARRAY, NativeOperandExcludedOBJLayerTex);
+    glDefaultTexParams(GL_TEXTURE_2D_ARRAY);
+    glTexImage3D(GL_TEXTURE_2D_ARRAY, 0, GL_RGBA, 256, 192, 3, 0,
+                 GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+
+    glGenTextures(1, &NativeOperandExcludedOBJDepthTex);
+    glBindTexture(GL_TEXTURE_2D, NativeOperandExcludedOBJDepthTex);
+    glDefaultTexParams(GL_TEXTURE_2D);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT16, 256, 192, 0,
+                 GL_DEPTH_COMPONENT, GL_UNSIGNED_SHORT, nullptr);
+
+    glGenFramebuffers(1, &NativeOperandExcludedOBJLayerFB);
+    glBindFramebuffer(GL_FRAMEBUFFER, NativeOperandExcludedOBJLayerFB);
+    glFramebufferTextureLayer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                              NativeOperandExcludedOBJLayerTex, 0, 0);
+    glFramebufferTextureLayer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1,
+                              NativeOperandExcludedOBJLayerTex, 0, 1);
+    glFramebufferTextureLayer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT2,
+                              NativeOperandExcludedOBJLayerTex, 0, 2);
+    glFramebufferTexture(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT,
+                         NativeOperandExcludedOBJDepthTex, 0);
+    glDrawBuffers(3, fbassign3);
 
     glGenTextures(1, &NativeOutputTex);
     glBindTexture(GL_TEXTURE_2D, NativeOutputTex);
@@ -1388,6 +2124,16 @@ bool GLRenderer2D::Init()
 
     glGenTextures(1, &NativeMetaTex);
     glBindTexture(GL_TEXTURE_2D, NativeMetaTex);
+    glDefaultTexParams(GL_TEXTURE_2D);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 256, 192, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+
+    glGenTextures(1, &NativeOrdinaryOBJRGBATex);
+    glBindTexture(GL_TEXTURE_2D, NativeOrdinaryOBJRGBATex);
+    glDefaultTexParams(GL_TEXTURE_2D);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 256, 192, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+
+    glGenTextures(1, &NativeOrdinaryOBJPreparedTex);
+    glBindTexture(GL_TEXTURE_2D, NativeOrdinaryOBJPreparedTex);
     glDefaultTexParams(GL_TEXTURE_2D);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 256, 192, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
 
@@ -1410,6 +2156,12 @@ bool GLRenderer2D::Init()
     glBindTexture(GL_TEXTURE_2D, NativeDirect3DSemanticsTex);
     glDefaultTexParams(GL_TEXTURE_2D);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 256, 192, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+
+    glGenTextures(1, &NativeDirect3DOperatorTex);
+    glBindTexture(GL_TEXTURE_2D, NativeDirect3DOperatorTex);
+    glDefaultTexParams(GL_TEXTURE_2D);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, 256, 192, 0, GL_RED,
+                 GL_UNSIGNED_BYTE, nullptr);
 
     glGenTextures(1, &NativeDirect3DCompositorTex);
     glBindTexture(GL_TEXTURE_2D, NativeDirect3DCompositorTex);
@@ -1505,10 +2257,22 @@ bool GLRenderer2D::Init()
     glDefaultTexParams(GL_TEXTURE_2D);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, ScreenW, ScreenH, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
 
+    glGenTextures(1, &UpscaledOrdinaryOBJRGBATex);
+    glBindTexture(GL_TEXTURE_2D, UpscaledOrdinaryOBJRGBATex);
+    glDefaultTexParams(GL_TEXTURE_2D);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, ScreenW, ScreenH, 0,
+                 GL_RGBA, GL_HALF_FLOAT, nullptr);
+
     glGenTextures(1, &UpscaledExactFinalTex);
     glBindTexture(GL_TEXTURE_2D, UpscaledExactFinalTex);
     glDefaultTexParams(GL_TEXTURE_2D);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, ScreenW, ScreenH, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+
+    glGenTextures(1, &UpscaledOverlayOpaqueWhiteTex);
+    glBindTexture(GL_TEXTURE_2D, UpscaledOverlayOpaqueWhiteTex);
+    glDefaultTexParams(GL_TEXTURE_2D);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, ScreenW, ScreenH, 0, GL_RGBA,
+                 GL_UNSIGNED_BYTE, nullptr);
 
     glGenTextures(1, &UpscaledGuardColorTex);
     glBindTexture(GL_TEXTURE_2D, UpscaledGuardColorTex);
@@ -1698,10 +2462,20 @@ bool GLRenderer2D::Init()
         CuNNyWorkTexHeight[i] = 1;
     }
 
+    glGenTextures(1, &StrictAffineCuNNy2xTex);
+    glBindTexture(GL_TEXTURE_2D, StrictAffineCuNNy2xTex);
+    glDefaultTexParams(GL_TEXTURE_2D);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, 2, 2, 0, GL_RGBA,
+                 GL_HALF_FLOAT, nullptr);
+    StrictAffineCuNNy2xWidth = 2;
+    StrictAffineCuNNy2xHeight = 2;
+
     glGenTextures(1, &XBRZInfoTex);
     glBindTexture(GL_TEXTURE_2D, XBRZInfoTex);
     glDefaultTexParams(GL_TEXTURE_2D);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, 256, 192, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+    XBRZInfoWidth = 256;
+    XBRZInfoHeight = 192;
 
     glGenFramebuffers(1, &XBRZInfoFB);
     glBindFramebuffer(GL_FRAMEBUFFER, XBRZInfoFB);
@@ -1748,11 +2522,19 @@ void GLRenderer2D::DeleteShaders()
     glDeleteProgram(NativeUpscaleShader);
     glDeleteProgram(NativeBoundaryGuardShader);
     glDeleteProgram(NativeResolveShader);
+    glDeleteProgram(OrdinaryOBJBandPresentationShader);
+    glDeleteProgram(OrdinaryOBJSpecialCompositeShader);
+    glDeleteProgram(ResolvedOBJMergeShader);
+    glDeleteProgram(StrictAffineOrdinaryOBJCompositeShader);
+    glDeleteProgram(StrictAffineMaskedOBJMaskShader);
+    glDeleteProgram(StrictAffineMaskedOBJMLAAShader);
+    glDeleteProgram(AffineOBJPresentationCompositeShader);
     glDeleteProgram(Native3DResolveShader);
     glDeleteProgram(OverlayEndpointShader);
     glDeleteProgram(OverlayCompositeShader);
     glDeleteProgram(OverlayHybridCompositeShader);
     glDeleteProgram(OverlayDebugShader);
+    glDeleteProgram(MasterBrightnessShader);
     glDeleteProgram(RGBAToYUVAShader);
     for (int model = 0; model < RendererSettings::GLArtCNNModelCount; model++)
     {
@@ -1763,6 +2545,10 @@ void GLRenderer2D::DeleteShaders()
     glDeleteProgram(Spline36Shader);
     glDeleteProgram(ArtCNNYUVAToRGBA2xShader);
     glDeleteProgram(AlphaReplaceShader);
+    glDeleteProgram(ReconstructionAlphaShader);
+    glDeleteProgram(MidpointAlphaShader);
+    glDeleteProgram(TransparentRGBPadShader);
+    glDeleteProgram(OpaqueOBJAssemblyShader);
     glDeleteProgram(NNEDI3VerticalComputeShader);
     glDeleteProgram(NNEDI3HorizontalComputeShader);
     glDeleteProgram(XBRZPreprocessShader);
@@ -1786,6 +2572,10 @@ void GLRenderer2D::DeleteShaders()
 
 GLRenderer2D::~GLRenderer2D()
 {
+    // Scratch textures belong to each engine; only shader programs are shared.
+    glDeleteTextures(3, ReconstructionAlphaWorkTex);
+    glDeleteTextures(1, &OpaqueOBJAssemblyTex);
+    glDeleteFramebuffers(1, &OpaqueOBJAssemblyFB);
     glDeleteBuffers(1, &SpritePreVtxBuffer);
     glDeleteVertexArrays(1, &SpritePreVtxArray);
 
@@ -1804,9 +2594,44 @@ GLRenderer2D::~GLRenderer2D()
     glDeleteTextures(22, AllBGLayerTex);
     glDeleteTextures(22, AllBGLayerMetaTex);
     glDeleteFramebuffers(22, AllBGLayerFB);
+    glDeleteTextures(4, EnhancedBGLayerTex);
+    glDeleteFramebuffers(4, EnhancedBGLayerFB);
+    constexpr int historicalTextureCount =
+        DeferredScanlineStrictAffineInputs::MaxHistoricalSourceEpochs * 4;
+    glDeleteTextures(
+        historicalTextureCount,
+        &DeferredStrictAffineHistoricalBGLayerTex[0][0]);
+    glDeleteTextures(
+        historicalTextureCount,
+        &DeferredStrictAffineHistoricalBGLayerMetaTex[0][0]);
+    glDeleteFramebuffers(
+        historicalTextureCount,
+        &DeferredStrictAffineHistoricalBGLayerFB[0][0]);
+    glDeleteTextures(
+        historicalTextureCount,
+        &DeferredStrictAffineHistoricalEnhancedBGLayerTex[0][0]);
+    glDeleteFramebuffers(
+        historicalTextureCount,
+        &DeferredStrictAffineHistoricalEnhancedBGLayerFB[0][0]);
+    glDeleteTextures(1, &EnhancedBGInputTex);
+    glDeleteFramebuffers(1, &EnhancedBGInputFB);
+    glDeleteTextures(1, &EnhancedBGPreparedTex);
+    glDeleteFramebuffers(1, &EnhancedBGPreparedFB);
+    glDeleteTextures(1, &EnhancedBGScaledTex);
+    glDeleteFramebuffers(1, &EnhancedBGScaledFB);
 
     glDeleteTextures(1, &SpriteTex);
     glDeleteFramebuffers(1, &SpriteFB);
+    glDeleteTextures(1, &EnhancedSpriteTex);
+    glDeleteFramebuffers(1, &EnhancedSpriteFB);
+    glDeleteTextures(1, &EnhancedSpriteInputTex);
+    glDeleteFramebuffers(1, &EnhancedSpriteInputFB);
+    glDeleteTextures(1, &EnhancedSpritePreparedTex);
+    glDeleteFramebuffers(1, &EnhancedSpritePreparedFB);
+    glDeleteTextures(1, &EnhancedSpriteScaledRGBTex);
+    glDeleteFramebuffers(1, &EnhancedSpriteScaledRGBFB);
+    glDeleteTextures(1, &EnhancedSpriteScaledRGBATex);
+    glDeleteFramebuffers(1, &EnhancedSpriteScaledRGBAFB);
 
     glDeleteTextures(1, &OBJLayerTex);
     glDeleteTextures(1, &OBJDepthTex);
@@ -1814,19 +2639,52 @@ GLRenderer2D::~GLRenderer2D()
 
     glDeleteTextures(1, &OutputTex);
     glDeleteFramebuffers(1, &OutputFB);
+    glDeleteTextures(1, &StrictAffineCandidateTex);
+    glDeleteFramebuffers(1, &StrictAffineCandidateFB);
+    glDeleteTextures(1, &StrictAffineMaskedOBJMaskTex);
+    glDeleteFramebuffers(1, &StrictAffineMaskedOBJMaskFB);
+    glDeleteTextures(1, &StrictAffineSupersamplePresentationOBJLayerTex);
+    glDeleteTextures(1, &StrictAffineSupersamplePresentationOBJDepthTex);
+    glDeleteFramebuffers(1,
+                         &StrictAffineSupersamplePresentationOBJLayerFB);
+    glDeleteTextures(1, &StrictAffineOBJLayerTex);
+    glDeleteTextures(1, &StrictAffineOBJDepthTex);
+    glDeleteFramebuffers(1, &StrictAffineOBJLayerFB);
+    glDeleteTextures(1, &AffinePresentationOBJLayerTex);
+    glDeleteTextures(1, &AffinePresentationOBJDepthTex);
+    glDeleteFramebuffers(1, &AffinePresentationOBJLayerFB);
+    glDeleteTextures(1, &AffineOverlapDebugTex);
+    glDeleteTextures(1, &AffineOverlapInputDebugTex);
+    glDeleteFramebuffers(1, &AffineOverlapCopyFB);
+    glDeleteTextures(1, &AffinePresentationUnderlayTex);
+    glDeleteFramebuffers(1, &AffinePresentationUnderlayFB);
 
     glDeleteTextures(1, &NativeOBJLayerTex);
     glDeleteTextures(1, &NativeOBJDepthTex);
     glDeleteFramebuffers(1, &NativeOBJLayerFB);
+    glDeleteTextures(1, &NativeOperandExcludedOBJLayerTex);
+    glDeleteTextures(1, &NativeOperandExcludedOBJDepthTex);
+    glDeleteFramebuffers(1, &NativeOperandExcludedOBJLayerFB);
+    glDeleteTextures(1, &OrdinaryOBJBandLayerTex);
+    glDeleteFramebuffers(1, &OrdinaryOBJBandLayerFB);
+    glDeleteTextures(1, &OrdinaryOBJBandScaledTex);
+    glDeleteFramebuffers(1, &OrdinaryOBJBandScaledFB);
+    glDeleteTextures(1, &ResolvedOrdinaryOBJNativeLayerTex);
+    glDeleteFramebuffers(1, &ResolvedOrdinaryOBJNativeLayerFB);
+    glDeleteTextures(1, &ResolvedOrdinaryOBJTex);
+    glDeleteFramebuffers(1, &ResolvedOrdinaryOBJFB);
 
     glDeleteTextures(1, &NativeOutputTex);
     glDeleteTextures(1, &NativeTopColorTex);
     glDeleteTextures(1, &NativeSecondColorTex);
     glDeleteTextures(1, &NativeMetaTex);
+    glDeleteTextures(1, &NativeOrdinaryOBJRGBATex);
+    glDeleteTextures(1, &NativeOrdinaryOBJPreparedTex);
     glDeleteTextures(1, &NativeLayerDebugTex);
     glDeleteTextures(1, &NativeExactFinalTex);
     glDeleteTextures(1, &NativeDirect3DTex);
     glDeleteTextures(1, &NativeDirect3DSemanticsTex);
+    glDeleteTextures(1, &NativeDirect3DOperatorTex);
     glDeleteTextures(1, &NativeDirect3DCompositorTex);
     glDeleteTextures(1, &NativeOverlayBlack3DTex);
     glDeleteTextures(1, &NativeOverlayWhite3DTex);
@@ -1847,7 +2705,9 @@ GLRenderer2D::~GLRenderer2D()
     glDeleteTextures(1, &UpscaledSecondColorTex);
     glDeleteTextures(1, &UpscaledMetaTex);
     glDeleteTextures(1, &UpscaledCoverageTex);
+    glDeleteTextures(1, &UpscaledOrdinaryOBJRGBATex);
     glDeleteTextures(1, &UpscaledExactFinalTex);
+    glDeleteTextures(1, &UpscaledOverlayOpaqueWhiteTex);
     glDeleteTextures(1, &UpscaledGuardColorTex);
     glDeleteTextures(1, &UpscaledOverlayUnderlayWeightTex);
     glDeleteTextures(1, &UpscaledOverlayOwnershipTex);
@@ -1887,6 +2747,7 @@ GLRenderer2D::~GLRenderer2D()
     glDeleteTextures(1, &ArtCNNRGBA2xTex);
     glDeleteFramebuffers(1, &ArtCNNOutputFB);
     glDeleteTextures(2, CuNNyWorkTex);
+    glDeleteTextures(1, &StrictAffineCuNNy2xTex);
     glDeleteTextures(1, &XBRZInfoTex);
     glDeleteFramebuffers(1, &XBRZInfoFB);
 
@@ -1897,6 +2758,7 @@ GLRenderer2D::~GLRenderer2D()
 
 void GLRenderer2D::Reset()
 {
+    WholeSceneDebugProducts = {};
     memset(BGLayerFB, 0, sizeof(BGLayerFB));
     memset(BGLayerTex, 0, sizeof(BGLayerTex));
     memset(BGLayerMetaTex, 0, sizeof(BGLayerMetaTex));
@@ -1925,6 +2787,7 @@ void GLRenderer2D::Reset()
     EVA = 0; EVB = 0; EVY = 0;
 
     memset(BGVRAMRange, 0xFF, sizeof(BGVRAMRange));
+    BGVRAMUploadCache.Reset();
 
     LayerConfigDirty = true;
     DeferredLayerPrerenderDirty = 0;
@@ -1936,19 +2799,35 @@ void GLRenderer2D::Reset()
 
     LastSpriteLine = 0;
     memset(OAM, 0, sizeof(OAM));
+    WideOBJWindowProofBits = 0;
     NumSprites = 0;
     SpriteUseMosaic = false;
 
     SpriteDispCnt = 0;
     SpriteConfigDirty = true;
     SpriteDirty = true;
+    SpriteSourceGeneration++;
+    InvalidateEnhancedOBJSources();
+    for (int layer = 0; layer < 4; layer++)
+    {
+        BGLayerSourceGeneration[layer]++;
+        EnhancedBGLayerSourceGeneration[layer] = 0;
+    }
 
     memset(TempPalBuffer, 0, sizeof(TempPalBuffer));
 
     WholeSceneScaleState = WholeSceneScaleEligibility::ScreenUnavailable;
     WholeSceneTrace = {};
+    WholeScenePlan = {};
+    WholeSceneExecutionTrace = {};
+    StrictAffineOrderedAssessment = {};
+    WholeScenePhysicalPresentationBrightnessActive = false;
+    WholeScenePhysicalPresentationBrightnessNextActive = false;
+    WholeScenePhysicalPresentationBrightnessState = 0;
+    WholeScenePhysicalPresentationBrightnessNextState = 0;
     WholeSceneDebugPoison = {};
     ResetWholeSceneNativeProductTracking();
+    ResetStrictAffineGeometryDemand();
 }
 
 void GLRenderer2D::PostSavestate()
@@ -1962,6 +2841,7 @@ void GLRenderer2D::SetScaleFactor(int scale)
     if (scale == ScaleFactor)
         return;
 
+    WholeSceneDebugProducts = {};
     ScaleFactor = scale;
     ScreenW = 256 * scale;
     ScreenH = 192 * scale;
@@ -1975,7 +2855,6 @@ void GLRenderer2D::SetScaleFactor(int scale)
         GL_COLOR_ATTACHMENT3,
         GL_COLOR_ATTACHMENT4,
     };
-    const GLenum fbassign4[] = {GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1, GL_COLOR_ATTACHMENT2, GL_COLOR_ATTACHMENT3};
 
     glUseProgram(CompositorShader);
     glUniform1i(CompositorScaleULoc, ScaleFactor);
@@ -2001,8 +2880,68 @@ void GLRenderer2D::SetScaleFactor(int scale)
     glFramebufferTexture(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, OBJDepthTex, 0);
     glDrawBuffers(3, fbassign3);
 
+    glBindTexture(GL_TEXTURE_2D_ARRAY, StrictAffineOBJLayerTex);
+    glTexImage3D(GL_TEXTURE_2D_ARRAY, 0, GL_RGBA, ScreenW, ScreenH, 3,
+                 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+
+    glBindTexture(GL_TEXTURE_2D, StrictAffineOBJDepthTex);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT16, ScreenW, ScreenH,
+                 0, GL_DEPTH_COMPONENT, GL_UNSIGNED_SHORT, nullptr);
+
+    glBindFramebuffer(GL_FRAMEBUFFER, StrictAffineOBJLayerFB);
+    glFramebufferTextureLayer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                              StrictAffineOBJLayerTex, 0, 0);
+    glFramebufferTextureLayer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1,
+                              StrictAffineOBJLayerTex, 0, 1);
+    glFramebufferTextureLayer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT2,
+                              StrictAffineOBJLayerTex, 0, 2);
+    glFramebufferTexture(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT,
+                         StrictAffineOBJDepthTex, 0);
+    glDrawBuffers(3, fbassign3);
+
+    glBindTexture(GL_TEXTURE_2D_ARRAY, AffinePresentationOBJLayerTex);
+    glTexImage3D(GL_TEXTURE_2D_ARRAY, 0, GL_RGBA, ScreenW, ScreenH, 3,
+                 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+
+    glBindTexture(GL_TEXTURE_2D, AffinePresentationOBJDepthTex);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT16, ScreenW, ScreenH,
+                 0, GL_DEPTH_COMPONENT, GL_UNSIGNED_SHORT, nullptr);
+
+    glBindFramebuffer(GL_FRAMEBUFFER, AffinePresentationOBJLayerFB);
+    glFramebufferTextureLayer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                              AffinePresentationOBJLayerTex, 0, 0);
+    glFramebufferTextureLayer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1,
+                              AffinePresentationOBJLayerTex, 0, 1);
+    glFramebufferTextureLayer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT2,
+                              AffinePresentationOBJLayerTex, 0, 2);
+    glFramebufferTexture(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT,
+                         AffinePresentationOBJDepthTex, 0);
+    glDrawBuffers(3, fbassign3);
+
+    glBindTexture(GL_TEXTURE_2D, AffinePresentationUnderlayTex);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, ScreenW, ScreenH, 0,
+                 GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+    glBindFramebuffer(GL_FRAMEBUFFER, AffinePresentationUnderlayFB);
+    glFramebufferTexture(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                         AffinePresentationUnderlayTex, 0);
+    glDrawBuffer(GL_COLOR_ATTACHMENT0);
+
     glBindTexture(GL_TEXTURE_2D, OutputTex);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, ScreenW, ScreenH, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+
+    glBindTexture(GL_TEXTURE_2D, StrictAffineCandidateTex);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, ScreenW, ScreenH, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+    glBindFramebuffer(GL_FRAMEBUFFER, StrictAffineCandidateFB);
+    glFramebufferTexture(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, StrictAffineCandidateTex, 0);
+    glDrawBuffer(GL_COLOR_ATTACHMENT0);
+
+    glBindTexture(GL_TEXTURE_2D, StrictAffineMaskedOBJMaskTex);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, ScreenW, ScreenH, 0,
+                 GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+    glBindFramebuffer(GL_FRAMEBUFFER, StrictAffineMaskedOBJMaskFB);
+    glFramebufferTexture(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                         StrictAffineMaskedOBJMaskTex, 0);
+    glDrawBuffer(GL_COLOR_ATTACHMENT0);
 
     glBindTexture(GL_TEXTURE_2D, UpscaledTopColorTex);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, ScreenW, ScreenH, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
@@ -2016,8 +2955,16 @@ void GLRenderer2D::SetScaleFactor(int scale)
     glBindTexture(GL_TEXTURE_2D, UpscaledCoverageTex);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, ScreenW, ScreenH, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
 
+    glBindTexture(GL_TEXTURE_2D, UpscaledOrdinaryOBJRGBATex);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, ScreenW, ScreenH, 0,
+                 GL_RGBA, GL_HALF_FLOAT, nullptr);
+
     glBindTexture(GL_TEXTURE_2D, UpscaledExactFinalTex);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, ScreenW, ScreenH, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+
+    glBindTexture(GL_TEXTURE_2D, UpscaledOverlayOpaqueWhiteTex);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, ScreenW, ScreenH, 0, GL_RGBA,
+                 GL_UNSIGNED_BYTE, nullptr);
 
     glBindTexture(GL_TEXTURE_2D, UpscaledGuardColorTex);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, ScreenW, ScreenH, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
@@ -2087,8 +3034,66 @@ void GLRenderer2D::SetScaleFactor(int scale)
     glDrawBuffers(5, fbassign5);
 }
 
+bool GLRenderer2D::EnsureStrictAffineSupersampleTargets(int width, int height)
+{
+    if (width <= 0 || height <= 0)
+        return false;
+    if (StrictAffineSupersampleWidth == static_cast<u32>(width) &&
+        StrictAffineSupersampleHeight == static_cast<u32>(height) &&
+        StrictAffineSupersamplePresentationOBJLayerTex != 0)
+    {
+        return true;
+    }
+
+    GLint maxTextureSize = 0;
+    glGetIntegerv(GL_MAX_TEXTURE_SIZE, &maxTextureSize);
+    if (width > maxTextureSize || height > maxTextureSize)
+        return false;
+
+    if (StrictAffineSupersamplePresentationOBJLayerTex == 0)
+    {
+        glGenTextures(1, &StrictAffineSupersamplePresentationOBJLayerTex);
+        glGenTextures(1, &StrictAffineSupersamplePresentationOBJDepthTex);
+        glGenFramebuffers(1,
+                          &StrictAffineSupersamplePresentationOBJLayerFB);
+    }
+
+    glBindTexture(GL_TEXTURE_2D_ARRAY,
+                  StrictAffineSupersamplePresentationOBJLayerTex);
+    glDefaultTexParams(GL_TEXTURE_2D_ARRAY);
+    glTexImage3D(GL_TEXTURE_2D_ARRAY, 0, GL_RGBA, width, height, 3, 0,
+                 GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+    glBindTexture(GL_TEXTURE_2D,
+                  StrictAffineSupersamplePresentationOBJDepthTex);
+    glDefaultTexParams(GL_TEXTURE_2D);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT16, width, height, 0,
+                 GL_DEPTH_COMPONENT, GL_UNSIGNED_SHORT, nullptr);
+    glBindFramebuffer(GL_FRAMEBUFFER,
+                      StrictAffineSupersamplePresentationOBJLayerFB);
+    glFramebufferTextureLayer(
+        GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+        StrictAffineSupersamplePresentationOBJLayerTex, 0, 0);
+    glFramebufferTextureLayer(
+        GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1,
+        StrictAffineSupersamplePresentationOBJLayerTex, 0, 1);
+    glFramebufferTextureLayer(
+        GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT2,
+        StrictAffineSupersamplePresentationOBJLayerTex, 0, 2);
+    glFramebufferTexture(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT,
+                         StrictAffineSupersamplePresentationOBJDepthTex, 0);
+    const GLenum objBuffers[] = {GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1, GL_COLOR_ATTACHMENT2};
+    glDrawBuffers(3, objBuffers);
+    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
+        return false;
+
+    StrictAffineSupersampleWidth = static_cast<u32>(width);
+    StrictAffineSupersampleHeight = static_cast<u32>(height);
+    return true;
+}
+
 void GLRenderer2D::SetRenderSettings(int scale, const RendererSettings::WholeScene2DScaleSettings& settings)
 {
+    WholeSceneDebugProducts = {};
     SetScaleFactor(scale);
     SetWholeSceneScaleRequested(settings.Enabled);
     SetWholeSceneScaleSourceBoundaryGuard(settings.SourceBoundaryGuard);
@@ -2112,6 +3117,30 @@ void GLRenderer2D::SetRenderSettings(int scale, const RendererSettings::WholeSce
     SetWholeSceneScaleHybridNativeEffectGuard(settings.HybridNativeEffectGuard);
     SetWholeSceneScaleHybridForeground2DBase(settings.HybridForeground2DBase);
     SetWholeSceneScaleHybridCleanLegacyCandidate(settings.HybridCleanLegacyCandidate);
+    SetWholeSceneScaleHybridStrictAffineHighRes(settings.HybridStrictAffineHighRes);
+    SetWholeSceneScaleHybridStrictAffineSourceEnhancement(
+        settings.HybridStrictAffineSourceEnhancement);
+    const auto alpha = RendererSettings::ResolveAffineAlphaReconstruction(settings.HybridAffineAlpha, settings.Algorithm);
+    if (AffineAlpha != alpha || AffineSampleGrid != settings.HybridAffineSampling ||
+        NNEDI3PremultipliedRGB != settings.HybridNNEDI3PremultipliedRGB)
+    {
+        InvalidateEnhancedOBJSources();
+        for (int layer = 0; layer < 4; ++layer) EnhancedBGLayerSourceGeneration[layer] = 0;
+        ResolvedOrdinaryOBJValid = false;
+        OrdinaryOBJBandScaledProductsValid = false;
+    }
+    AffineAlpha = alpha;
+    AffineSampleGrid = settings.HybridAffineSampling;
+    NNEDI3PremultipliedRGB = settings.HybridNNEDI3PremultipliedRGB;
+    SetWholeSceneScaleHybridStrictAffineOBJSubpixel2x(
+        AffineSampleGrid == RendererSettings::AffineSampling::Supersample2x);
+    SetWholeSceneScaleHybridStrictAffineConnectedSources(
+        settings.HybridStrictAffineConnectedSources);
+    WholeSceneScaleHybridStrictAffineOpaqueAssemblies = settings.HybridStrictAffineOpaqueAssemblies;
+    SetWholeSceneScaleHybridStrictAffineTopTextBG(
+        settings.HybridStrictAffineTopTextBG);
+    SetWholeSceneScaleHybridStrictAffineMaskedOBJMLAA(
+        settings.HybridStrictAffineMaskedOBJMLAA);
 }
 
 void GLRenderer2D::SetWholeSceneScaleRequested(bool enable)
@@ -2285,8 +3314,51 @@ void GLRenderer2D::SetWholeSceneScaleHybridCleanLegacyCandidate(bool enable)
     WholeSceneScaleHybridCleanLegacyCandidate = enable;
 }
 
+void GLRenderer2D::SetWholeSceneScaleHybridStrictAffineHighRes(bool enable)
+{
+    if (WholeSceneScaleHybridStrictAffineHighRes != enable)
+        ResetStrictAffineGeometryDemand();
+    WholeSceneScaleHybridStrictAffineHighRes = enable;
+}
+
+void GLRenderer2D::SetWholeSceneScaleHybridStrictAffineSourceEnhancement(bool enable)
+{
+    WholeSceneScaleHybridStrictAffineSourceEnhancement = enable;
+}
+
+void GLRenderer2D::SetWholeSceneScaleHybridStrictAffineOBJSubpixel2x(bool enable)
+{
+
+    WholeSceneScaleHybridStrictAffineOBJSubpixel2x = enable;
+}
+
+void GLRenderer2D::SetWholeSceneScaleHybridStrictAffineConnectedSources(bool enable)
+{
+    if (WholeSceneScaleHybridStrictAffineConnectedSources != enable)
+    {
+        InvalidateEnhancedOBJSources();
+        std::fill(&ConnectedOBJSourceHashes[0], &ConnectedOBJSourceHashes[128], 0);
+        std::memset(EnhancedOBJSourceRegions, 0, sizeof(EnhancedOBJSourceRegions));
+    }
+    WholeSceneScaleHybridStrictAffineConnectedSources = enable;
+}
+
+void GLRenderer2D::SetWholeSceneScaleHybridStrictAffineTopTextBG(bool enable)
+{
+    WholeSceneScaleHybridStrictAffineTopTextBG = enable;
+}
+
+void GLRenderer2D::SetWholeSceneScaleHybridStrictAffineMaskedOBJMLAA(bool enable)
+{
+    WholeSceneScaleHybridStrictAffineMaskedOBJMLAA = enable;
+}
+
 void GLRenderer2D::SetWholeSceneDebugPoison(bool source3D, bool native3DResolve, bool native3DResolveAlpha)
 {
+    if (WholeSceneDebugPoison.Source3D != source3D ||
+        WholeSceneDebugPoison.Native3DResolve != native3DResolve ||
+        WholeSceneDebugPoison.Native3DResolveAlpha != native3DResolveAlpha)
+        WholeSceneDebugProducts = {};
     WholeSceneDebugPoison.Source3D = source3D;
     WholeSceneDebugPoison.Native3DResolve = native3DResolve;
     WholeSceneDebugPoison.Native3DResolveAlpha = native3DResolveAlpha;
@@ -2294,7 +3366,8 @@ void GLRenderer2D::SetWholeSceneDebugPoison(bool source3D, bool native3DResolve,
 
 void GLRenderer2D::SetWholeSceneDebugViewsActive(bool active)
 {
-    WholeSceneDebugViewsActive.store(active, std::memory_order_relaxed);
+    if (WholeSceneDebugViewsActive.exchange(active, std::memory_order_relaxed) != active)
+        WholeSceneDebugProducts = {};
 }
 
 namespace
@@ -2612,7 +3685,21 @@ bool IsOverlayDebugView(WholeScene2DDebugView view)
 bool IsAuxiliaryWholeSceneDebugView(WholeScene2DDebugView view)
 {
     using DebugView = WholeScene2DDebugView;
-    return view == DebugView::OverlayUnderlayWeight ||
+    return (view >= DebugView::StrictAffineOverlapSemantic &&
+            view <= DebugView::StrictAffineOverlapSubpixelCoverage) ||
+           view == DebugView::StrictAffineCandidate ||
+           view == DebugView::StrictAffineNativeReference ||
+           view == DebugView::StrictAffineDownsampleDifference ||
+           view == DebugView::StrictAffineEnhancedBG2Source ||
+           view == DebugView::StrictAffineEnhancedBG3Source ||
+           view == DebugView::StrictAffineEnhancedOBJSource ||
+           view == DebugView::StrictAffineTransformedOBJColor ||
+           view == DebugView::StrictAffineTransformedOBJCoverage ||
+           view == DebugView::StrictAffineOrdinaryOBJBand0Color ||
+           view == DebugView::StrictAffineOrdinaryOBJBand0Coverage ||
+           view == DebugView::StrictAffineOrdinaryOBJBand0Scaled ||
+           view == DebugView::StrictAffineResolvedOrdinaryOBJ ||
+           view == DebugView::OverlayUnderlayWeight ||
            view == DebugView::OverlayReconstructedNative ||
            view == DebugView::OverlayReconstructionError ||
            view == DebugView::OverlayValidityConfidence ||
@@ -2680,7 +3767,13 @@ bool IsNativeLayerDebugView(WholeScene2DDebugView view)
 
 void GLRenderer2D::ResetWholeSceneRenderTrace()
 {
+    WholeSceneDebugProducts = {};
     WholeSceneTrace = {};
+    OrdinaryOBJBandProducts = {};
+    OrdinaryOBJOperandPlanHash = 0;
+    OrdinaryOBJBandProductsValid = false;
+    OrdinaryOBJBandScaledProductsValid = false;
+    OrdinaryOBJBandPresentationConsumed = false;
     UpdateWholeSceneTraceFrameSplitState();
 }
 
@@ -2691,6 +3784,13 @@ void GLRenderer2D::ResetWholeSceneNativeProductTracking()
     WholeSceneNativeProductValidRows = 0;
     WholeSceneNativeProductsFrameComplete = false;
     memset(WholeSceneNativeProductRowValid, 0, sizeof(WholeSceneNativeProductRowValid));
+    for (auto& identity : WholeSceneNativeProductRowIdentities)
+        identity = {};
+    WholeSceneNativeProductRowIdentityValid = true;
+    WholeSceneNativeProductRowIdentityFailure =
+        WholeSceneNativeProductRowIdentityInvalidReason::None;
+    WholeSceneNativeProductIdentityRows = 0;
+    WholeSceneNativeProductFrameIdentity = 0;
     WholeSceneNativeProductEpochValid = true;
     WholeSceneNativeProductEpochInvalidReason = 0;
     WholeSceneNativeProductEligibilityInitialized = false;
@@ -2702,6 +3802,10 @@ void GLRenderer2D::ResetWholeSceneNativeProductTracking()
     WholeSceneNativeProductFinalizerPathSeen = false;
     WholeSceneOverlayEndpointsValid = false;
     WholeSceneOverlayEndpointSourceTex = 0;
+    for (auto& epoch : DeferredStrictAffineHistoricalSourceEpochs)
+        epoch = {};
+    DeferredStrictAffineHistoricalSourceEpochCount = 0;
+    DeferredStrictAffineHistoricalSourceEpochOverflow = false;
     UpdateWholeSceneTraceFrameSplitState();
 }
 
@@ -2711,6 +3815,14 @@ void GLRenderer2D::UpdateWholeSceneTraceFrameSplitState()
     WholeSceneTrace.FullFrameFinalizerPasses = WholeSceneFullFrameFinalizerPasses;
     WholeSceneTrace.NativeProductValidRows = WholeSceneNativeProductValidRows;
     WholeSceneTrace.NativeProductsFrameComplete = WholeSceneNativeProductsFrameComplete;
+    WholeSceneTrace.NativeProductRowIdentityValid =
+        WholeSceneNativeProductRowIdentityValid;
+    WholeSceneTrace.NativeProductRowIdentityInvalidReason =
+        WholeSceneNativeProductRowIdentityFailure;
+    WholeSceneTrace.NativeProductIdentityRows =
+        WholeSceneNativeProductIdentityRows;
+    WholeSceneTrace.NativeProductFrameIdentity =
+        WholeSceneNativeProductFrameIdentity;
     WholeSceneTrace.NativeProductEpochValid = WholeSceneNativeProductEpochValid;
     WholeSceneTrace.NativeProductEpochInvalidReason = WholeSceneNativeProductEpochInvalidReason;
     WholeSceneTrace.NativeProductFrameEligibility = WholeSceneNativeProductFrameEligibility;
@@ -2753,8 +3865,8 @@ void GLRenderer2D::RecordWholeSceneNativeProductEligibility(WholeSceneScaleEligi
              !IsBenignMainVRAMDisplayNativeProductEligibilityTransition(eligibility))
     {
         WholeSceneNativeProductEpochValid = false;
-        if (WholeSceneNativeProductEpochInvalidReason == 0)
-            WholeSceneNativeProductEpochInvalidReason = 1;
+        WholeSceneNativeProductEpochInvalidReason |=
+            WholeSceneNativeProductEpochInvalidEligibility;
     }
     WholeSceneNativeProductLastEligibility = eligibility;
 
@@ -2774,8 +3886,8 @@ void GLRenderer2D::RecordWholeSceneNativeProductRenderPath(WholeSceneRenderPath 
     else if (WholeSceneNativeProductFramePath != path)
     {
         WholeSceneNativeProductEpochValid = false;
-        if (WholeSceneNativeProductEpochInvalidReason == 0)
-            WholeSceneNativeProductEpochInvalidReason = 2;
+        WholeSceneNativeProductEpochInvalidReason |=
+            WholeSceneNativeProductEpochInvalidPath;
     }
     WholeSceneNativeProductLastPath = path;
 
@@ -2787,9 +3899,15 @@ void GLRenderer2D::RecordWholeSceneNativeProductRenderPath(WholeSceneRenderPath 
 
 bool GLRenderer2D::CanFinalizeWholeSceneNativeProducts() const
 {
-    return WholeSceneNativeProductFinalizerPathSeen &&
-           WholeSceneNativeProductEpochValid &&
-           WholeSceneNativeProductsFrameComplete;
+    return CanFinalizeWholeSceneRowOwnedNativeProduct({
+        WholeSceneNativeProductFinalizerPathSeen,
+        WholeSceneNativeProductEpochValid,
+        WholeSceneNativeProductEpochInvalidReason,
+        WholeSceneNativeProductRowIdentityValid,
+        WholeSceneNativeProductIdentityRows,
+        WholeSceneNativeProductFrameIdentity,
+        WholeSceneNativeProductsFrameComplete,
+    });
 }
 
 bool GLRenderer2D::AreWholeSceneNativeProductsComplete() const
@@ -2804,6 +3922,374 @@ bool GLRenderer2D::AreWholeSceneNativeProductsComplete() const
     }
 
     return true;
+}
+
+GLRenderer2D::DeferredScanlineStrictAffinePlan
+GLRenderer2D::BuildDeferredScanlineStrictAffinePlan() const
+{
+    DeferredScanlineStrictAffinePlan plan = {};
+    DeferredScanlineStrictAffineInputs assessmentInputs = {};
+    assessmentInputs.FeatureEnabled =
+        WholeSceneScaleHybridStrictAffineHighRes;
+    assessmentInputs.ConservativeHybridMode =
+        WholeSceneScaleMode ==
+        RendererSettings::WholeScene2DScaleMode::ConservativeHybridUpscale;
+    assessmentInputs.OutputScale = ScaleFactor;
+    assessmentInputs.CandidateTargetAvailable =
+        StrictAffineCandidateTex != 0 && StrictAffineCandidateFB != 0;
+    assessmentInputs.NativeFrameComplete =
+        WholeSceneNativeProductsFrameComplete;
+    assessmentInputs.NativeRowIdentityValid =
+        WholeSceneNativeProductRowIdentityValid &&
+        WholeSceneNativeProductIdentityRows == 192 &&
+        WholeSceneNativeProductFrameIdentity != 0;
+
+    bool screenSwap = GPU.ScreenSwap;
+    const bool routeUniform =
+        Parent.GetFinalPassScreenSwapForRange(0, 192, screenSwap);
+    const u32 displayMode =
+        (DispCnt >> 16) & (GPU2D.Num ? 0x1u : 0x3u);
+    const auto& updateTrace = WholeSceneCurrentUpdateDebugTrace;
+    const bool layerConfigStable =
+        (updateTrace.StateDirtyDispCntDiff & ~0x00001F00u) == 0 &&
+        updateTrace.StateDirtyBGCntDiff[0] == 0 &&
+        updateTrace.StateDirtyBGCntDiff[1] == 0 &&
+        updateTrace.StateDirtyBGCntDiff[2] == 0 &&
+        updateTrace.StateDirtyBGCntDiff[3] == 0;
+    constexpr u32 allowedDirtyReasons =
+        kWholeSceneDirtyLayerEnable | kWholeSceneDirtyBlend;
+    constexpr u32 allowedMiscDiffs =
+        kWholeSceneMiscBlendCnt | kWholeSceneMiscEVA |
+        kWholeSceneMiscEVB | kWholeSceneMiscEVY;
+    const bool recordedStateSupported =
+        (updateTrace.StateDirtyReasonMask & ~allowedDirtyReasons) == 0 &&
+        (updateTrace.StateDirtyMiscDiffMask & ~allowedMiscDiffs) == 0;
+    assessmentInputs.RouteAndPresentationUniform =
+        routeUniform && displayMode == 1 && layerConfigStable &&
+        recordedStateSupported &&
+        !WholeSceneFullFrameFinalizerUnsafeFrame;
+
+    bool hasAffineOBJ = false;
+    bool hasOrdinaryOBJ = false;
+    bool hasUnsupportedOrdinaryOBJPresentation = false;
+    bool hasSemiTransparentOrdinaryOBJ = false;
+    bool hasSemiTransparentAffineOBJ = false;
+    bool hasBitmapOrdinaryOBJ = false;
+    bool hasBitmapAffineOBJ = false;
+    bool hasUnsupportedSemiTransparentOBJ = false;
+    for (int sprite = 0; sprite < NumSprites; sprite++)
+    {
+        const auto& source = SpriteConfig.uOAM[sprite];
+        const bool ordinary =
+            source.Rotscale == static_cast<u32>(-1);
+        hasAffineOBJ |= !ordinary && source.OBJMode != 2;
+        if (ordinary && source.OBJMode != 2)
+        {
+            hasOrdinaryOBJ = true;
+            hasUnsupportedOrdinaryOBJPresentation |=
+                source.OBJMode != 0 || source.Type >= 2 || source.Mosaic;
+        }
+        if (source.OBJMode == 1)
+        {
+            hasSemiTransparentOrdinaryOBJ |= ordinary;
+            hasSemiTransparentAffineOBJ |= !ordinary;
+        }
+        else if (source.OBJMode == 3)
+        {
+            if (source.Type == 2)
+            {
+                hasBitmapOrdinaryOBJ |= ordinary;
+                hasBitmapAffineOBJ |= !ordinary;
+            }
+            else
+            {
+                hasUnsupportedSemiTransparentOBJ = true;
+            }
+        }
+    }
+    plan.HasAffineOBJ = hasAffineOBJ;
+    plan.HasOrdinaryOBJ = hasOrdinaryOBJ;
+
+    bool allRowsSupported = assessmentInputs.RouteAndPresentationUniform;
+    bool transformedAffineBG = false;
+    u64 previousRowSourceGeneration = 0;
+    for (int y = 0; y < 192; y++)
+    {
+        assessmentInputs.RowValid[y] = WholeSceneNativeProductRowValid[y] &&
+            WholeSceneNativeProductRowIdentities[y].Valid;
+        assessmentInputs.RowSourceGeneration[y] =
+            WholeSceneNativeProductRowIdentities[y].SourceGeneration;
+        assessmentInputs.LiveRowSourceGeneration[y] =
+            BuildWholeSceneRowSourceGeneration(y);
+        const u64 rowSourceGeneration =
+            assessmentInputs.RowSourceGeneration[y];
+        if (y == 0)
+        {
+            plan.FirstRowSourceGeneration = rowSourceGeneration;
+            plan.SourceEpochCount = rowSourceGeneration != 0 ? 1u : 0u;
+        }
+        else if (rowSourceGeneration != previousRowSourceGeneration)
+        {
+            plan.SourceEpochCount++;
+            if (plan.FirstSourceTransitionY < 0)
+                plan.FirstSourceTransitionY = y;
+        }
+        previousRowSourceGeneration = rowSourceGeneration;
+
+        const auto& row = ScanlineConfig.uScanline[y];
+        StrictAffineHighResEligibilityInputs rowInputs = {};
+        rowInputs.FeatureEnabled = true;
+        rowInputs.ConservativeHybridMode = true;
+        rowInputs.ScalePathAvailable = true;
+        rowInputs.OutputScale = std::max(ScaleFactor, 2);
+        rowInputs.YStart = 0;
+        rowInputs.YEnd = 192;
+        rowInputs.DisplayModeComposited = true;
+        rowInputs.SnapshotCoherent = true;
+        rowInputs.CandidateTargetAvailable = true;
+        rowInputs.HighResolutionGeometryRequired = true;
+
+        u32 participantCount = 0;
+        bool paletteSource = false;
+        for (int layer = 0; layer < 4; layer++)
+        {
+            if (row.BGPrio[layer] == 0xFFFFFFFFu)
+                continue;
+            const u32 layerBit = 1u << layer;
+            const u32 type = LayerConfig.uBGConfig[layer].Type;
+            rowInputs.VisibleLayerMask |= layerBit;
+            plan.VisibleBGMask |= layerBit;
+            participantCount++;
+            if (type == 2)
+            {
+                rowInputs.TiledAffineBGMask |= layerBit;
+                plan.AffineBGMask |= layerBit;
+                rowInputs.RequiredChannels |= static_cast<u64>(
+                    WholeSceneOutputChannel::AffineBGGeometry);
+                paletteSource = true;
+            }
+            else if (type == 3)
+            {
+                rowInputs.ExtendedTiledAffineBGMask |= layerBit;
+                plan.AffineBGMask |= layerBit;
+                rowInputs.RequiredChannels |= static_cast<u64>(
+                    WholeSceneOutputChannel::AffineBGGeometry);
+                paletteSource = true;
+            }
+            else if (type <= 1)
+            {
+                rowInputs.TextTiledBGMask |= layerBit;
+                plan.TextBGMask |= layerBit;
+                rowInputs.RequiredChannels |= static_cast<u64>(
+                    WholeSceneOutputChannel::TextBGGeometry);
+                paletteSource = true;
+            }
+            else if (type == 6)
+            {
+                rowInputs.Direct3DLayerMask |= layerBit;
+                rowInputs.RequiredChannels |= static_cast<u64>(
+                    WholeSceneOutputChannel::Direct3D);
+            }
+            else
+            {
+                allRowsSupported = false;
+            }
+
+            if ((row.BGMosaicEnable[layer] && row.MosaicSize[0] > 0))
+                rowInputs.RequiredChannels |= static_cast<u64>(
+                    WholeSceneOutputChannel::Mosaic);
+
+            if ((plan.AffineBGMask & layerBit) != 0 &&
+                !IsStrictAffineBGIdentityEquivalentForRange(layer, y, y + 1))
+            {
+                transformedAffineBG = true;
+            }
+        }
+
+        const bool objVisible =
+            row.EnableOBJ && OBJEnable && NumSprites > 0;
+        if (objVisible)
+        {
+            rowInputs.VisibleLayerMask |= 1u << 4;
+            rowInputs.RequiredChannels |= static_cast<u64>(
+                WholeSceneOutputChannel::OBJGeometry);
+            if (hasAffineOBJ)
+                rowInputs.RequiredChannels |= static_cast<u64>(
+                    WholeSceneOutputChannel::AffineOBJGeometry);
+            if (hasSemiTransparentOrdinaryOBJ ||
+                hasSemiTransparentAffineOBJ ||
+                hasBitmapOrdinaryOBJ || hasBitmapAffineOBJ ||
+                hasUnsupportedSemiTransparentOBJ)
+            {
+                rowInputs.RequiredChannels |= static_cast<u64>(
+                    WholeSceneOutputChannel::SemiTransparentOBJ);
+            }
+            participantCount++;
+            paletteSource = true;
+            plan.OBJVisible = true;
+        }
+        if (participantCount > 1)
+            rowInputs.RequiredChannels |= static_cast<u64>(
+                WholeSceneOutputChannel::Priority);
+        if (paletteSource)
+            rowInputs.RequiredChannels |= static_cast<u64>(
+                WholeSceneOutputChannel::Palette);
+
+        rowInputs.AlphaBlendTarget1Mask = row.BlendCnt & 0x3Fu;
+        rowInputs.AlphaBlendTarget2Mask = (row.BlendCnt >> 8) & 0x3Fu;
+        rowInputs.ColorEffectMode = (row.BlendCnt >> 6) & 0x3u;
+        rowInputs.ColorEffectFactor =
+            std::min<u32>(row.BlendCoef[2], 16u);
+        if (rowInputs.ColorEffectMode == 1 &&
+            rowInputs.AlphaBlendTarget1Mask != 0 &&
+            rowInputs.AlphaBlendTarget2Mask != 0)
+        {
+            rowInputs.RequiredChannels |= static_cast<u64>(
+                WholeSceneOutputChannel::AlphaBlend);
+        }
+        else if ((rowInputs.ColorEffectMode == 2 ||
+                  rowInputs.ColorEffectMode == 3) &&
+                 rowInputs.ColorEffectFactor > 0 &&
+                 rowInputs.AlphaBlendTarget1Mask != 0)
+        {
+            rowInputs.RequiredChannels |= static_cast<u64>(
+                WholeSceneOutputChannel::ColorEffect);
+        }
+        rowInputs.RequiredChannels |= static_cast<u64>(
+            WholeSceneOutputChannel::DisplaySelection);
+        rowInputs.RequiredChannels |= static_cast<u64>(
+            WholeSceneOutputChannel::PhysicalRouting);
+
+        // Unlike the ordinary path-12 presentation recipe, this bounded
+        // deferred executor does not remove ordinary OBJ and reinsert a
+        // reconstructed surface later. The complete OBJ layer participates
+        // directly in the output-resolution row compositor, so the
+        // excluded-ordinary-OBJ priority restriction does not apply.
+        rowInputs.HasOrdinaryOBJ = false;
+        rowInputs.HasSemiTransparentOrdinaryOBJ =
+            objVisible && hasSemiTransparentOrdinaryOBJ;
+        rowInputs.HasSemiTransparentAffineOBJ =
+            objVisible && hasSemiTransparentAffineOBJ;
+        rowInputs.HasBitmapOrdinaryOBJ =
+            objVisible && hasBitmapOrdinaryOBJ;
+        rowInputs.HasBitmapAffineOBJ = objVisible && hasBitmapAffineOBJ;
+        rowInputs.HasUnsupportedSemiTransparentOBJ =
+            objVisible && hasUnsupportedSemiTransparentOBJ;
+        rowInputs.AlphaBlendOrdinaryOBJPrioritySafe = true;
+
+        plan.RequiredChannels |= rowInputs.RequiredChannels;
+        const u32 affineMask = rowInputs.TiledAffineBGMask |
+            rowInputs.ExtendedTiledAffineBGMask;
+        if (affineMask != 0)
+        {
+            const StrictAffineHighResBlockReason rowReason =
+                ChooseStrictAffineHighResBlockReason(rowInputs);
+            allRowsSupported &=
+                rowReason == StrictAffineHighResBlockReason::None;
+        }
+        else
+        {
+            // A row may temporarily expose only a text/OBJ companion. The
+            // row-state compositor models that subset, but it must not gain
+            // windows, mosaic, Direct3D, bitmap material alpha or another
+            // unsupported channel while the affine owner is absent.
+            const u64 unsupported =
+                static_cast<u64>(WholeSceneOutputChannel::Windows) |
+                static_cast<u64>(WholeSceneOutputChannel::OBJWindow) |
+                static_cast<u64>(WholeSceneOutputChannel::Mosaic) |
+                static_cast<u64>(WholeSceneOutputChannel::Direct3D) |
+                static_cast<u64>(WholeSceneOutputChannel::DisplayCapture) |
+                static_cast<u64>(WholeSceneOutputChannel::CaptureFeedback) |
+                static_cast<u64>(WholeSceneOutputChannel::VRAMDisplay);
+            allRowsSupported &=
+                (rowInputs.RequiredChannels & unsupported) == 0 &&
+                !rowInputs.HasBitmapOrdinaryOBJ &&
+                !rowInputs.HasBitmapAffineOBJ &&
+                !rowInputs.HasUnsupportedSemiTransparentOBJ;
+        }
+    }
+
+    if (DispCnt & ((1u << 13) | (1u << 14) | (1u << 15)))
+        allRowsSupported = false;
+    if (SpriteUseMosaic)
+        allRowsSupported = false;
+    if (!GPU2D.Num && GPU.CaptureEnable)
+        allRowsSupported = false;
+
+    const u16 masterBrightness = GPU2D.Num
+        ? Parent.MasterBrightnessB
+        : Parent.MasterBrightnessA;
+    const u32 brightnessMode = (masterBrightness >> 14) & 0x3u;
+    const u32 brightnessFactor =
+        std::min<u32>(masterBrightness & 0x1Fu, 16u);
+    if ((brightnessMode == 1 || brightnessMode == 2) &&
+        brightnessFactor > 0)
+    {
+        plan.RequiredChannels |= static_cast<u64>(
+            WholeSceneOutputChannel::MasterBrightness);
+    }
+
+    assessmentInputs.AllRowsSupported = allRowsSupported;
+    const StrictAffineSourceEnhancementDecision sourceEnhancement =
+        CurrentStrictAffineSourceEnhancementDecision(true);
+    const StrictAffineSourceEnhancementDecision ordinaryScaling =
+        CurrentStrictAffineOrdinaryScalingDecision(true);
+    const bool reconstructedSourcePresentation =
+        ordinaryScaling ==
+            StrictAffineSourceEnhancementDecision::Spline36Inline ||
+        ordinaryScaling ==
+            StrictAffineSourceEnhancementDecision::ArtCNNCachedAffineSources ||
+        ordinaryScaling ==
+            StrictAffineSourceEnhancementDecision::CuNNyCachedAffineSources ||
+        ordinaryScaling ==
+            StrictAffineSourceEnhancementDecision::NNEDI3CachedAffineSources ||
+        ordinaryScaling ==
+            StrictAffineSourceEnhancementDecision::XBRZCachedAffineSources;
+    plan.RequiresResolvedOrdinaryOBJ =
+        plan.OBJVisible && hasOrdinaryOBJ && reconstructedSourcePresentation;
+    assessmentInputs.OrdinaryOBJPresentationRequired =
+        plan.RequiresResolvedOrdinaryOBJ;
+    assessmentInputs.OrdinaryOBJPresentationSupported =
+        !hasUnsupportedOrdinaryOBJPresentation;
+    assessmentInputs.HighResolutionGeometryRequired =
+        transformedAffineBG || hasAffineOBJ;
+    assessmentInputs.LiveSourceGeneration =
+        BuildWholeSceneRepresentationSourceGeneration();
+    plan.LiveSourceGeneration = assessmentInputs.LiveSourceGeneration;
+    assessmentInputs.HistoricalSourceEpochCount =
+        DeferredStrictAffineHistoricalSourceEpochOverflow
+            ? DeferredScanlineStrictAffineInputs::MaxHistoricalSourceEpochs + 1
+            : DeferredStrictAffineHistoricalSourceEpochCount;
+    for (u32 epochIndex = 0;
+         epochIndex < DeferredStrictAffineHistoricalSourceEpochCount;
+         epochIndex++)
+    {
+        const auto& epoch =
+            DeferredStrictAffineHistoricalSourceEpochs[epochIndex];
+        assessmentInputs.HistoricalSourceEpochAvailable[epochIndex] =
+            epoch.Valid &&
+            epoch.SpriteGeneration == SpriteSourceGeneration &&
+            epoch.SourceEnhancement == sourceEnhancement &&
+            epoch.YStart >= 0 && epoch.YEnd > epoch.YStart &&
+            epoch.YEnd < 192;
+        assessmentInputs.HistoricalSourceEpochYStart[epochIndex] =
+            epoch.YStart;
+        assessmentInputs.HistoricalSourceEpochYEnd[epochIndex] = epoch.YEnd;
+        assessmentInputs.HistoricalSourceEpochGeneration[epochIndex] =
+            epoch.SourceGeneration;
+        for (int y = 0; y < 192; y++)
+        {
+            assessmentInputs.
+                HistoricalSourceEpochRowGeneration[epochIndex][y] =
+                BuildWholeSceneRowSourceGeneration(
+                    y,
+                    epoch.BGLayerGeneration,
+                    epoch.SpriteGeneration);
+        }
+    }
+    plan.Assessment =
+        AssessDeferredScanlineStrictAffine(assessmentInputs);
+    return plan;
 }
 
 bool GLRenderer2D::ShouldUseCompositorExactOverlayEndpoints() const
@@ -2825,7 +4311,10 @@ bool GLRenderer2D::ShouldUseCompositorExactOverlayEndpoints() const
     return (blendTarget2 & direct3DMask) && (blendTarget1 & twoDLayerMask);
 }
 
-void GLRenderer2D::RecordWholeSceneNativeProductChunk(int ystart, int yend)
+void GLRenderer2D::RecordWholeSceneNativeProductChunk(
+    int ystart,
+    int yend,
+    const WholeSceneOutputRepresentationProduct& product)
 {
     ystart = std::clamp(ystart, 0, 192);
     yend = std::clamp(yend, 0, 192);
@@ -2833,16 +4322,107 @@ void GLRenderer2D::RecordWholeSceneNativeProductChunk(int ystart, int yend)
         return;
 
     WholeSceneNativeChunkAccumulationPasses++;
+    const bool descriptorValid =
+        product.Valid &&
+        product.ValidYStart == ystart &&
+        product.ValidYEnd == yend &&
+        product.Kind != WholeSceneOutputRepresentationKind::None &&
+        product.SourceGeneration != 0 &&
+        product.RowEpochIdentity != 0 &&
+        product.ProductIdentity != 0;
+    if (!descriptorValid)
+    {
+        WholeSceneNativeProductRowIdentityValid = false;
+        if (WholeSceneNativeProductRowIdentityFailure ==
+            WholeSceneNativeProductRowIdentityInvalidReason::None)
+        {
+            WholeSceneNativeProductRowIdentityFailure =
+                WholeSceneNativeProductRowIdentityInvalidReason::
+                    DescriptorScopeMismatch;
+        }
+    }
+
     for (int y = ystart; y < yend; y++)
     {
+        WholeSceneNativeProductRowIdentity identity = {};
+        if (descriptorValid)
+        {
+            identity.Valid = true;
+            identity.ProductYStart = ystart;
+            identity.ProductYEnd = yend;
+            identity.Representation = product.Kind;
+            identity.Path = WholeScenePlan.SelectedPath;
+            identity.SourceGeneration =
+                BuildWholeSceneRowSourceGeneration(y);
+            identity.RowEpochIdentity = product.RowEpochIdentity;
+            identity.ProductIdentity = product.ProductIdentity;
+        }
+
         if (WholeSceneNativeProductRowValid[y])
+        {
+            const auto& previous = WholeSceneNativeProductRowIdentities[y];
+            const bool sameIdentity =
+                previous.Valid == identity.Valid &&
+                previous.ProductYStart == identity.ProductYStart &&
+                previous.ProductYEnd == identity.ProductYEnd &&
+                previous.Representation == identity.Representation &&
+                previous.Path == identity.Path &&
+                previous.SourceGeneration == identity.SourceGeneration &&
+                previous.RowEpochIdentity == identity.RowEpochIdentity &&
+                previous.ProductIdentity == identity.ProductIdentity;
+            if (!sameIdentity)
+            {
+                WholeSceneNativeProductRowIdentityValid = false;
+                if (WholeSceneNativeProductRowIdentityFailure ==
+                    WholeSceneNativeProductRowIdentityInvalidReason::None)
+                {
+                    WholeSceneNativeProductRowIdentityFailure =
+                        WholeSceneNativeProductRowIdentityInvalidReason::
+                            OverlapIdentityMismatch;
+                }
+            }
             continue;
+        }
 
         WholeSceneNativeProductRowValid[y] = true;
         WholeSceneNativeProductValidRows++;
+        WholeSceneNativeProductRowIdentities[y] = identity;
+        if (identity.Valid)
+            WholeSceneNativeProductIdentityRows++;
     }
 
     WholeSceneNativeProductsFrameComplete = AreWholeSceneNativeProductsComplete();
+    WholeSceneNativeProductFrameIdentity = 0;
+    if (WholeSceneNativeProductsFrameComplete &&
+        WholeSceneNativeProductRowIdentityValid &&
+        WholeSceneNativeProductIdentityRows == 192)
+    {
+        constexpr u64 offset = 1469598103934665603ull;
+        constexpr u64 prime = 1099511628211ull;
+        u64 hash = offset;
+        auto mix = [&](u64 value)
+        {
+            for (int byte = 0; byte < 8; byte++)
+            {
+                hash ^= value & 0xFFu;
+                hash *= prime;
+                value >>= 8;
+            }
+        };
+        for (int y = 0; y < 192; y++)
+        {
+            const auto& identity = WholeSceneNativeProductRowIdentities[y];
+            mix(static_cast<u64>(y));
+            mix(static_cast<u64>(identity.ProductYStart));
+            mix(static_cast<u64>(identity.ProductYEnd));
+            mix(static_cast<u64>(identity.Representation));
+            mix(static_cast<u64>(identity.Path));
+            mix(identity.SourceGeneration);
+            mix(identity.RowEpochIdentity);
+            mix(identity.ProductIdentity);
+        }
+        WholeSceneNativeProductFrameIdentity = hash ? hash : 1;
+    }
     UpdateWholeSceneTraceFrameSplitState();
 }
 
@@ -2956,6 +4536,60 @@ void GLRenderer2D::AppendWholeSceneModeStatus(std::string& status) const
                     status += "\nHybrid foreground boundary 2D base is enabled for safe Direct3D-absent fallback halos.";
                 if (WholeSceneScaleHybridCleanLegacyCandidate)
                     status += "\nHybrid clean native-stack candidate is enabled for simple Direct3D plus 2D frames.";
+                if (WholeSceneScaleHybridStrictAffineHighRes)
+                    status += "\nStrict high-resolution affine geometry is enabled for its bounded admitted BG/OBJ topologies.";
+                if (WholeSceneScaleHybridStrictAffineSourceEnhancement)
+                {
+                    status += "\nAffine source enhancement is requested separately from high-resolution affine geometry.";
+                    switch (CurrentStrictAffineSourceEnhancementDecision())
+                    {
+                    case StrictAffineSourceEnhancementDecision::Spline36CachedAffineSources:
+                        status += " Spline36 RGB is reconstructed into a source cache before affine placement.";
+                        break;
+                    case StrictAffineSourceEnhancementDecision::NativeCachedAffineSources:
+                        status += " Native RGB is retained while alpha is reconstructed independently.";
+                        break;
+                    case StrictAffineSourceEnhancementDecision::Spline36Inline:
+                        status += " Spline36 reconstruction is applied only to affine BG and affine OBJ source color.";
+                        break;
+                    case StrictAffineSourceEnhancementDecision::ArtCNNCachedAffineSources:
+                        status += " ArtCNN source reconstruction is applied from the affine BG and fixed-slot affine OBJ caches.";
+                        break;
+                    case StrictAffineSourceEnhancementDecision::CuNNyCachedAffineSources:
+                        status += " CuNNy source reconstruction is applied from the affine BG and fixed-slot affine OBJ caches.";
+                        break;
+                    case StrictAffineSourceEnhancementDecision::NNEDI3CachedAffineSources:
+                        status += " NNEDI3 source reconstruction is applied from the affine BG and fixed-slot affine OBJ caches.";
+                        break;
+                    case StrictAffineSourceEnhancementDecision::XBRZCachedAffineSources:
+                        status += " xBRZ RGBA source reconstruction is applied from the affine BG and fixed-slot affine OBJ caches; affine OBJ stays on this path across identity and uses xBRZ alpha only as presentation coverage.";
+                        break;
+                    case StrictAffineSourceEnhancementDecision::AlgorithmUnsupported:
+                        status += " The selected scaler has no affine-source implementation, so path 12 keeps nearest source sampling.";
+                        break;
+                    case StrictAffineSourceEnhancementDecision::StrictAffinePathNotSelected:
+                        status += " The last OutputPlan did not select path 12, so no enhancement was applied.";
+                        break;
+                    case StrictAffineSourceEnhancementDecision::Disabled:
+                        break;
+                    }
+                }
+                {
+                    const char* alphaNames[] = {"native mask", "bilinear", "Spline36", "NNEDI3", "xBRZ"};
+                    status += "\nIndependent alpha reconstruction: ";
+                    status += alphaNames[static_cast<int>(AffineAlpha)];
+                    status += WholeSceneScaleHybridStrictAffineOBJSubpixel2x
+                        ? "; sprite sampling: 2x supersampling." : "; sprite sampling: output grid.";
+                    status += " RGB, display alpha and source assembly are independent. Native ownership and DS effects retain their semantic inputs.";
+                }
+
+
+                if (WholeSceneScaleHybridStrictAffineTopTextBG)
+                    status += "\nCompanion text-BG enhancement is requested; enabled ordinary text BGs participating in an admitted strict-affine scene are reconstructed with the selected scaler. Native binary ownership remains the default; coherent reconstructed coverage and directional masked output AA are selected independently.";
+                    status += "\nSupported affine and companion BG presentation uses the selected alpha reconstruction at output resolution. Existing native ownership, effect and underlay admission rules still apply.";
+                if (WholeSceneScaleHybridStrictAffineMaskedOBJMLAA)
+                    status += "\nDirectional masked output AA is requested; native-coverage ordinary OBJ and companion text-BG ownership drive MLAA-style endpoint searches and nearest opposing-color blends after strict affine rendering. Reconstructed or supersampled contours retain their own coverage.";
+
                 if (ShouldUseWholeSceneHybridOverlayForSuppressedDirect3DAlphaBlend())
                     status += "\nHybrid is using presentation overlay because Direct3D is a zero-weight native alpha-blend target.";
                 if (IsWholeSceneHybridFragmentationGuardActive())
@@ -3050,15 +4684,327 @@ void GLRenderer2D::AppendWholeSceneRenderTrace(std::string& status) const
     status += std::to_string(WholeSceneTrace.YEnd);
     status += "\n  actual path: ";
     status += WholeSceneRenderPathName(WholeSceneTrace.Path);
+    status += "\n  output plan: ";
+    status += WholeSceneRenderPathName(WholeScenePlan.SelectedPath);
+    status += "\n  selected representation product valid/kind/terminal/compositor-input/caps: ";
+    status += yesNo(WholeScenePlan.SelectedRepresentationProduct.Valid);
+    status += "/";
+    status += std::to_string(static_cast<int>(
+        WholeScenePlan.SelectedRepresentationProduct.Kind));
+    status += "/";
+    status += yesNo(
+        WholeScenePlan.SelectedRepresentationProduct.TerminalCompleted);
+    status += "/";
+    status += yesNo(
+        WholeScenePlan.SelectedRepresentationProduct.CompositorInputEligible);
+    status += "/";
+    status += std::to_string(
+        WholeScenePlan.SelectedRepresentationProduct.CapabilityMask);
+    status += "; source/row/product identity ";
+    status += std::to_string(
+        WholeScenePlan.SelectedRepresentationProduct.SourceGeneration);
+    status += "/";
+    status += std::to_string(
+        WholeScenePlan.SelectedRepresentationProduct.RowEpochIdentity);
+    status += "/";
+    status += std::to_string(
+        WholeScenePlan.SelectedRepresentationProduct.ProductIdentity);
+    status += "; decision parity ";
+    status += WholeSceneExecutionTrace.DecisionParity ? "yes" : "no";
+    status += "; source ";
+    status += std::to_string(static_cast<int>(WholeScenePlan.DecisionSource));
+    status += "; execution kind planned/executed ";
+    status += std::to_string(static_cast<int>(WholeScenePlan.ExecutionKind));
+    status += "/";
+    status += std::to_string(static_cast<int>(
+        WholeSceneExecutionTrace.ExecutedExecutionKind));
+    status += "\n  output plan compositor recipe bound/reason/executed/parity/hash: ";
+    status += yesNo(WholeSceneRecipePreparation.Compositor.Bound);
+    status += "/";
+    status += std::to_string(static_cast<int>(
+        WholeSceneRecipePreparation.Compositor.Reason));
+    status += "/";
+    status += yesNo(
+        WholeSceneExecutionTrace.CompositorRecipeExecutionObserved);
+    status += "/";
+    status += yesNo(WholeSceneExecutionTrace.CompositorRecipeParity);
+    status += "/";
+    status += std::to_string(
+        WholeSceneRecipePreparation.Compositor.Recipe.RecipeHash);
+    status += "; row epoch ";
+    status += std::to_string(
+        WholeSceneRecipePreparation.Compositor.Recipe.RowEpochIdentity);
+    status += "; fallback policy/disposition/reason/prepared hash ";
+    status += std::to_string(static_cast<int>(
+        WholeScenePlan.CompositorFallbackPolicy));
+    status += "/";
+    status += std::to_string(static_cast<int>(
+        WholeSceneExecutionTrace.CompositorExecutionDisposition));
+    status += "/";
+    status += std::to_string(static_cast<int>(
+        WholeSceneExecutionTrace.CompositorExecutionReason));
+    status += "/";
+    status += std::to_string(
+        WholeSceneExecutionTrace.PreparedCompositorRecipeHash);
+    status += "; effect owner/state/scope ";
+    status += std::to_string(static_cast<int>(
+        WholeSceneRecipePreparation.Compositor.Recipe.EffectOwner));
+    status += "/";
+    status += std::to_string(
+        WholeSceneRecipePreparation.Compositor.Recipe.EffectState.StateHash);
+    status += "/";
+    status += yesNo(WholeSceneCompositorRecipeProductsCoverScope(
+        WholeSceneRecipePreparation.Compositor.Recipe));
+    status += "\n  output plan compositor planned/actual ready/rejection/inputs: ";
+    status += yesNo(WholeSceneRecipePreparation.Compositor.Recipe.Ready);
+    status += "/";
+    status += FormatHex(
+        WholeSceneRecipePreparation.Compositor.Recipe.RejectionMask, 4);
+    status += "/";
+    status += std::to_string(
+        WholeSceneRecipePreparation.Compositor.Recipe.Inputs.size());
+    status += " -> ";
+    status += yesNo(WholeSceneExecutionTrace.ExecutedCompositorRecipe.Ready);
+    status += "/";
+    status += FormatHex(
+        WholeSceneExecutionTrace.ExecutedCompositorRecipe.RejectionMask, 4);
+    status += "/";
+    status += std::to_string(
+        WholeSceneExecutionTrace.ExecutedCompositorRecipe.Inputs.size());
+    status += "; resolved OBJ/enhanced BG/coverage BG ";
+    status += yesNo(WholeSceneCompositorRecipeHasInput(
+        WholeSceneExecutionTrace.ExecutedCompositorRecipe,
+        WholeSceneCompositorInputKind::ResolvedOBJSurface));
+    status += "/";
+    status += FormatHex(WholeSceneCompositorRecipeEnhancedBGMask(
+        WholeSceneExecutionTrace.ExecutedCompositorRecipe), 1);
+    status += "/";
+    status += FormatHex(
+        WholeSceneCompositorRecipeReconstructedBGCoverageMask(
+            WholeSceneExecutionTrace.ExecutedCompositorRecipe), 1);
+    status += "\n  ordered presentation recipe bound/executed/parity/dependency/hash: ";
+    status += yesNo(WholeSceneRecipePreparation.OrderedPresentation.Bound);
+    status += "/";
+    status += yesNo(
+        WholeSceneExecutionTrace.OrderedPresentationRecipeExecutionObserved);
+    status += "/";
+    status += yesNo(
+        WholeSceneExecutionTrace.OrderedPresentationRecipeParity);
+    status += "/";
+    status += std::to_string(
+        WholeSceneRecipePreparation.OrderedPresentation.Recipe.
+            DependencyRecipeHash);
+    status += "/";
+    status += std::to_string(
+        WholeSceneRecipePreparation.OrderedPresentation.Recipe.RecipeHash);
+    status += "; row epoch ";
+    status += std::to_string(
+        WholeSceneRecipePreparation.OrderedPresentation.Recipe.
+            RowEpochIdentity);
+    status += "; fallback policy/disposition/reason/prepared base/recipe ";
+    status += std::to_string(static_cast<int>(
+        WholeScenePlan.OrderedPresentationFallbackPolicy));
+    status += "/";
+    status += std::to_string(static_cast<int>(
+        WholeSceneExecutionTrace.OrderedPresentationExecutionDisposition));
+    status += "/";
+    status += std::to_string(static_cast<int>(
+        WholeSceneExecutionTrace.OrderedPresentationExecutionReason));
+    status += "/";
+    status += std::to_string(
+        WholeSceneExecutionTrace.PreparedOrderedPresentationBaseRecipeHash);
+    status += "/";
+    status += std::to_string(
+        WholeSceneExecutionTrace.PreparedOrderedPresentationRecipeHash);
+    status += "; ready/rejection/inputs ";
+    status += yesNo(
+        WholeSceneRecipePreparation.OrderedPresentation.Recipe.Ready);
+    status += "/";
+    status += FormatHex(
+        WholeSceneRecipePreparation.OrderedPresentation.Recipe.RejectionMask,
+        4);
+    status += "/";
+    status += std::to_string(
+        WholeSceneRecipePreparation.OrderedPresentation.Recipe.Inputs.size());
+    status += "\n  operand-excluded overlay recipe bound/executed/parity/first/hash: ";
+    status += yesNo(
+        WholeSceneRecipePreparation.OperandExcludedOverlay.Bound);
+    status += "/";
+    status += yesNo(
+        WholeSceneExecutionTrace.
+            OperandExcludedOverlayRecipeExecutionObserved);
+    status += "/";
+    status += yesNo(
+        WholeSceneExecutionTrace.OperandExcludedOverlayRecipeParity);
+    status += "/";
+    status += std::to_string(
+        WholeSceneRecipePreparation.OperandExcludedOverlay.Recipe.
+            FirstExcludedOperand);
+    status += "/";
+    status += std::to_string(
+        WholeSceneRecipePreparation.OperandExcludedOverlay.Recipe.RecipeHash);
+    status += "; row epoch ";
+    status += std::to_string(
+        WholeSceneRecipePreparation.OperandExcludedOverlay.Recipe.
+            RowEpochIdentity);
+    status += "; fallback policy/disposition/reason/prepared hash ";
+    status += std::to_string(static_cast<int>(
+        WholeScenePlan.OperandExcludedOverlayFallbackPolicy));
+    status += "/";
+    status += std::to_string(static_cast<int>(
+        WholeSceneExecutionTrace.
+            OperandExcludedOverlayExecutionDisposition));
+    status += "/";
+    status += std::to_string(static_cast<int>(
+        WholeSceneExecutionTrace.OperandExcludedOverlayExecutionReason));
+    status += "/";
+    status += std::to_string(
+        WholeSceneExecutionTrace.PreparedOperandExcludedOverlayRecipeHash);
+    status += "\n  strict affine presentation kind/reason/affine insertion: ";
+    status += std::to_string(static_cast<int>(
+        WholeSceneExecutionTrace.StrictAffinePresentationExecutionKind));
+    status += "/";
+    status += std::to_string(static_cast<int>(
+        WholeSceneExecutionTrace.StrictAffinePresentationExecutionReason));
+    status += "/";
+    status += yesNo(
+        WholeSceneExecutionTrace.StrictAffinePresentationAffineOBJInsertion);
+    status += "\n  strict affine products semantic/resolved/ordered/overlay/atomic/native/insertion/subpixel: ";
+    status += yesNo(WholeSceneExecutionTrace.
+        StrictAffineProductAssessment.SemanticRecipeReady);
+    status += "/";
+    status += yesNo(WholeSceneExecutionTrace.
+        StrictAffineProductAssessment.ResolvedOBJSurfaceReady);
+    status += "/";
+    status += yesNo(WholeSceneExecutionTrace.
+        StrictAffineProductAssessment.OrderedOperandsReady);
+    status += "/";
+    status += yesNo(WholeSceneExecutionTrace.
+        StrictAffineProductAssessment.OperandExcludedOverlayReady);
+    status += "/";
+    status += yesNo(WholeSceneExecutionTrace.
+        StrictAffineProductAssessment.AtomicOrdinaryBandReady);
+    status += "/";
+    status += yesNo(WholeSceneExecutionTrace.
+        StrictAffineProductAssessment.NativeStackReady);
+    status += "/";
+    status += yesNo(WholeSceneExecutionTrace.
+        StrictAffineProductAssessment.AffineOBJInsertionReady);
+    status += "/";
+    status += yesNo(WholeSceneExecutionTrace.
+        StrictAffineProductAssessment.AffineOBJSubpixel2xReady);
+    status += "; ordered affine output-grid/subpixel-2x operands ";
+    status += std::to_string(
+        WholeSceneExecutionTrace.OrderedAffineOutputGridOperandCount);
+    status += "/";
+    status += std::to_string(
+        WholeSceneExecutionTrace.OrderedAffineSubpixel2xOperandCount);
+    status += "\n  deferred scanline strict affine evaluated/eligible/reason: ";
+    status += yesNo(WholeSceneTrace.DeferredScanlineStrictAffineEvaluated);
+    status += "/";
+    status += yesNo(WholeSceneTrace.DeferredScanlineStrictAffineEligible);
+    status += "/";
+    status += std::to_string(static_cast<int>(
+        WholeSceneTrace.DeferredScanlineStrictAffineReason));
+    status += "; historical attempted/valid/used/y-end/native/enhanced ";
+    status += yesNo(WholeSceneTrace.
+        DeferredStrictAffineHistoricalSourceAttempted);
+    status += "/";
+    status += yesNo(WholeSceneTrace.
+        DeferredStrictAffineHistoricalSourceValid);
+    status += "/";
+    status += yesNo(WholeSceneTrace.
+        DeferredStrictAffineHistoricalSourceUsed);
+    status += "/";
+    status += std::to_string(WholeSceneTrace.
+        DeferredStrictAffineHistoricalSourceYEnd);
+    status += "/";
+    status += FormatHex(WholeSceneTrace.
+        DeferredStrictAffineHistoricalNativeBGMask, 1);
+    status += "/";
+    status += FormatHex(WholeSceneTrace.
+        DeferredStrictAffineHistoricalEnhancedBGMask, 1);
+    status += "; row epochs/first transition/first/live ";
+    status += std::to_string(WholeSceneTrace.
+        DeferredStrictAffineRowSourceEpochCount);
+    status += "/";
+    status += std::to_string(WholeSceneTrace.
+        DeferredStrictAffineFirstSourceTransitionY);
+    status += "/";
+    status += std::to_string(WholeSceneTrace.
+        DeferredStrictAffineFirstRowSourceGeneration);
+    status += "/";
+    status += std::to_string(WholeSceneTrace.
+        DeferredStrictAffineLiveSourceGeneration);
+    status += "\n  strict affine block/geometry-required/affine-obj: ";
+    status += std::to_string(
+        static_cast<int>(WholeScenePlan.StrictAffineBlockReason));
+    status += "/";
+    status += yesNo(StrictAffineHighResolutionGeometryRequired);
+    status += "/";
+    status += yesNo(StrictAffineHasAffineOBJ);
+    status += "; visible/identity/transformed BG masks ";
+    status += FormatHex(StrictAffineVisibleBGMask, 1);
+    status += "/";
+    status += FormatHex(StrictAffineIdentityEquivalentBGMask, 1);
+    status += "/";
+    status += FormatHex(StrictAffineTransformedBGMask, 1);
+    status += "; identity-stable frames BG2/BG3 ";
+    status += std::to_string(StrictAffineIdentityStableFrames[2]);
+    status += "/";
+    status += std::to_string(StrictAffineIdentityStableFrames[3]);
+    status += "; range/fragmentation/conservative ";
+    status += std::to_string(WholeScenePlan.ExecutionYStart);
+    status += "-";
+    status += std::to_string(WholeScenePlan.ExecutionYEnd);
+    status += "/";
+    status += yesNo(WholeScenePlan.ExecutionCurrentFragmentationFallback);
+    status += "; considered representations ";
+    status += FormatHex(WholeScenePlan.ConsideredRepresentationMask, 3);
+    status += "\n  capability admission changed/reason/initial/rejected unsupported/evidence: ";
+    status += yesNo(WholeScenePlan.AdmissionChangedSelection);
+    status += "/";
+    status += std::to_string(static_cast<int>(WholeScenePlan.AdmissionReason));
+    status += "/";
+    status += std::to_string(static_cast<int>(WholeScenePlan.InitialSelectedPath));
+    status += "/";
+    status += FormatHex(WholeScenePlan.AdmissionRejectedUnsupportedChannels, 5);
+    status += "/";
+    status += FormatHex(WholeScenePlan.AdmissionRejectedEvidenceUnavailableChannels, 5);
+    status += "\n  output plan stage/class: ";
+    status += std::to_string(static_cast<int>(WholeScenePlan.InsertionStage));
+    status += "/";
+    status += std::to_string(static_cast<int>(WholeScenePlan.CorrectnessClass));
+    status += "; required/reproduced/inactive/unsupported/evidence ";
+    status += FormatHex(WholeScenePlan.RequiredChannels, 5);
+    status += "/";
+    status += FormatHex(WholeScenePlan.ReproducedChannels, 5);
+    status += "/";
+    status += FormatHex(WholeScenePlan.InactiveChannels, 5);
+    status += "/";
+    status += FormatHex(WholeScenePlan.UnsupportedChannels, 5);
+    status += "/";
+    status += FormatHex(WholeScenePlan.EvidenceUnavailableChannels, 5);
+    status += "\n  output plan transforms planned/observed/unobserved/disagreed/unexpected: ";
+    status += FormatHex(WholeScenePlan.PlannedTransformMask, 2);
+    status += "/";
+    status += FormatHex(WholeSceneExecutionTrace.ObservedTransformMask, 2);
+    status += "/";
+    status += FormatHex(
+        WholeSceneOutputUnobservedTransformMask(WholeScenePlan,
+                                                WholeSceneExecutionTrace),
+        2);
+    status += "/";
+    status += FormatHex(WholeSceneExecutionTrace.TransformDisagreementMask, 2);
+    status += "/";
+    status += FormatHex(
+        WholeSceneExecutionTrace.UnexpectedObservedTransformMask,
+        2);
     if (WholeSceneTrace.Path == WholeSceneRenderPath::SourceACaptureReplacement ||
         WholeSceneTrace.Path == WholeSceneRenderPath::CaptureEpochOverlay)
     {
-        status += "; replacement mode: ";
-        status += SourceACaptureReplacementModeName(WholeSceneTrace.SourceACaptureMode);
         status += "; background epoch ";
         status += std::to_string(WholeSceneTrace.SourceABackgroundEpochSerial);
-        status += "; product choice ";
-        status += std::to_string(static_cast<int>(WholeSceneTrace.SourceAProductChoice));
     }
     status += "\n  hybrid fragmentation fallback: ";
     status += yesNo(WholeSceneTrace.HybridFragmentationFallback);
@@ -3077,6 +5023,12 @@ void GLRenderer2D::AppendWholeSceneRenderTrace(std::string& status) const
     status += "/192";
     status += "\n  native products complete: ";
     status += yesNo(WholeSceneTrace.NativeProductsFrameComplete);
+    status += "\n  native product row identity valid/rows/frame: ";
+    status += yesNo(WholeSceneTrace.NativeProductRowIdentityValid);
+    status += "/";
+    status += std::to_string(WholeSceneTrace.NativeProductIdentityRows);
+    status += "/";
+    status += FormatHex(WholeSceneTrace.NativeProductFrameIdentity, 16);
     status += "\n  native product epoch valid: ";
     status += yesNo(WholeSceneTrace.NativeProductEpochValid);
     status += "\n  finalizer-capable path seen: ";
@@ -3137,6 +5089,135 @@ void GLRenderer2D::AppendWholeSceneRenderTrace(std::string& status) const
     status += yesNo(WholeSceneTrace.Linear3D);
     status += "\n  ResolveDirect3DToNative called: ";
     status += yesNo(WholeSceneTrace.Resolve3D);
+    status += "\n  strict affine debug product class: ";
+    status += std::to_string(
+        static_cast<u32>(WholeSceneTrace.StrictAffineDebugClass));
+    status += "\n  strict affine source enhancement decision: ";
+    status += std::to_string(static_cast<u32>(
+        WholeSceneTrace.StrictAffineSourceEnhancement));
+    status += "\n  experimental premultiplied NNEDI3 RGB requested: ";
+    status += yesNo(NNEDI3PremultipliedRGB);
+    status += " (requires NNEDI3 source reconstruction and explicit NNEDI3 alpha)";
+    status += "\n  strict affine enhanced OBJ active slots: ";
+    status += std::to_string(WholeSceneTrace.StrictAffineEnhancedOBJActiveSlots);
+    status += "\n  strict affine enhanced OBJ cache hits/misses: ";
+    status += std::to_string(WholeSceneTrace.StrictAffineEnhancedOBJCacheHits);
+    status += "/";
+    status += std::to_string(WholeSceneTrace.StrictAffineEnhancedOBJCacheMisses);
+    status += "\n  strict affine enhanced OBJ scaler dispatches/fallbacks: ";
+    status += std::to_string(WholeSceneTrace.StrictAffineEnhancedOBJNeuralDispatches);
+    status += "/";
+    status += std::to_string(WholeSceneTrace.StrictAffineEnhancedOBJFallbacks);
+    status += "\n  strict affine ordinary OBJ native stack: ";
+    status += yesNo(WholeSceneTrace.StrictAffineOrdinaryOBJNativeStack);
+    status += "\n  strict affine resolved OBJ requested/ordinary-ready/reused/merged: ";
+    status += yesNo(WholeSceneTrace.StrictAffineResolvedOBJRequested);
+    status += "/";
+    status += yesNo(
+        WholeSceneTrace.StrictAffineResolvedOBJOrdinaryProductReady);
+    status += "/";
+    status += yesNo(
+        WholeSceneTrace.StrictAffineResolvedOBJOrdinaryProductReused);
+    status += "/";
+    status += yesNo(WholeSceneTrace.StrictAffineResolvedOBJMergeExecuted);
+    status += "; rejection ";
+    status += FormatHex(
+        WholeSceneTrace.StrictAffineResolvedOBJRejectionMask, 2);
+    status += "\n  strict affine OBJ operand plan requested/policy-ready/execution-ready/executed: ";
+    status += yesNo(WholeSceneTrace.StrictAffineOBJOperandPlanRequested);
+    status += "/";
+    status += yesNo(WholeSceneRecipePreparation.OrderedPresentation.Bound);
+    status += "/";
+    status += yesNo(WholeSceneExecutionTrace.
+        StrictAffineProductAssessment.OrderedOperandsReady);
+    status += "/";
+    status += yesNo(WholeSceneExecutionTrace.
+        StrictAffinePresentationExecutionKind ==
+            WholeSceneStrictAffinePresentationKind::OrderedOperands);
+    status += "; no-affine extension/isolation ";
+    status += yesNo(
+        WholeSceneTrace.StrictAffineOBJOperandPlanNoAffineExtension);
+    status += "/";
+    status += yesNo(
+        WholeSceneTrace.StrictAffineOBJOperandPlanSpecialIsolationReady);
+    status += "; native-stack base ";
+    status += "no";
+    status += "; clean BG/3D base ";
+    status += yesNo(WholeSceneTrace.StrictAffineOBJOperandPlanCleanBG3DBase);
+    status += "; rejection/operands/products/hash ";
+    status += FormatHex(WholeSceneTrace.StrictAffineOBJOperandPlanRejectionMask, 2);
+    status += "/";
+    status += std::to_string(WholeSceneTrace.StrictAffineOBJOperandPlanOperandCount);
+    status += "/";
+    status += std::to_string(
+        WholeSceneTrace.StrictAffineOBJOperandPlanPresentationProductCount);
+    status += "/";
+    status += std::to_string(WholeSceneTrace.StrictAffineOBJOperandPlanHash);
+    status += "\n  strict affine operand-excluded overlay requested/ready/executed: ";
+    status += yesNo(WholeSceneTrace.StrictAffineOperandExcludedOverlayRequested);
+    status += "/";
+    status += yesNo(WholeSceneExecutionTrace.
+        StrictAffineProductAssessment.OperandExcludedOverlayReady);
+    status += "/";
+    status += yesNo(WholeSceneExecutionTrace.
+        OperandExcludedOverlayRecipeExecutionObserved);
+    status += "; rejection/OAM hash ";
+    status += FormatHex(
+        WholeSceneTrace.StrictAffineOperandExcludedOverlayRejectionMask, 3);
+    status += "/";
+    status += std::to_string(
+        WholeSceneTrace.StrictAffineOperandExcludedOverlayOAMHash);
+    status += "\n  strict affine enhanced BG active layers: ";
+    status += std::to_string(WholeSceneTrace.StrictAffineEnhancedBGActiveLayers);
+    status += "\n  strict affine enhanced BG cache hits/misses: ";
+    status += std::to_string(WholeSceneTrace.StrictAffineEnhancedBGCacheHits);
+    status += "/";
+    status += std::to_string(WholeSceneTrace.StrictAffineEnhancedBGCacheMisses);
+    status += "\n  strict affine enhanced BG scaler dispatches/fallbacks: ";
+    status += std::to_string(WholeSceneTrace.StrictAffineEnhancedBGNeuralDispatches);
+    status += "/";
+    status += std::to_string(WholeSceneTrace.StrictAffineEnhancedBGFallbacks);
+    status += "\n  strict affine underlay candidate/proven BG mask: ";
+    status += FormatHex(WholeSceneTrace.StrictAffineUnderlayCandidateBGMask, 1);
+    status += "/";
+    status += FormatHex(WholeSceneTrace.StrictAffineConstantBackdropProofBGMask, 1);
+    status += "\n  strict affine constant-backdrop composited BG mask: ";
+    status += FormatHex(
+        WholeSceneTrace.StrictAffineConstantBackdropCompositeBGMask, 1);
+    status += "\n  strict affine BG2/BG3 underlay rejection mask: ";
+    status += FormatHex(WholeSceneTrace.StrictAffineBG2UnderlayRejectReasons, 2);
+    status += "/";
+    status += FormatHex(WholeSceneTrace.StrictAffineBG3UnderlayRejectReasons, 2);
+    status += " (";
+    status += StrictAffineUnderlayProofSummary(
+        (WholeSceneTrace.StrictAffineUnderlayCandidateBGMask & (1u << 2)) != 0,
+        WholeSceneTrace.StrictAffineBG2UnderlayRejectReasons);
+    status += "/";
+    status += StrictAffineUnderlayProofSummary(
+        (WholeSceneTrace.StrictAffineUnderlayCandidateBGMask & (1u << 3)) != 0,
+        WholeSceneTrace.StrictAffineBG3UnderlayRejectReasons);
+    status += ")";
+    status += "\n  strict affine BG2/BG3 observed backdrop color: ";
+    status += FormatHex(WholeSceneTrace.StrictAffineBG2UnderlayBackdropColor, 4);
+    status += "/";
+    status += FormatHex(WholeSceneTrace.StrictAffineBG3UnderlayBackdropColor, 4);
+    status += "\n  strict affine deferred text-BG AA requested/executed: ";
+    status += yesNo(WholeSceneTrace.StrictAffineDeferredTextBGAARequested);
+    status += "/";
+    status += yesNo(WholeSceneTrace.StrictAffineDeferredTextBGAAExecuted);
+    status += "\n  strict affine deferred ordinary-OBJ candidate requested/product/evaluated: ";
+    status += yesNo(
+        WholeSceneTrace.StrictAffineDeferredOrdinaryOBJCandidateRequested);
+    status += "/";
+    status += yesNo(
+        WholeSceneTrace.StrictAffineDeferredOrdinaryOBJCandidateProductReady);
+    status += "/";
+    status += yesNo(
+        WholeSceneTrace.StrictAffineDeferredOrdinaryOBJCandidateEvaluated);
+    status += "\n  strict affine candidate valid: ";
+    status += yesNo(WholeSceneTrace.StrictAffineCandidateValid);
+    status += "\n  strict affine native reference valid: ";
+    status += yesNo(WholeSceneTrace.StrictAffineNativeReferenceValid);
     status += "\n  poison high-res Direct3D source: ";
     status += yesNo(WholeSceneDebugPoison.Source3D);
     status += "\n  poison native 3D resolve: ";
@@ -3165,6 +5246,426 @@ void GLRenderer2D::AppendWholeSceneRenderTrace(std::string& status) const
     status += yesNo(WholeSceneTrace.OverlayTrueFinalValid);
     status += "\n  overlay endpoint final path: ";
     status += WholeSceneOverlayEndpointFinalModeName(WholeSceneTrace.OverlayEndpointFinalMode);
+}
+
+void GLRenderer2D::CaptureAffineOBJDebugEvidence(
+    WholeScene2DAffineOBJDebugEvidence& evidence) const
+{
+    evidence = {};
+    auto& summary = evidence.Summary;
+    summary.SourceGeneration = SpriteSourceGeneration;
+
+    auto hashValue = [](u64& hash, u64 value)
+    {
+        constexpr u64 kFNVPrime = 1099511628211ull;
+        for (int byte = 0; byte < 8; byte++)
+        {
+            hash ^= (value >> (byte * 8)) & 0xFFu;
+            hash *= kFNVPrime;
+        }
+    };
+    u64 sourceHash = 1469598103934665603ull;
+    u64 transformHash = 1469598103934665603ull;
+    int rotscaleUseCount[32] {};
+
+    for (int spriteIndex = 0; spriteIndex < NumSprites; spriteIndex++)
+    {
+        const auto& sprite = SpriteConfig.uOAM[spriteIndex];
+        if (sprite.Rotscale >= 32)
+            continue;
+
+        WholeScene2DAffineOBJDebugRecord record;
+        record.RenderedIndex = spriteIndex;
+        record.OAMIndex = SpriteOAMIndex[spriteIndex];
+        if (record.OAMIndex >= 0 && record.OAMIndex < 128)
+        {
+            record.Attr0 = OAM[record.OAMIndex * 4 + 0];
+            record.Attr1 = OAM[record.OAMIndex * 4 + 1];
+            record.Attr2 = OAM[record.OAMIndex * 4 + 2];
+        }
+        record.PositionX = sprite.Position[0];
+        record.PositionY = sprite.Position[1];
+        record.Width = sprite.Size[0];
+        record.Height = sprite.Size[1];
+        record.BoundWidth = sprite.BoundSize[0];
+        record.BoundHeight = sprite.BoundSize[1];
+        record.RotscaleIndex = static_cast<int>(sprite.Rotscale);
+        for (int component = 0; component < 4; component++)
+            record.Rotscale[component] = SpriteConfig.uRotscale[sprite.Rotscale][component];
+        record.OBJMode = sprite.OBJMode;
+        record.SourceType = sprite.Type;
+        record.PaletteOffset = sprite.PalOffset;
+        record.TileOffset = sprite.TileOffset;
+        record.TileStride = sprite.TileStride;
+        record.Priority = sprite.BGPrio;
+        record.Mosaic = sprite.Mosaic != 0;
+        record.DoubleSize = record.BoundWidth != record.Width ||
+                            record.BoundHeight != record.Height;
+        record.IdentityTransform =
+            record.Rotscale[0] == 256 && record.Rotscale[1] == 0 &&
+            record.Rotscale[2] == 0 && record.Rotscale[3] == 256;
+        record.SourceGeneration = SpriteSourceGeneration;
+        record.EnhancedSourceCacheValid = IsEnhancedOBJSourceValid(
+            spriteIndex, BuildEnhancedOBJSourceKey(spriteIndex));
+        if (record.EnhancedSourceCacheValid)
+        {
+            const auto& key = EnhancedOBJSourceKeys[spriteIndex];
+            record.EnhancedAlgorithm = key.Algorithm;
+            record.EnhancedSourceScale = key.SourceScale;
+        }
+
+        evidence.Records.push_back(record);
+        rotscaleUseCount[record.RotscaleIndex]++;
+        summary.Count++;
+        summary.TransformedCount += !record.IdentityTransform;
+        summary.DoubleSizeCount += record.DoubleSize;
+        summary.SemiTransparentCount +=
+            record.OBJMode == 1 || record.OBJMode == 3;
+        summary.BitmapCount += record.SourceType >= 2;
+        summary.MosaicCount += record.Mosaic;
+        summary.OBJModeMask |= 1u << std::min<u32>(record.OBJMode, 31u);
+        summary.SourceTypeMask |= 1u << std::min<u32>(record.SourceType, 31u);
+        summary.PriorityMask |= 1u << std::min<u32>(record.Priority, 31u);
+
+        const int maxX = record.PositionX + record.BoundWidth;
+        const int maxY = record.PositionY + record.BoundHeight;
+        if (summary.Count == 1)
+        {
+            summary.MinX = record.PositionX;
+            summary.MinY = record.PositionY;
+            summary.MaxX = maxX;
+            summary.MaxY = maxY;
+        }
+        else
+        {
+            summary.MinX = std::min(summary.MinX, record.PositionX);
+            summary.MinY = std::min(summary.MinY, record.PositionY);
+            summary.MaxX = std::max(summary.MaxX, maxX);
+            summary.MaxY = std::max(summary.MaxY, maxY);
+        }
+
+        hashValue(sourceHash, static_cast<u32>(record.OAMIndex));
+        hashValue(sourceHash, static_cast<u32>(record.Width));
+        hashValue(sourceHash, static_cast<u32>(record.Height));
+        hashValue(sourceHash, record.OBJMode);
+        hashValue(sourceHash, record.SourceType);
+        hashValue(sourceHash, record.PaletteOffset);
+        hashValue(sourceHash, record.TileOffset);
+        hashValue(sourceHash, record.TileStride);
+        hashValue(sourceHash, record.Priority);
+        hashValue(sourceHash, record.Mosaic);
+
+        hashValue(transformHash, static_cast<u32>(record.OAMIndex));
+        hashValue(transformHash, static_cast<u32>(record.PositionX));
+        hashValue(transformHash, static_cast<u32>(record.PositionY));
+        hashValue(transformHash, static_cast<u32>(record.BoundWidth));
+        hashValue(transformHash, static_cast<u32>(record.BoundHeight));
+        hashValue(transformHash, static_cast<u32>(record.RotscaleIndex));
+        for (s32 component : record.Rotscale)
+            hashValue(transformHash, static_cast<u32>(component));
+    }
+
+    for (int count : rotscaleUseCount)
+    {
+        if (count > 0)
+            summary.DistinctRotscaleCount++;
+        if (count > 1)
+            summary.SharedRotscaleSpriteCount += count;
+    }
+
+    for (size_t firstIndex = 0; firstIndex < evidence.Records.size(); firstIndex++)
+    {
+        const auto& first = evidence.Records[firstIndex];
+        const int firstMaxX = first.PositionX + first.BoundWidth;
+        const int firstMaxY = first.PositionY + first.BoundHeight;
+        for (size_t secondIndex = firstIndex + 1;
+             secondIndex < evidence.Records.size();
+             secondIndex++)
+        {
+            const auto& second = evidence.Records[secondIndex];
+            const int secondMaxX = second.PositionX + second.BoundWidth;
+            const int secondMaxY = second.PositionY + second.BoundHeight;
+            const int overlapX = std::min(firstMaxX, secondMaxX) -
+                                 std::max(first.PositionX, second.PositionX);
+            const int overlapY = std::min(firstMaxY, secondMaxY) -
+                                 std::max(first.PositionY, second.PositionY);
+            const bool overlapping = overlapX > 0 && overlapY > 0;
+            const bool touching = !overlapping && overlapX >= 0 && overlapY >= 0;
+            if (!overlapping && !touching)
+                continue;
+
+            const bool sameRotscale =
+                first.RotscaleIndex == second.RotscaleIndex;
+            const bool sameState =
+                sameRotscale && first.OBJMode == second.OBJMode &&
+                first.SourceType == second.SourceType &&
+                first.PaletteOffset == second.PaletteOffset &&
+                first.Priority == second.Priority &&
+                first.Mosaic == second.Mosaic;
+
+            summary.OverlappingPairs += overlapping;
+            summary.TouchingPairs += touching;
+            summary.SameRotscaleOverlappingPairs += overlapping && sameRotscale;
+            summary.SameRotscaleTouchingPairs += touching && sameRotscale;
+            summary.SameStateOverlappingPairs += overlapping && sameState;
+            summary.SameStateTouchingPairs += touching && sameState;
+        }
+    }
+
+    u64 groupSourceHash = 1469598103934665603ull;
+    u64 canonicalGroupLayoutHash = 1469598103934665603ull;
+    for (int rotscaleIndex = 0; rotscaleIndex < 32; rotscaleIndex++)
+    {
+        size_t anchorRecordIndex = evidence.Records.size();
+        int memberCount = 0;
+        for (size_t recordIndex = 0;
+             recordIndex < evidence.Records.size();
+             recordIndex++)
+        {
+            if (evidence.Records[recordIndex].RotscaleIndex != rotscaleIndex)
+                continue;
+            if (anchorRecordIndex == evidence.Records.size())
+                anchorRecordIndex = recordIndex;
+            memberCount++;
+        }
+        if (memberCount == 0)
+            continue;
+
+        auto& anchor = evidence.Records[anchorRecordIndex];
+        WholeScene2DAffineOBJGroupDebugRecord group;
+        group.RotscaleIndex = rotscaleIndex;
+        group.AnchorRenderedIndex = anchor.RenderedIndex;
+        group.AnchorOAMIndex = anchor.OAMIndex;
+        group.MemberCount = memberCount;
+        for (int component = 0; component < 4; component++)
+            group.Rotscale[component] = anchor.Rotscale[component];
+        group.AllNormalMode = true;
+        group.AllSupportedSource = true;
+        group.NoMosaic = true;
+        group.SameMode = true;
+        group.SameSourceType = true;
+        group.SamePriority = true;
+        group.AllEnhancedCachesValid = true;
+
+        const s64 anchorCenterX2 =
+            static_cast<s64>(anchor.PositionX) * 2 + anchor.BoundWidth;
+        const s64 anchorCenterY2 =
+            static_cast<s64>(anchor.PositionY) * 2 + anchor.BoundHeight;
+        u64 memberSourceHash = 1469598103934665603ull;
+        u64 memberLayoutHash = 1469598103934665603ull;
+        int memberIndex = 0;
+        for (auto& member : evidence.Records)
+        {
+            if (member.RotscaleIndex != rotscaleIndex)
+                continue;
+
+            member.CandidateGroupMemberIndex = memberIndex++;
+            member.CandidateGroupMemberCount = memberCount;
+            member.CandidateGroupAnchorOAMIndex = anchor.OAMIndex;
+            const s64 centerX2 =
+                static_cast<s64>(member.PositionX) * 2 + member.BoundWidth;
+            const s64 centerY2 =
+                static_cast<s64>(member.PositionY) * 2 + member.BoundHeight;
+            const s64 deltaX2 = centerX2 - anchorCenterX2;
+            const s64 deltaY2 = centerY2 - anchorCenterY2;
+            // The sprite shader evaluates source = screen * OAM-matrix / 256.
+            // Centers may be half-integral, hence the exact /512 numerator.
+            member.CandidateGroupSourceOffsetX512 =
+                deltaX2 * group.Rotscale[0] +
+                deltaY2 * group.Rotscale[1];
+            member.CandidateGroupSourceOffsetY512 =
+                deltaX2 * group.Rotscale[2] +
+                deltaY2 * group.Rotscale[3];
+
+            if (member.OAMIndex >= 0 && member.OAMIndex < 128)
+            {
+                group.MemberOAMMask[member.OAMIndex >> 6] |=
+                    1ull << (member.OAMIndex & 63);
+            }
+            const int memberMaxX = member.PositionX + member.BoundWidth;
+            const int memberMaxY = member.PositionY + member.BoundHeight;
+            if (member.CandidateGroupMemberIndex == 0)
+            {
+                group.MinX = member.PositionX;
+                group.MinY = member.PositionY;
+                group.MaxX = memberMaxX;
+                group.MaxY = memberMaxY;
+            }
+            else
+            {
+                group.MinX = std::min(group.MinX, member.PositionX);
+                group.MinY = std::min(group.MinY, member.PositionY);
+                group.MaxX = std::max(group.MaxX, memberMaxX);
+                group.MaxY = std::max(group.MaxY, memberMaxY);
+            }
+
+            group.AllNormalMode &= member.OBJMode == 0;
+            group.AllSupportedSource &= member.SourceType < 3;
+            group.NoMosaic &= !member.Mosaic;
+            group.SameMode &= member.OBJMode == anchor.OBJMode;
+            group.SameSourceType &= member.SourceType == anchor.SourceType;
+            group.SamePriority &= member.Priority == anchor.Priority;
+            group.AllEnhancedCachesValid &= member.EnhancedSourceCacheValid;
+
+            hashValue(memberSourceHash, static_cast<u32>(member.OAMIndex));
+            hashValue(memberSourceHash, member.SourceGeneration);
+            hashValue(memberSourceHash, static_cast<u32>(member.Width));
+            hashValue(memberSourceHash, static_cast<u32>(member.Height));
+            hashValue(memberSourceHash, member.OBJMode);
+            hashValue(memberSourceHash, member.SourceType);
+            hashValue(memberSourceHash, member.PaletteOffset);
+            hashValue(memberSourceHash, member.TileOffset);
+            hashValue(memberSourceHash, member.TileStride);
+            hashValue(memberSourceHash, member.Priority);
+            hashValue(memberSourceHash, member.Mosaic);
+            hashValue(memberSourceHash, member.EnhancedAlgorithm);
+            hashValue(memberSourceHash, member.EnhancedSourceScale);
+
+            hashValue(memberLayoutHash, static_cast<u32>(member.OAMIndex));
+            hashValue(memberLayoutHash,
+                      static_cast<u64>(member.CandidateGroupSourceOffsetX512));
+            hashValue(memberLayoutHash,
+                      static_cast<u64>(member.CandidateGroupSourceOffsetY512));
+            hashValue(memberLayoutHash, static_cast<u32>(member.Width));
+            hashValue(memberLayoutHash, static_cast<u32>(member.Height));
+        }
+
+        for (size_t firstIndex = 0;
+             firstIndex < evidence.Records.size();
+             firstIndex++)
+        {
+            const auto& first = evidence.Records[firstIndex];
+            if (first.RotscaleIndex != rotscaleIndex)
+                continue;
+            const int firstMaxX = first.PositionX + first.BoundWidth;
+            const int firstMaxY = first.PositionY + first.BoundHeight;
+            for (size_t secondIndex = firstIndex + 1;
+                 secondIndex < evidence.Records.size();
+                 secondIndex++)
+            {
+                const auto& second = evidence.Records[secondIndex];
+                if (second.RotscaleIndex != rotscaleIndex)
+                    continue;
+                const int secondMaxX = second.PositionX + second.BoundWidth;
+                const int secondMaxY = second.PositionY + second.BoundHeight;
+                const int overlapX = std::min(firstMaxX, secondMaxX) -
+                                     std::max(first.PositionX, second.PositionX);
+                const int overlapY = std::min(firstMaxY, secondMaxY) -
+                                     std::max(first.PositionY, second.PositionY);
+                const bool overlapping = overlapX > 0 && overlapY > 0;
+                const bool touching =
+                    !overlapping && overlapX >= 0 && overlapY >= 0;
+                group.OverlappingPairs += overlapping;
+                group.TouchingPairs += touching;
+            }
+        }
+
+        if (!group.AllSupportedSource)
+            group.RejectionMask |= AffineOBJGroupRejectUnsupportedSource;
+        if (!group.AllNormalMode)
+            group.RejectionMask |= AffineOBJGroupRejectNonNormalMode;
+        if (!group.NoMosaic)
+            group.RejectionMask |= AffineOBJGroupRejectMosaic;
+        if (!group.SameMode)
+            group.RejectionMask |= AffineOBJGroupRejectMixedMode;
+        if (!group.SameSourceType)
+            group.RejectionMask |= AffineOBJGroupRejectMixedSourceType;
+        if (!group.SamePriority)
+            group.RejectionMask |= AffineOBJGroupRejectMixedPriority;
+        if (memberCount > 1 && group.TouchingPairs == 0 &&
+            group.OverlappingPairs == 0)
+        {
+            group.RejectionMask |= AffineOBJGroupRejectNoBoundContact;
+        }
+
+        group.SourceHash = memberSourceHash ? memberSourceHash : 1;
+        group.CanonicalLayoutHash = memberLayoutHash ? memberLayoutHash : 1;
+        group.SingletonCacheControlReady =
+            memberCount == 1 && group.RejectionMask == AffineOBJGroupRejectNone &&
+            group.AllEnhancedCachesValid;
+        group.StructuralMultiSpriteCandidate =
+            memberCount > 1 && group.RejectionMask == AffineOBJGroupRejectNone;
+        group.RequiresTemporalLayoutProof =
+            group.StructuralMultiSpriteCandidate;
+
+        summary.SingletonGroupCount += memberCount == 1;
+        summary.SharedGroupCount += memberCount > 1;
+        summary.SingletonCacheControlReadyCount +=
+            group.SingletonCacheControlReady;
+        summary.StructuralMultiSpriteCandidateGroupCount +=
+            group.StructuralMultiSpriteCandidate;
+        summary.RejectedSharedGroupCount +=
+            memberCount > 1 && !group.StructuralMultiSpriteCandidate;
+
+        hashValue(groupSourceHash, static_cast<u32>(group.RotscaleIndex));
+        hashValue(groupSourceHash, group.SourceHash);
+        hashValue(canonicalGroupLayoutHash,
+                  static_cast<u32>(group.RotscaleIndex));
+        hashValue(canonicalGroupLayoutHash, group.CanonicalLayoutHash);
+        evidence.Groups.push_back(group);
+    }
+
+    if (summary.Count > 0)
+    {
+        summary.SourceHash = sourceHash ? sourceHash : 1;
+        summary.TransformHash = transformHash ? transformHash : 1;
+        summary.GroupSourceHash = groupSourceHash ? groupSourceHash : 1;
+        summary.CanonicalGroupLayoutHash =
+            canonicalGroupLayoutHash ? canonicalGroupLayoutHash : 1;
+    }
+
+    // Describe the compositor-input boundary separately from the affine
+    // source-group evidence above. A genuinely transformed role remains on
+    // the affine side through a brief exact-identity crossing, while an
+    // authored rotscale entry which has never moved may remain in its
+    // assembled ordinary band. Classification alone grants no authority; a
+    // separate bounded consumer policy must prove a supported recipe.
+    std::vector<WholeSceneOBJBandInput> bandInputs;
+    bandInputs.reserve(NumSprites);
+    for (int spriteIndex = 0; spriteIndex < NumSprites; spriteIndex++)
+    {
+        const auto& sprite = SpriteConfig.uOAM[spriteIndex];
+        WholeSceneOBJBandInput input;
+        input.RenderedIndex = spriteIndex;
+        input.OAMIndex = SpriteOAMIndex[spriteIndex];
+        input.Priority = sprite.BGPrio;
+        input.OBJMode = sprite.OBJMode;
+        input.SourceType = sprite.Type;
+        input.Mosaic = sprite.Mosaic != 0;
+        input.PositionX = sprite.Position[0];
+        input.PositionY = sprite.Position[1];
+        input.BoundWidth = sprite.BoundSize[0];
+        input.BoundHeight = sprite.BoundSize[1];
+        input.IsAffine = IsSemanticAffineOBJRole(spriteIndex);
+        if (input.IsAffine)
+        {
+            input.AffineGroupKey = static_cast<int>(sprite.Rotscale);
+            const auto group = std::find_if(
+                evidence.Groups.begin(), evidence.Groups.end(),
+                [&input](const WholeScene2DAffineOBJGroupDebugRecord& candidate)
+                {
+                    return candidate.RotscaleIndex == input.AffineGroupKey;
+                });
+            input.AffineGroupReady =
+                group != evidence.Groups.end() &&
+                group->MemberCount == 1 &&
+                group->RejectionMask == AffineOBJGroupRejectNone;
+        }
+        bandInputs.push_back(input);
+    }
+    WholeSceneOBJBandContext bandContext;
+    for (int layer = 0; layer < 4; layer++)
+    {
+        if ((LayerEnable & (1u << layer)) == 0)
+            continue;
+        const u32 type = LayerConfig.uBGConfig[layer].Type;
+        if (type == 2 || type == 3)
+            bandContext.AffineBGMask |= 1u << layer;
+        bandContext.BGPriority[layer] = BGCnt[layer] & 0x3u;
+    }
+    bandContext.OBJWindowEnabled = HasActiveOBJWindowParticipant();
+    evidence.OrdinaryBands = ClassifyWholeSceneOBJBands(
+        bandInputs, WholeSceneOBJBandLimit, bandContext);
 }
 
 void GLRenderer2D::AppendWholeSceneTimingCSVHeader(std::string& header, const char* prefix) const
@@ -3203,6 +5704,39 @@ void GLRenderer2D::AppendWholeSceneTimingCSVHeader(std::string& header, const ch
         add(std::string(tag) + "_full_frame_unsafe_misc_diff_mask");
     };
 
+    AppendWholeSceneOutputPlanCSVHeader(header, prefix);
+    add("affine_obj_count");
+    add("affine_obj_transformed_count");
+    add("affine_obj_double_size_count");
+    add("affine_obj_semitransparent_count");
+    add("affine_obj_bitmap_count");
+    add("affine_obj_mosaic_count");
+    add("affine_obj_distinct_rotscale_count");
+    add("affine_obj_shared_rotscale_sprite_count");
+    add("affine_obj_singleton_group_count");
+    add("affine_obj_shared_group_count");
+    add("affine_obj_singleton_cache_control_ready_count");
+    add("affine_obj_structural_multisprite_candidate_group_count");
+    add("strict_affine_connected_obj_source_slots");
+    add("affine_obj_rejected_shared_group_count");
+    add("affine_obj_touching_pairs");
+    add("affine_obj_overlapping_pairs");
+    add("affine_obj_same_rotscale_touching_pairs");
+    add("affine_obj_same_rotscale_overlapping_pairs");
+    add("affine_obj_same_state_touching_pairs");
+    add("affine_obj_same_state_overlapping_pairs");
+    add("affine_obj_min_x");
+    add("affine_obj_min_y");
+    add("affine_obj_max_x");
+    add("affine_obj_max_y");
+    add("affine_obj_mode_mask");
+    add("affine_obj_source_type_mask");
+    add("affine_obj_priority_mask");
+    add("affine_obj_source_generation");
+    add("affine_obj_source_hash");
+    add("affine_obj_transform_hash");
+    add("affine_obj_group_source_hash");
+    add("affine_obj_canonical_group_layout_hash");
     add("eligibility");
     add("path");
     add("current_path_reason");
@@ -3241,6 +5775,10 @@ void GLRenderer2D::AppendWholeSceneTimingCSVHeader(std::string& header, const ch
     add("full_frame_finalizer_passes");
     add("native_product_valid_rows");
     add("native_products_complete");
+    add("native_product_row_identity_valid");
+    add("native_product_row_identity_invalid_reason");
+    add("native_product_identity_rows");
+    add("native_product_frame_identity");
     add("native_product_epoch_valid");
     add("native_product_epoch_invalid_reason");
     add("native_product_frame_eligibility");
@@ -3248,7 +5786,6 @@ void GLRenderer2D::AppendWholeSceneTimingCSVHeader(std::string& header, const ch
     add("native_product_frame_path");
     add("native_product_last_path");
     add("native_product_finalizer_path_seen");
-    add("source_a_resolution_mode");
     add("source_a_request_background_epoch_serial");
     add("source_a_resolved_background_source");
     add("source_a_resolved_background_epoch_serial");
@@ -3302,7 +5839,6 @@ void GLRenderer2D::AppendWholeSceneTimingCSVHeader(std::string& header, const ch
     add("route_event_publish_product_capture_presentation_hash");
     add("route_event_publish_product_current_presentation_hash");
     add("route_event_publish_product_class");
-    add("source_a_product_choice_reason");
     add("capture_policy_authority");
     add("capture_policy_role");
     add("capture_policy_request_kind");
@@ -3321,15 +5857,9 @@ void GLRenderer2D::AppendWholeSceneTimingCSVHeader(std::string& header, const ch
     add("capture_repr_effect_state");
     add("capture_repr_effect_compatible");
     add("capture_repr_product_use_accepted");
-    add("capture_repr_presentation_hash_match");
-    add("capture_repr_stored_effect_owner");
-    add("capture_repr_stored_effect_state");
-    add("capture_repr_consume_effect_owner");
-    add("capture_repr_consume_effect_state");
-    add("capture_repr_effect_action");
-    add("capture_repr_effect_phase_incompatible");
-    add("capture_repr_final_pass_effect_owner");
-    add("capture_repr_apply_effect_on_blit");
+    add("capture_repr_product_row_scope_compatible");
+    add("capture_repr_product_valid_y_start");
+    add("capture_repr_product_valid_y_end");
     add("capture_repr_output_brightness_applied");
     add("capture_repr_output_effect_owner");
     add("capture_repr_output_effect_state");
@@ -3349,8 +5879,6 @@ void GLRenderer2D::AppendWholeSceneTimingCSVHeader(std::string& header, const ch
     add("source_a_chosen_product_kind");
     add("source_a_chosen_product_render_action");
     add("source_a_chosen_product_class");
-    add("source_a_prefer_exact_route_product");
-    add("source_a_full_product_candidate_presentation_match");
     add("source_a_full_product_candidate_capture_bank");
     add("source_a_full_product_candidate_tex");
     add("source_a_full_product_candidate_event_valid");
@@ -3382,6 +5910,68 @@ void GLRenderer2D::AppendWholeSceneTimingCSVHeader(std::string& header, const ch
     add("highres_3d");
     add("linear_3d");
     add("resolve_3d");
+    add("deferred_scanline_strict_affine_evaluated");
+    add("deferred_scanline_strict_affine_eligible");
+    add("deferred_scanline_strict_affine_reason");
+    add("deferred_strict_affine_historical_source_attempted");
+    add("deferred_strict_affine_historical_source_valid");
+    add("deferred_strict_affine_historical_source_used");
+    add("deferred_strict_affine_historical_source_y_end");
+    add("deferred_strict_affine_historical_native_bg_mask");
+    add("deferred_strict_affine_historical_enhanced_bg_mask");
+    add("deferred_strict_affine_row_source_epoch_count");
+    add("deferred_strict_affine_first_source_transition_y");
+    add("deferred_strict_affine_first_row_source_generation");
+    add("deferred_strict_affine_live_source_generation");
+    add("strict_affine_debug_product_class");
+    add("strict_affine_source_enhancement_decision");
+    add("strict_affine_enhanced_obj_active_slots");
+    add("strict_affine_enhanced_obj_cache_hits");
+    add("strict_affine_enhanced_obj_cache_misses");
+    add("strict_affine_enhanced_obj_neural_dispatches");
+    add("strict_affine_enhanced_obj_fallbacks");
+    add("strict_affine_ordinary_obj_native_stack");
+    add("strict_affine_resolved_obj_requested");
+    add("strict_affine_resolved_obj_ordinary_product_ready");
+    add("strict_affine_resolved_obj_ordinary_product_reused");
+    add("strict_affine_resolved_obj_merge_executed");
+    add("strict_affine_resolved_obj_rejection_mask");
+    add("strict_affine_obj_operand_plan_requested");
+    add("strict_affine_obj_operand_plan_no_affine_extension");
+    add("strict_affine_obj_operand_plan_special_isolation_ready");
+    add("strict_affine_obj_operand_plan_policy_ready");
+    add("strict_affine_obj_operand_plan_execution_ready");
+    add("strict_affine_obj_operand_plan_executed");
+    add("strict_affine_obj_operand_plan_native_stack_base");
+    add("strict_affine_obj_operand_plan_clean_bg3d_base");
+    add("strict_affine_obj_operand_plan_rejection_mask");
+    add("strict_affine_obj_operand_plan_operand_count");
+    add("strict_affine_obj_operand_plan_presentation_product_count");
+    add("strict_affine_obj_operand_plan_hash");
+    add("strict_affine_operand_excluded_overlay_requested");
+    add("strict_affine_operand_excluded_overlay_ready");
+    add("strict_affine_operand_excluded_overlay_executed");
+    add("strict_affine_operand_excluded_overlay_rejection_mask");
+    add("strict_affine_operand_excluded_overlay_oam_hash");
+    add("strict_affine_enhanced_bg_active_layers");
+    add("strict_affine_enhanced_bg_cache_hits");
+    add("strict_affine_enhanced_bg_cache_misses");
+    add("strict_affine_enhanced_bg_neural_dispatches");
+    add("strict_affine_enhanced_bg_fallbacks");
+    add("strict_affine_underlay_candidate_bg_mask");
+    add("strict_affine_constant_backdrop_proof_bg_mask");
+    add("strict_affine_constant_backdrop_composite_bg_mask");
+    add("strict_affine_bg2_underlay_reject_reasons");
+    add("strict_affine_bg3_underlay_reject_reasons");
+    add("strict_affine_bg2_underlay_backdrop_color");
+    add("strict_affine_bg3_underlay_backdrop_color");
+    add("strict_affine_deferred_text_bg_aa_requested");
+    add("strict_affine_deferred_text_bg_aa_executed");
+    add("strict_affine_deferred_ordinary_obj_candidate_requested");
+    add("strict_affine_deferred_ordinary_obj_candidate_product_ready");
+    add("strict_affine_deferred_ordinary_obj_candidate_evaluated");
+    add("strict_affine_candidate_valid");
+    add("strict_affine_native_reference_valid");
     add("native_exact_final");
     add("physical_final_native_input");
     add("native_3d_resolve");
@@ -3538,6 +6128,47 @@ void GLRenderer2D::AppendWholeSceneTimingCSVRow(std::string& row) const
         row += std::to_string(value);
     };
 
+    AppendWholeSceneOutputPlanCSVRow(
+        row,
+        WholeScenePlan,
+        WholeSceneRecipePreparation,
+        WholeSceneExecutionTrace);
+    WholeScene2DAffineOBJDebugEvidence affineOBJEvidence;
+    CaptureAffineOBJDebugEvidence(affineOBJEvidence);
+    const auto& affineOBJ = affineOBJEvidence.Summary;
+    addInt(affineOBJ.Count);
+    addInt(affineOBJ.TransformedCount);
+    addInt(affineOBJ.DoubleSizeCount);
+    addInt(affineOBJ.SemiTransparentCount);
+    addInt(affineOBJ.BitmapCount);
+    addInt(affineOBJ.MosaicCount);
+    addInt(affineOBJ.DistinctRotscaleCount);
+    addInt(affineOBJ.SharedRotscaleSpriteCount);
+    addInt(affineOBJ.SingletonGroupCount);
+    addInt(affineOBJ.SharedGroupCount);
+    addInt(affineOBJ.SingletonCacheControlReadyCount);
+    addInt(affineOBJ.StructuralMultiSpriteCandidateGroupCount);
+    addInt(std::count_if(ConnectedOBJSourceHashes, ConnectedOBJSourceHashes + NumSprites,
+                         [](u64 hash) { return hash != 0; }));
+    addInt(affineOBJ.RejectedSharedGroupCount);
+    addInt(affineOBJ.TouchingPairs);
+    addInt(affineOBJ.OverlappingPairs);
+    addInt(affineOBJ.SameRotscaleTouchingPairs);
+    addInt(affineOBJ.SameRotscaleOverlappingPairs);
+    addInt(affineOBJ.SameStateTouchingPairs);
+    addInt(affineOBJ.SameStateOverlappingPairs);
+    addInt(affineOBJ.MinX);
+    addInt(affineOBJ.MinY);
+    addInt(affineOBJ.MaxX);
+    addInt(affineOBJ.MaxY);
+    addInt(affineOBJ.OBJModeMask);
+    addInt(affineOBJ.SourceTypeMask);
+    addInt(affineOBJ.PriorityMask);
+    addU64(affineOBJ.SourceGeneration);
+    addU64(affineOBJ.SourceHash);
+    addU64(affineOBJ.TransformHash);
+    addU64(affineOBJ.GroupSourceHash);
+    addU64(affineOBJ.CanonicalGroupLayoutHash);
     addInt(WholeSceneScaleState);
     addInt(WholeSceneTrace.Path);
     addInt(WholeSceneTrace.CurrentReason);
@@ -3580,6 +6211,10 @@ void GLRenderer2D::AppendWholeSceneTimingCSVRow(std::string& row) const
     addInt(WholeSceneTrace.FullFrameFinalizerPasses);
     addInt(WholeSceneTrace.NativeProductValidRows);
     addInt(WholeSceneTrace.NativeProductsFrameComplete);
+    addInt(WholeSceneTrace.NativeProductRowIdentityValid);
+    addInt(WholeSceneTrace.NativeProductRowIdentityInvalidReason);
+    addInt(WholeSceneTrace.NativeProductIdentityRows);
+    addU64(WholeSceneTrace.NativeProductFrameIdentity);
     addInt(WholeSceneTrace.NativeProductEpochValid);
     addInt(WholeSceneTrace.NativeProductEpochInvalidReason);
     addInt(WholeSceneTrace.NativeProductFrameEligibility);
@@ -3587,7 +6222,6 @@ void GLRenderer2D::AppendWholeSceneTimingCSVRow(std::string& row) const
     addInt(WholeSceneTrace.NativeProductFramePath);
     addInt(WholeSceneTrace.NativeProductLastPath);
     addInt(WholeSceneTrace.NativeProductFinalizerPathSeen);
-    addInt(WholeSceneTrace.SourceACaptureMode);
     addU64(WholeSceneTrace.SourceABackgroundEpochSerial);
     addInt(WholeSceneTrace.EffectiveSourceABackgroundSource);
     addU64(WholeSceneTrace.EffectiveSourceABackgroundEpochSerial);
@@ -3641,7 +6275,6 @@ void GLRenderer2D::AppendWholeSceneTimingCSVRow(std::string& row) const
     addU64(WholeSceneTrace.RouteEventPublishProductCapturePresentationHash);
     addU64(WholeSceneTrace.RouteEventPublishProductCurrentPresentationHash);
     addInt(WholeSceneTrace.RouteEventPublishProductPresentationClass);
-    addInt(WholeSceneTrace.SourceAProductChoice);
     addInt(WholeSceneTrace.CaptureAuthority);
     addInt(WholeSceneTrace.CaptureRole);
     addInt(WholeSceneTrace.CaptureRequestKind);
@@ -3705,15 +6338,9 @@ void GLRenderer2D::AppendWholeSceneTimingCSVRow(std::string& row) const
     addInt(routeEffectState);
     addInt(representationEffectCompatible);
     addInt(WholeSceneTrace.CaptureProductUseAccepted);
-    addInt(WholeSceneTrace.CaptureProductPresentationHashMatch);
-    addInt(WholeSceneTrace.CaptureProductStoredEffectOwner);
-    addInt(WholeSceneTrace.CaptureProductStoredEffectState);
-    addInt(WholeSceneTrace.CaptureProductConsumeEffectOwner);
-    addInt(WholeSceneTrace.CaptureProductConsumeEffectState);
-    addInt(WholeSceneTrace.CaptureProductEffectAction);
-    addInt(WholeSceneTrace.CaptureProductEffectPhaseIncompatible);
-    addInt(WholeSceneTrace.CaptureProductFinalPassEffectOwner);
-    addInt(WholeSceneTrace.CaptureProductApplyEffectOnBlit);
+    addInt(WholeSceneTrace.CaptureProductRowScopeCompatible);
+    addInt(WholeSceneTrace.CaptureProductValidYStart);
+    addInt(WholeSceneTrace.CaptureProductValidYEnd);
     addInt(WholeSceneTrace.OutputPresentationMasterBrightnessApplied);
     addInt(WholeSceneTrace.OutputPresentationEffectOwner);
     addInt(WholeSceneTrace.OutputPresentationEffectState);
@@ -3733,8 +6360,6 @@ void GLRenderer2D::AppendWholeSceneTimingCSVRow(std::string& row) const
     addInt(WholeSceneTrace.SourceAChosenProductKind);
     addInt(WholeSceneTrace.SourceAChosenProductRenderAction);
     addInt(WholeSceneTrace.SourceAChosenProductPresentationClass);
-    addInt(WholeSceneTrace.SourceAPreferExactRouteProduct);
-    addInt(WholeSceneTrace.SourceAFullProductKeyMatch);
     addInt(WholeSceneTrace.SourceAFullProductCaptureBank);
     addInt(WholeSceneTrace.SourceAFullProductTex);
     addInt(WholeSceneTrace.SourceAFullProductEventValid);
@@ -3766,6 +6391,79 @@ void GLRenderer2D::AppendWholeSceneTimingCSVRow(std::string& row) const
     addInt(WholeSceneTrace.HighRes3D);
     addInt(WholeSceneTrace.Linear3D);
     addInt(WholeSceneTrace.Resolve3D);
+    addInt(WholeSceneTrace.DeferredScanlineStrictAffineEvaluated);
+    addInt(WholeSceneTrace.DeferredScanlineStrictAffineEligible);
+    addInt(WholeSceneTrace.DeferredScanlineStrictAffineReason);
+    addInt(WholeSceneTrace.DeferredStrictAffineHistoricalSourceAttempted);
+    addInt(WholeSceneTrace.DeferredStrictAffineHistoricalSourceValid);
+    addInt(WholeSceneTrace.DeferredStrictAffineHistoricalSourceUsed);
+    addInt(WholeSceneTrace.DeferredStrictAffineHistoricalSourceYEnd);
+    addInt(WholeSceneTrace.DeferredStrictAffineHistoricalNativeBGMask);
+    addInt(WholeSceneTrace.DeferredStrictAffineHistoricalEnhancedBGMask);
+    addInt(WholeSceneTrace.DeferredStrictAffineRowSourceEpochCount);
+    addInt(WholeSceneTrace.DeferredStrictAffineFirstSourceTransitionY);
+    addU64(WholeSceneTrace.DeferredStrictAffineFirstRowSourceGeneration);
+    addU64(WholeSceneTrace.DeferredStrictAffineLiveSourceGeneration);
+    addInt(WholeSceneTrace.StrictAffineDebugClass);
+    addInt(WholeSceneTrace.StrictAffineSourceEnhancement);
+    addInt(WholeSceneTrace.StrictAffineEnhancedOBJActiveSlots);
+    addInt(WholeSceneTrace.StrictAffineEnhancedOBJCacheHits);
+    addInt(WholeSceneTrace.StrictAffineEnhancedOBJCacheMisses);
+    addInt(WholeSceneTrace.StrictAffineEnhancedOBJNeuralDispatches);
+    addInt(WholeSceneTrace.StrictAffineEnhancedOBJFallbacks);
+    addInt(WholeSceneTrace.StrictAffineOrdinaryOBJNativeStack);
+    addInt(WholeSceneTrace.StrictAffineResolvedOBJRequested);
+    addInt(WholeSceneTrace.StrictAffineResolvedOBJOrdinaryProductReady);
+    addInt(WholeSceneTrace.StrictAffineResolvedOBJOrdinaryProductReused);
+    addInt(WholeSceneTrace.StrictAffineResolvedOBJMergeExecuted);
+    addInt(WholeSceneTrace.StrictAffineResolvedOBJRejectionMask);
+    addInt(WholeSceneTrace.StrictAffineOBJOperandPlanRequested);
+    addInt(WholeSceneTrace.StrictAffineOBJOperandPlanNoAffineExtension);
+    addInt(WholeSceneTrace.StrictAffineOBJOperandPlanSpecialIsolationReady);
+    // Compatibility columns retained for existing harvested replay
+    // assertions. Their values now derive from plan intent and the typed
+    // execution assessment instead of parallel mutable trace booleans.
+    addInt(WholeSceneRecipePreparation.OrderedPresentation.Bound);
+    addInt(WholeSceneExecutionTrace.
+        StrictAffineProductAssessment.OrderedOperandsReady);
+    addInt(WholeSceneExecutionTrace.StrictAffinePresentationExecutionKind ==
+        WholeSceneStrictAffinePresentationKind::OrderedOperands);
+    addInt(false);
+    addInt(WholeSceneTrace.StrictAffineOBJOperandPlanCleanBG3DBase);
+    addInt(WholeSceneTrace.StrictAffineOBJOperandPlanRejectionMask);
+    addInt(WholeSceneTrace.StrictAffineOBJOperandPlanOperandCount);
+    addInt(WholeSceneTrace.StrictAffineOBJOperandPlanPresentationProductCount);
+    addU64(WholeSceneTrace.StrictAffineOBJOperandPlanHash);
+    addInt(WholeSceneTrace.StrictAffineOperandExcludedOverlayRequested);
+    addInt(WholeSceneExecutionTrace.
+        StrictAffineProductAssessment.OperandExcludedOverlayReady);
+    addInt(WholeSceneExecutionTrace.
+        OperandExcludedOverlayRecipeExecutionObserved);
+    addInt(
+        WholeSceneTrace.StrictAffineOperandExcludedOverlayRejectionMask);
+    addU64(WholeSceneTrace.StrictAffineOperandExcludedOverlayOAMHash);
+    addInt(WholeSceneTrace.StrictAffineEnhancedBGActiveLayers);
+    addInt(WholeSceneTrace.StrictAffineEnhancedBGCacheHits);
+    addInt(WholeSceneTrace.StrictAffineEnhancedBGCacheMisses);
+    addInt(WholeSceneTrace.StrictAffineEnhancedBGNeuralDispatches);
+    addInt(WholeSceneTrace.StrictAffineEnhancedBGFallbacks);
+    addInt(WholeSceneTrace.StrictAffineUnderlayCandidateBGMask);
+    addInt(WholeSceneTrace.StrictAffineConstantBackdropProofBGMask);
+    addInt(WholeSceneTrace.StrictAffineConstantBackdropCompositeBGMask);
+    addInt(WholeSceneTrace.StrictAffineBG2UnderlayRejectReasons);
+    addInt(WholeSceneTrace.StrictAffineBG3UnderlayRejectReasons);
+    addInt(WholeSceneTrace.StrictAffineBG2UnderlayBackdropColor);
+    addInt(WholeSceneTrace.StrictAffineBG3UnderlayBackdropColor);
+    addInt(WholeSceneTrace.StrictAffineDeferredTextBGAARequested);
+    addInt(WholeSceneTrace.StrictAffineDeferredTextBGAAExecuted);
+    addInt(
+        WholeSceneTrace.StrictAffineDeferredOrdinaryOBJCandidateRequested);
+    addInt(
+        WholeSceneTrace.StrictAffineDeferredOrdinaryOBJCandidateProductReady);
+    addInt(
+        WholeSceneTrace.StrictAffineDeferredOrdinaryOBJCandidateEvaluated);
+    addInt(WholeSceneTrace.StrictAffineCandidateValid);
+    addInt(WholeSceneTrace.StrictAffineNativeReferenceValid);
     addInt(WholeSceneTrace.NativeExactFinalValid);
     addInt(WholeSceneTrace.PhysicalFinalNativeInputValid);
     addInt(WholeSceneTrace.Native3DResolveValid);
@@ -3933,6 +6631,7 @@ void GLRenderer2D::AppendWholeSceneTimingCSVRow(std::string& row) const
 
 void GLRenderer2D::ResetWholeSceneUpdateTiming()
 {
+    WholeSceneDebugProducts = {};
     CaptureBackedHandoff.FrameSerial++;
     CaptureBackedHandoff.BackgroundUpdated = false;
     CaptureBackedHandoff.ReuseDecision = CaptureBackedHandoffReuseReason::None;
@@ -4038,10 +6737,10 @@ bool GLRenderer2D::CanBypassWholeSceneHybridPresentationGuardForDirect2D(int yst
     bool screenSwap = false;
     if (!Parent.GetFinalPassScreenSwapForRange(ystart, yend, screenSwap))
         return false;
+    // A uniform screen-swap-only transition is still direct A/B output. The
+    // final pass owns physical routing, so the temporal excursion heuristic
+    // must not override otherwise-current direct-output products here.
     (void)screenSwap;
-
-    if (Parent.IsFinalPresentationScreenSwapExcursionActiveForRange(ystart, yend))
-        return false;
 
     // Master brightness is applied by the final pass, so it does not change
     // which direct-2D renderer owns the physical screen.
@@ -4139,11 +6838,20 @@ bool GLRenderer2D::IsWholeSceneCaptureBackedHandoffCandidate() const
     const bool hasProvenRouteProduct =
         CaptureBackedRoute[currentRouteSlot].Product.Valid &&
         CaptureBackedRoute[currentRouteSlot].Product.CapturedEventSerial;
+    HandoffStableLiveCandidateInputs stableLiveInputs = {};
+    stableLiveInputs.Direct3DOnlyLiveBackground = direct3DOnlyLiveBackground;
+    stableLiveInputs.HasProvenRouteProduct = hasProvenRouteProduct;
+    stableLiveInputs.RouteHasCapturedPhase =
+        CaptureBackedRoute[currentRouteSlot].HasCapturedPhase;
+    stableLiveInputs.CurrentCaptureEventMatchesRoute =
+        CurrentCaptureEventMatchesHandoffRoute(currentRouteSlot);
+    stableLiveInputs.CurrentCaptureEventFresh =
+        CurrentCaptureEventIsFreshForHandoffRoute(currentRouteSlot);
+    stableLiveInputs.HasNoBGUpload =
+        WholeSceneCurrentUpdateDebugTrace.BGUploadRows == 0;
+    stableLiveInputs.NativeProductEpochValid = WholeSceneNativeProductEpochValid;
     const bool stableKnownLiveRoute =
-        direct3DOnlyLiveBackground &&
-        hasProvenRouteProduct &&
-        WholeSceneCurrentUpdateDebugTrace.BGUploadRows == 0 &&
-        WholeSceneNativeProductEpochValid;
+        ::melonDS::IsHandoffStableLiveCandidate(stableLiveInputs);
 
     return visibleFullDisplaySourceACaptureBG ||
            stableKnownLiveRoute ||
@@ -4160,15 +6868,16 @@ bool GLRenderer2D::ShouldUseWholeSceneCaptureBackedHandoffForRange(int ystart, i
     if (slot < 0 || slot >= kCaptureBackedHandoffRouteSlots)
         return false;
 
-    if (key.Phase == CaptureBackedHandoffPhase::CapturedBitmap)
-        return HasOnlyFullDisplayCaptureFromSourceABGLayers() ||
-               CaptureBackedRoute[slot].HasCapturedPhase;
-
-    if (key.Phase == CaptureBackedHandoffPhase::Live3D)
-        return CaptureBackedRoute[slot].HasCapturedPhase ||
-               IsStableCaptureBackedHandoffLiveUpdate(key);
-
-    return false;
+    HandoffPresentationEligibilityInputs inputs = {};
+    inputs.Phase = key.Phase;
+    inputs.RouteHasCapturedPhase = CaptureBackedRoute[slot].HasCapturedPhase;
+    inputs.CurrentCaptureEventMatchesRoute =
+        CurrentCaptureEventMatchesHandoffRoute(slot);
+    inputs.CurrentCaptureEventFresh =
+        CurrentCaptureEventIsFreshForHandoffRoute(slot);
+    inputs.HasOnlyFullDisplaySourceACapture =
+        HasOnlyFullDisplayCaptureFromSourceABGLayers();
+    return ::melonDS::ShouldUseHandoffPresentation(inputs);
 }
 
 void GLRenderer2D::UpdateWholeSceneCaptureBackedHandoffGuard()
@@ -4228,6 +6937,39 @@ int GLRenderer2D::BeginCaptureBackedHandoffRoute(int ystart, int yend)
 int GLRenderer2D::CaptureBackedHandoffRouteSlot(const CaptureBackedHandoffRouteKey& key) const
 {
     return key.EngineFinalBottom ? 1 : 0;
+}
+
+bool GLRenderer2D::CurrentCaptureEventMatchesHandoffRoute(int slot) const
+{
+    if (slot < 0 || slot >= kCaptureBackedHandoffRouteSlots)
+        return false;
+
+    const auto& event = Parent.LastHighResDisplayCaptureEvent;
+    const auto& product = CaptureBackedRoute[slot].Product;
+    return event.Valid &&
+           event.Serial != 0 &&
+           event.RejectReason == GLRenderer::HighResCaptureRejectReason::None &&
+           event.MainEngineFinalBottom == (slot == 1) &&
+           product.Valid &&
+           product.CapturedEventSerial == event.Serial &&
+           product.Identity.CaptureBank == event.DstBlock &&
+           product.Identity.Source3DSerial == event.Source3DSerial &&
+           product.Identity.Source3DSceneHash == event.Source3DSceneHash &&
+           product.Identity.CapturePresentationHash ==
+               event.SourcePresentationHash;
+}
+
+bool GLRenderer2D::CurrentCaptureEventIsFreshForHandoffRoute(int slot) const
+{
+    if (slot < 0 || slot >= kCaptureBackedHandoffRouteSlots)
+        return false;
+
+    const auto& product = CaptureBackedRoute[slot].Product;
+    return product.Valid &&
+           product.CapturedEventSerial != 0 &&
+           CaptureBackedHandoff.FrameSerial -
+                   product.CapturedEventFrameSerial <=
+               1;
 }
 
 bool GLRenderer2D::IsStableCaptureBackedHandoffLiveUpdate(const CaptureBackedHandoffRouteKey& key) const
@@ -4393,18 +7135,6 @@ void GLRenderer2D::UpdateCaptureBackedRoutePresentation(int slot,
     state.SourcePresentationHash = sourcePresentationHash;
     state.CurrentOverlayPresentationHash = currentOverlayPresentationHash;
     state.StableFrames = stableFrames;
-}
-
-void GLRenderer2D::InvalidateCaptureBackedRouteProduct(int slot)
-{
-    if (slot >= 0 && slot < kCaptureBackedHandoffRouteSlots)
-    {
-        ClearCaptureBackedRouteProductState(slot);
-        return;
-    }
-
-    for (int i = 0; i < kCaptureBackedHandoffRouteSlots; i++)
-        ClearCaptureBackedRouteProductState(i);
 }
 
 int GLRenderer2D::VisibleSingleDisplayCaptureBank() const
@@ -5226,6 +7956,7 @@ void GLRenderer2D::UploadBGVRAM(NonStupidBitField<1024>& bgDirty, int line)
                         1024, end - start,
                         GL_RED_INTEGER, GL_UNSIGNED_BYTE,
                         &vram[start * 1024]);
+        BGVRAMUploadCache.RecordUpload(vram, start * 1024, (end - start) * 1024);
     }
 }
 
@@ -5904,6 +8635,15 @@ void GLRenderer2D::AppendWholeSceneBitmapFMVTrace(std::string& status) const
 
 void GLRenderer2D::AppendWholeSceneTextureStatsTrace(std::string& status) const
 {
+    if (WholeSceneTrace.StrictAffineCandidateValid)
+    {
+        status += "\n\nStrict affine candidate trace:";
+        status += FormatTextureContentStats("StrictAffineCandidateTex", StrictAffineCandidateTex);
+        if (WholeSceneTrace.StrictAffineNativeReferenceValid)
+            status += FormatTextureContentStats("NativeOutputTex", NativeOutputTex);
+        return;
+    }
+
     if (WholeSceneTrace.Path != WholeSceneRenderPath::FinalNativeUpscale &&
         WholeSceneTrace.Path != WholeSceneRenderPath::OverlayOperatorUpscale &&
         WholeSceneTrace.Path != WholeSceneRenderPath::ConservativeHybridUpscale)
@@ -5932,7 +8672,18 @@ void GLRenderer2D::AppendWholeSceneTextureStatsTrace(std::string& status) const
     }
 }
 
-std::string GLRenderer2D::DescribeWholeSceneScaleState() const
+std::string GLRenderer2D::DescribeWholeSceneScaleState(WholeScene2DDebugReadContext* context) const
+{
+    if (!context)
+        return BuildWholeSceneScaleStateDescription();
+
+    auto& status = context->EngineStatus[GPU2D.Num];
+    if (!status)
+        status = BuildWholeSceneScaleStateDescription();
+    return *status;
+}
+
+std::string GLRenderer2D::BuildWholeSceneScaleStateDescription() const
 {
     auto withCoreTrace = [this](std::string status)
     {
@@ -5982,7 +8733,8 @@ bool GLRenderer2D::ReadWholeSceneDebugView(WholeScene2DDebugView view,
                                            int& width,
                                            int& height,
                                            std::vector<u32>& rgba,
-                                           std::string* status) const
+                                           std::string* status,
+                                           WholeScene2DDebugReadContext* context) const
 {
     width = 0;
     height = 0;
@@ -6005,10 +8757,17 @@ bool GLRenderer2D::ReadWholeSceneDebugView(WholeScene2DDebugView view,
     bool decodeOBJCoverage = false;
     bool decodeAlphaCoverage = false;
     bool decodeSandwichProbe = false;
+    bool decodeStrictAffineDownsampleDifference = false;
+    bool decodeStrictAffineSourceRGBA = false;
+    bool decodeStrictAffineOBJColor = false;
+    bool decodeStrictAffineOBJCoverage = false;
     int sandwichProbeMode = 0;
     bool useTextureLevelSize = false;
     int logicalWidth = 0;
     int logicalHeight = 0;
+    int logicalX = 0;
+    int logicalY = 0;
+    int selectedAffineOBJ = -1;
     int nativeLayerDebugLayer = -1;
 
     switch (view)
@@ -6235,6 +8994,254 @@ bool GLRenderer2D::ReadWholeSceneDebugView(WholeScene2DDebugView view,
         height = 192;
         decodeAlphaCoverage = true;
         break;
+    case WholeScene2DDebugView::StrictAffineCandidate:
+        if (!WholeSceneTrace.StrictAffineCandidateValid)
+        {
+            if (status)
+                *status = "The strict affine candidate was not generated for this frame.";
+            return false;
+        }
+        texture = StrictAffineCandidateTex;
+        width = ScreenW;
+        height = ScreenH;
+        break;
+    case WholeScene2DDebugView::StrictAffineNativeReference:
+        if (!WholeSceneTrace.StrictAffineNativeReferenceValid)
+        {
+            if (status)
+                *status = "The independent native reference was not generated for this frame.";
+            return false;
+        }
+        texture = NativeOutputTex;
+        width = 256;
+        height = 192;
+        break;
+    case WholeScene2DDebugView::StrictAffineDownsampleDifference:
+        if (!WholeSceneTrace.StrictAffineCandidateValid ||
+            !WholeSceneTrace.StrictAffineNativeReferenceValid)
+        {
+            if (status)
+                *status = "The strict affine candidate and independent native reference were not both generated for this frame.";
+            return false;
+        }
+        texture = StrictAffineCandidateTex;
+        width = ScreenW;
+        height = ScreenH;
+        decodeStrictAffineDownsampleDifference = true;
+        break;
+    case WholeScene2DDebugView::StrictAffineEnhancedBG2Source:
+    case WholeScene2DDebugView::StrictAffineEnhancedBG3Source:
+    {
+        const int bg = view == WholeScene2DDebugView::StrictAffineEnhancedBG2Source
+            ? 2
+            : 3;
+        const auto& source = LayerConfig.uBGConfig[bg];
+        const StrictAffineSourceEnhancementDecision sourceEnhancement =
+            WholeSceneTrace.StrictAffineSourceEnhancement;
+        const int sourceScale = sourceEnhancement ==
+                StrictAffineSourceEnhancementDecision::Spline36Inline
+            ? (ScaleFactor >= 4 ? 4 : 2)
+            : StrictAffineCachedSourceScale(sourceEnhancement, ScaleFactor);
+        const bool backdropPrecomposed =
+            (WholeSceneTrace.StrictAffineConstantBackdropCompositeBGMask &
+             (1u << bg)) != 0;
+        const u32 backdropColor = backdropPrecomposed
+            ? (bg == 2
+                ? WholeSceneTrace.StrictAffineBG2UnderlayBackdropColor
+                : WholeSceneTrace.StrictAffineBG3UnderlayBackdropColor)
+            : 0;
+        const bool valid =
+            WholeSceneTrace.StrictAffineCandidateValid &&
+            (LayerEnable & (1u << bg)) != 0 &&
+            source.Type <= 3 &&
+            sourceScale > 1 &&
+            EnhancedBGLayerSourceGeneration[bg] == BGLayerSourceGeneration[bg] &&
+            EnhancedBGLayerAlgorithm[bg] ==
+                static_cast<u32>(WholeSceneScaleAlgorithm) &&
+            EnhancedBGLayerBackdropPrecomposed[bg] == backdropPrecomposed &&
+            EnhancedBGLayerBackdropColor[bg] == backdropColor &&
+            EnhancedBGLayerWidth[bg] ==
+                static_cast<u32>(source.Size[0] * sourceScale) &&
+            EnhancedBGLayerHeight[bg] ==
+                static_cast<u32>(source.Size[1] * sourceScale);
+        if (!valid)
+        {
+            if (status)
+                *status = "The current frame has no valid enhanced source product for this BG. The view requires the strict affine path, source enhancement, and Spline36, ArtCNN, CuNNy, NNEDI3 or xBRZ. Spline36's debug reconstruction is generated only while auxiliary debug views are active.";
+            return false;
+        }
+        texture = EnhancedBGLayerTex[bg];
+        useTextureLevelSize = true;
+        decodeStrictAffineSourceRGBA = true;
+        break;
+    }
+    case WholeScene2DDebugView::StrictAffineAssembledOBJSourceAtlas:
+        if (!OpaqueOBJAssemblyTex || !WholeSceneExecutionTrace.OrderedOpaqueAssemblyCount)
+        {
+            if (status) *status = "No current compatible normal-source assembly.";
+            return false;
+        }
+        texture = OpaqueOBJAssemblyTex;
+        useTextureLevelSize = true;
+        decodeStrictAffineSourceRGBA = true;
+        break;
+    case WholeScene2DDebugView::NativeOBJSourceAtlas:
+        texture = SpriteTex;
+        useTextureLevelSize = true;
+        decodeStrictAffineSourceRGBA = true;
+        break;
+    case WholeScene2DDebugView::StrictAffineEnhancedOBJSourceAtlas:
+        if (!WholeSceneTrace.StrictAffineCandidateValid || !EnhancedSpriteTex ||
+            (EnhancedOBJSourceValidMask[0] == 0 && EnhancedOBJSourceValidMask[1] == 0))
+        {
+            if (status) *status = "No current enhanced affine sprite source atlas is available.";
+            return false;
+        }
+        texture = EnhancedSpriteTex;
+        useTextureLevelSize = true;
+        decodeStrictAffineSourceRGBA = true;
+        break;
+    case WholeScene2DDebugView::StrictAffineEnhancedOBJSource:
+    {
+        if (!WholeSceneTrace.StrictAffineCandidateValid)
+        {
+            if (status)
+                *status = "No cached enhanced affine-OBJ source was generated for the current strict-affine frame.";
+            return false;
+        }
+
+        for (int sprite = 0; sprite < NumSprites; sprite++)
+        {
+            const auto& source = SpriteConfig.uOAM[sprite];
+            if (source.Rotscale == static_cast<u32>(-1) ||
+                source.Type >= 3 ||
+                IsOrdinaryEquivalentAffineSprite(sprite))
+                continue;
+            if (!IsEnhancedOBJSourceValid(sprite,
+                                          BuildEnhancedOBJSourceKey(sprite)))
+                continue;
+            selectedAffineOBJ = sprite;
+            break;
+        }
+        if (selectedAffineOBJ < 0)
+        {
+            if (status)
+                *status = "No active strict-path affine OBJ has a valid cached source product. This view requires ArtCNN, CuNNy, NNEDI3 or xBRZ affine source enhancement.";
+            return false;
+        }
+
+        const auto& source = SpriteConfig.uOAM[selectedAffineOBJ];
+        const int sourceScale = static_cast<int>(EnhancedSpriteSourceScale);
+        texture = EnhancedSpriteTex;
+        useTextureLevelSize = true;
+        logicalX = (selectedAffineOBJ & 0xF) * 64 * sourceScale;
+        logicalY = (selectedAffineOBJ >> 4) * 64 * sourceScale;
+        logicalX += EnhancedOBJSourceRegions[selectedAffineOBJ][0] * sourceScale;
+        logicalY += EnhancedOBJSourceRegions[selectedAffineOBJ][1] * sourceScale;
+        logicalWidth = source.Size[0] * sourceScale;
+        logicalHeight = source.Size[1] * sourceScale;
+        decodeStrictAffineSourceRGBA = true;
+        break;
+    }
+    case WholeScene2DDebugView::StrictAffineTransformedOBJColor:
+        if (!WholeSceneTrace.StrictAffineCandidateValid ||
+            (!WholeSceneTrace.StrictAffineOrdinaryOBJNativeStack &&
+             !WholeSceneTrace.StrictAffineResolvedOBJMergeExecuted))
+        {
+            if (status)
+                *status = "The separated transformed affine-OBJ layer was not generated for the current frame.";
+            return false;
+        }
+        texture = StrictAffineOBJLayerTex;
+        textureTarget = GL_TEXTURE_2D_ARRAY;
+        textureLayer = 0;
+        width = ScreenW;
+        height = ScreenH;
+        decodeStrictAffineOBJColor = true;
+        break;
+    case WholeScene2DDebugView::StrictAffineTransformedOBJCoverage:
+        if (!WholeSceneTrace.StrictAffineCandidateValid ||
+            (!WholeSceneTrace.StrictAffineOrdinaryOBJNativeStack &&
+             !WholeSceneTrace.StrictAffineResolvedOBJMergeExecuted))
+        {
+            if (status)
+                *status = "The separated transformed affine-OBJ layer was not generated for the current frame.";
+            return false;
+        }
+        texture = StrictAffineOBJLayerTex;
+        textureTarget = GL_TEXTURE_2D_ARRAY;
+        textureLayer = 2;
+        width = ScreenW;
+        height = ScreenH;
+        decodeStrictAffineOBJCoverage = true;
+        break;
+    case WholeScene2DDebugView::StrictAffineOrdinaryOBJBand0Color:
+    case WholeScene2DDebugView::StrictAffineOrdinaryOBJBand0Coverage:
+        if (!OrdinaryOBJBandProductsValid ||
+            OrdinaryOBJBandProducts.Summary.BandCount <= 0)
+        {
+            if (status)
+                *status = "No full-frame, normal-mode ordered ordinary-OBJ band product was generated for the current frame.";
+            return false;
+        }
+        texture = OrdinaryOBJBandLayerTex;
+        textureTarget = GL_TEXTURE_2D_ARRAY;
+        textureLayer =
+            view == WholeScene2DDebugView::StrictAffineOrdinaryOBJBand0Color
+                ? 0 : 2;
+        width = 256;
+        height = 192;
+        decodeOBJCoverage =
+            view == WholeScene2DDebugView::StrictAffineOrdinaryOBJBand0Coverage;
+        break;
+    case WholeScene2DDebugView::StrictAffineOrdinaryOBJBand0Scaled:
+        if (!OrdinaryOBJBandScaledProductsValid ||
+            OrdinaryOBJBandProducts.Summary.BandCount <= 0)
+        {
+            if (status)
+                *status = "No selected-scaler ordered ordinary-OBJ band product was generated for the current frame.";
+            return false;
+        }
+        texture = OrdinaryOBJBandScaledTex;
+        textureTarget = GL_TEXTURE_2D_ARRAY;
+        textureLayer = 0;
+        width = static_cast<int>(OrdinaryOBJBandScaledWidth);
+        height = static_cast<int>(OrdinaryOBJBandScaledHeight);
+        break;
+    case WholeScene2DDebugView::StrictAffineOverlapSemantic:
+    case WholeScene2DDebugView::StrictAffineOverlapUnderlay:
+    case WholeScene2DDebugView::StrictAffineOverlapDecisions:
+    case WholeScene2DDebugView::StrictAffineOverlapSubpixelColor:
+    case WholeScene2DDebugView::StrictAffineOverlapSubpixelFlags:
+    case WholeScene2DDebugView::StrictAffineOverlapSubpixelCoverage:
+    {
+        if (!WholeSceneDebugProducts.AffineOverlap)
+        {
+            if (status)
+                *status = "No full-frame immediate-compositor localized 2x overlap snapshot was produced this frame. Ordered/native-stack paths and partial passes are not represented.";
+            return false;
+        }
+        const int index = static_cast<int>(view) -
+            static_cast<int>(WholeScene2DDebugView::StrictAffineOverlapSemantic);
+        texture = index < 3 ? AffineOverlapDebugTex : AffineOverlapInputDebugTex;
+        textureTarget = GL_TEXTURE_2D_ARRAY;
+        textureLayer = index % 3;
+        width = AffineOverlapDebugWidth * (index < 3 ? 1 : 2);
+        height = AffineOverlapDebugHeight * (index < 3 ? 1 : 2);
+        break;
+    }
+    case WholeScene2DDebugView::StrictAffineResolvedOrdinaryOBJ:
+        if (!ResolvedOrdinaryOBJValid ||
+            !WholeSceneTrace.StrictAffineResolvedOBJOrdinaryProductReady)
+        {
+            if (status)
+                *status = "No unified ordinary-OBJ reconstruction was generated for the current frame.";
+            return false;
+        }
+        texture = ResolvedOrdinaryOBJTex;
+        width = static_cast<int>(ResolvedOrdinaryOBJWidth);
+        height = static_cast<int>(ResolvedOrdinaryOBJHeight);
+        break;
     case WholeScene2DDebugView::Direct3D:
         if (GPU2D.Num != 0)
         {
@@ -6276,10 +9283,12 @@ bool GLRenderer2D::ReadWholeSceneDebugView(WholeScene2DDebugView view,
         height = ScreenH;
         break;
     case WholeScene2DDebugView::HybridSelector:
-        if (WholeSceneTrace.Path != WholeSceneRenderPath::ConservativeHybridUpscale)
+        if ((WholeSceneTrace.Path != WholeSceneRenderPath::ConservativeHybridUpscale ||
+             !WholeScenePlan.Selector.EffectiveConservativeHybrid) &&
+            WholeSceneTrace.Path != WholeSceneRenderPath::StrictAffineHighRes)
         {
             if (status)
-                *status = "Hybrid selector debug requires conservative hybrid overlay upscale mode.";
+                *status = "Selector debug requires an active conservative hybrid selector or strict high-resolution affine mode.";
             return false;
         }
         texture = HybridSelectorTex;
@@ -6287,10 +9296,11 @@ bool GLRenderer2D::ReadWholeSceneDebugView(WholeScene2DDebugView view,
         height = ScreenH;
         break;
     case WholeScene2DDebugView::HybridCoverageMiss:
-        if (WholeSceneTrace.Path != WholeSceneRenderPath::ConservativeHybridUpscale)
+        if (WholeSceneTrace.Path != WholeSceneRenderPath::ConservativeHybridUpscale ||
+            !WholeScenePlan.Selector.EffectiveConservativeHybrid)
         {
             if (status)
-                *status = "Hybrid coverage miss debug requires conservative hybrid overlay upscale mode.";
+                *status = "Hybrid coverage miss debug requires an active conservative hybrid selector.";
             return false;
         }
         texture = HybridCoverageMissTex;
@@ -6298,10 +9308,12 @@ bool GLRenderer2D::ReadWholeSceneDebugView(WholeScene2DDebugView view,
         height = ScreenH;
         break;
     case WholeScene2DDebugView::HybridForegroundAlpha:
-        if (WholeSceneTrace.Path != WholeSceneRenderPath::ConservativeHybridUpscale)
+        if ((WholeSceneTrace.Path != WholeSceneRenderPath::ConservativeHybridUpscale ||
+             !WholeScenePlan.Selector.EffectiveConservativeHybrid) &&
+            WholeSceneTrace.Path != WholeSceneRenderPath::StrictAffineHighRes)
         {
             if (status)
-                *status = "Hybrid foreground alpha debug requires conservative hybrid overlay upscale mode.";
+                *status = "Foreground/coverage debug requires an active conservative hybrid selector or strict high-resolution affine mode.";
             return false;
         }
         texture = HybridForegroundAlphaTex;
@@ -6309,10 +9321,11 @@ bool GLRenderer2D::ReadWholeSceneDebugView(WholeScene2DDebugView view,
         height = ScreenH;
         break;
     case WholeScene2DDebugView::HybridFinalSource:
-        if (WholeSceneTrace.Path != WholeSceneRenderPath::ConservativeHybridUpscale)
+        if (WholeSceneTrace.Path != WholeSceneRenderPath::ConservativeHybridUpscale ||
+            !WholeScenePlan.Selector.EffectiveConservativeHybrid)
         {
             if (status)
-                *status = "Hybrid final source debug requires conservative hybrid overlay upscale mode.";
+                *status = "Hybrid final source debug requires an active conservative hybrid selector.";
             return false;
         }
         texture = HybridFinalSourceTex;
@@ -6376,7 +9389,7 @@ bool GLRenderer2D::ReadWholeSceneDebugView(WholeScene2DDebugView view,
     if (requiresWholeScene && !CanUseWholeSceneScalePath())
     {
         if (status)
-            *status = DescribeWholeSceneScaleState();
+            *status = DescribeWholeSceneScaleState(context);
         return false;
     }
 
@@ -6399,6 +9412,42 @@ bool GLRenderer2D::ReadWholeSceneDebugView(WholeScene2DDebugView view,
     {
         if (status)
             *status = "This auxiliary debug view is generated only while the whole-scene debug dialog is active.";
+        return false;
+    }
+
+    bool diagnosticProduced = true;
+    switch (view)
+    {
+    case WholeScene2DDebugView::OverlayReconstructedNative:
+    case WholeScene2DDebugView::OverlayReconstructionError:
+    case WholeScene2DDebugView::OverlayValidityConfidence:
+        diagnosticProduced = WholeSceneDebugProducts.OverlayNative;
+        break;
+    case WholeScene2DDebugView::OverlayUnderlayWeight:
+    case WholeScene2DDebugView::OverlayOwnershipReason:
+        diagnosticProduced = WholeSceneDebugProducts.OverlayScaled;
+        break;
+    case WholeScene2DDebugView::HybridSelector:
+        diagnosticProduced = WholeSceneDebugProducts.HybridSelector;
+        break;
+    case WholeScene2DDebugView::HybridCoverageMiss:
+        diagnosticProduced = WholeSceneDebugProducts.HybridCoverageMiss;
+        break;
+    case WholeScene2DDebugView::HybridForegroundAlpha:
+        diagnosticProduced = WholeSceneDebugProducts.HybridForegroundAlpha;
+        break;
+    case WholeScene2DDebugView::HybridFinalSource:
+        diagnosticProduced = WholeSceneDebugProducts.HybridFinalSource;
+        break;
+    default:
+        break;
+    }
+    if (!diagnosticProduced)
+    {
+        if (status)
+            *status = "This diagnostic was not generated in full for the current frame; "
+                      "the selected rendering path may not produce it, or capture/settings "
+                      "changed since the last frame.";
         return false;
     }
 
@@ -6441,8 +9490,11 @@ bool GLRenderer2D::ReadWholeSceneDebugView(WholeScene2DDebugView view,
 
     GLint textureWidth = 0;
     GLint textureHeight = 0;
+    GLint textureDepth = 1;
     glGetTexLevelParameteriv(textureTarget, 0, GL_TEXTURE_WIDTH, &textureWidth);
     glGetTexLevelParameteriv(textureTarget, 0, GL_TEXTURE_HEIGHT, &textureHeight);
+    if (textureTarget == GL_TEXTURE_2D_ARRAY)
+        glGetTexLevelParameteriv(textureTarget, 0, GL_TEXTURE_DEPTH, &textureDepth);
     if (textureWidth <= 0 || textureHeight <= 0)
     {
         restoreReadbackState();
@@ -6475,19 +9527,53 @@ bool GLRenderer2D::ReadWholeSceneDebugView(WholeScene2DDebugView view,
         return false;
     }
 
-    rgba.resize(width * height);
-
-    std::vector<u32> arrayData;
-    u32* readback = rgba.data();
-    if (textureTarget == GL_TEXTURE_2D_ARRAY)
+    if (textureTarget == GL_TEXTURE_2D_ARRAY &&
+        (textureDepth <= 0 || textureLayer < 0 || textureLayer >= textureDepth))
     {
-        arrayData.resize(width * height * 3);
-        readback = arrayData.data();
+        restoreReadbackState();
+
+        if (status)
+            *status = "The selected debug array layer is outside the readable texture depth.";
+        return false;
     }
 
+    rgba.resize(width * height);
+
     glPixelStorei(GL_PACK_ALIGNMENT, 1);
-    while (glGetError() != GL_NO_ERROR) {}
-    glGetTexImage(textureTarget, 0, GL_RGBA, GL_UNSIGNED_BYTE, readback);
+    if (!OpenGL::ClearErrors())
+    {
+        restoreReadbackState();
+
+        if (status)
+            *status = "Failed to clear stale OpenGL errors before debug readback.";
+        return false;
+    }
+    if (textureTarget == GL_TEXTURE_2D_ARRAY)
+    {
+        // A view consumes one layer. Reading the entire array for every view
+        // multiplied transfers and temporary memory by the array depth.
+        GLint previousReadFB = 0;
+        GLuint readFB = 0;
+        glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &previousReadFB);
+        glGenFramebuffers(1, &readFB);
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, readFB);
+        glFramebufferTextureLayer(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                  texture, 0, textureLayer);
+        glReadBuffer(GL_COLOR_ATTACHMENT0);
+        const bool complete = glCheckFramebufferStatus(GL_READ_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
+        if (complete)
+            glReadPixels(0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, previousReadFB);
+        glDeleteFramebuffers(1, &readFB);
+        if (!complete)
+        {
+            restoreReadbackState();
+            if (status) *status = "The selected debug array layer is not framebuffer-readable.";
+            return false;
+        }
+    }
+    else
+        glGetTexImage(textureTarget, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
     const GLenum readbackError = glGetError();
     if (readbackError != GL_NO_ERROR)
     {
@@ -6502,13 +9588,6 @@ bool GLRenderer2D::ReadWholeSceneDebugView(WholeScene2DDebugView view,
             *status = buffer;
         }
         return false;
-    }
-
-    if (textureTarget == GL_TEXTURE_2D_ARRAY)
-    {
-        const int layerOffset = width * height * textureLayer;
-        for (int i = 0; i < width * height; i++)
-            rgba[i] = arrayData[layerOffset + i];
     }
 
     std::vector<u32> stackRole3DRGBA;
@@ -6527,12 +9606,15 @@ bool GLRenderer2D::ReadWholeSceneDebugView(WholeScene2DDebugView view,
     std::vector<u32> sandwich2DBaseRGBA;
     std::vector<u32> sandwichNativeMetaRGBA;
     std::vector<u32> sandwichDirect3DRGBA;
+    std::vector<u32> strictAffineNativeRGBA;
     int sandwich2DBaseWidth = 0;
     int sandwich2DBaseHeight = 0;
     int sandwichNativeMetaWidth = 0;
     int sandwichNativeMetaHeight = 0;
     int sandwichDirect3DWidth = 0;
     int sandwichDirect3DHeight = 0;
+    int strictAffineNativeWidth = 0;
+    int strictAffineNativeHeight = 0;
 
     auto readTexture2D = [](GLuint sourceTexture,
                             std::vector<u32>& outRGBA,
@@ -6570,6 +9652,12 @@ bool GLRenderer2D::ReadWholeSceneDebugView(WholeScene2DDebugView view,
         if (sandwich2DBaseWidth != width || sandwich2DBaseHeight != height)
             sandwich2DBaseRGBA.clear();
     }
+
+    if (decodeStrictAffineDownsampleDifference)
+        readTexture2D(NativeOutputTex,
+                      strictAffineNativeRGBA,
+                      strictAffineNativeWidth,
+                      strictAffineNativeHeight);
 
     if (decode3DStackRole && stackRoleMetaTexture)
     {
@@ -6618,17 +9706,149 @@ bool GLRenderer2D::ReadWholeSceneDebugView(WholeScene2DDebugView view,
 
     restoreReadbackState();
 
+    if (decodeStrictAffineDownsampleDifference)
+    {
+        if (strictAffineNativeWidth != 256 || strictAffineNativeHeight != 192 ||
+            width % 256 != 0 || height % 192 != 0 ||
+            width / 256 != height / 192)
+        {
+            if (status)
+                *status = "Strict affine paired comparison requires integer, equal-axis scaling and a 256x192 native reference.";
+            return false;
+        }
+
+        const int comparisonScale = width / 256;
+        std::vector<u32> difference(256 * 192);
+        for (int nativeY = 0; nativeY < 192; nativeY++)
+        {
+            for (int nativeX = 0; nativeX < 256; nativeX++)
+            {
+                unsigned int sums[3] = {};
+                for (int dy = 0; dy < comparisonScale; dy++)
+                {
+                    for (int dx = 0; dx < comparisonScale; dx++)
+                    {
+                        const u32 pixel = rgba[
+                            (nativeY * comparisonScale + dy) * width +
+                            nativeX * comparisonScale + dx];
+                        const u8* channel = reinterpret_cast<const u8*>(&pixel);
+                        sums[0] += channel[0];
+                        sums[1] += channel[1];
+                        sums[2] += channel[2];
+                    }
+                }
+
+                const unsigned int samples =
+                    static_cast<unsigned int>(comparisonScale * comparisonScale);
+                const u8* native = reinterpret_cast<const u8*>(
+                    &strictAffineNativeRGBA[nativeY * 256 + nativeX]);
+                u8* out = reinterpret_cast<u8*>(
+                    &difference[nativeY * 256 + nativeX]);
+                for (int channel = 0; channel < 3; channel++)
+                {
+                    const int downsampled =
+                        static_cast<int>((sums[channel] + samples / 2) / samples);
+                    out[channel] = static_cast<u8>(
+                        std::abs(downsampled - native[channel]));
+                }
+                out[3] = 255;
+            }
+        }
+        rgba = std::move(difference);
+        width = 256;
+        height = 192;
+    }
+
     if (logicalWidth > 0 && logicalHeight > 0 &&
-        logicalWidth <= width && logicalHeight <= height &&
-        (logicalWidth != width || logicalHeight != height))
+        logicalX >= 0 && logicalY >= 0 &&
+        logicalX + logicalWidth <= width &&
+        logicalY + logicalHeight <= height &&
+        (logicalX != 0 || logicalY != 0 ||
+         logicalWidth != width || logicalHeight != height))
     {
         std::vector<u32> cropped(logicalWidth * logicalHeight);
         for (int y = 0; y < logicalHeight; y++)
-            std::copy_n(rgba.begin() + y * width, logicalWidth, cropped.begin() + y * logicalWidth);
+            std::copy_n(rgba.begin() + (logicalY + y) * width + logicalX,
+                        logicalWidth,
+                        cropped.begin() + y * logicalWidth);
 
         rgba = std::move(cropped);
         width = logicalWidth;
         height = logicalHeight;
+    }
+
+    if (decodeStrictAffineSourceRGBA)
+    {
+        if (view == WholeScene2DDebugView::NativeOBJSourceAtlas ||
+            view == WholeScene2DDebugView::StrictAffineEnhancedOBJSourceAtlas)
+        {
+            // The GPU atlas retains unused storage. Hide it only in the debug
+            // readback so stale slots cannot be mistaken for current sources.
+            const bool enhanced =
+                view == WholeScene2DDebugView::StrictAffineEnhancedOBJSourceAtlas;
+            const int sourceScale = enhanced ? static_cast<int>(EnhancedSpriteSourceScale) : 1;
+            const int slotSize = 64 * sourceScale;
+            for (int slot = 0; slot < 128; slot++)
+            {
+                int sourceWidth = 0, sourceHeight = 0;
+                if (slot < NumSprites && SpriteConfig.uOAM[slot].Type < 3 &&
+                    (!enhanced || IsEnhancedOBJSourceValid(slot, BuildEnhancedOBJSourceKey(slot))))
+                {
+                    sourceWidth = SpriteConfig.uOAM[slot].Size[0];
+                    sourceHeight = SpriteConfig.uOAM[slot].Size[1];
+                    // Connected members each store the complete joined source,
+                    // including the neighboring member's reconstruction context.
+                    if (enhanced && EnhancedOBJSourceRegions[slot][2] > 0)
+                    {
+                        sourceWidth = EnhancedOBJSourceRegions[slot][2];
+                        sourceHeight = EnhancedOBJSourceRegions[slot][3];
+                    }
+                }
+                sourceWidth = std::clamp(sourceWidth, 0, 64) * sourceScale;
+                sourceHeight = std::clamp(sourceHeight, 0, 64) * sourceScale;
+                const int x0 = (slot & 15) * slotSize;
+                const int y0 = (slot >> 4) * slotSize;
+                for (int y = y0; y < std::min(y0 + slotSize, height); y++)
+                {
+                    const int firstUnusedX = x0 + (y - y0 < sourceHeight ? sourceWidth : 0);
+                    const int endX = std::min(x0 + slotSize, width);
+                    if (firstUnusedX < endX)
+                        std::fill(rgba.begin() + y * width + firstUnusedX,
+                                  rgba.begin() + y * width + endX, 0u);
+                }
+            }
+        }
+        std::vector<u32> rgbAndAlpha(width * 2 * height);
+        for (int y = 0; y < height; y++)
+        {
+            for (int x = 0; x < width; x++)
+            {
+                const u32 sourcePixel = rgba[y * width + x];
+                const u8* source = reinterpret_cast<const u8*>(&sourcePixel);
+
+                u32& rgbPixel = rgbAndAlpha[y * width * 2 + x];
+                u8* rgb = reinterpret_cast<u8*>(&rgbPixel);
+                rgb[0] = source[0];
+                rgb[1] = source[1];
+                rgb[2] = source[2];
+                rgb[3] = 255;
+
+                u32& alphaPixel = rgbAndAlpha[y * width * 2 + width + x];
+                u8* alpha = reinterpret_cast<u8*>(&alphaPixel);
+                alpha[0] = source[3];
+                alpha[1] = source[3];
+                alpha[2] = source[3];
+                alpha[3] = 255;
+            }
+        }
+        rgba = std::move(rgbAndAlpha);
+        width *= 2;
+    }
+
+    if (decodeStrictAffineOBJColor)
+    {
+        for (u32& pixel : rgba)
+            reinterpret_cast<u8*>(&pixel)[3] = 255;
     }
 
     if (decodeAlphaCoverage)
@@ -6652,6 +9872,19 @@ bool GLRenderer2D::ReadWholeSceneDebugView(WholeScene2DDebugView view,
             chan[0] = coverage;
             chan[1] = coverage;
             chan[2] = coverage;
+            chan[3] = 255;
+        }
+    }
+    else if (decodeStrictAffineOBJCoverage)
+    {
+        for (u32& pixel : rgba)
+        {
+            u8* chan = reinterpret_cast<u8*>(&pixel);
+            const u8 sourceCoverage = chan[0];
+            const u8 affinePresence = chan[1] ? 255 : 0;
+            chan[0] = sourceCoverage;
+            chan[1] = affinePresence;
+            chan[2] = 0;
             chan[3] = 255;
         }
     }
@@ -7275,47 +10508,243 @@ bool GLRenderer2D::ReadWholeSceneDebugView(WholeScene2DDebugView view,
     {
         if (view == WholeScene2DDebugView::Direct3D)
             *status = "Direct 3D texture.";
+        else if (view == WholeScene2DDebugView::StrictAffineCandidate)
+        {
+            switch (WholeSceneTrace.StrictAffineSourceEnhancement)
+            {
+            case StrictAffineSourceEnhancementDecision::Spline36Inline:
+                *status = "Strict output-resolution affine candidate with Spline36-filtered affine source reconstruction.";
+                break;
+            case StrictAffineSourceEnhancementDecision::ArtCNNCachedAffineSources:
+                *status = "Strict output-resolution affine candidate sampling an ArtCNN-reconstructed affine source.";
+                break;
+            case StrictAffineSourceEnhancementDecision::CuNNyCachedAffineSources:
+                *status = "Strict output-resolution affine candidate sampling a CuNNy-reconstructed affine source.";
+                break;
+            case StrictAffineSourceEnhancementDecision::NNEDI3CachedAffineSources:
+                *status = "Strict output-resolution affine candidate sampling an NNEDI3-reconstructed affine source.";
+                break;
+            case StrictAffineSourceEnhancementDecision::XBRZCachedAffineSources:
+                *status = "Strict output-resolution affine candidate sampling an xBRZ-reconstructed affine source.";
+                break;
+            default:
+                *status = "Strict output-resolution affine candidate with nearest source-layer sampling.";
+                break;
+            }
+            if (WholeSceneTrace.StrictAffineConstantBackdropCompositeBGMask != 0)
+                *status += " Proven constant-backdrop layers were precomposed before reconstruction and retain separate logical-map domain coverage.";
+            *status += "\n";
+            *status += DescribeWholeSceneScaleState(context);
+        }
+        else if (view == WholeScene2DDebugView::StrictAffineNativeReference)
+        {
+            *status = "Independent native compositor reference for the strict affine paired evaluator.";
+            *status += "\n";
+            *status += DescribeWholeSceneScaleState(context);
+        }
+        else if (view == WholeScene2DDebugView::StrictAffineDownsampleDifference)
+        {
+            *status = "Absolute RGB difference between the box-downsampled strict affine candidate and the independent native reference. Black is exact; channel brightness is the unamplified byte difference.";
+            *status += "\n";
+            *status += DescribeWholeSceneScaleState(context);
+        }
+        else if (view == WholeScene2DDebugView::StrictAffineEnhancedBG2Source ||
+                 view == WholeScene2DDebugView::StrictAffineEnhancedBG3Source)
+        {
+            const int bg = view == WholeScene2DDebugView::StrictAffineEnhancedBG2Source
+                ? 2
+                : 3;
+            const auto& source = LayerConfig.uBGConfig[bg];
+            const int sourceScale = source.Size[0] > 0
+                ? static_cast<int>(EnhancedBGLayerWidth[bg]) / source.Size[0]
+                : 0;
+            const bool spline36 =
+                WholeSceneTrace.StrictAffineSourceEnhancement ==
+                StrictAffineSourceEnhancementDecision::Spline36Inline;
+            *status = (spline36 ? "Spline36 BG" : "Enhanced BG") +
+                std::to_string(bg) +
+                (spline36
+                    ? " logical source debug reconstruction before screen-space sampling ("
+                    : " logical source cache before screen-space sampling (") +
+                std::to_string(sourceScale) + "x, " +
+                std::to_string(width) + "x" + std::to_string(height) + ").";
+            *status += " RGB forced opaque is shown on the left; reconstructed alpha is shown on the right.";
+            if (spline36)
+                *status += " Production evaluates the same kernel inline at affine sample positions; this regular-grid texture is generated only for inspection.";
+            if (EnhancedBGLayerBackdropPrecomposed[bg])
+                *status += " The proven constant backdrop was precomposed before source reconstruction.";
+            *status += "\n";
+            *status += DescribeWholeSceneScaleState(context);
+        }
+        else if (view == WholeScene2DDebugView::StrictAffineAssembledOBJSourceAtlas)
+        {
+            *status = "Assembled normal sources: RGB left, alpha right. Each slot is 64 native texels times the cache scale; up to 16 slots per row.\n" +
+                OpaqueOBJAssemblyDescription;
+        }
+        else if (view == WholeScene2DDebugView::NativeOBJSourceAtlas ||
+                 view == WholeScene2DDebugView::StrictAffineEnhancedOBJSourceAtlas)
+        {
+            const int sourceScale = view == WholeScene2DDebugView::NativeOBJSourceAtlas
+                ? 1 : static_cast<int>(EnhancedSpriteSourceScale);
+            *status = "Current source atlas: RGB left, alpha right; 16 compact slots per row, 64 native texels per slot. Source scale=" +
+                std::to_string(sourceScale) + ". Inactive/invalid slots and unused slot areas are shown black; connected enhanced sources retain their full joined context.\n";
+            *status += "slot,oam,x,y,width,height,bound_width,bound_height,matrix,pa,pb,pc,pd,mode,type,palette,tile,stride,priority,cache_valid\n";
+            for (int sprite = 0; sprite < NumSprites; sprite++)
+            {
+                const auto& s = SpriteConfig.uOAM[sprite];
+                *status += std::to_string(sprite) + "," + std::to_string(SpriteOAMIndex[sprite]);
+                auto add = [&](s64 v) { *status += "," + std::to_string(v); };
+                add(s.Position[0]); add(s.Position[1]); add(s.Size[0]); add(s.Size[1]);
+                add(s.BoundSize[0]); add(s.BoundSize[1]); add(int(s.Rotscale));
+                for (int c = 0; c < 4; c++) add(s.Rotscale < 32 ? SpriteConfig.uRotscale[s.Rotscale][c] : 0);
+                add(s.OBJMode); add(s.Type); add(s.PalOffset); add(s.TileOffset); add(s.TileStride); add(s.BGPrio);
+                add(IsEnhancedOBJSourceValid(sprite, BuildEnhancedOBJSourceKey(sprite)));
+                *status += "\n";
+            }
+        }
+        else if (view == WholeScene2DDebugView::StrictAffineEnhancedOBJSource)
+        {
+            const auto& source = SpriteConfig.uOAM[selectedAffineOBJ];
+            *status = "Enhanced affine OBJ source cache before OAM sampling (RGB forced opaque on the left; source alpha on the right): compact slot " +
+                std::to_string(selectedAffineOBJ) + ", native size " +
+                std::to_string(source.Size[0]) + "x" +
+                std::to_string(source.Size[1]) + ", cache scale " +
+                std::to_string(EnhancedSpriteSourceScale) + "x, exported size " +
+                std::to_string(width) + "x" + std::to_string(height) +
+                ". Selection is the first active strict-path affine OBJ in OAM order with a valid cache product.";
+            *status += "\n";
+            *status += DescribeWholeSceneScaleState(context);
+        }
+        else if (view >= WholeScene2DDebugView::StrictAffineOverlapSemantic &&
+                 view <= WholeScene2DDebugView::StrictAffineOverlapSubpixelCoverage)
+        {
+            *status += "\nImmediate compositor overlap snapshot; input color premultiplied: ";
+            *status += WholeSceneDebugProducts.AffineOverlapPremultiplied ? "yes" : "no";
+            *status += ". Raw RGBA bytes, including alpha, are preserved. Decision R/G/B/A correspond to GL taps (0,0)/(1,0)/(0,1)/(1,1).";
+        }
+        else if (view == WholeScene2DDebugView::StrictAffineTransformedOBJColor)
+        {
+            *status = WholeSceneTrace.StrictAffineResolvedOBJMergeExecuted
+                ? "Unified output-resolution OBJ RGB after authoritative all-OBJ winner selection. Ordinary winners use the reconstructed ordinary surface; affine winners retain enhanced affine sampling. Debug alpha is forced opaque so fringe RGB remains visible; use Transformed OBJ coverage for support."
+                : "Genuinely transformed affine OBJ RGB after output-resolution OAM sampling, before scene priority composition and masked edge AA. Debug alpha is forced opaque so fringe RGB remains visible; use Transformed OBJ coverage for support.";
+            *status += "\n";
+            *status += DescribeWholeSceneScaleState(context);
+        }
+        else if (view == WholeScene2DDebugView::StrictAffineTransformedOBJCoverage)
+        {
+            *status = WholeSceneTrace.StrictAffineResolvedOBJMergeExecuted
+                ? "Unified OBJ support before final composition: red is presentation coverage, green identifies an affine semantic winner, and blue carries normalized OAM identity. Ordinary winners are therefore red/blue; affine winners add green."
+                : "Transformed affine OBJ support before final composition: red is reconstructed source coverage and green is semantic affine presence. Yellow agreement means both are present; red-only or green-only contours expose the exact coverage mismatch.";
+            *status += "\n";
+            *status += DescribeWholeSceneScaleState(context);
+        }
+        else if (view == WholeScene2DDebugView::StrictAffineOrdinaryOBJBand0Color ||
+                 view == WholeScene2DDebugView::StrictAffineOrdinaryOBJBand0Coverage)
+        {
+            const auto& summary = OrdinaryOBJBandProducts.Summary;
+            const auto& band = OrdinaryOBJBandProducts.Bands.front();
+            *status = view == WholeScene2DDebugView::StrictAffineOrdinaryOBJBand0Color
+                ? "Diagnostic native color for assembled ordinary-OBJ band 0."
+                : "Diagnostic native source coverage for assembled ordinary-OBJ band 0.";
+            *status += " Members: " + std::to_string(band.MemberCount) +
+                "; total-priority range " +
+                std::to_string(band.MinTotalPriority) + "-" +
+                std::to_string(band.MaxTotalPriority) +
+                "; recipe bands " + std::to_string(summary.BandCount) +
+                "; affine BG mask " + FormatHex(summary.AffineBGMask, 1) +
+                "; preserved special OBJ behind " +
+                std::to_string(band.PreservedBehindOAMMask[0]) + ":" +
+                std::to_string(band.PreservedBehindOAMMask[1]) +
+                "; classification hash " +
+                std::to_string(summary.ClassificationHash) +
+                ". This product is rendered from its member OAM set and " +
+                (OrdinaryOBJBandPresentationConsumed
+                    ? "is consumed by the bounded ordinary-OBJ-over-affine-BG presentation path."
+                    : "is not consumed by final output.");
+            *status += "\n";
+            *status += DescribeWholeSceneScaleState(context);
+        }
+        else if (view == WholeScene2DDebugView::StrictAffineOrdinaryOBJBand0Scaled)
+        {
+            const auto& summary = OrdinaryOBJBandProducts.Summary;
+            const auto& band = OrdinaryOBJBandProducts.Bands.front();
+            *status = "Diagnostic selected-scaler reconstruction of assembled ordinary-OBJ band 0. Members: " +
+                std::to_string(band.MemberCount) +
+                "; total-priority range " +
+                std::to_string(band.MinTotalPriority) + "-" +
+                std::to_string(band.MaxTotalPriority) +
+                "; reconstructed size " + std::to_string(width) + "x" +
+                std::to_string(height) +
+                "; recipe bands " + std::to_string(summary.BandCount) +
+                "; affine BG mask " + FormatHex(summary.AffineBGMask, 1) +
+                "; preserved special OBJ behind " +
+                std::to_string(band.PreservedBehindOAMMask[0]) + ":" +
+                std::to_string(band.PreservedBehindOAMMask[1]) +
+                "; classification hash " +
+                std::to_string(summary.ClassificationHash) +
+                ". Every band member was scaled together; this product " +
+                (OrdinaryOBJBandPresentationConsumed
+                    ? "is consumed by the bounded ordinary-OBJ-over-affine-BG presentation path."
+                    : "is not consumed by final output.");
+            *status += "\n";
+            *status += DescribeWholeSceneScaleState(context);
+        }
+        else if (view == WholeScene2DDebugView::StrictAffineResolvedOrdinaryOBJ)
+        {
+            *status = "Selected-scaler reconstruction of the complete native OAM-resolved ordinary-OBJ surface used by the unified OBJ merge (" +
+                std::to_string(width) + "x" + std::to_string(height) +
+                "). All ordinary sprites are resolved together before scaling; authored material/effect metadata remains authoritative in the separate merged OBJ surface.";
+            *status += "\n";
+            *status += DescribeWholeSceneScaleState(context);
+        }
         else if (view == WholeScene2DDebugView::NativeExactFinal)
         {
             *status = (WholeSceneScaleMode == RendererSettings::WholeScene2DScaleMode::OverlayOperatorUpscale)
                 ? "Native exact final texture. In presentation overlay upscale mode this is the black-underlay endpoint used as overlay contribution."
                 : "Native exact final texture used as the source for postprocessing upscale.";
             *status += "\n";
-            *status += DescribeWholeSceneScaleState();
+            *status += DescribeWholeSceneScaleState(context);
         }
         else if (view == WholeScene2DDebugView::Native3DResolve)
         {
             *status = "Native 3D visual resolve texture generated from high-resolution Direct3D before native final compositing. Alpha carries visual coverage.";
             *status += "\n";
-            *status += DescribeWholeSceneScaleState();
+            *status += DescribeWholeSceneScaleState(context);
         }
         else if (view == WholeScene2DDebugView::Native3DSemantics)
         {
             *status = "Native 3D semantics texture. Red is visual coverage, green is native material alpha, and blue is native presence.";
             *status += "\n";
-            *status += DescribeWholeSceneScaleState();
+            *status += DescribeWholeSceneScaleState(context);
         }
         else if (view == WholeScene2DDebugView::FinalNative3DInput)
         {
             *status = "3D texture used by the native-stage final-native/overlay compositor. In high-res resolved mode, RGB comes from the visual resolve and alpha comes from native 3D semantics.";
             *status += "\n";
-            *status += DescribeWholeSceneScaleState();
+            *status += DescribeWholeSceneScaleState(context);
         }
         else if (view == WholeScene2DDebugView::Native3DStackRole ||
                  view == WholeScene2DDebugView::Upscaled3DStackRole)
         {
             if (!status->empty())
                 *status += "\n";
-            *status += DescribeWholeSceneScaleState();
+            *status += DescribeWholeSceneScaleState(context);
         }
         else if (view == WholeScene2DDebugView::OverlayTrueNativeFinal)
         {
             *status = "Overlay true native final texture: the native final result with the selected native-stage 3D underlay.";
             *status += "\n";
-            *status += DescribeWholeSceneScaleState();
+            *status += DescribeWholeSceneScaleState(context);
         }
         else if (view == WholeScene2DDebugView::HybridSelector)
         {
+            if (WholeSceneTrace.Path == WholeSceneRenderPath::StrictAffineHighRes)
+            {
+                *status = "Strict high-resolution affine semantic selector before later ordered operands and masked output AA. Orange = BG3, blue = BG2, green = BG1, red/orange = BG0, magenta = Direct3D, yellow = OBJ, gray = backdrop. Intermediate colors are the compositor's actual fractional presentation coverage between the selected semantic owner and its immediate underlay.";
+                *status += "\n";
+                *status += DescribeWholeSceneScaleState(context);
+                return true;
+            }
             *status = "Hybrid selector debug. Magenta = high-resolution foreground compositor, cyan = overlay assist. Fallback pixels are bright when the overlay operator is visible and dim otherwise: gray = no Direct3D, blue = Direct3D absent from the native cell, yellow = native 2D effect, purple = Direct3D hidden below the top two layers, orange = Direct3D effect-blocked, teal = safe window-excluded 3D fallback, red = unknown fallback.";
             *status += "\n";
             *status += WholeSceneScaleHybridWindowEdgeAssist
@@ -7330,25 +10759,32 @@ bool GLRenderer2D::ReadWholeSceneDebugView(WholeScene2DDebugView view,
             *status += WholeSceneScaleHybridForeground2DBase
                 ? "Hybrid foreground boundary 2D base is enabled, so narrow Direct3D-absent fallback halos beside safe foreground Direct3D can use a BG0/Direct3D-excluded high-resolution 2D base.\n"
                 : "Hybrid foreground boundary 2D base is disabled, so Direct3D-absent fallback pixels use true native presentation.\n";
-            *status += DescribeWholeSceneScaleState();
+            *status += DescribeWholeSceneScaleState(context);
         }
         else if (view == WholeScene2DDebugView::HybridCoverageMiss)
         {
             *status = "Hybrid coverage miss debug. Red = high-resolution Direct3D coverage exists but the hybrid selector falls back to native presentation. Magenta = selected high-resolution foreground, cyan = overlay assist, and dim fallback colors identify fallback reasons with no high-resolution coverage at that pixel.";
             *status += "\n";
-            *status += DescribeWholeSceneScaleState();
+            *status += DescribeWholeSceneScaleState(context);
         }
         else if (view == WholeScene2DDebugView::HybridForegroundAlpha)
         {
+            if (WholeSceneTrace.Path == WholeSceneRenderPath::StrictAffineHighRes)
+            {
+                *status = "Strict high-resolution affine post-MLAA selector coverage for the enhanced text-BG union. White = selected text BG, black = its completed underlay, gray = the actual directional blend weight written across the semantic boundary. Compare with Hybrid selector to distinguish source coverage from post-AA repair.";
+                *status += "\n";
+                *status += DescribeWholeSceneScaleState(context);
+                return true;
+            }
             *status = "Hybrid foreground alpha debug. Magenta = selected high-resolution foreground with full Direct3D alpha, yellow/orange = selected foreground with fractional Direct3D alpha, red = selected foreground with zero Direct3D alpha, cyan = overlay assist, and dim blue = non-selected fallback.";
             *status += "\n";
-            *status += DescribeWholeSceneScaleState();
+            *status += DescribeWholeSceneScaleState(context);
         }
         else if (view == WholeScene2DDebugView::HybridFinalSource)
         {
             *status = "Hybrid final source debug. Cyan = overlay operator result, pink = hybrid foreground compositor texture, blue = high-resolution foreground-boundary 2D base, gray = native fallback.";
             *status += "\n";
-            *status += DescribeWholeSceneScaleState();
+            *status += DescribeWholeSceneScaleState(context);
         }
         else if (view == WholeScene2DDebugView::SandwichLower2D ||
                  view == WholeScene2DDebugView::SandwichUpper2D ||
@@ -7356,18 +10792,18 @@ bool GLRenderer2D::ReadWholeSceneDebugView(WholeScene2DDebugView view,
         {
             if (!status->empty())
                 *status += "\n";
-            *status += DescribeWholeSceneScaleState();
+            *status += DescribeWholeSceneScaleState(context);
         }
         else if (nativeLayerDebugView)
         {
             *status = "Native screen-space layer debug view after scroll/affine, mosaic, window selection, and layer enable checks.";
             *status += "\n";
-            *status += DescribeWholeSceneScaleState();
+            *status += DescribeWholeSceneScaleState(context);
         }
         else if (highResDebugView)
             *status = "High-resolution compositor debug texture.";
         else
-            *status = DescribeWholeSceneScaleState();
+            *status = DescribeWholeSceneScaleState(context);
     }
 
     return true;
@@ -7848,6 +11284,19 @@ bool GLRenderer2D::CanUseWholeSceneFinalUpscalePath() const
            WholeSceneScaleMode == RendererSettings::WholeScene2DScaleMode::FinalNativeUpscale;
 }
 
+bool GLRenderer2D::CanUseWholeSceneNativeExactFloorPath() const
+{
+    if (!WholeSceneScaleRequested || ScaleFactor <= 1 ||
+        !GPU.ScreensEnabled || !UnitEnabled || ForcedBlank)
+    {
+        return false;
+    }
+
+    const u32 dispmode =
+        (DispCnt >> 16) & (GPU2D.Num ? 0x1u : 0x3u);
+    return dispmode == 1;
+}
+
 bool GLRenderer2D::CanUsePhysicalFinalPostprocessNativeInputPath() const
 {
     if (!Parent.PhysicalFinalUpscale ||
@@ -7866,6 +11315,20 @@ bool GLRenderer2D::CanUseWholeSceneHybridCleanLegacyCandidatePath() const
 {
     // Decision logic lives in ChooseHybridCleanLegacyBlockReason
     // (WholeSceneScalePolicy.cpp); this wrapper only gathers frame facts.
+    return CanUseHybridCleanLegacyCandidate(BuildHybridCleanLegacyEligibilityInputs());
+}
+
+bool GLRenderer2D::CanUseWholeSceneIdentityEquivalentAffineFallbackPath() const
+{
+    return WholeScenePlan.SelectedPath ==
+               WholeSceneRenderPath::LegacyNativeUpscale &&
+           WholeScenePlan.StrictAffineBlockReason ==
+               StrictAffineHighResBlockReason::
+                   HighResolutionGeometryNotRequired;
+}
+
+HybridCleanLegacyEligibilityInputs GLRenderer2D::BuildHybridCleanLegacyEligibilityInputs() const
+{
     HybridCleanLegacyEligibilityInputs inputs = {};
     inputs.ScalePathAvailable = CanUseWholeSceneScalePath();
     inputs.ConservativeHybridMode =
@@ -7893,7 +11356,7 @@ bool GLRenderer2D::CanUseWholeSceneHybridCleanLegacyCandidatePath() const
             inputs.AnyCaptureBackedSprite = true;
     }
 
-    return CanUseHybridCleanLegacyCandidate(inputs);
+    return inputs;
 }
 
 bool GLRenderer2D::CanUseWholeSceneFullFrameFinalizerPath() const
@@ -7911,10 +11374,18 @@ bool GLRenderer2D::CanUseWholeSceneFullFrameFinalizerPath() const
     return true;
 }
 
+bool GLRenderer2D::CanUseWholeSceneRowOwnedDeferredFinalizerPath() const
+{
+    return WholeSceneFullFrameFinalizerUnsafeFrame &&
+           CanUseWholeSceneFullFrameFinalizerPath() &&
+           !IsWholeSceneCaptureBackedHandoffGuardActive();
+}
+
 bool GLRenderer2D::CanUseWholeSceneSplitLegacyFallbackPath() const
 {
     return CanUseWholeSceneScalePath() &&
            WholeSceneFullFrameFinalizerUnsafeFrame &&
+           !CanUseWholeSceneRowOwnedDeferredFinalizerPath() &&
            !IsWholeSceneCurrentFragmentationGuardActive() &&
            WholeSceneCurrentFramePartialComposites < kWholeSceneHybridFragmentationGuardThreshold;
 }
@@ -7975,6 +11446,7 @@ bool GLRenderer2D::CanUseWholeSceneArtCNNPath() const
 {
     return (CanUseWholeSceneLegacyPath() ||
             CanUseWholeSceneHybridCleanLegacyCandidatePath() ||
+            CanUseWholeSceneIdentityEquivalentAffineFallbackPath() ||
             CanUseWholeSceneSplitLegacyFallbackPath()) &&
            RendererSettings::IsGLArtCNNAlgorithm(WholeSceneScaleAlgorithm) &&
            (ScaleFactor >= 2);
@@ -7984,6 +11456,7 @@ bool GLRenderer2D::CanUseWholeSceneNNEDI3Path() const
 {
     return (CanUseWholeSceneLegacyPath() ||
             CanUseWholeSceneHybridCleanLegacyCandidatePath() ||
+            CanUseWholeSceneIdentityEquivalentAffineFallbackPath() ||
             CanUseWholeSceneSplitLegacyFallbackPath()) &&
            RendererSettings::IsGLNNEDI3Algorithm(WholeSceneScaleAlgorithm) &&
            (ScaleFactor >= 2);
@@ -7993,6 +11466,7 @@ bool GLRenderer2D::CanUseWholeSceneXBRZPath() const
 {
     return (CanUseWholeSceneLegacyPath() ||
             CanUseWholeSceneHybridCleanLegacyCandidatePath() ||
+            CanUseWholeSceneIdentityEquivalentAffineFallbackPath() ||
             CanUseWholeSceneSplitLegacyFallbackPath()) &&
            WholeSceneScaleAlgorithm == RendererSettings::GLScaleAlgorithm::XBRZ &&
            (ScaleFactor > 1);
@@ -8002,6 +11476,7 @@ bool GLRenderer2D::CanUseWholeSceneCuNNyPath() const
 {
     return (CanUseWholeSceneLegacyPath() ||
             CanUseWholeSceneHybridCleanLegacyCandidatePath() ||
+            CanUseWholeSceneIdentityEquivalentAffineFallbackPath() ||
             CanUseWholeSceneSplitLegacyFallbackPath()) &&
            RendererSettings::IsGLCuNNyAlgorithm(WholeSceneScaleAlgorithm) &&
            (ScaleFactor >= 2);
@@ -8026,6 +11501,50 @@ bool GLRenderer2D::WholeSceneHighResLayerFilterNoWrap() const
 int GLRenderer2D::WholeSceneHighResSpriteFilterMode() const
 {
     return WholeSceneHighResLayerFilterMode();
+}
+
+StrictAffineSourceEnhancementDecision
+GLRenderer2D::CurrentStrictAffineSourceEnhancementDecision(
+    bool strictPathSelectedOverride) const
+{
+    if ((strictPathSelectedOverride ||
+        WholeScenePlan.SelectedPath == WholeSceneRenderPath::StrictAffineHighRes))
+    {
+        if (!WholeSceneScaleHybridStrictAffineSourceEnhancement)
+            return StrictAffineSourceEnhancementDecision::NativeCachedAffineSources;
+        if (WholeSceneScaleAlgorithm == RendererSettings::GLScaleAlgorithm::Spline36)
+            return StrictAffineSourceEnhancementDecision::Spline36CachedAffineSources;
+    }
+    return ChooseStrictAffineSourceEnhancement({
+        WholeSceneScaleHybridStrictAffineSourceEnhancement,
+        strictPathSelectedOverride ||
+            WholeScenePlan.SelectedPath == WholeSceneRenderPath::StrictAffineHighRes,
+        WholeSceneScaleAlgorithm == RendererSettings::GLScaleAlgorithm::Spline36,
+        RendererSettings::IsGLArtCNNAlgorithm(WholeSceneScaleAlgorithm),
+        RendererSettings::IsGLCuNNyAlgorithm(WholeSceneScaleAlgorithm),
+        RendererSettings::IsGLNNEDI3Algorithm(WholeSceneScaleAlgorithm),
+        WholeSceneScaleAlgorithm == RendererSettings::GLScaleAlgorithm::XBRZ,
+    });
+}
+
+StrictAffineSourceEnhancementDecision
+GLRenderer2D::CurrentStrictAffineOrdinaryScalingDecision(
+    bool strictPathSelectedOverride) const
+{
+    // Strict-affine source enhancement controls only the source sampled by
+    // transformed geometry. Ordinary scene operands retain the selected
+    // whole-scene scaler independently, matching the established 2x affine
+    // supersampling configuration without forcing reconstructed affine edges.
+    return ChooseStrictAffineSourceEnhancement({
+        true,
+        strictPathSelectedOverride ||
+            WholeScenePlan.SelectedPath == WholeSceneRenderPath::StrictAffineHighRes,
+        WholeSceneScaleAlgorithm == RendererSettings::GLScaleAlgorithm::Spline36,
+        RendererSettings::IsGLArtCNNAlgorithm(WholeSceneScaleAlgorithm),
+        RendererSettings::IsGLCuNNyAlgorithm(WholeSceneScaleAlgorithm),
+        RendererSettings::IsGLNNEDI3Algorithm(WholeSceneScaleAlgorithm),
+        WholeSceneScaleAlgorithm == RendererSettings::GLScaleAlgorithm::XBRZ,
+    });
 }
 
 int GLRenderer2D::WholeSceneArtCNNModelIndex() const
@@ -8148,7 +11667,7 @@ void GLRenderer2D::UpdateAndRender(int line)
     // check if VRAM was modified, and flatten it as needed
     phaseStart = std::chrono::steady_clock::now();
 
-    static_assert(VRAMDirtyGranularity == 512);
+    static_assert(VRAMDirtyGranularity == GLBGVRAMUploadCache::BlockSize);
     NonStupidBitField<1024> bgDirty;
     NonStupidBitField<64> bgExtPalDirty;
     NonStupidBitField<16> objExtPalDirty;
@@ -8189,6 +11708,11 @@ void GLRenderer2D::UpdateAndRender(int line)
     u32 bgvrammask = 0;
     if (screenon)
         GPU2D.GetBGVRAM(bgvram, bgvrammask);
+
+    // Compare after flattening/remapping, before invalidating layer products.
+    // Register, palette and deferred dirtiness remain independent of VRAM.
+    if (screenon)
+        BGVRAMUploadCache.FilterUnchanged(bgvram, bgvrammask + 1, bgDirty);
 
     const u8 covered_layers = CoveredByOpaqueBitmapBGLayerMask(LastLine, line, bgvram, bgvrammask);
     const u8 register_layer_pre_dirty = layer_pre_dirty;
@@ -8250,7 +11774,7 @@ void GLRenderer2D::UpdateAndRender(int line)
         if ((cfg.Type == 1 || cfg.Type == 3) && (cfg.PalOffset > 0))
         {
             u32 pal = cfg.PalOffset - 1;
-            if (bgExtPalDirty.CheckRange(pal, pal + 16))
+            if (bgExtPalDirty.CheckRange(pal, 16))
             {
                 layer_pre_dirty |= (1 << layer);
                 palette_layer_pre_dirty |= (1 << layer);
@@ -8339,6 +11863,10 @@ void GLRenderer2D::UpdateAndRender(int line)
     if (layer_pre_dirty)
         comp_dirty = true;
 
+    // Widescreen cover proofs read the current source. If it changed during
+    // this frame, older rows need a historical source rather than these bytes.
+    if (line > 0) WideCoverUnstableBGMask |= layer_pre_dirty;
+
     RecordWholeSceneLayerDirty(line, layer_pre_dirty);
 
     if (Parent.NeedPartialRender)
@@ -8373,9 +11901,9 @@ void GLRenderer2D::UpdateAndRender(int line)
         GPU2D.Num ? Parent.GPU.MasterBrightnessB : Parent.GPU.MasterBrightnessA;
     // A full-whole-scene capture can expose an intermediate bitmap generation
     // that the ordinary capture source does not. If that generation becomes
-    // visible exactly as the game releases a full-white mask, retain the mask
-    // for this physical frame. Capture data and product provenance stay raw.
-    if (ShouldHoldFullWhiteForCaptureBackedBrightnessRelease({
+    // visible exactly as the game releases a full-white endpoint, retain that
+    // physical transform for this frame. Capture data and provenance stay raw.
+    if (ShouldPlanPhysicalBrightnessForCaptureBackedRelease({
             WholeSceneScaleRequested,
             line,
             previousMasterBrightness,
@@ -8383,16 +11911,17 @@ void GLRenderer2D::UpdateAndRender(int line)
             crossing_full_whole_scene_capture,
         }))
     {
-        const u32 engineMask = 1u << GPU2D.Num;
-        Parent.MasterBrightnessHoldEngineMask |= engineMask;
-        Parent.MasterBrightnessHoldNextEngineMask |= engineMask;
+        WholeScenePhysicalPresentationBrightnessActive = true;
+        WholeScenePhysicalPresentationBrightnessNextActive = true;
+        WholeScenePhysicalPresentationBrightnessState = previousMasterBrightness;
+        WholeScenePhysicalPresentationBrightnessNextState = previousMasterBrightness;
     }
     if (line > 0 && register_layer_pre_dirty && CanUseWholeSceneFullFrameFinalizerPath())
     {
         WholeSceneFullFrameFinalizerUnsafeFrame = true;
         WholeSceneNativeProductEpochValid = false;
-        if (WholeSceneNativeProductEpochInvalidReason == 0)
-            WholeSceneNativeProductEpochInvalidReason = 3;
+        WholeSceneNativeProductEpochInvalidReason |=
+            WholeSceneNativeProductEpochInvalidMidFrameState;
         auto& unsafeTrace = WholeSceneCurrentUpdateDebugTrace;
         unsafeTrace.FullFrameUnsafeEvents++;
         unsafeTrace.FullFrameUnsafeReasonMask |= state_dirty_reason_mask;
@@ -8434,6 +11963,18 @@ void GLRenderer2D::UpdateAndRender(int line)
         AddWholeSceneUpdateTiming(WholeSceneUpdateTiming.PartialComposite, ElapsedUS(phaseStart));
     }
 
+    // The rows above this boundary have already consumed the current BG
+    // source. Preserve that representation before palette upload and layer
+    // prerender replace it, so the deferred strict compositor can reconstruct
+    // the same two source epochs without reverting those rows to path 6.
+    PreserveDeferredStrictAffineHistoricalSourceEpoch(
+        line,
+        layer_pre_dirty,
+        register_layer_pre_dirty,
+        vram_layer_pre_dirty,
+        palette_layer_pre_dirty,
+        deferred_layer_pre_dirty);
+
     // update registers
     phaseStart = std::chrono::steady_clock::now();
 
@@ -8472,6 +12013,14 @@ void GLRenderer2D::UpdateAndRender(int line)
         AddWholeSceneUpdateTiming(WholeSceneUpdateTiming.LayerPrerender, ElapsedUS(phaseStart));
     }
 
+    const u32 objPaletteMask = palmask << 1;
+    if ((GPU.PaletteDirty & objPaletteMask) ||
+        objExtPalDirty.CheckRange(0, 16))
+    {
+        SpriteDirty = true;
+        SpriteSourceGeneration++;
+    }
+
     if (SpriteDirty)
     {
         phaseStart = std::chrono::steady_clock::now();
@@ -8499,6 +12048,7 @@ void GLRenderer2D::UpdateAndRender(int line)
         PrerenderSprites();
 
         LastSpriteLine = line;
+        GPU.PaletteDirty &= ~objPaletteMask;
         AddWholeSceneUpdateTiming(WholeSceneUpdateTiming.OBJPrerender, ElapsedUS(phaseStart));
     }
 
@@ -8509,6 +12059,7 @@ void GLRenderer2D::UpdateAndRender(int line)
 
 void GLRenderer2D::DrawScanline(u32 line)
 {
+    if (line == 0) WideCoverUnstableBGMask = 0;
     UpdateAndRender(line);
 }
 
@@ -8528,16 +12079,11 @@ void GLRenderer2D::VBlank()
 
     phaseStart = std::chrono::steady_clock::now();
     RenderScreen(LastLine, 192);
-    const bool chunkedUnsafeOverlay =
-        WholeSceneFullFrameFinalizerUnsafeFrame &&
-        WholeSceneScaleFragmentationFallback == RendererSettings::WholeScene2DFragmentationFallback::Off &&
-        CanUseWholeSceneOverlayOperatorPath();
-    const bool captureBackedHandoff =
-        CanUseWholeSceneScalePath() &&
-        CanUseWholeSceneOverlayOperatorPath() &&
-        ShouldUseWholeSceneCaptureBackedHandoffForRange(LastLine, 192);
-    if (CanUseWholeSceneScalePath() && !chunkedUnsafeOverlay && !captureBackedHandoff)
+    if (CanUseWholeSceneScalePath() &&
+        !WholeSceneOutputExecutionSuppressesDeferredFinalizer(WholeScenePlan))
+    {
         RenderScreenWholeSceneFinalizeFullFrame();
+    }
     AddWholeSceneUpdateTiming(WholeSceneUpdateTiming.VBlankComposite, ElapsedUS(phaseStart));
 
     LastSpriteLine = 0;
@@ -8680,6 +12226,9 @@ void GLRenderer2D::UpdateScanlineConfig(int line)
     else
         cfg.WinRegs |= 0xFF000000;
 
+    cfg.OBJWindowEnabled = (GPU2D.DispCnt & (1 << 15)) != 0;
+    if (cfg.OBJWindowEnabled)
+        cfg.OBJWindowEnabled |= WideOBJWindowProofBits;
     cfg.WinMask = 0;
 
     if ((GPU2D.DispCnt & (1<<13)) && (GPU2D.Win0Active & 0x1))
@@ -8741,7 +12290,85 @@ void GLRenderer2D::UpdateScanlineConfig(int line)
         cfg.WinPos[2] = 256;
         cfg.WinPos[3] = 256;
     }
+
+    for (int layer = 0; layer < 4; layer++)
+    {
+        cfg.BGPrio[layer] = LayerEnable & (1 << layer)
+            ? static_cast<u32>(BGCnt[layer] & 0x3)
+            : 0xFFFFFFFFu;
+    }
+    cfg.EnableOBJ = !!(LayerEnable & (1 << 4));
+    cfg.Enable3D = !!(DispCnt & (1 << 3));
+    cfg.BlendCnt = BlendCnt;
+    cfg.BlendEffect = (BlendCnt >> 6) & 0x3;
+    cfg.BlendCoef[0] = EVA;
+    cfg.BlendCoef[1] = EVB;
+    cfg.BlendCoef[2] = EVY;
+    cfg.BlendCoef[3] = 0;
 };
+
+void GLRenderer2D::BuildWideCoverPolicies(int ystart, int yend, u32 (&policies)[192][2]) const
+{
+    u8* vram;
+    u32 mask;
+    GPU2D.GetBGVRAM(vram, mask);
+    int captureInfo[32];
+    GPU2D.GetCaptureInfo_BG(captureInfo);
+    for (int layer = 1; layer < 4; ++layer)
+    {
+        const auto& cfg = LayerConfig.uBGConfig[layer];
+        if (!(LayerEnable & (1u << layer)) || (WideCoverUnstableBGMask & (1u << layer)) ||
+            cfg.Type > 1 || cfg.PalOffset ||
+            (GPU2D.BGCnt[layer] & (1 << 6))) continue;
+        // Capture-backed bytes need their own provenance, not a colour proof
+        // over a possibly deferred CPU copy of VRAM.
+        bool captured = false;
+        const auto& ranges = BGVRAMRange[layer];
+        for (int r = 0; r < 4; r += 2)
+            if (ranges[r] != 0xFFFFFFFFu)
+                for (u32 b = ranges[r] >> 14; b < (ranges[r] + ranges[r + 1] + 0x3FFF) >> 14; ++b)
+                    captured |= captureInfo[b & (GPU2D.Num ? 7 : 31)] >= 0;
+        if (captured) continue;
+        const WideTextCoverSource source {vram, mask, &GPU.Palette[GPU2D.Num ? 0x400 : 0],
+            cfg.Size[0], cfg.Size[1], cfg.MapOffset, cfg.TileOffset, cfg.Type == 1};
+        u32 color = 0;
+        if (!source.UniformColor(color)) continue;
+        for (int y = ystart; y < yend; ++y)
+        {
+            const auto& row = ScanlineConfig.uScanline[y];
+            if (row.BGMosaicEnable[layer] || row.BGPrio[layer] == 0xFFFFFFFFu) continue;
+            // Require opaque coverage at both native edges on this row;
+            // a one-sided panel is insufficient. Interior holes are allowed.
+            if (!source.OpaqueAt(row.BGOffset[layer][0], row.BGOffset[layer][1]) ||
+                !source.OpaqueAt(row.BGOffset[layer][0] + 255, row.BGOffset[layer][1])) continue;
+            for (int side = 0; side < 2; ++side)
+            {
+                const int x = side ? 255 : 0;
+                const u32 permissions = WideWindowPermissions(row, x, row.OBJWindowEnabled != 0);
+                if (permissions == 0x100 || !(permissions & (1u << layer))) continue;
+                bool blocked = false;
+                for (int other = 0; other < 4; ++other)
+                    if (other != layer && (permissions & (1u << other)) &&
+                        (row.BGPrio[other] < row.BGPrio[layer] ||
+                         (row.BGPrio[other] == row.BGPrio[layer] && other < layer))) blocked = true;
+                // Do not replace a native edge occupied by a sprite. This is
+                // deliberately conservative even for transparent sprite texels.
+                if (row.EnableOBJ && (permissions & (1u << 4)))
+                    for (int i = 0; i < NumSprites; ++i)
+                    {
+                        const auto& sprite = SpriteConfig.uOAM[i];
+                        int sx = sprite.Position[0] & 511;
+                        if (sx >= 256) sx -= 512;
+                        const int sy = (y - sprite.Position[1]) & 255;
+                        if (x >= sx && x < sx + sprite.BoundSize[0] && sy < sprite.BoundSize[1]) blocked = true;
+                    }
+                if (!blocked)
+                    policies[y][side] = MakeWideWindowPolicy(row, 0, x, row.OBJWindowEnabled != 0,
+                                                            false, layer, color);
+            }
+        }
+    }
+}
 
 void GLRenderer2D::UpdateLayerConfig()
 {
@@ -9111,6 +12738,7 @@ void GLRenderer2D::UpdateOAM(int ystart, int yend)
         // add this sprite to the OAM array
 
         auto& sprcfg = cfg.uOAM[NumSprites];
+        SpriteOAMIndex[NumSprites] = sprnum;
 
         sprcfg.Position[0] = (u32)xpos;
         sprcfg.Position[1] = (u32)ypos;
@@ -9254,7 +12882,7 @@ void GLRenderer2D::UpdateOAM(int ystart, int yend)
                     &cfg);
 }
 
-void GLRenderer2D::UpdateCompositorConfig()
+void GLRenderer2D::UpdateCompositorConfig(int ystart, int yend)
 {
     // compositor info buffer
     for (int i = 0; i < 4; i++)
@@ -9273,14 +12901,1086 @@ void GLRenderer2D::UpdateCompositorConfig()
 
     CompositorConfig.uEnable3D = !!(DispCnt & (1<<3));
 
-    CompositorConfig.uBlendCnt = BlendCnt;
-    CompositorConfig.uBlendEffect = (BlendCnt >> 6) & 0x3;
+    const WholeSceneOutputTransform* plannedColorEffect =
+        ystart >= 0 && yend > ystart
+            ? ResolveWholeSceneOutputTransformForExecution(
+                  WholeScenePlan,
+                  WholeSceneOutputTransformKind::CompositorColorEffect,
+                  ystart,
+                  yend)
+            : nullptr;
+    const u32 plannedBlendMode = plannedColorEffect
+        ? (plannedColorEffect->State >> 6) & 0x3u
+        : 0;
+    const bool strictAffinePlannedBrightness =
+        plannedColorEffect &&
+        WholeScenePlan.SelectedRepresentation ==
+            WholeSceneOutputRepresentationKind::StrictAffineHighRes &&
+        (plannedBlendMode == 2 || plannedBlendMode == 3) &&
+        (plannedColorEffect->State & 0x3Fu) != 0 &&
+        plannedColorEffect->AuxState > 0;
+    const bool executePlannedColorEffect =
+        plannedColorEffect &&
+        plannedColorEffect->State == BlendCnt &&
+        plannedColorEffect->AuxState == EVY &&
+        (strictAffinePlannedBrightness ||
+         ConsumerFullScreenBrightnessColorEffect(
+             static_cast<u16>(plannedColorEffect->State),
+             static_cast<u8>(plannedColorEffect->AuxState)) != 0);
+    const u16 compositorBlendCnt = executePlannedColorEffect
+        ? static_cast<u16>(plannedColorEffect->State)
+        : BlendCnt;
+    const u8 compositorEVY = executePlannedColorEffect
+        ? static_cast<u8>(plannedColorEffect->AuxState)
+        : EVY;
+
+    CompositorConfig.uBlendCnt = compositorBlendCnt;
+    CompositorConfig.uBlendEffect = (compositorBlendCnt >> 6) & 0x3;
     CompositorConfig.uBlendCoef[0] = EVA;
     CompositorConfig.uBlendCoef[1] = EVB;
-    CompositorConfig.uBlendCoef[2] = EVY;
+    CompositorConfig.uBlendCoef[2] = compositorEVY;
+
+    if (executePlannedColorEffect)
+    {
+        MarkWholeSceneOutputTransformPlanExecuted(
+            WholeScenePlan,
+            WholeSceneExecutionTrace,
+            WholeSceneOutputTransformKind::CompositorColorEffect,
+            ystart,
+            yend,
+            compositorBlendCnt,
+            compositorEVY);
+    }
 
     glBindBuffer(GL_UNIFORM_BUFFER, CompositorConfigUBO);
     glBufferSubData(GL_UNIFORM_BUFFER, 0, sizeof(CompositorConfig), &CompositorConfig);
+}
+
+
+GLRenderer2D::EnhancedOBJSourceKey
+GLRenderer2D::BuildEnhancedOBJSourceKey(
+    int sprite,
+    StrictAffineSourceEnhancementDecision sourceEnhancement) const
+{
+    EnhancedOBJSourceKey key = {};
+    if (sprite < 0 || sprite >= NumSprites)
+        return key;
+
+    const auto& source = SpriteConfig.uOAM[sprite];
+    key.SourceGeneration = SpriteSourceGeneration;
+    key.Type = source.Type;
+    key.Width = static_cast<u32>(source.Size[0]);
+    key.Height = static_cast<u32>(source.Size[1]);
+    key.PalOffset = source.PalOffset;
+    key.TileOffset = source.TileOffset;
+    key.TileStride = source.TileStride;
+    key.Algorithm = static_cast<u32>(WholeSceneScaleAlgorithm);
+    const StrictAffineSourceEnhancementDecision effectiveSourceEnhancement =
+        sourceEnhancement != StrictAffineSourceEnhancementDecision::Disabled
+            ? sourceEnhancement
+            : CurrentStrictAffineSourceEnhancementDecision();
+    key.SourceScale = static_cast<u32>(StrictAffineCachedSourceScale(
+        effectiveSourceEnhancement, ScaleFactor));
+    // Bump when the isolated padding, color reconstruction or presentation-
+    // coverage contract changes. Placement and affine matrices remain absent.
+    key.EnhancementVersion = 9 + static_cast<u32>(AffineAlpha);
+    if (NNEDI3PremultipliedRGB) key.EnhancementVersion += 16;
+    key.ConnectedSourceHash = ConnectedOBJSourceHashes[sprite];
+    return key;
+}
+
+bool GLRenderer2D::IsEnhancedOBJSourceValid(
+    int sprite, const EnhancedOBJSourceKey& key) const
+{
+    if (sprite < 0 || sprite >= 128)
+        return false;
+    const u64 bit = 1ull << (sprite & 63);
+    return (EnhancedOBJSourceValidMask[sprite >> 6] & bit) != 0 &&
+           EnhancedOBJSourceKeys[sprite] == key;
+}
+
+void GLRenderer2D::MarkEnhancedOBJSourceValid(
+    int sprite, const EnhancedOBJSourceKey& key)
+{
+    if (sprite < 0 || sprite >= 128)
+        return;
+    EnhancedOBJSourceKeys[sprite] = key;
+    EnhancedOBJSourceValidMask[sprite >> 6] |= 1ull << (sprite & 63);
+}
+
+void GLRenderer2D::InvalidateEnhancedOBJSources()
+{
+    std::fill(std::begin(OpaqueOBJAssemblyValid),std::end(OpaqueOBJAssemblyValid),false);
+    EnhancedOBJSourceValidMask[0] = 0;
+    EnhancedOBJSourceValidMask[1] = 0;
+}
+
+bool GLRenderer2D::EnsureEnhancedOBJTextures(int sourceScale)
+{
+    if (sourceScale != 2 && sourceScale != 4)
+        return false;
+    if (EnhancedSpriteSourceScale == static_cast<u32>(sourceScale))
+        return true;
+
+    const int atlasWidth = 1024 * sourceScale;
+    const int atlasHeight = 512 * sourceScale;
+    const int scratchSize = 64 * sourceScale;
+    GLint maxTextureSize = 0;
+    glGetIntegerv(GL_MAX_TEXTURE_SIZE, &maxTextureSize);
+    if (atlasWidth > maxTextureSize || atlasHeight > maxTextureSize ||
+        scratchSize > maxTextureSize)
+    {
+        return false;
+    }
+
+    glBindTexture(GL_TEXTURE_2D, EnhancedSpriteTex);
+    glDefaultTexParams(GL_TEXTURE_2D);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, atlasWidth, atlasHeight, 0,
+                 GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+    glBindFramebuffer(GL_FRAMEBUFFER, EnhancedSpriteFB);
+    glFramebufferTexture(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                         EnhancedSpriteTex, 0);
+
+    glBindTexture(GL_TEXTURE_2D, EnhancedSpriteScaledRGBTex);
+    glDefaultTexParams(GL_TEXTURE_2D);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, scratchSize, scratchSize, 0,
+                 GL_RGBA, GL_HALF_FLOAT, nullptr);
+    glBindFramebuffer(GL_FRAMEBUFFER, EnhancedSpriteScaledRGBFB);
+    glFramebufferTexture(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                         EnhancedSpriteScaledRGBTex, 0);
+
+    glBindTexture(GL_TEXTURE_2D, EnhancedSpriteScaledRGBATex);
+    glDefaultTexParams(GL_TEXTURE_2D);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, scratchSize, scratchSize, 0,
+                 GL_RGBA, GL_HALF_FLOAT, nullptr);
+    glBindFramebuffer(GL_FRAMEBUFFER, EnhancedSpriteScaledRGBAFB);
+    glFramebufferTexture(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                         EnhancedSpriteScaledRGBATex, 0);
+
+    EnhancedSpriteSourceScale = sourceScale;
+    InvalidateEnhancedOBJSources();
+    return true;
+}
+
+bool GLRenderer2D::PrepareOpaqueOBJAssemblies(u32* spriteMask, int* slots,
+                                              int ystart, int yend)
+{
+    // Only normal presentation color uses the assembled sources. Native
+    // ownership and special OBJ operations still use the original OAM entries.
+    // Check every captured row: a deferred frame need not share VBlank state.
+    if ((DispCnt & 0xE000u) != 0 ||
+        (CompositorConfig.uBlendEffect == 1 &&
+         (CompositorConfig.uBlendCnt & (1u << 4))))
+        return false;
+    for (int y = ystart; y < yend; y++)
+    {
+        const auto& row = ScanlineConfig.uScanline[y];
+        if (row.WinRegs != 0xFFFFFFFFu ||
+            (row.BlendEffect == 1 && (row.BlendCnt & (1u << 4))))
+            return false;
+    }
+    std::fill(slots, slots + 128, -1);
+    std::array<ConnectedOBJSourceInput,128> sources;
+    for (int i=0;i<NumSprites;i++)
+    {
+        const auto& s=SpriteConfig.uOAM[i]; auto& out=sources[i];
+        out.OAM=SpriteOAMIndex[i]; out.MatrixIndex=int(s.Rotscale);
+        out.X=s.Position[0]; out.Y=s.Position[1];
+        out.Width=s.Size[0]; out.Height=s.Size[1];
+        out.BoundWidth=s.BoundSize[0]; out.BoundHeight=s.BoundSize[1];
+        out.Mode=s.OBJMode; out.Type=s.Type; out.Priority=s.BGPrio; out.Mosaic=s.Mosaic;
+        if (s.Rotscale<32)
+            for (int c=0;c<4;c++) out.Matrix[c]=SpriteConfig.uRotscale[s.Rotscale][c];
+        if (!(spriteMask[i>>5] & (1u<<(i&31))) || EnhancedOBJSourceRegions[i][2])
+            out.MatrixIndex=-1;
+    }
+    const auto groups=PlanOpaqueOBJAssemblies(sources.data(),NumSprites);
+    if (groups.empty()) return false;
+    const auto enhancement=CurrentStrictAffineSourceEnhancementDecision();
+    int scale=StrictAffineCachedSourceScale(enhancement,ScaleFactor);
+    int width=std::min<int>(16,groups.size())*64*scale;
+    int height=((int(groups.size())+15)/16)*64*scale;
+    GLint maxSize=0; glGetIntegerv(GL_MAX_TEXTURE_SIZE,&maxSize);
+    if (width>maxSize || height>maxSize) return false;
+    if (!OpaqueOBJAssemblyTex) glGenTextures(1,&OpaqueOBJAssemblyTex);
+    if (!OpaqueOBJAssemblyFB) glGenFramebuffers(1,&OpaqueOBJAssemblyFB);
+    if (width!=OpaqueOBJAssemblyWidth || height!=OpaqueOBJAssemblyHeight)
+    {
+        glBindTexture(GL_TEXTURE_2D,OpaqueOBJAssemblyTex);
+        glDefaultTexParams(GL_TEXTURE_2D);
+        glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA8,width,height,0,GL_RGBA,GL_UNSIGNED_BYTE,nullptr);
+        glBindFramebuffer(GL_FRAMEBUFFER,OpaqueOBJAssemblyFB);
+        glFramebufferTexture(GL_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,OpaqueOBJAssemblyTex,0);
+        if (glCheckFramebufferStatus(GL_FRAMEBUFFER)!=GL_FRAMEBUFFER_COMPLETE) return false;
+        OpaqueOBJAssemblyWidth=width; OpaqueOBJAssemblyHeight=height;
+        std::fill(std::begin(OpaqueOBJAssemblyValid),std::end(OpaqueOBJAssemblyValid),false);
+    }
+    bool ready=false;
+    OpaqueOBJAssemblyDescription = "slot,root_oam,member_oams\n";
+    const int model=enhancement==StrictAffineSourceEnhancementDecision::ArtCNNCachedAffineSources
+        ? WholeSceneArtCNNModelIndex() : RendererSettings::GetGLCuNNyModelIndex(WholeSceneScaleAlgorithm);
+    for (size_t slot=0;slot<groups.size();slot++)
+    {
+        const auto& group=groups[slot];
+        auto key=BuildEnhancedOBJSourceKey(group.Root,enhancement);
+        u64 hash=1469598103934665603ull;
+        auto add=[&](u64 v) { hash^=v; hash*=1099511628211ull; };
+        add(model); add(static_cast<int>(AffineAlpha));
+        add(NNEDI3PremultipliedRGB);
+        for (int i:group.Members)
+        {
+            const auto& s=SpriteConfig.uOAM[i];
+            add(SpriteOAMIndex[i]); add(s.Type); add(s.PalOffset); add(s.TileOffset);
+            add(s.TileStride); add(s.Size[0]); add(s.Size[1]);
+        }
+        key.ConnectedSourceHash=hash;
+        if (!OpaqueOBJAssemblyValid[slot] || !(OpaqueOBJAssemblyKeys[slot]==key))
+        {
+            OpaqueOBJAssemblyValid[slot]=false;
+            if (!RebuildEnhancedOBJSource(group.Root,enhancement,model,nullptr,&group.Members,slot))
+                continue;
+            OpaqueOBJAssemblyKeys[slot]=key; OpaqueOBJAssemblyValid[slot]=true;
+            WholeSceneExecutionTrace.OrderedOpaqueAssemblyRebuildCount++;
+        }
+        slots[group.Root]=slot;
+        OpaqueOBJAssemblyDescription += std::to_string(slot) + "," +
+            std::to_string(SpriteOAMIndex[group.Root]) + ",";
+        for (int i:group.Members)
+            OpaqueOBJAssemblyDescription += std::to_string(SpriteOAMIndex[i]) + " ";
+        OpaqueOBJAssemblyDescription += "\n";
+        for (int i:group.Members)
+            if (i!=group.Root) spriteMask[i>>5]&=~(1u<<(i&31));
+        WholeSceneExecutionTrace.OrderedOpaqueAssemblyCount++;
+        ready=true;
+    }
+    return ready;
+}
+
+bool GLRenderer2D::RebuildEnhancedOBJSource(
+    int sprite,
+    StrictAffineSourceEnhancementDecision sourceEnhancement,
+    int sourceModelIndex,
+    const ConnectedOBJSourcePair* pair,
+    const std::vector<int>* assembly, int assemblySlot)
+{
+    if (sprite < 0 || sprite >= NumSprites)
+        return false;
+
+    const auto& source = SpriteConfig.uOAM[sprite];
+    const int width = pair ? pair->Width : source.Size[0];
+    const int height = pair ? pair->Height : source.Size[1];
+    const int sourceScale = StrictAffineCachedSourceScale(sourceEnhancement,
+                                                          ScaleFactor);
+    if (source.Type >= 3 || width <= 0 || height <= 0 ||
+        width > 64 || height > 64 ||
+        !EnsureEnhancedOBJTextures(sourceScale))
+        return false;
+
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_STENCIL_TEST);
+    glDisable(GL_BLEND);
+    glDisable(GL_SCISSOR_TEST);
+    glColorMaski(0, GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glDepthMask(GL_FALSE);
+
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, EnhancedSpriteInputFB);
+    glViewport(0, 0, 64, 64);
+    glClearColor(0, 0, 0, 0);
+    glClear(GL_COLOR_BUFFER_BIT);
+
+    const int sourceX = (sprite & 0xF) * 64;
+    const int sourceY = (sprite >> 4) * 64;
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, SpriteFB);
+    glReadBuffer(GL_COLOR_ATTACHMENT0);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, EnhancedSpriteInputFB);
+    glDrawBuffer(GL_COLOR_ATTACHMENT0);
+    if (!pair)
+        glBlitFramebuffer(sourceX, sourceY, sourceX + width, sourceY + height,
+                          0, 0, width, height, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    if (pair)
+    {
+        // Assemble the native rectangle before any reconstruction.
+        // Each original sprite still owns its own geometry/material later.
+        for (int member = 0; member < 2; member++)
+        {
+            int index = pair->Members[member];
+            const auto& part = SpriteConfig.uOAM[index];
+            int x = (index & 15) * 64, y = (index >> 4) * 64;
+            glBlitFramebuffer(x, y, x + part.Size[0], y + part.Size[1],
+                pair->X[member], pair->Y[member],
+                pair->X[member] + part.Size[0], pair->Y[member] + part.Size[1],
+                GL_COLOR_BUFFER_BIT, GL_NEAREST);
+        }
+    }
+
+    if (assembly)
+    {
+        s32 members[128][4] {};
+        for (size_t i=0; i<assembly->size(); i++)
+        {
+            int index=(*assembly)[i]; const auto& part=SpriteConfig.uOAM[index];
+            members[i][0]=(index&15)*64; members[i][1]=(index>>4)*64;
+            members[i][2]=part.Size[0]; members[i][3]=part.Size[1];
+        }
+        glUseProgram(OpaqueOBJAssemblyShader);
+        glUniform1i(glGetUniformLocation(OpaqueOBJAssemblyShader,"Source"),0);
+        glUniform1i(glGetUniformLocation(OpaqueOBJAssemblyShader,"uMemberCount"),assembly->size());
+        glUniform2i(glGetUniformLocation(OpaqueOBJAssemblyShader,"uRootSize"),width,height);
+        glUniform4iv(glGetUniformLocation(OpaqueOBJAssemblyShader,"uMembers"),assembly->size(),&members[0][0]);
+        RenderFullscreenPass(OpaqueOBJAssemblyShader,EnhancedSpriteInputFB,64,64,SpriteTex,0);
+    }
+
+    glUseProgram(TransparentRGBPadShader);
+    GLint sourceSizeLoc =
+        glGetUniformLocation(TransparentRGBPadShader, "uSourceSize");
+    if (sourceSizeLoc >= 0)
+        glUniform2i(sourceSizeLoc, width, height);
+    // Bound hidden-RGB extension to the selected scaler's actual native input
+    // footprint. This conditions otherwise meaningless transparent palette
+    // RGB before reconstruction; it does not alter semantic source alpha.
+    int padRadius = 1;
+    switch (sourceEnhancement)
+    {
+    case StrictAffineSourceEnhancementDecision::Spline36CachedAffineSources:
+        padRadius = 3;
+        break;
+    case StrictAffineSourceEnhancementDecision::ArtCNNCachedAffineSources:
+        padRadius = 7;
+        break;
+    case StrictAffineSourceEnhancementDecision::CuNNyCachedAffineSources:
+        padRadius = 6;
+        break;
+    case StrictAffineSourceEnhancementDecision::NNEDI3CachedAffineSources:
+        padRadius = 8;
+        break;
+    case StrictAffineSourceEnhancementDecision::XBRZCachedAffineSources:
+        padRadius = 2;
+        break;
+    default:
+        break;
+    }
+    GLint padRadiusLoc =
+        glGetUniformLocation(TransparentRGBPadShader, "uPadRadius");
+    if (padRadiusLoc >= 0)
+        glUniform1i(padRadiusLoc, padRadius);
+    GLint precomposeBackdropLoc =
+        glGetUniformLocation(TransparentRGBPadShader,
+                             "uPrecomposeBackdrop");
+    if (precomposeBackdropLoc >= 0)
+        glUniform1i(precomposeBackdropLoc, false);
+    RenderFullscreenPass(TransparentRGBPadShader,
+                         EnhancedSpritePreparedFB,
+                         64,
+                         64,
+                         EnhancedSpriteInputTex,
+                         0);
+
+    if (!RenderStrictAffineCachedRGB(sourceEnhancement,
+                                     sourceModelIndex,
+                                     EnhancedSpritePreparedTex,
+                                     EnhancedSpriteScaledRGBTex,
+                                     64,
+                                     64,
+                                     sourceScale))
+        return false;
+
+    // Reconstruct display coverage independently of the RGB scaler. Native
+    // alpha remains the semantic authority for ownership and DS blending.
+    {
+        if (!ReconstructAffineAlpha(EnhancedSpriteInputTex, EnhancedSpriteScaledRGBTex,
+                                    EnhancedSpriteScaledRGBATex, 64, 64, sourceScale, sourceEnhancement))
+            return false;
+    }
+
+    if (assembly)
+    {
+        int x=(assemblySlot&15)*64*sourceScale, y=(assemblySlot>>4)*64*sourceScale;
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, EnhancedSpriteScaledRGBAFB);
+        glReadBuffer(GL_COLOR_ATTACHMENT0);
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER,OpaqueOBJAssemblyFB);
+        glDrawBuffer(GL_COLOR_ATTACHMENT0);
+        glBlitFramebuffer(0,0,64*sourceScale,64*sourceScale,
+            x,y,x+64*sourceScale,y+64*sourceScale,GL_COLOR_BUFFER_BIT,GL_NEAREST);
+        return true;
+    }
+
+    const int targetX = (sprite & 0xF) * 64 * sourceScale;
+    const int targetY = (sprite >> 4) * 64 * sourceScale;
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, EnhancedSpriteScaledRGBAFB);
+    glReadBuffer(GL_COLOR_ATTACHMENT0);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, EnhancedSpriteFB);
+    glDrawBuffer(GL_COLOR_ATTACHMENT0);
+    if (!pair)
+        glBlitFramebuffer(0, 0, width * sourceScale, height * sourceScale,
+                          targetX, targetY, targetX + width * sourceScale,
+                          targetY + height * sourceScale, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    if (pair)
+    {
+        // Keep the full joined context in both existing 64x64 atlas slots.
+        // Cropping it back to each member would reintroduce the filtering seam.
+        for (int member = 0; member < 2; member++)
+        {
+            int index = pair->Members[member];
+            int x = (index & 15) * 64 * sourceScale;
+            int y = (index >> 4) * 64 * sourceScale;
+            glBlitFramebuffer(0, 0, width * sourceScale, height * sourceScale,
+                x, y, x + width * sourceScale, y + height * sourceScale,
+                GL_COLOR_BUFFER_BIT, GL_NEAREST);
+        }
+    }
+
+    return true;
+}
+
+bool GLRenderer2D::PrepareStrictAffineEnhancedOBJSources(
+    StrictAffineSourceEnhancementDecision sourceEnhancement,
+    int sourceModelIndex)
+{
+    const int sourceScale = StrictAffineCachedSourceScale(sourceEnhancement,
+                                                          ScaleFactor);
+    if (!EnsureEnhancedOBJTextures(sourceScale))
+        return false;
+
+    bool hasActiveAffineOBJ = false;
+    bool allReady = true;
+
+    std::fill(&ConnectedOBJSourceHashes[0], &ConnectedOBJSourceHashes[128], 0);
+    std::memset(EnhancedOBJSourceRegions, 0, sizeof(EnhancedOBJSourceRegions));
+    std::vector<ConnectedOBJSourcePair> pairs;
+    int pairIndex[128], degree[128] {};
+    std::fill(pairIndex, pairIndex + 128, -1);
+    if (WholeSceneScaleHybridStrictAffineConnectedSources)
+    {
+        auto input = [&](int index) {
+            const auto& s = SpriteConfig.uOAM[index];
+            ConnectedOBJSourceInput out;
+            out.OAM = SpriteOAMIndex[index]; out.MatrixIndex = int(s.Rotscale);
+            out.X = s.Position[0]; out.Y = s.Position[1];
+            out.Width = s.Size[0]; out.Height = s.Size[1];
+            out.BoundWidth = s.BoundSize[0]; out.BoundHeight = s.BoundSize[1];
+            if (s.Rotscale < 32)
+                for (int c = 0; c < 4; c++) out.Matrix[c] = SpriteConfig.uRotscale[s.Rotscale][c];
+            out.Mode = s.OBJMode; out.Type = s.Type; out.Palette = s.PalOffset;
+            out.Tile = s.TileOffset; out.Stride = s.TileStride;
+            out.Priority = s.BGPrio; out.Mosaic = s.Mosaic;
+            return out;
+        };
+        for (int i = 0; i + 1 < NumSprites; i++)
+        {
+            ConnectedOBJSourcePair pair;
+            // Count larger neighbors too, so a three-piece object cannot be
+            // partially grouped merely because one adjacent pair exceeds 64.
+            if (!PlanConnectedOBJSourcePair(input(i), input(i + 1), pair, 128)) continue;
+            pair.Members[0] = i; pair.Members[1] = i + 1;
+            pairs.push_back(pair);
+            degree[i]++; degree[i + 1]++;
+        }
+        for (size_t p = 0; p < pairs.size(); p++)
+        {
+            const auto& pair = pairs[p];
+            if (degree[pair.Members[0]] != 1 || degree[pair.Members[1]] != 1) continue;
+            if (pair.Width > 64 || pair.Height > 64) continue;
+            u64 hash = 1469598103934665603ull;
+            auto add = [&](u64 v) { hash ^= v; hash *= 1099511628211ull; };
+            add(pair.Width); add(pair.Height);
+            for (int m = 0; m < 2; m++)
+            {
+                int index = pair.Members[m];
+                const auto& s = SpriteConfig.uOAM[index];
+                add(SpriteOAMIndex[index]); add(s.Type); add(s.PalOffset);
+                add(s.TileOffset); add(s.TileStride); add(s.Size[0]); add(s.Size[1]);
+                add(pair.X[m]); add(pair.Y[m]);
+            }
+            for (int m = 0; m < 2; m++)
+            {
+                int index = pair.Members[m];
+                pairIndex[index] = int(p);
+                ConnectedOBJSourceHashes[index] = hash;
+                EnhancedOBJSourceRegions[index][0] = pair.X[m];
+                EnhancedOBJSourceRegions[index][1] = pair.Y[m];
+                EnhancedOBJSourceRegions[index][2] = pair.Width;
+                EnhancedOBJSourceRegions[index][3] = pair.Height;
+            }
+        }
+    }
+
+    for (int sprite = 0; sprite < NumSprites; sprite++)
+    {
+        const auto& source = SpriteConfig.uOAM[sprite];
+        if (source.Rotscale == static_cast<u32>(-1) || source.Type >= 3)
+            continue;
+
+        hasActiveAffineOBJ = true;
+        WholeSceneTrace.StrictAffineEnhancedOBJActiveSlots++;
+        const ConnectedOBJSourcePair* pair = pairIndex[sprite] >= 0 ? &pairs[pairIndex[sprite]] : nullptr;
+        if (pair && pair->Members[1] == sprite) continue;
+        const EnhancedOBJSourceKey key = BuildEnhancedOBJSourceKey(
+            sprite, sourceEnhancement);
+        if (IsEnhancedOBJSourceValid(sprite, key) &&
+            (!pair || IsEnhancedOBJSourceValid(pair->Members[1],
+                BuildEnhancedOBJSourceKey(pair->Members[1], sourceEnhancement))))
+        {
+            WholeSceneTrace.StrictAffineEnhancedOBJCacheHits += pair ? 2 : 1;
+            continue;
+        }
+
+        WholeSceneTrace.StrictAffineEnhancedOBJCacheMisses += pair ? 2 : 1;
+        if (!RebuildEnhancedOBJSource(sprite,
+                                      sourceEnhancement,
+                                      sourceModelIndex, pair))
+        {
+            WholeSceneTrace.StrictAffineEnhancedOBJFallbacks += pair ? 2 : 1;
+            allReady = false;
+            continue;
+        }
+
+        WholeSceneTrace.StrictAffineEnhancedOBJNeuralDispatches++;
+        MarkEnhancedOBJSourceValid(sprite, key);
+        if (pair)
+            MarkEnhancedOBJSourceValid(pair->Members[1],
+                BuildEnhancedOBJSourceKey(pair->Members[1], sourceEnhancement));
+    }
+
+    return hasActiveAffineOBJ && allReady;
+}
+
+bool GLRenderer2D::EnsureDeferredStrictAffineHistoricalBGLayerTexture(
+    int epoch, int layer, int width, int height)
+{
+    if (epoch < 0 ||
+        epoch >= static_cast<int>(DeferredScanlineStrictAffineInputs::
+                                      MaxHistoricalSourceEpochs) ||
+        layer < 0 || layer >= 4 || width <= 0 || height <= 0)
+        return false;
+    if (DeferredStrictAffineHistoricalBGLayerWidth[epoch][layer] ==
+            static_cast<u32>(width) &&
+        DeferredStrictAffineHistoricalBGLayerHeight[epoch][layer] ==
+            static_cast<u32>(height))
+        return true;
+
+    glBindTexture(GL_TEXTURE_2D,
+                  DeferredStrictAffineHistoricalBGLayerTex[epoch][layer]);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA,
+                 GL_UNSIGNED_BYTE, nullptr);
+    glBindTexture(GL_TEXTURE_2D,
+                  DeferredStrictAffineHistoricalBGLayerMetaTex[epoch][layer]);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA,
+                 GL_UNSIGNED_BYTE, nullptr);
+    DeferredStrictAffineHistoricalBGLayerWidth[epoch][layer] = width;
+    DeferredStrictAffineHistoricalBGLayerHeight[epoch][layer] = height;
+    glBindFramebuffer(GL_FRAMEBUFFER,
+                      DeferredStrictAffineHistoricalBGLayerFB[epoch][layer]);
+    glFramebufferTexture(
+        GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+        DeferredStrictAffineHistoricalBGLayerTex[epoch][layer], 0);
+    glFramebufferTexture(
+        GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1,
+        DeferredStrictAffineHistoricalBGLayerMetaTex[epoch][layer], 0);
+    const GLenum drawBuffers[2] = {
+        GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1
+    };
+    glDrawBuffers(2, drawBuffers);
+    return glCheckFramebufferStatus(GL_FRAMEBUFFER) ==
+        GL_FRAMEBUFFER_COMPLETE;
+}
+
+bool GLRenderer2D::EnsureDeferredStrictAffineHistoricalEnhancedBGLayerTexture(
+    int epoch, int layer, int width, int height)
+{
+    if (epoch < 0 ||
+        epoch >= static_cast<int>(DeferredScanlineStrictAffineInputs::
+                                      MaxHistoricalSourceEpochs) ||
+        layer < 0 || layer >= 4 || width <= 0 || height <= 0)
+        return false;
+    if (DeferredStrictAffineHistoricalEnhancedBGLayerWidth[epoch][layer] ==
+            static_cast<u32>(width) &&
+        DeferredStrictAffineHistoricalEnhancedBGLayerHeight[epoch][layer] ==
+            static_cast<u32>(height))
+        return true;
+
+    glBindTexture(
+        GL_TEXTURE_2D,
+        DeferredStrictAffineHistoricalEnhancedBGLayerTex[epoch][layer]);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, width, height, 0, GL_RGBA,
+                 GL_HALF_FLOAT, nullptr);
+    DeferredStrictAffineHistoricalEnhancedBGLayerWidth[epoch][layer] = width;
+    DeferredStrictAffineHistoricalEnhancedBGLayerHeight[epoch][layer] = height;
+    glBindFramebuffer(
+        GL_FRAMEBUFFER,
+        DeferredStrictAffineHistoricalEnhancedBGLayerFB[epoch][layer]);
+    glFramebufferTexture(
+        GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+        DeferredStrictAffineHistoricalEnhancedBGLayerTex[epoch][layer], 0);
+    glDrawBuffer(GL_COLOR_ATTACHMENT0);
+    return glCheckFramebufferStatus(GL_FRAMEBUFFER) ==
+        GL_FRAMEBUFFER_COMPLETE;
+}
+
+void GLRenderer2D::PreserveDeferredStrictAffineHistoricalSourceEpoch(
+    int line,
+    u8 layerPreDirty,
+    u8 registerLayerPreDirty,
+    u8 vramLayerPreDirty,
+    u8 paletteLayerPreDirty,
+    u8 deferredLayerPreDirty)
+{
+    if (!WholeSceneScaleHybridStrictAffineHighRes ||
+        WholeSceneScaleMode !=
+            RendererSettings::WholeScene2DScaleMode::ConservativeHybridUpscale ||
+        ScaleFactor <= 1 || line <= 0 || line >= 192 ||
+        registerLayerPreDirty != 0 || deferredLayerPreDirty != 0)
+        return;
+
+    const u8 sourceDirtyMask = vramLayerPreDirty | paletteLayerPreDirty;
+    if (sourceDirtyMask == 0 ||
+        (layerPreDirty & ~sourceDirtyMask) != 0)
+    {
+        return;
+    }
+
+    if (DeferredStrictAffineHistoricalSourceEpochOverflow)
+        return;
+    if (DeferredStrictAffineHistoricalSourceEpochCount >=
+        DeferredScanlineStrictAffineInputs::MaxHistoricalSourceEpochs)
+    {
+        DeferredStrictAffineHistoricalSourceEpochOverflow = true;
+        return;
+    }
+
+    u32 historicalVisibleBGMask = 0;
+    const int epochIndex =
+        static_cast<int>(DeferredStrictAffineHistoricalSourceEpochCount);
+    const int epochYStart = epochIndex == 0
+        ? 0
+        : DeferredStrictAffineHistoricalSourceEpochs[epochIndex - 1].YEnd;
+    if (line <= epochYStart)
+    {
+        DeferredStrictAffineHistoricalSourceEpochOverflow = true;
+        return;
+    }
+    for (int y = epochYStart; y < line; y++)
+    {
+        const auto& row = ScanlineConfig.uScanline[y];
+        for (int layer = 0; layer < 4; layer++)
+        {
+            if (row.BGPrio[layer] != 0xFFFFFFFFu &&
+                LayerConfig.uBGConfig[layer].Type < 6)
+                historicalVisibleBGMask |= 1u << layer;
+        }
+    }
+    const u32 dirtyMask =
+        (layerPreDirty & 0xFu) & historicalVisibleBGMask;
+    if (dirtyMask == 0)
+        return;
+
+    auto& epoch = DeferredStrictAffineHistoricalSourceEpochs[epochIndex];
+    epoch = {};
+    epoch.Attempted = true;
+    epoch.YStart = epochYStart;
+    epoch.YEnd = line;
+    epoch.SourceGeneration = BuildWholeSceneRepresentationSourceGeneration();
+    epoch.SpriteGeneration = SpriteSourceGeneration;
+    for (int layer = 0; layer < 4; layer++)
+        epoch.BGLayerGeneration[layer] = BGLayerSourceGeneration[layer];
+    epoch.SourceEnhancement =
+        CurrentStrictAffineSourceEnhancementDecision(true);
+    epoch.SourceModelIndex = epoch.SourceEnhancement ==
+            StrictAffineSourceEnhancementDecision::ArtCNNCachedAffineSources
+        ? WholeSceneArtCNNModelIndex()
+        : (epoch.SourceEnhancement ==
+               StrictAffineSourceEnhancementDecision::CuNNyCachedAffineSources
+            ? RendererSettings::GetGLCuNNyModelIndex(
+                  WholeSceneScaleAlgorithm)
+            : -1);
+    DeferredStrictAffineHistoricalSourceEpochCount++;
+
+    bool nativeReady = true;
+    for (int layer = 0; layer < 4; layer++)
+    {
+        const u32 layerBit = 1u << layer;
+        if ((dirtyMask & layerBit) == 0)
+            continue;
+        const auto& source = LayerConfig.uBGConfig[layer];
+        if (source.Type >= 6 || source.Size[0] == 0 || source.Size[1] == 0 ||
+            !EnsureDeferredStrictAffineHistoricalBGLayerTexture(
+                epochIndex, layer, source.Size[0], source.Size[1]))
+        {
+            nativeReady = false;
+            continue;
+        }
+
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, BGLayerFB[layer]);
+        glBindFramebuffer(
+            GL_DRAW_FRAMEBUFFER,
+            DeferredStrictAffineHistoricalBGLayerFB[epochIndex][layer]);
+        glReadBuffer(GL_COLOR_ATTACHMENT0);
+        glDrawBuffer(GL_COLOR_ATTACHMENT0);
+        glBlitFramebuffer(0, 0, source.Size[0], source.Size[1],
+                          0, 0, source.Size[0], source.Size[1],
+                          GL_COLOR_BUFFER_BIT, GL_NEAREST);
+        glReadBuffer(GL_COLOR_ATTACHMENT1);
+        glDrawBuffer(GL_COLOR_ATTACHMENT1);
+        glBlitFramebuffer(0, 0, source.Size[0], source.Size[1],
+                          0, 0, source.Size[0], source.Size[1],
+                          GL_COLOR_BUFFER_BIT, GL_NEAREST);
+        epoch.NativeBGMask |= layerBit;
+    }
+
+    const bool cached =
+        epoch.SourceEnhancement ==
+            StrictAffineSourceEnhancementDecision::ArtCNNCachedAffineSources ||
+        epoch.SourceEnhancement ==
+            StrictAffineSourceEnhancementDecision::CuNNyCachedAffineSources ||
+        epoch.SourceEnhancement ==
+            StrictAffineSourceEnhancementDecision::NNEDI3CachedAffineSources ||
+        epoch.SourceEnhancement ==
+            StrictAffineSourceEnhancementDecision::XBRZCachedAffineSources;
+    if (cached && nativeReady)
+    {
+        const u32 companionTextMask =
+            WholeSceneScaleHybridStrictAffineTopTextBG ? dirtyMask : 0u;
+        const u32 readyMask = PrepareStrictAffineEnhancedBGSources(
+            epoch.SourceEnhancement,
+            epoch.SourceModelIndex,
+            0,
+            false,
+            0,
+            companionTextMask,
+            dirtyMask);
+        for (int layer = 0; layer < 4; layer++)
+        {
+            const u32 layerBit = 1u << layer;
+            if ((readyMask & dirtyMask & layerBit) == 0)
+                continue;
+            const int width = EnhancedBGLayerWidth[layer];
+            const int height = EnhancedBGLayerHeight[layer];
+            if (!EnsureDeferredStrictAffineHistoricalEnhancedBGLayerTexture(
+                    epochIndex, layer, width, height))
+                continue;
+            glBindFramebuffer(GL_READ_FRAMEBUFFER, EnhancedBGLayerFB[layer]);
+            glReadBuffer(GL_COLOR_ATTACHMENT0);
+            glBindFramebuffer(
+                GL_DRAW_FRAMEBUFFER,
+                DeferredStrictAffineHistoricalEnhancedBGLayerFB[epochIndex][layer]);
+            glDrawBuffer(GL_COLOR_ATTACHMENT0);
+            glBlitFramebuffer(0, 0, width, height,
+                              0, 0, width, height,
+                              GL_COLOR_BUFFER_BIT, GL_NEAREST);
+            epoch.EnhancedBGMask |= layerBit;
+        }
+    }
+
+    epoch.Valid = nativeReady && epoch.NativeBGMask == dirtyMask;
+}
+
+bool GLRenderer2D::EnsureEnhancedBGLayerTexture(int layer, int width,
+                                                 int height)
+{
+    if (layer < 0 || layer >= 4 || width <= 0 || height <= 0)
+        return false;
+    if (EnhancedBGLayerWidth[layer] == static_cast<u32>(width) &&
+        EnhancedBGLayerHeight[layer] == static_cast<u32>(height))
+        return true;
+
+    GLint maxTextureSize = 0;
+    glGetIntegerv(GL_MAX_TEXTURE_SIZE, &maxTextureSize);
+    if (width > maxTextureSize || height > maxTextureSize)
+        return false;
+
+    glBindTexture(GL_TEXTURE_2D, EnhancedBGLayerTex[layer]);
+    glDefaultTexParams(GL_TEXTURE_2D);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, width, height, 0, GL_RGBA,
+                 GL_HALF_FLOAT, nullptr);
+    glBindFramebuffer(GL_FRAMEBUFFER, EnhancedBGLayerFB[layer]);
+    glFramebufferTexture(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                         EnhancedBGLayerTex[layer], 0);
+    glDrawBuffer(GL_COLOR_ATTACHMENT0);
+    EnhancedBGLayerWidth[layer] = width;
+    EnhancedBGLayerHeight[layer] = height;
+    return true;
+}
+
+bool GLRenderer2D::EnsureEnhancedBGScratchTextures(int width, int height,
+                                                    int sourceScale)
+{
+    if (width <= 0 || height <= 0 ||
+        (sourceScale != 2 && sourceScale != 4))
+        return false;
+    if (EnhancedBGScratchWidth == static_cast<u32>(width) &&
+        EnhancedBGScratchHeight == static_cast<u32>(height) &&
+        EnhancedBGScratchScale == static_cast<u32>(sourceScale))
+        return true;
+
+    GLint maxTextureSize = 0;
+    glGetIntegerv(GL_MAX_TEXTURE_SIZE, &maxTextureSize);
+    if (width * sourceScale > maxTextureSize ||
+        height * sourceScale > maxTextureSize)
+    {
+        return false;
+    }
+
+    glBindTexture(GL_TEXTURE_2D, EnhancedBGInputTex);
+    glDefaultTexParams(GL_TEXTURE_2D);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA,
+                 GL_UNSIGNED_BYTE, nullptr);
+    glBindFramebuffer(GL_FRAMEBUFFER, EnhancedBGInputFB);
+    glFramebufferTexture(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                         EnhancedBGInputTex, 0);
+    glDrawBuffer(GL_COLOR_ATTACHMENT0);
+
+    glBindTexture(GL_TEXTURE_2D, EnhancedBGPreparedTex);
+    glDefaultTexParams(GL_TEXTURE_2D);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA,
+                 GL_UNSIGNED_BYTE, nullptr);
+    glBindFramebuffer(GL_FRAMEBUFFER, EnhancedBGPreparedFB);
+    glFramebufferTexture(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                         EnhancedBGPreparedTex, 0);
+    glDrawBuffer(GL_COLOR_ATTACHMENT0);
+
+    glBindTexture(GL_TEXTURE_2D, EnhancedBGScaledTex);
+    glDefaultTexParams(GL_TEXTURE_2D);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F,
+                 width * sourceScale, height * sourceScale, 0,
+                  GL_RGBA, GL_HALF_FLOAT, nullptr);
+    glBindFramebuffer(GL_FRAMEBUFFER, EnhancedBGScaledFB);
+    glFramebufferTexture(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                         EnhancedBGScaledTex, 0);
+    glDrawBuffer(GL_COLOR_ATTACHMENT0);
+
+    EnhancedBGScratchWidth = width;
+    EnhancedBGScratchHeight = height;
+    EnhancedBGScratchScale = sourceScale;
+    return true;
+}
+
+bool GLRenderer2D::RebuildEnhancedBGLayer(
+    int layer,
+    StrictAffineSourceEnhancementDecision sourceEnhancement,
+    int sourceModelIndex,
+    int sourceScaleOverride,
+    u32 affineConstantBackdropPrecomposeMask,
+    bool allowTextBG)
+{
+    if (layer < 0 || layer >= 4)
+        return false;
+
+    const auto& source = LayerConfig.uBGConfig[layer];
+    const int width = source.Size[0];
+    const int height = source.Size[1];
+    const int sourceScale = sourceScaleOverride > 0
+        ? sourceScaleOverride
+        : StrictAffineCachedSourceScale(sourceEnhancement, ScaleFactor);
+    constexpr int padding = 8;
+    const int paddedWidth = width + padding * 2;
+    const int paddedHeight = height + padding * 2;
+    const bool affineBG = source.Type == 2 || source.Type == 3;
+    const bool textBG = allowTextBG && (source.Type == 0 || source.Type == 1);
+    if ((!affineBG && !textBG) || width <= 0 || height <= 0 ||
+        !EnsureEnhancedBGLayerTexture(layer,
+                                      width * sourceScale,
+                                      height * sourceScale) ||
+        !EnsureEnhancedBGScratchTextures(paddedWidth,
+                                         paddedHeight,
+                                         sourceScale))
+        return false;
+
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_STENCIL_TEST);
+    glDisable(GL_BLEND);
+    glDisable(GL_SCISSOR_TEST);
+    glColorMaski(0, GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glDepthMask(GL_FALSE);
+
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, EnhancedBGInputFB);
+    glViewport(0, 0, paddedWidth, paddedHeight);
+    glClearColor(0, 0, 0, 0);
+    glClear(GL_COLOR_BUFFER_BIT);
+
+    auto blit = [&](int sx0, int sy0, int sx1, int sy1,
+                    int dx0, int dy0, int dx1, int dy1)
+    {
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, BGLayerFB[layer]);
+        glReadBuffer(GL_COLOR_ATTACHMENT0);
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, EnhancedBGInputFB);
+        glDrawBuffer(GL_COLOR_ATTACHMENT0);
+        glBlitFramebuffer(sx0, sy0, sx1, sy1, dx0, dy0, dx1, dy1,
+                          GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    };
+
+    blit(0, 0, width, height,
+         padding, padding, padding + width, padding + height);
+
+    if (!source.Clamp)
+    {
+        blit(width - padding, 0, width, height,
+             0, padding, padding, padding + height);
+        blit(0, 0, padding, height,
+             padding + width, padding,
+             padding + width + padding, padding + height);
+        blit(0, height - padding, width, height,
+             padding, 0, padding + width, padding);
+        blit(0, 0, width, padding,
+             padding, padding + height,
+             padding + width, padding + height + padding);
+
+        blit(width - padding, height - padding, width, height,
+             0, 0, padding, padding);
+        blit(0, height - padding, padding, height,
+             padding + width, 0,
+             padding + width + padding, padding);
+        blit(width - padding, 0, width, padding,
+             0, padding + height,
+             padding, padding + height + padding);
+        blit(0, 0, padding, padding,
+             padding + width, padding + height,
+             padding + width + padding, padding + height + padding);
+    }
+
+    const bool precomposeBackdrop =
+        (affineConstantBackdropPrecomposeMask & (1u << layer)) != 0;
+    const u32 backdropColor = layer == 2
+        ? WholeSceneTrace.StrictAffineBG2UnderlayBackdropColor
+        : WholeSceneTrace.StrictAffineBG3UnderlayBackdropColor;
+
+    // Ordinarily cached reconstruction owns RGB only and receives the same
+    // guarded hidden-RGB frontier as enhanced OBJ. When the underlay proof is
+    // active, however, reconstruct the actual visible image: every absent
+    // source texel (including clamp padding outside the map) is replaced by
+    // the proven constant backdrop before Spline36, CuNNy, NNEDI3, or xBRZ can
+    // classify/filter the edge. The compositor retains a separate logical-map
+    // domain mask, so this opaque reconstruction support does not grant layer
+    // ownership outside the legal affine source.
+    glUseProgram(TransparentRGBPadShader);
+    GLint sourceSizeLoc =
+        glGetUniformLocation(TransparentRGBPadShader, "uSourceSize");
+    if (sourceSizeLoc >= 0)
+        glUniform2i(sourceSizeLoc, paddedWidth, paddedHeight);
+    GLint padRadiusLoc =
+        glGetUniformLocation(TransparentRGBPadShader, "uPadRadius");
+    if (padRadiusLoc >= 0)
+        glUniform1i(padRadiusLoc,
+            sourceEnhancement == StrictAffineSourceEnhancementDecision::Spline36CachedAffineSources ? 3 : 1);
+    GLint precomposeBackdropLoc =
+        glGetUniformLocation(TransparentRGBPadShader,
+                             "uPrecomposeBackdrop");
+    if (precomposeBackdropLoc >= 0)
+        glUniform1i(precomposeBackdropLoc, precomposeBackdrop);
+    GLint backdropColorLoc =
+        glGetUniformLocation(TransparentRGBPadShader, "uBackdropColor");
+    if (backdropColorLoc >= 0)
+        glUniform1i(backdropColorLoc, static_cast<GLint>(backdropColor));
+    RenderFullscreenPass(TransparentRGBPadShader,
+                         EnhancedBGPreparedFB,
+                         paddedWidth,
+                         paddedHeight,
+                         EnhancedBGInputTex,
+                         0);
+
+    if (!RenderStrictAffineCachedRGB(sourceEnhancement,
+                                     sourceModelIndex,
+                                     EnhancedBGPreparedTex,
+                                     EnhancedBGScaledTex,
+                                     paddedWidth,
+                                     paddedHeight,
+                                     sourceScale))
+        return false;
+
+    if (!ReconstructAffineAlpha(EnhancedBGPreparedTex, EnhancedBGScaledTex,
+                                EnhancedBGScaledTex, paddedWidth, paddedHeight, sourceScale, sourceEnhancement))
+        return false;
+
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, EnhancedBGScaledFB);
+    glReadBuffer(GL_COLOR_ATTACHMENT0);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, EnhancedBGLayerFB[layer]);
+    glDrawBuffer(GL_COLOR_ATTACHMENT0);
+    glBlitFramebuffer(padding * sourceScale, padding * sourceScale,
+                      (padding + width) * sourceScale,
+                      (padding + height) * sourceScale,
+                      0, 0, width * sourceScale, height * sourceScale,
+                      GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    return true;
+}
+
+u32 GLRenderer2D::PrepareStrictAffineEnhancedBGSources(
+    StrictAffineSourceEnhancementDecision sourceEnhancement,
+    int sourceModelIndex,
+    int sourceScaleOverride,
+    bool recordTrace,
+    u32 affineConstantBackdropPrecomposeMask,
+    u32 additionalTextBGMask,
+    u32 enabledBGMaskOverride)
+{
+    const int sourceScale = sourceScaleOverride > 0
+        ? sourceScaleOverride
+        : StrictAffineCachedSourceScale(sourceEnhancement, ScaleFactor);
+    u32 readyMask = 0;
+    const u32 enabledBGMask = enabledBGMaskOverride != 0
+        ? enabledBGMaskOverride
+        : LayerEnable;
+    for (int layer = 0; layer < 4; layer++)
+    {
+        const auto& source = LayerConfig.uBGConfig[layer];
+        const bool affineBG = source.Type == 2 || source.Type == 3;
+        const bool textBG =
+            (additionalTextBGMask & (1u << layer)) != 0 &&
+            (source.Type == 0 || source.Type == 1);
+        if (!(enabledBGMask & (1u << layer)) ||
+            (!affineBG && !textBG))
+            continue;
+
+        if (recordTrace)
+            WholeSceneTrace.StrictAffineEnhancedBGActiveLayers++;
+        const u32 algorithm = static_cast<u32>(WholeSceneScaleAlgorithm);
+        const bool precomposeBackdrop =
+            (affineConstantBackdropPrecomposeMask & (1u << layer)) != 0;
+        const u32 backdropColor = precomposeBackdrop
+            ? (layer == 2
+                ? WholeSceneTrace.StrictAffineBG2UnderlayBackdropColor
+                : WholeSceneTrace.StrictAffineBG3UnderlayBackdropColor)
+            : 0;
+        const bool valid =
+            EnhancedBGLayerSourceGeneration[layer] ==
+                BGLayerSourceGeneration[layer] &&
+            EnhancedBGLayerAlgorithm[layer] == algorithm &&
+            EnhancedBGLayerBackdropPrecomposed[layer] ==
+                precomposeBackdrop &&
+            EnhancedBGLayerBackdropColor[layer] == backdropColor &&
+            EnhancedBGLayerWidth[layer] ==
+                static_cast<u32>(source.Size[0] * sourceScale) &&
+            EnhancedBGLayerHeight[layer] ==
+                static_cast<u32>(source.Size[1] * sourceScale);
+        if (valid)
+        {
+            if (recordTrace)
+                WholeSceneTrace.StrictAffineEnhancedBGCacheHits++;
+            readyMask |= 1u << layer;
+            continue;
+        }
+
+        if (recordTrace)
+            WholeSceneTrace.StrictAffineEnhancedBGCacheMisses++;
+        if (!RebuildEnhancedBGLayer(layer,
+                                    sourceEnhancement,
+                                    sourceModelIndex,
+                                    sourceScale,
+                                    affineConstantBackdropPrecomposeMask,
+                                    textBG))
+        {
+            if (recordTrace)
+                WholeSceneTrace.StrictAffineEnhancedBGFallbacks++;
+            continue;
+        }
+
+        if (recordTrace)
+            WholeSceneTrace.StrictAffineEnhancedBGNeuralDispatches++;
+        EnhancedBGLayerSourceGeneration[layer] =
+            BGLayerSourceGeneration[layer];
+        EnhancedBGLayerAlgorithm[layer] = algorithm;
+        EnhancedBGLayerBackdropPrecomposed[layer] = precomposeBackdrop;
+        EnhancedBGLayerBackdropColor[layer] = backdropColor;
+        readyMask |= 1u << layer;
+    }
+    return readyMask;
 }
 
 
@@ -9345,6 +14045,7 @@ void GLRenderer2D::PrerenderLayer(int layer)
     glBindBuffer(GL_ARRAY_BUFFER, Parent.RectVtxBuffer);
     glBindVertexArray(Parent.RectVtxArray);
     glDrawArrays(GL_TRIANGLES, 0, 2*3);
+    BGLayerSourceGeneration[layer]++;
 }
 
 void GLRenderer2D::PrerenderLayerRows(int layer, int firstRow, int lastRow)
@@ -9371,12 +14072,81 @@ void GLRenderer2D::PrerenderLayerRows(int layer, int firstRow, int lastRow)
 
 void GLRenderer2D::DoRenderSprites(int line)
 {
-    int ystart = LastSpriteLine;
-    int yend = line;
-    int spriteFilterMode = WholeSceneHighResSpriteFilterMode();
+    RenderSpritesToLayer(LastSpriteLine,
+                         line,
+                         WholeSceneHighResSpriteFilterMode(),
+                         false);
+}
+
+void GLRenderer2D::RenderSpritesToLayer(int ystart,
+                                        int yend,
+                                        int spriteFilterMode,
+                                        bool affineSourceEnhancementOnly,
+                                        bool useEnhancedSpriteSource,
+                                        GLuint targetFB,
+                                        bool affineOnly,
+                                        int targetScale,
+                                        bool linearEnhancedSource,
+                                        bool excludeOrdinaryEquivalentAffine,
+                                        bool xbrzPresentationOnly,
+                                        int affineOBJPresentationCoverageMode,
+                                        const u32* includedSpriteMask,
+                                        bool orderedPresentationBand,
+                                        const int* assembledSlots)
+{
+    if (xbrzPresentationOnly &&
+        useEnhancedSpriteSource)
+    {
+        affineOBJPresentationCoverageMode = 9;
+        linearEnhancedSource = WholeSceneScaleHybridStrictAffineSourceEnhancement &&
+            WholeSceneScaleAlgorithm != RendererSettings::GLScaleAlgorithm::XBRZ;
+    }
+    int fallbackAssemblySlots[128];
+    u32 fallbackAssemblyMask[4] = {~0u, ~0u, ~0u, ~0u};
+    if (includedSpriteMask)
+        std::copy(includedSpriteMask, includedSpriteMask + 4, fallbackAssemblyMask);
+    if (xbrzPresentationOnly &&
+        useEnhancedSpriteSource &&
+        orderedPresentationBand &&
+        !assembledSlots &&
+        WholeSceneScaleHybridStrictAffineOpaqueAssemblies &&
+        PrepareOpaqueOBJAssemblies(fallbackAssemblyMask,
+                                    fallbackAssemblySlots, ystart, yend))
+    {
+        assembledSlots = fallbackAssemblySlots;
+        includedSpriteMask = fallbackAssemblyMask;
+    }
+    const int renderScale = targetScale > 0 ? targetScale : ScaleFactor;
+    const int renderWidth = 256 * renderScale;
+    const int renderHeight = 192 * renderScale;
 
     glUseProgram(SpriteShader);
+    SetUniform1iIfPresent(SpriteShader, "uExplicitAlphaReconstruction", static_cast<int>(AffineAlpha));
+    glUniform1i(SpriteUseAssembledSourceULoc, assembledSlots != nullptr);
+    if (assembledSlots)
+    {
+        glUniform1iv(SpriteAssembledSlotsULoc,NumSprites,assembledSlots);
+        glActiveTexture(GL_TEXTURE4);
+        glBindTexture(GL_TEXTURE_2D,OpaqueOBJAssemblyTex);
+    }
     glUniform1i(SpriteFilterModeULoc, spriteFilterMode);
+    glUniform1i(SpriteAffineSourceEnhancementOnlyULoc,
+                affineSourceEnhancementOnly);
+    glUniform1i(SpriteUseEnhancedSourceULoc, useEnhancedSpriteSource);
+    if (useEnhancedSpriteSource)
+        glUniform4iv(glGetUniformLocation(SpriteShader, "uEnhancedSpriteSourceRegions"),
+                     NumSprites, &EnhancedOBJSourceRegions[0][0]);
+    glUniform1i(SpriteEnhancedSourceScaleULoc,
+                useEnhancedSpriteSource
+                    ? static_cast<GLint>(EnhancedSpriteSourceScale)
+                    : 2);
+    glUniform1i(SpriteLinearEnhancedSourceULoc,
+                useEnhancedSpriteSource && linearEnhancedSource);
+    glUniform1i(SpriteXBRZPresentationOnlyULoc, xbrzPresentationOnly);
+    glUniform1i(SpriteAffineOBJPresentationCoverageModeULoc,
+                affineOBJPresentationCoverageMode);
+    glUniform1i(SpriteOrderedPresentationBandULoc,
+                orderedPresentationBand);
 
     glDisable(GL_DEPTH_TEST);
     glDisable(GL_STENCIL_TEST);
@@ -9392,8 +14162,168 @@ void GLRenderer2D::DoRenderSprites(int line)
                     &SpriteScanlineConfig.uMosaicLine[ystart]);
 
     glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
-    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, OBJLayerFB);
-    glViewport(0, 0, ScreenW, ScreenH);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER,
+                      targetFB ? targetFB : OBJLayerFB);
+    glViewport(0, 0, renderWidth, renderHeight);
+
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, SpriteTex);
+
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D_ARRAY, Parent.CaptureOutput128Tex);
+
+    glActiveTexture(GL_TEXTURE2);
+    glBindTexture(GL_TEXTURE_2D_ARRAY, Parent.CaptureOutput256Tex);
+
+    glActiveTexture(GL_TEXTURE3);
+    glBindTexture(GL_TEXTURE_2D, EnhancedSpriteTex);
+
+    glEnable(GL_SCISSOR_TEST);
+    glScissor(0, ystart * renderScale,
+              renderWidth, (yend-ystart) * renderScale);
+
+    // NOTE
+    // this requires two passes for mosaic emulation, because mosaic flags get set for
+    // transparent pixels too, and priority is only checked against opaque pixels
+
+    glClearColor(0, 0, 0, 0);
+    glClearDepth(1);
+    glColorMaski(0, GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glColorMaski(1, GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glColorMaski(2, GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glDepthMask(GL_TRUE);
+    const GLenum colorOnly = GL_COLOR_ATTACHMENT0;
+    const GLenum normalBuffers[3] = {
+        GL_COLOR_ATTACHMENT0,
+        GL_COLOR_ATTACHMENT1,
+        GL_COLOR_ATTACHMENT2,
+    };
+    if (orderedPresentationBand)
+        glDrawBuffers(1, &colorOnly);
+    else
+        glDrawBuffers(3, normalBuffers);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+    if (orderedPresentationBand)
+    {
+        // Reconstructed coverage is presentation alpha, not DS semantic
+        // opacity. Retain every admitted normal affine OBJ by composing the
+        // selected OAM set back-to-front at the subpixel grid. Premultiplied
+        // source-over makes the result independent of transparent RGB and
+        // avoids resolving each sprite separately against the same base.
+        glDisable(GL_DEPTH_TEST);
+        glDepthMask(GL_FALSE);
+        glEnable(GL_BLEND);
+        glBlendEquation(GL_FUNC_ADD);
+        glBlendFuncSeparate(GL_ONE, GL_ONE_MINUS_SRC_ALPHA,
+                            GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+        glColorMaski(0, GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+
+        glUniform1i(SpriteRenderTransULoc, 0);
+        RenderSprites(false, ystart, yend, affineOnly,
+                      excludeOrdinaryEquivalentAffine,
+                      includedSpriteMask, true);
+
+        glDisable(GL_BLEND);
+        glDrawBuffers(3, normalBuffers);
+        glColorMaski(1, GL_TRUE, GL_TRUE, GL_FALSE, GL_TRUE);
+        glColorMaski(2, GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+        glUniform1i(SpriteOrderedPresentationBandULoc, 0);
+        if (spriteFilterMode != 0)
+            glUniform1i(SpriteFilterModeULoc, 0);
+        if (affineSourceEnhancementOnly)
+            glUniform1i(SpriteAffineSourceEnhancementOnlyULoc, 0);
+        if (useEnhancedSpriteSource)
+            glUniform1i(SpriteUseEnhancedSourceULoc, 0);
+        if (linearEnhancedSource)
+            glUniform1i(SpriteLinearEnhancedSourceULoc, 0);
+        if (xbrzPresentationOnly)
+            glUniform1i(SpriteXBRZPresentationOnlyULoc, 0);
+        if (affineOBJPresentationCoverageMode != 0)
+            glUniform1i(SpriteAffineOBJPresentationCoverageModeULoc, 0);
+        glDisable(GL_SCISSOR_TEST);
+        return;
+    }
+
+    glColorMaski(0, GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
+    glColorMaski(2, GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
+    glDepthMask(GL_FALSE);
+
+    if (SpriteUseMosaic)
+    {
+        glUniform1i(SpriteRenderTransULoc, 1);
+        glColorMaski(1, GL_FALSE, GL_TRUE, GL_FALSE, GL_TRUE);
+
+        RenderSprites(false, ystart, yend, affineOnly,
+                      excludeOrdinaryEquivalentAffine,
+                      includedSpriteMask);
+    }
+
+    glUniform1i(SpriteRenderTransULoc, 0);
+    glColorMaski(1, GL_FALSE, GL_FALSE, GL_TRUE, GL_FALSE);
+
+    RenderSprites(true, ystart, yend, affineOnly,
+                  excludeOrdinaryEquivalentAffine,
+                  includedSpriteMask);
+
+    glEnable(GL_DEPTH_TEST);
+    glDepthFunc(GL_LESS);
+    glDepthMask(GL_TRUE);
+    glColorMaski(0, GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glColorMaski(1, GL_TRUE, GL_TRUE, GL_FALSE, GL_TRUE);
+    glColorMaski(2, GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+
+    RenderSprites(false, ystart, yend, affineOnly,
+                  excludeOrdinaryEquivalentAffine,
+                  includedSpriteMask);
+
+    if (spriteFilterMode != 0)
+        glUniform1i(SpriteFilterModeULoc, 0);
+    if (affineSourceEnhancementOnly)
+        glUniform1i(SpriteAffineSourceEnhancementOnlyULoc, 0);
+    if (useEnhancedSpriteSource)
+        glUniform1i(SpriteUseEnhancedSourceULoc, 0);
+    if (linearEnhancedSource)
+        glUniform1i(SpriteLinearEnhancedSourceULoc, 0);
+    if (xbrzPresentationOnly)
+        glUniform1i(SpriteXBRZPresentationOnlyULoc, 0);
+    if (affineOBJPresentationCoverageMode != 0)
+        glUniform1i(SpriteAffineOBJPresentationCoverageModeULoc, 0);
+
+    glDisable(GL_SCISSOR_TEST);
+}
+
+void GLRenderer2D::DoRenderSpritesNative(int line)
+{
+    int ystart = LastSpriteLine;
+    int yend = line;
+
+    glUseProgram(SpriteShader);
+    glUniform1i(SpriteUseAssembledSourceULoc,false);
+    glUniform1i(SpriteFilterModeULoc, 0);
+    glUniform1i(SpriteAffineSourceEnhancementOnlyULoc, 0);
+    glUniform1i(SpriteUseEnhancedSourceULoc, 0);
+    glUniform1i(SpriteEnhancedSourceScaleULoc, 2);
+    glUniform1i(SpriteXBRZPresentationOnlyULoc, 0);
+    glUniform1i(SpriteAffineOBJPresentationCoverageModeULoc, 0);
+    glUniform1i(SpriteOrderedPresentationBandULoc, 0);
+
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_STENCIL_TEST);
+    glDisable(GL_BLEND);
+
+    glBindBufferBase(GL_UNIFORM_BUFFER, 21, SpriteConfigUBO);
+    glBindBufferBase(GL_UNIFORM_BUFFER, 24, SpriteScanlineConfigUBO);
+
+    glBindBuffer(GL_UNIFORM_BUFFER, SpriteScanlineConfigUBO);
+    glBufferSubData(GL_UNIFORM_BUFFER,
+                    ystart * sizeof(s32),
+                    (yend - ystart) * sizeof(s32),
+                    &SpriteScanlineConfig.uMosaicLine[ystart]);
+
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, NativeOBJLayerFB);
+    glViewport(0, 0, 256, 192);
 
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, SpriteTex);
@@ -9405,11 +14335,7 @@ void GLRenderer2D::DoRenderSprites(int line)
     glBindTexture(GL_TEXTURE_2D_ARRAY, Parent.CaptureOutput256Tex);
 
     glEnable(GL_SCISSOR_TEST);
-    glScissor(0, ystart * ScaleFactor, ScreenW, (yend-ystart) * ScaleFactor);
-
-    // NOTE
-    // this requires two passes for mosaic emulation, because mosaic flags get set for
-    // transparent pixels too, and priority is only checked against opaque pixels
+    glScissor(0, ystart, 256, (yend-ystart));
 
     glClearColor(0, 0, 0, 0);
     glClearDepth(1);
@@ -9445,84 +14371,44 @@ void GLRenderer2D::DoRenderSprites(int line)
 
     RenderSprites(false, ystart, yend);
 
-    if (spriteFilterMode != 0)
-        glUniform1i(SpriteFilterModeULoc, 0);
-
     glDisable(GL_SCISSOR_TEST);
 }
 
-void GLRenderer2D::DoRenderSpritesNative(int line)
+bool GLRenderer2D::IsOrdinaryEquivalentAffineSprite(int sprite) const
 {
-    int ystart = LastSpriteLine;
-    int yend = line;
+    if (sprite < 0 || sprite >= NumSprites)
+        return false;
 
-    glUseProgram(SpriteShader);
-    glUniform1i(SpriteFilterModeULoc, 0);
+    const auto& source = SpriteConfig.uOAM[sprite];
+    if (source.Rotscale >= 32 || source.Type >= 2 ||
+        source.OBJMode != 0 || source.Mosaic)
+        return false;
 
-    glDisable(GL_DEPTH_TEST);
-    glDisable(GL_STENCIL_TEST);
-    glDisable(GL_BLEND);
+    // Legacy xBRZ retains isolated affine roles through identity. Explicit
+    // reconstruction uses the same geometric role and continuity policy for
+    // every RGB provider; source color must not choose the composition route.
 
-    glBindBufferBase(GL_UNIFORM_BUFFER, 21, SpriteConfigUBO);
-    glBindBufferBase(GL_UNIFORM_BUFFER, 24, SpriteScanlineConfigUBO);
-
-    glBindBuffer(GL_UNIFORM_BUFFER, SpriteScanlineConfigUBO);
-    glBufferSubData(GL_UNIFORM_BUFFER,
-                    ystart * sizeof(s32),
-                    (yend - ystart) * sizeof(s32),
-                    &SpriteScanlineConfig.uMosaicLine[ystart]);
-
-    glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
-    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, NativeOBJLayerFB);
-    glViewport(0, 0, 256, 192);
-
-    glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, SpriteTex);
-
-    glActiveTexture(GL_TEXTURE1);
-    glBindTexture(GL_TEXTURE_2D_ARRAY, Parent.CaptureOutput128Tex);
-
-    glActiveTexture(GL_TEXTURE2);
-    glBindTexture(GL_TEXTURE_2D_ARRAY, Parent.CaptureOutput256Tex);
-
-    glEnable(GL_SCISSOR_TEST);
-    glScissor(0, ystart, 256, (yend-ystart));
-
-    glClearColor(0, 0, 0, 0);
-    glClearDepth(1);
-    glColorMaski(0, GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
-    glColorMaski(1, GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
-    glDepthMask(GL_TRUE);
-    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-
-    glColorMaski(0, GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
-    glDepthMask(GL_FALSE);
-
-    if (SpriteUseMosaic)
-    {
-        glUniform1i(SpriteRenderTransULoc, 1);
-        glColorMaski(1, GL_FALSE, GL_TRUE, GL_FALSE, GL_TRUE);
-
-        RenderSprites(false, ystart, yend);
-    }
-
-    glUniform1i(SpriteRenderTransULoc, 0);
-    glColorMaski(1, GL_FALSE, GL_FALSE, GL_TRUE, GL_FALSE);
-
-    RenderSprites(true, ystart, yend);
-
-    glEnable(GL_DEPTH_TEST);
-    glDepthFunc(GL_LESS);
-    glDepthMask(GL_TRUE);
-    glColorMaski(0, GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
-    glColorMaski(1, GL_TRUE, GL_TRUE, GL_FALSE, GL_TRUE);
-
-    RenderSprites(false, ystart, yend);
-
-    glDisable(GL_SCISSOR_TEST);
+    const auto& matrix = SpriteConfig.uRotscale[source.Rotscale];
+    return matrix[0] == 0x100 && matrix[1] == 0 &&
+           matrix[2] == 0 && matrix[3] == 0x100;
 }
 
-void GLRenderer2D::RenderSprites(bool window, int ystart, int yend)
+void GLRenderer2D::GetOrdinaryEquivalentAffineSpriteMask(
+    u32 (&mask)[4]) const
+{
+    mask[0] = mask[1] = mask[2] = mask[3] = 0;
+    for (int sprite = 0; sprite < NumSprites; sprite++)
+    {
+        if (IsOrdinaryEquivalentAffineSprite(sprite))
+            mask[sprite >> 5] |= 1u << (sprite & 31);
+    }
+}
+
+void GLRenderer2D::RenderSprites(bool window, int ystart, int yend,
+                                 bool affineOnly,
+                                 bool excludeOrdinaryEquivalentAffine,
+                                 const u32* includedSpriteMask,
+                                 bool reverseOrder)
 {
     if (window)
     {
@@ -9533,12 +14419,24 @@ void GLRenderer2D::RenderSprites(bool window, int ystart, int yend)
     u16* vtxbuf = SpriteVtxData;
     int vtxnum = 0;
 
-    for (int i = 0; i < NumSprites; i++)
+    for (int pass = 0; pass < NumSprites; pass++)
     {
+        const int i = reverseOrder ? NumSprites - 1 - pass : pass;
         auto& sprite = SpriteConfig.uOAM[i];
+
+        if (includedSpriteMask &&
+            (includedSpriteMask[i >> 5] & (1u << (i & 31))) == 0)
+        {
+            continue;
+        }
 
         bool iswin = (sprite.OBJMode == 2);
         if (iswin != window)
+            continue;
+        if (affineOnly && !window && sprite.Rotscale == -1)
+            continue;
+        if (affineOnly && excludeOrdinaryEquivalentAffine &&
+            IsOrdinaryEquivalentAffineSprite(i))
             continue;
 
         s32 xpos = sprite.Position[0];
@@ -9547,7 +14445,12 @@ void GLRenderer2D::RenderSprites(bool window, int ystart, int yend)
         s32 boundheight = sprite.BoundSize[1];
 
         bool yc0 = ((ypos + boundheight) > ystart) && (ypos < yend);
-        bool yc1 = (((ypos&0xFF) + boundheight) > ystart) && ((ypos&0xFF) < yend);
+        // Positive positions already equal their wrapped position. Emitting
+        // both copies was harmless with opaque/depth-tested writes, but the
+        // ordered source-over path accumulates fractional coverage twice.
+        bool yc1 = ((ypos & 0xFF) != ypos) &&
+                   (((ypos & 0xFF) + boundheight) > ystart) &&
+                   ((ypos & 0xFF) < yend);
 
         if (yc0)
         {
@@ -9588,6 +14491,1180 @@ void GLRenderer2D::RenderSprites(bool window, int ystart, int yend)
     glDrawArrays(GL_TRIANGLES, 0, vtxnum);
 }
 
+void GLRenderer2D::UpdateSemanticAffineOBJRoleContinuity()
+{
+    u64 nextMask[2] {};
+    bool activeOAM[128] {};
+    for (int sprite = 0; sprite < NumSprites; sprite++)
+    {
+        const auto& source = SpriteConfig.uOAM[sprite];
+        const int oamIndex = SpriteOAMIndex[sprite];
+        if (source.Rotscale == static_cast<u32>(-1) ||
+            oamIndex < 0 || oamIndex >= 128)
+        {
+            continue;
+        }
+
+        activeOAM[oamIndex] = true;
+        auto roleKey = BuildEnhancedOBJSourceKey(sprite);
+        // This is a structural role key, not a cache-generation key. Palette
+        // or source-pixel animation must not make a continuously rotating OAM
+        // role jump reconstruction domains.
+        roleKey.SourceGeneration = 0;
+        roleKey.Algorithm = 0;
+        roleKey.SourceScale = 0;
+        roleKey.EnhancementVersion = 0;
+        const int word = oamIndex >> 6;
+        const u64 bit = 1ull << (oamIndex & 63);
+        const bool sameRole =
+            (SemanticAffineOBJRoleMask[word] & bit) != 0 &&
+            SemanticAffineOBJRoleKeys[oamIndex] == roleKey &&
+            SemanticAffineOBJRoleRotscale[oamIndex] == source.Rotscale;
+        if (!sameRole)
+            SemanticAffineOBJIdentityGrace[oamIndex] = 0;
+
+        const bool transformed = !IsOrdinaryEquivalentAffineSprite(sprite);
+        // Presentation choice: localized 2x uses the same identity membership
+        // as bilinear. Stable ordinary-equivalent entries can stay in the
+        // completed artwork instead of changing reconstruction just because
+        // supersampling is enabled. This may change appearance when motion
+        // starts/stops; the choice can be revisited independently of sampling.
+        if (transformed)
+        {
+            // Bridge a brief exact-identity crossing without permanently
+            // forcing a role which has stopped moving through the more
+            // expensive isolated-affine presentation path.
+            SemanticAffineOBJIdentityGrace[oamIndex] = 4;
+        }
+        const bool retainAsAffine =
+            transformed ||
+            (sameRole && SemanticAffineOBJIdentityGrace[oamIndex] > 0);
+        if (retainAsAffine)
+        {
+            nextMask[word] |= bit;
+            if (!transformed)
+                SemanticAffineOBJIdentityGrace[oamIndex]--;
+        }
+        SemanticAffineOBJRoleKeys[oamIndex] = roleKey;
+        SemanticAffineOBJRoleRotscale[oamIndex] = source.Rotscale;
+    }
+
+    for (int oamIndex = 0; oamIndex < 128; oamIndex++)
+    {
+        if (!activeOAM[oamIndex])
+            SemanticAffineOBJIdentityGrace[oamIndex] = 0;
+    }
+    SemanticAffineOBJRoleMask[0] = nextMask[0];
+    SemanticAffineOBJRoleMask[1] = nextMask[1];
+}
+
+bool GLRenderer2D::IsSemanticAffineOBJRole(int sprite) const
+{
+    if (sprite < 0 || sprite >= NumSprites)
+        return false;
+    const int oamIndex = SpriteOAMIndex[sprite];
+    if (oamIndex < 0 || oamIndex >= 128)
+        return false;
+    return (SemanticAffineOBJRoleMask[oamIndex >> 6] &
+            (1ull << (oamIndex & 63))) != 0;
+}
+
+bool GLRenderer2D::RenderOrdinaryOBJBandProducts(
+    const WholeSceneOBJBandClassification& classification,
+    int ystart,
+    int yend,
+    StrictAffineSourceEnhancementDecision sourceEnhancement,
+    int sourceModelIndex,
+    const WholeSceneOBJOperandPlan* operandPlan)
+{
+    OrdinaryOBJBandProducts = {};
+    OrdinaryOBJOperandPlanHash = 0;
+    OrdinaryOBJBandProductsValid = false;
+    OrdinaryOBJBandScaledProductsValid = false;
+
+    // The first product deliberately requires one coherent full-frame OAM
+    // recipe. Scanline-qualified product lifetimes are a later milestone; do
+    // not make a partial surface look authoritative by filling it with final-
+    // frame state.
+    if (ystart != 0 || yend != 192 ||
+        !classification.Summary.RecipeReady ||
+        classification.Summary.BandCount <= 0 ||
+        classification.Summary.BandCount > WholeSceneOBJBandLimit ||
+        static_cast<int>(classification.Bands.size()) !=
+            classification.Summary.BandCount)
+    {
+        return false;
+    }
+
+    int presentationProductCount = classification.Summary.BandCount;
+    if (operandPlan)
+    {
+        if (!operandPlan->Ready ||
+            operandPlan->ClassificationHash !=
+                classification.Summary.ClassificationHash)
+        {
+            return false;
+        }
+        for (const auto& operand : operandPlan->BackToFront)
+        {
+            if (operand.PresentationIndex >= 0)
+            {
+                presentationProductCount = std::max(
+                    presentationProductCount,
+                    operand.PresentationIndex + 1);
+            }
+        }
+    }
+    if (presentationProductCount <= 0 ||
+        presentationProductCount > WholeSceneOBJPresentationProductLimit)
+    {
+        return false;
+    }
+
+    // Keep the bounded array out of ordinary frames. It is allocated only
+    // after a debug consumer or the narrow affine-BG presentation path asks
+    // the strict renderer to publish an admitted recipe.
+    if (!OrdinaryOBJBandLayerTex)
+    {
+        glGenTextures(1, &OrdinaryOBJBandLayerTex);
+        glBindTexture(GL_TEXTURE_2D_ARRAY, OrdinaryOBJBandLayerTex);
+        glDefaultTexParams(GL_TEXTURE_2D_ARRAY);
+        glTexImage3D(GL_TEXTURE_2D_ARRAY, 0, GL_RGBA, 256, 192,
+                     WholeSceneOBJPresentationProductLimit * 3, 0, GL_RGBA,
+                     GL_UNSIGNED_BYTE, nullptr);
+    }
+    if (!OrdinaryOBJBandLayerFB)
+        glGenFramebuffers(1, &OrdinaryOBJBandLayerFB);
+
+    const bool nearestSourcePresentation =
+        sourceEnhancement ==
+            StrictAffineSourceEnhancementDecision::Disabled;
+    int sourceScale = nearestSourcePresentation
+        ? ScaleFactor
+        : StrictAffineCachedSourceScale(sourceEnhancement, ScaleFactor);
+    if (sourceEnhancement ==
+        StrictAffineSourceEnhancementDecision::Spline36Inline)
+    {
+        sourceScale = ScaleFactor >= 4 ? 4 : 2;
+    }
+    const bool canScale = nearestSourcePresentation
+        ? sourceScale > 1
+        : (sourceScale == 2 || sourceScale == 4);
+    bool allScaled = canScale;
+    const int scaledWidth = 256 * sourceScale;
+    const int scaledHeight = 192 * sourceScale;
+    const bool scaledSizeChanged =
+        OrdinaryOBJBandScaledWidth != static_cast<u32>(scaledWidth) ||
+        OrdinaryOBJBandScaledHeight != static_cast<u32>(scaledHeight);
+    const bool allocateScaledBand = canScale && !OrdinaryOBJBandScaledTex;
+    if (allocateScaledBand)
+        glGenTextures(1, &OrdinaryOBJBandScaledTex);
+    if (canScale && (scaledSizeChanged || allocateScaledBand))
+    {
+        glBindTexture(GL_TEXTURE_2D_ARRAY, OrdinaryOBJBandScaledTex);
+        glDefaultTexParams(GL_TEXTURE_2D_ARRAY);
+        glTexImage3D(GL_TEXTURE_2D_ARRAY, 0, GL_RGBA8,
+                     scaledWidth, scaledHeight,
+                     WholeSceneOBJPresentationProductLimit,
+                     0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+    }
+    if (canScale && (scaledSizeChanged || allocateScaledBand))
+    {
+        OrdinaryOBJBandScaledWidth = scaledWidth;
+        OrdinaryOBJBandScaledHeight = scaledHeight;
+    }
+    if (canScale && !OrdinaryOBJBandScaledFB)
+        glGenFramebuffers(1, &OrdinaryOBJBandScaledFB);
+
+    int padRadius = 1;
+    switch (sourceEnhancement)
+    {
+    case StrictAffineSourceEnhancementDecision::Spline36CachedAffineSources:
+        padRadius = 3;
+        break;
+    case StrictAffineSourceEnhancementDecision::ArtCNNCachedAffineSources:
+        padRadius = 7;
+        break;
+    case StrictAffineSourceEnhancementDecision::CuNNyCachedAffineSources:
+        padRadius = 6;
+        break;
+    case StrictAffineSourceEnhancementDecision::NNEDI3CachedAffineSources:
+        padRadius = 8;
+        break;
+    case StrictAffineSourceEnhancementDecision::XBRZCachedAffineSources:
+        padRadius = 2;
+        break;
+    default:
+        break;
+    }
+
+    const GLenum buffers[] = {
+        GL_COLOR_ATTACHMENT0,
+        GL_COLOR_ATTACHMENT1,
+        GL_COLOR_ATTACHMENT2,
+    };
+    for (int presentationIndex = 0;
+         presentationIndex < presentationProductCount;
+         presentationIndex++)
+    {
+        u32 includedSpriteMask[4] {};
+        int includedCount = 0;
+        if (presentationIndex < classification.Summary.BandCount)
+        {
+            for (const auto& member : classification.Members)
+            {
+                if (member.BandIndex != presentationIndex ||
+                    member.RenderedIndex < 0 ||
+                    member.RenderedIndex >= 128 ||
+                    member.RejectionMask != OBJBandRejectNone)
+                {
+                    continue;
+                }
+                includedSpriteMask[member.RenderedIndex >> 5] |=
+                    1u << (member.RenderedIndex & 31);
+                includedCount++;
+            }
+            if (includedCount !=
+                classification.Bands[presentationIndex].MemberCount)
+            {
+                return false;
+            }
+        }
+        else
+        {
+            const auto productOperand = std::find_if(
+                operandPlan->BackToFront.begin(),
+                operandPlan->BackToFront.end(),
+                [presentationIndex](const WholeSceneOBJOperand& operand)
+                {
+                    return operand.PresentationIndex == presentationIndex;
+                });
+            if (productOperand == operandPlan->BackToFront.end() ||
+                productOperand->Kind !=
+                    WholeSceneOBJOperandKind::SemiTransparentOBJ)
+            {
+                return false;
+            }
+            for (const auto& member : classification.Members)
+            {
+                if (member.OAMIndex < 0 || member.OAMIndex >= 128 ||
+                    member.RenderedIndex < 0 ||
+                    member.RenderedIndex >= 128)
+                {
+                    continue;
+                }
+                const int word = member.OAMIndex >> 6;
+                const u64 bit = 1ull << (member.OAMIndex & 63);
+                if ((productOperand->OAMMask[word] & bit) == 0)
+                    continue;
+                includedSpriteMask[member.RenderedIndex >> 5] |=
+                    1u << (member.RenderedIndex & 31);
+                includedCount++;
+            }
+            if (includedCount == 0)
+                return false;
+        }
+
+        glBindFramebuffer(GL_FRAMEBUFFER, OrdinaryOBJBandLayerFB);
+        glFramebufferTexture(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT,
+                             NativeOBJDepthTex, 0);
+        for (int component = 0; component < 3; component++)
+        {
+            glFramebufferTextureLayer(
+                GL_FRAMEBUFFER,
+                GL_COLOR_ATTACHMENT0 + component,
+                OrdinaryOBJBandLayerTex,
+                0,
+                presentationIndex * 3 + component);
+        }
+        glDrawBuffers(3, buffers);
+        if (glCheckFramebufferStatus(GL_FRAMEBUFFER) !=
+            GL_FRAMEBUFFER_COMPLETE)
+        {
+            return false;
+        }
+
+        // Render directly from the compact OAM member mask. This preserves
+        // the ordinary sprites' native depth/OAM ordering inside the band and
+        // retains pixels hidden by affine OBJ or BG in the completed native
+        // winner map. No BG, affine OBJ or final-frame underlay is copied in.
+        RenderSpritesToLayer(0,
+                             192,
+                             0,
+                             false,
+                             false,
+                             OrdinaryOBJBandLayerFB,
+                             false,
+                             1,
+                             false,
+                             false,
+                             false,
+                             0,
+                             includedSpriteMask);
+
+        if (!canScale)
+            continue;
+
+        if (nearestSourcePresentation)
+        {
+            // Geometry-only strict affine keeps ordinary UI/text bands on
+            // native nearest texels while affine groups are rerasterized on
+            // the output grid. This is an integer nearest expansion of the
+            // completed ordinary band, not a selected-scaler reconstruction.
+            glBindFramebuffer(GL_READ_FRAMEBUFFER,
+                              OrdinaryOBJBandLayerFB);
+            glReadBuffer(GL_COLOR_ATTACHMENT0);
+            glBindFramebuffer(GL_DRAW_FRAMEBUFFER,
+                              OrdinaryOBJBandScaledFB);
+            glFramebufferTextureLayer(GL_DRAW_FRAMEBUFFER,
+                                      GL_COLOR_ATTACHMENT0,
+                                      OrdinaryOBJBandScaledTex,
+                                      0,
+                                      presentationIndex);
+            glDrawBuffer(GL_COLOR_ATTACHMENT0);
+            glBlitFramebuffer(0, 0, 256, 192,
+                              0, 0, scaledWidth, scaledHeight,
+                              GL_COLOR_BUFFER_BIT, GL_NEAREST);
+            continue;
+        }
+
+        // Copy this band's completed native color into a regular 2D texture.
+        // The scaler sees the assembled band as one input, never one sprite at
+        // a time, while the color/flags/coverage source triplet remains intact
+        // for later semantic-compositor work.
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, OrdinaryOBJBandLayerFB);
+        glReadBuffer(GL_COLOR_ATTACHMENT0);
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, ArtCNNOutputFB);
+        glFramebufferTexture(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                             NativeOrdinaryOBJRGBATex, 0);
+        glDrawBuffer(GL_COLOR_ATTACHMENT0);
+        glBlitFramebuffer(0, 0, 256, 192,
+                          0, 0, 256, 192,
+                          GL_COLOR_BUFFER_BIT, GL_NEAREST);
+
+        // Match the isolated affine-OBJ input conditioning for the selected
+        // scaler. Only meaningless RGB beneath transparent source texels is
+        // extended; native source alpha and band membership stay unchanged.
+        glUseProgram(TransparentRGBPadShader);
+        GLint sourceSizeLoc = glGetUniformLocation(TransparentRGBPadShader,
+                                                   "uSourceSize");
+        if (sourceSizeLoc >= 0)
+            glUniform2i(sourceSizeLoc, 256, 192);
+        GLint padRadiusLoc = glGetUniformLocation(TransparentRGBPadShader,
+                                                 "uPadRadius");
+        if (padRadiusLoc >= 0)
+            glUniform1i(padRadiusLoc, padRadius);
+        GLint precomposeBackdropLoc = glGetUniformLocation(
+            TransparentRGBPadShader, "uPrecomposeBackdrop");
+        if (precomposeBackdropLoc >= 0)
+            glUniform1i(precomposeBackdropLoc, false);
+        RenderFullscreenPassToTexture(TransparentRGBPadShader,
+                                      NativeOrdinaryOBJPreparedTex,
+                                      256,
+                                      192,
+                                      NativeOrdinaryOBJRGBATex,
+                                      0);
+
+        const bool scaled = RenderStrictAffineCachedRGB(sourceEnhancement,
+            sourceModelIndex, NativeOrdinaryOBJPreparedTex,
+            UpscaledOrdinaryOBJRGBATex, 256, 192, sourceScale);
+        if (!scaled)
+        {
+            allScaled = false;
+            continue;
+        }
+
+        if (!ReconstructAffineAlpha(NativeOrdinaryOBJPreparedTex, UpscaledOrdinaryOBJRGBATex,
+                                    UpscaledOrdinaryOBJRGBATex, 256, 192, sourceScale, sourceEnhancement))
+        {
+            allScaled = false;
+            continue;
+        }
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, OrdinaryOBJBandScaledFB);
+        glFramebufferTextureLayer(GL_DRAW_FRAMEBUFFER,
+                                  GL_COLOR_ATTACHMENT0,
+                                  OrdinaryOBJBandScaledTex,
+                                  0,
+                                  presentationIndex);
+        glDrawBuffer(GL_COLOR_ATTACHMENT0);
+        {
+            glBindFramebuffer(GL_READ_FRAMEBUFFER, ArtCNNOutputFB);
+            glFramebufferTexture(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                 UpscaledOrdinaryOBJRGBATex, 0);
+            glReadBuffer(GL_COLOR_ATTACHMENT0);
+            glBindFramebuffer(GL_DRAW_FRAMEBUFFER, OrdinaryOBJBandScaledFB);
+            glBlitFramebuffer(0, 0, scaledWidth, scaledHeight,
+                              0, 0, scaledWidth, scaledHeight,
+                              GL_COLOR_BUFFER_BIT, GL_NEAREST);
+        }
+    }
+
+    OrdinaryOBJBandProducts = classification;
+    OrdinaryOBJOperandPlanHash = operandPlan ? operandPlan->PlanHash : 0;
+    OrdinaryOBJBandProductsValid = true;
+    OrdinaryOBJBandScaledProductsValid = allScaled;
+    return true;
+}
+
+bool GLRenderer2D::RenderResolvedOrdinaryOBJProduct(
+    int ystart,
+    int yend,
+    StrictAffineSourceEnhancementDecision sourceEnhancement,
+    int sourceModelIndex)
+{
+    if (ystart != 0 || yend != 192)
+    {
+        WholeSceneTrace.StrictAffineResolvedOBJRejectionMask |=
+            StrictAffineResolvedOBJRejectRange;
+        return false;
+    }
+
+    u32 includedSpriteMask[4] {};
+    int includedCount = 0;
+    u64 ordinaryOAMHash = 1469598103934665603ull;
+    auto hashValue = [](u64& hash, u64 value)
+    {
+        constexpr u64 kFNVPrime = 1099511628211ull;
+        for (int byte = 0; byte < 8; byte++)
+        {
+            hash ^= (value >> (byte * 8)) & 0xFFu;
+            hash *= kFNVPrime;
+        }
+    };
+    for (int sprite = 0; sprite < NumSprites; sprite++)
+    {
+        const auto& source = SpriteConfig.uOAM[sprite];
+
+        if (source.Rotscale != static_cast<u32>(-1))
+            continue;
+
+        // This first resolved-surface slice preserves the compositor's normal
+        // and mode-1 material equations. OBJ windows, mosaic, bitmap material
+        // alpha and capture-backed sources need additional product metadata;
+        // do not silently flatten them into presentation RGBA.
+        if (source.OBJMode == 2 || source.OBJMode == 3 ||
+            source.Mosaic || source.Type >= 2)
+        {
+            WholeSceneTrace.StrictAffineResolvedOBJRejectionMask |=
+                StrictAffineResolvedOBJRejectUnsupportedSprite;
+            return false;
+        }
+
+        includedSpriteMask[sprite >> 5] |= 1u << (sprite & 31);
+        includedCount++;
+        hashValue(ordinaryOAMHash, static_cast<u32>(sprite));
+        hashValue(ordinaryOAMHash, static_cast<u32>(SpriteOAMIndex[sprite]));
+        hashValue(ordinaryOAMHash, static_cast<u32>(source.Position[0]));
+        hashValue(ordinaryOAMHash, static_cast<u32>(source.Position[1]));
+        hashValue(ordinaryOAMHash, source.Flip[0]);
+        hashValue(ordinaryOAMHash, source.Flip[1]);
+        hashValue(ordinaryOAMHash, static_cast<u32>(source.Size[0]));
+        hashValue(ordinaryOAMHash, static_cast<u32>(source.Size[1]));
+        hashValue(ordinaryOAMHash, static_cast<u32>(source.BoundSize[0]));
+        hashValue(ordinaryOAMHash, static_cast<u32>(source.BoundSize[1]));
+        hashValue(ordinaryOAMHash, source.OBJMode);
+        hashValue(ordinaryOAMHash, source.Type);
+        hashValue(ordinaryOAMHash, source.PalOffset);
+        hashValue(ordinaryOAMHash, source.TileOffset);
+        hashValue(ordinaryOAMHash, source.TileStride);
+        hashValue(ordinaryOAMHash, source.BGPrio);
+        hashValue(ordinaryOAMHash, source.Mosaic);
+    }
+    if (includedCount == 0)
+    {
+        WholeSceneTrace.StrictAffineResolvedOBJRejectionMask |=
+            StrictAffineResolvedOBJRejectNoOrdinaryOBJ;
+        return false;
+    }
+
+    int sourceScale = StrictAffineCachedSourceScale(sourceEnhancement,
+                                                     ScaleFactor);
+    if (sourceEnhancement ==
+        StrictAffineSourceEnhancementDecision::Spline36Inline)
+    {
+        sourceScale = ScaleFactor >= 4 ? 4 : 2;
+    }
+    if ((sourceScale != 2 && sourceScale != 4) ||
+        256 * sourceScale != ScreenW ||
+        192 * sourceScale != ScreenH)
+    {
+        WholeSceneTrace.StrictAffineResolvedOBJRejectionMask |=
+            StrictAffineResolvedOBJRejectScale;
+        return false;
+    }
+
+    const int scaledWidth = ScreenW;
+    const int scaledHeight = ScreenH;
+    ResolvedOrdinaryOBJProductKey productKey;
+    productKey.SourceGeneration = SpriteSourceGeneration;
+    productKey.OrdinaryOAMHash = ordinaryOAMHash;
+    productKey.SourceEnhancement = static_cast<u32>(sourceEnhancement);
+    productKey.SourceModelIndex = sourceModelIndex;
+    productKey.SourceScale = static_cast<u32>(sourceScale);
+    productKey.Width = static_cast<u32>(scaledWidth);
+    productKey.Height = static_cast<u32>(scaledHeight);
+    productKey.AlphaTreatment = 3 + static_cast<u32>(AffineAlpha);
+    if (NNEDI3PremultipliedRGB) productKey.AlphaTreatment += 16;
+    if (ResolvedOrdinaryOBJValid &&
+        ResolvedOrdinaryOBJKey == productKey &&
+        ResolvedOrdinaryOBJTex != 0)
+    {
+        WholeSceneTrace.StrictAffineResolvedOBJOrdinaryProductReused = true;
+        return true;
+    }
+    ResolvedOrdinaryOBJValid = false;
+
+    // Retained with the cached RGBA product: band diagnostics and ordered
+    // recipes must not overwrite the native ownership used on cache hits.
+    if (!ResolvedOrdinaryOBJNativeLayerTex)
+    {
+        glGenTextures(1, &ResolvedOrdinaryOBJNativeLayerTex);
+        glBindTexture(GL_TEXTURE_2D_ARRAY, ResolvedOrdinaryOBJNativeLayerTex);
+        glDefaultTexParams(GL_TEXTURE_2D_ARRAY);
+        glTexImage3D(GL_TEXTURE_2D_ARRAY, 0, GL_RGBA, 256, 192,
+                     3, 0, GL_RGBA,
+                     GL_UNSIGNED_BYTE, nullptr);
+    }
+    if (!ResolvedOrdinaryOBJNativeLayerFB)
+        glGenFramebuffers(1, &ResolvedOrdinaryOBJNativeLayerFB);
+
+    const bool scaledSizeChanged =
+        ResolvedOrdinaryOBJWidth != static_cast<u32>(scaledWidth) ||
+        ResolvedOrdinaryOBJHeight != static_cast<u32>(scaledHeight);
+    const bool allocateScaled = !ResolvedOrdinaryOBJTex;
+    if (allocateScaled)
+        glGenTextures(1, &ResolvedOrdinaryOBJTex);
+    if (scaledSizeChanged || allocateScaled)
+    {
+        glBindTexture(GL_TEXTURE_2D, ResolvedOrdinaryOBJTex);
+        glDefaultTexParams(GL_TEXTURE_2D);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8,
+                     scaledWidth, scaledHeight, 0,
+                     GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+    }
+    ResolvedOrdinaryOBJWidth = scaledWidth;
+    ResolvedOrdinaryOBJHeight = scaledHeight;
+    if (!ResolvedOrdinaryOBJFB)
+        glGenFramebuffers(1, &ResolvedOrdinaryOBJFB);
+
+    glBindFramebuffer(GL_FRAMEBUFFER, ResolvedOrdinaryOBJNativeLayerFB);
+    glFramebufferTexture(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT,
+                         NativeOBJDepthTex, 0);
+    const GLenum buffers[] = {
+        GL_COLOR_ATTACHMENT0,
+        GL_COLOR_ATTACHMENT1,
+        GL_COLOR_ATTACHMENT2,
+    };
+    for (int component = 0; component < 3; component++)
+    {
+        glFramebufferTextureLayer(GL_FRAMEBUFFER,
+                                  GL_COLOR_ATTACHMENT0 + component,
+                                  ResolvedOrdinaryOBJNativeLayerTex,
+                                  0,
+                                  component);
+    }
+    glDrawBuffers(3, buffers);
+    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
+    {
+        WholeSceneTrace.StrictAffineResolvedOBJRejectionMask |=
+            StrictAffineResolvedOBJRejectStorage;
+        return false;
+    }
+
+    // Resolve all ordinary sprites together. OAM priority/order happens once
+    // here, while affine entries remain available in the independent semantic
+    // all-OBJ raster used by the merge pass.
+    RenderSpritesToLayer(0, 192, 0, false, false,
+                         ResolvedOrdinaryOBJNativeLayerFB, false, 1,
+                         false, false, false, 0,
+                         includedSpriteMask);
+
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, ResolvedOrdinaryOBJNativeLayerFB);
+    glReadBuffer(GL_COLOR_ATTACHMENT0);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, ArtCNNOutputFB);
+    glFramebufferTexture(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                         NativeOrdinaryOBJRGBATex, 0);
+    glDrawBuffer(GL_COLOR_ATTACHMENT0);
+    glBlitFramebuffer(0, 0, 256, 192,
+                      0, 0, 256, 192,
+                      GL_COLOR_BUFFER_BIT, GL_NEAREST);
+
+    int padRadius = 1;
+    switch (sourceEnhancement)
+    {
+    case StrictAffineSourceEnhancementDecision::Spline36CachedAffineSources:
+        padRadius = 3;
+        break;
+    case StrictAffineSourceEnhancementDecision::ArtCNNCachedAffineSources:
+        padRadius = 7;
+        break;
+    case StrictAffineSourceEnhancementDecision::CuNNyCachedAffineSources:
+        padRadius = 6;
+        break;
+    case StrictAffineSourceEnhancementDecision::NNEDI3CachedAffineSources:
+        padRadius = 8;
+        break;
+    case StrictAffineSourceEnhancementDecision::XBRZCachedAffineSources:
+        padRadius = 2;
+        break;
+    default:
+        break;
+    }
+
+    glUseProgram(TransparentRGBPadShader);
+    SetUniform2iIfPresent(TransparentRGBPadShader, "uSourceSize", 256, 192);
+    SetUniform1iIfPresent(TransparentRGBPadShader, "uPadRadius", padRadius);
+    SetUniform1iIfPresent(TransparentRGBPadShader, "uPrecomposeBackdrop", 0);
+    RenderFullscreenPassToTexture(TransparentRGBPadShader,
+                                  NativeOrdinaryOBJPreparedTex,
+                                  256,
+                                  192,
+                                  NativeOrdinaryOBJRGBATex,
+                                  0);
+
+    const bool scaled = RenderStrictAffineCachedRGB(sourceEnhancement,
+        sourceModelIndex, NativeOrdinaryOBJPreparedTex,
+        UpscaledOrdinaryOBJRGBATex, 256, 192, sourceScale);
+    if (!scaled)
+    {
+        WholeSceneTrace.StrictAffineResolvedOBJRejectionMask |=
+            StrictAffineResolvedOBJRejectRGBScale;
+        return false;
+    }
+
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, ResolvedOrdinaryOBJFB);
+    glFramebufferTexture(GL_DRAW_FRAMEBUFFER,
+                         GL_COLOR_ATTACHMENT0,
+                         ResolvedOrdinaryOBJTex,
+                         0);
+    glDrawBuffer(GL_COLOR_ATTACHMENT0);
+    if (!ReconstructAffineAlpha(NativeOrdinaryOBJPreparedTex, UpscaledOrdinaryOBJRGBATex,
+                                ResolvedOrdinaryOBJTex, 256, 192, sourceScale, sourceEnhancement))
+    {
+        WholeSceneTrace.StrictAffineResolvedOBJRejectionMask |= StrictAffineResolvedOBJRejectAlphaScale;
+        return false;
+    }
+    ResolvedOrdinaryOBJKey = productKey;
+    ResolvedOrdinaryOBJValid = true;
+    return true;
+}
+
+void GLRenderer2D::RenderResolvedOBJMerge(GLuint semanticOBJLayerTex)
+{
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, StrictAffineOBJLayerFB);
+    const GLenum buffers[] = {
+        GL_COLOR_ATTACHMENT0,
+        GL_COLOR_ATTACHMENT1,
+        GL_COLOR_ATTACHMENT2,
+    };
+    glDrawBuffers(3, buffers);
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_STENCIL_TEST);
+    glDisable(GL_BLEND);
+    glColorMaski(0, GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glColorMaski(1, GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glColorMaski(2, GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glDepthMask(GL_FALSE);
+    glViewport(0, 0, ScreenW, ScreenH);
+
+    glUseProgram(ResolvedOBJMergeShader);
+    glUniform1i(ResolvedOBJMergeScaleULoc, ScaleFactor);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D_ARRAY, semanticOBJLayerTex);
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, ResolvedOrdinaryOBJTex);
+    glActiveTexture(GL_TEXTURE2);
+    glBindTexture(GL_TEXTURE_2D_ARRAY, ResolvedOrdinaryOBJNativeLayerTex);
+    glBindBuffer(GL_ARRAY_BUFFER, Parent.RectVtxBuffer);
+    glBindVertexArray(Parent.RectVtxArray);
+    glDrawArrays(GL_TRIANGLES, 0, 2 * 3);
+    glActiveTexture(GL_TEXTURE0);
+}
+
+void GLRenderer2D::RenderOrdinaryOBJBandPresentation(GLuint baseTex,
+                                                       GLuint targetFB,
+                                                       int ystart,
+                                                       int yend,
+                                                       int bandIndex,
+                                                       GLuint presentationTex,
+                                                       bool useSeparateCoverage,
+                                                       bool useSubpixelPresentation,
+                                                       bool usePremultipliedPresentation,
+                                                       int objPriority)
+{
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, targetFB);
+    glDrawBuffer(GL_COLOR_ATTACHMENT0);
+
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_STENCIL_TEST);
+    glDisable(GL_BLEND);
+    glColorMaski(0, GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glDepthMask(GL_FALSE);
+    glViewport(0, 0, ScreenW, ScreenH);
+    glEnable(GL_SCISSOR_TEST);
+    glScissor(0, ystart * ScaleFactor, ScreenW,
+              (yend - ystart) * ScaleFactor);
+
+    glUseProgram(OrdinaryOBJBandPresentationShader);
+    glBindBufferBase(GL_UNIFORM_BUFFER, 22, ScanlineConfigUBO);
+    glBindBufferBase(GL_UNIFORM_BUFFER, 23, CompositorConfigUBO);
+    GLint scaleLoc = glGetUniformLocation(
+        OrdinaryOBJBandPresentationShader, "uScaleFactor");
+    if (scaleLoc >= 0)
+        glUniform1i(scaleLoc, ScaleFactor);
+    GLint objPriorityLoc = glGetUniformLocation(
+        OrdinaryOBJBandPresentationShader, "uOBJPriority");
+    if (objPriorityLoc >= 0)
+        glUniform1i(objPriorityLoc, objPriority);
+    GLint bandLayerLoc = glGetUniformLocation(
+        OrdinaryOBJBandPresentationShader, "uBandLayer");
+    if (bandLayerLoc >= 0)
+        glUniform1i(bandLayerLoc, bandIndex);
+    GLint separateCoverageLoc = glGetUniformLocation(
+        OrdinaryOBJBandPresentationShader, "uUseSeparateCoverage");
+    if (separateCoverageLoc >= 0)
+        glUniform1i(separateCoverageLoc, useSeparateCoverage);
+    GLint subpixelPresentationLoc = glGetUniformLocation(
+        OrdinaryOBJBandPresentationShader, "uUseSubpixelPresentation");
+    if (subpixelPresentationLoc >= 0)
+        glUniform1i(subpixelPresentationLoc, useSubpixelPresentation);
+    GLint premultipliedPresentationLoc = glGetUniformLocation(
+        OrdinaryOBJBandPresentationShader,
+        "uUsePremultipliedPresentation");
+    if (premultipliedPresentationLoc >= 0)
+        glUniform1i(premultipliedPresentationLoc,
+                    usePremultipliedPresentation);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, baseTex);
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D_ARRAY,
+                  presentationTex ? presentationTex :
+                                    OrdinaryOBJBandScaledTex);
+    glActiveTexture(GL_TEXTURE2);
+    glBindTexture(GL_TEXTURE_2D, UpscaledMetaTex);
+
+    glBindBuffer(GL_ARRAY_BUFFER, Parent.RectVtxBuffer);
+    glBindVertexArray(Parent.RectVtxArray);
+    glDrawArrays(GL_TRIANGLES, 0, 2 * 3);
+    glActiveTexture(GL_TEXTURE0);
+    glDisable(GL_SCISSOR_TEST);
+    OrdinaryOBJBandPresentationConsumed = true;
+}
+
+void GLRenderer2D::RenderOrdinaryOBJSpecialComposite(GLuint baseTex,
+                                                      GLuint targetFB,
+                                                      int ystart,
+                                                      int yend,
+                                                      int presentationIndex,
+                                                      int objPriority,
+                                                      bool useSubpixelPresentation)
+{
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, targetFB);
+    glDrawBuffer(GL_COLOR_ATTACHMENT0);
+
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_STENCIL_TEST);
+    glDisable(GL_BLEND);
+    glColorMaski(0, GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glDepthMask(GL_FALSE);
+    glViewport(0, 0, ScreenW, ScreenH);
+    glEnable(GL_SCISSOR_TEST);
+    glScissor(0, ystart * ScaleFactor, ScreenW,
+              (yend - ystart) * ScaleFactor);
+
+    glUseProgram(OrdinaryOBJSpecialCompositeShader);
+    glBindBufferBase(GL_UNIFORM_BUFFER, 22, ScanlineConfigUBO);
+    GLint scaleLoc = glGetUniformLocation(
+        OrdinaryOBJSpecialCompositeShader, "uScaleFactor");
+    if (scaleLoc >= 0)
+        glUniform1i(scaleLoc, ScaleFactor);
+    GLint objPriorityLoc = glGetUniformLocation(
+        OrdinaryOBJSpecialCompositeShader, "uOBJPriority");
+    if (objPriorityLoc >= 0)
+        glUniform1i(objPriorityLoc, objPriority);
+    GLint subpixelLoc = glGetUniformLocation(
+        OrdinaryOBJSpecialCompositeShader, "uUseSubpixelPresentation");
+    if (subpixelLoc >= 0)
+        glUniform1i(subpixelLoc, useSubpixelPresentation);
+    GLint evaLoc = glGetUniformLocation(OrdinaryOBJSpecialCompositeShader,
+                                        "uEVA");
+    GLint evbLoc = glGetUniformLocation(OrdinaryOBJSpecialCompositeShader,
+                                        "uEVB");
+    if (evaLoc >= 0)
+        glUniform1i(evaLoc, EVA);
+    if (evbLoc >= 0)
+        glUniform1i(evbLoc, EVB);
+    GLint usePresentationLoc = glGetUniformLocation(
+        OrdinaryOBJSpecialCompositeShader, "uUsePresentation");
+    GLint presentationLayerLoc = glGetUniformLocation(
+        OrdinaryOBJSpecialCompositeShader, "uPresentationLayer");
+    if (usePresentationLoc >= 0)
+        glUniform1i(usePresentationLoc, presentationIndex >= 0);
+    if (presentationLayerLoc >= 0)
+        glUniform1i(presentationLayerLoc,
+                    std::max(presentationIndex, 0));
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, baseTex);
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D_ARRAY, StrictAffineOBJLayerTex);
+    glActiveTexture(GL_TEXTURE2);
+    glBindTexture(GL_TEXTURE_2D_ARRAY,
+                  useSubpixelPresentation
+                      ? StrictAffineSupersamplePresentationOBJLayerTex
+                      : OrdinaryOBJBandScaledTex);
+    glActiveTexture(GL_TEXTURE3);
+    glBindTexture(GL_TEXTURE_2D, UpscaledMetaTex);
+
+    glBindBuffer(GL_ARRAY_BUFFER, Parent.RectVtxBuffer);
+    glBindVertexArray(Parent.RectVtxArray);
+    glDrawArrays(GL_TRIANGLES, 0, 2 * 3);
+    glActiveTexture(GL_TEXTURE0);
+    glDisable(GL_SCISSOR_TEST);
+}
+
+GLRenderer2D::OrderedOBJPresentationPolicy
+GLRenderer2D::BuildOrderedOBJPresentationPolicy(
+    StrictAffineSourceEnhancementDecision sourceEnhancement,
+    bool enhancedOBJReady,
+    bool reconstructedContour) const
+{
+    OrderedOBJPresentationPolicy policy;
+    const bool spline36 = sourceEnhancement ==
+        StrictAffineSourceEnhancementDecision::Spline36Inline;
+    const bool nnedi3 = sourceEnhancement ==
+        StrictAffineSourceEnhancementDecision::NNEDI3CachedAffineSources;
+    const bool xbrz = sourceEnhancement ==
+        StrictAffineSourceEnhancementDecision::XBRZCachedAffineSources;
+    const bool cached = IsStrictAffineCachedSource(sourceEnhancement);
+    const bool scalerAlpha = xbrz || nnedi3;
+
+    // Strict affine geometry does not require reconstructed source edges.
+    // The capture-backed promotion uses this policy as well as path 12, so a
+    // disabled source enhancer must still expose native nearest color/alpha
+    // to output-grid affine placement instead of disabling the promotion.
+    if (sourceEnhancement ==
+        StrictAffineSourceEnhancementDecision::Disabled)
+    {
+        policy.OutputGridCoverageMode = kAffineOBJCoverageNativeAlpha;
+        policy.SubpixelCoverageMode = kAffineOBJCoverageNativeAlpha;
+        return policy;
+    }
+
+    policy.SpriteFilterMode = spline36 ? 1 : 0;
+    policy.UseEnhancedSource = cached && enhancedOBJReady;
+    policy.LinearSubpixelSource = cached && !xbrz;
+
+    if (policy.UseEnhancedSource)
+    {
+        policy.OutputGridCoverageMode = policy.SubpixelCoverageMode = 9;
+        return policy;
+    }
+
+    // Retain native/source contour fallback when no reconstructed product is
+    // available. Output-grid and localized-subpixel placement share this policy.
+    const int contourMode = scalerAlpha
+        ? kAffineOBJCoverageScalerContour
+        : kAffineOBJCoverageSpline36Contour;
+    if (reconstructedContour && !xbrz)
+    {
+        policy.OutputGridCoverageMode = contourMode;
+    }
+    else
+    {
+        policy.OutputGridCoverageMode =
+            ChooseAffineOBJOutputGridCoverageMode(xbrz);
+    }
+
+    policy.SubpixelCoverageMode = reconstructedContour && !xbrz
+        ? contourMode
+        : ChooseAffineOBJSubpixelCoverageMode(scalerAlpha);
+    return policy;
+}
+
+GLuint GLRenderer2D::RenderOrderedOBJPresentationRecipe(
+    const WholeSceneCompositorRecipe& recipe,
+    std::size_t firstOperand,
+    int ystart,
+    int yend,
+    const OrderedOBJPresentationPolicy& policy)
+{
+    const bool requiresSubpixel2x =
+        WholeSceneCompositorRecipePresentationCount(
+            recipe,
+            WholeSceneCompositorPresentationKind::AffineSubpixel2x) != 0 ||
+        WholeSceneCompositorRecipePresentationCount(
+            recipe,
+            WholeSceneCompositorPresentationKind::
+                DSSpecialEffectSubpixel2x) != 0;
+    if (requiresSubpixel2x &&
+        !EnsureStrictAffineSupersampleTargets(ScreenW * 2, ScreenH * 2))
+    {
+        return 0;
+    }
+
+    GLuint orderedCurrentTex = StrictAffineCandidateTex;
+    GLuint orderedNextFB = OutputFB;
+    auto advanceOrderedTarget = [&]()
+    {
+        if (orderedCurrentTex == StrictAffineCandidateTex)
+        {
+            orderedCurrentTex = OutputTex;
+            orderedNextFB = StrictAffineCandidateFB;
+        }
+        else
+        {
+            orderedCurrentTex = StrictAffineCandidateTex;
+            orderedNextFB = OutputFB;
+        }
+    };
+    auto buildRenderedMask =
+        [&](const WholeSceneCompositorInputProduct& operand,
+            u32 (&spriteMask)[4])
+    {
+        spriteMask[0] = spriteMask[1] = spriteMask[2] = spriteMask[3] = 0;
+        for (int sprite = 0; sprite < NumSprites; sprite++)
+        {
+            const int oamIndex = SpriteOAMIndex[sprite];
+            if (oamIndex < 0 || oamIndex >= 128)
+                continue;
+            const int word = oamIndex >> 6;
+            const u64 bit = 1ull << (oamIndex & 63);
+            if ((operand.OAMMask[word] & bit) != 0)
+                spriteMask[sprite >> 5] |= 1u << (sprite & 31);
+        }
+    };
+
+    for (std::size_t inputIndex = 1;
+         inputIndex < recipe.Inputs.size();
+         inputIndex++)
+    {
+        const std::size_t operandIndex = inputIndex - 1;
+        if (operandIndex < firstOperand)
+            continue;
+
+        const auto& operand = recipe.Inputs[inputIndex];
+        if (operand.Kind == WholeSceneCompositorInputKind::OrdinaryOBJBand)
+        {
+            RenderOrdinaryOBJBandPresentation(orderedCurrentTex,
+                                               orderedNextFB,
+                                               ystart,
+                                               yend,
+                                               operand.ProductIndex);
+            advanceOrderedTarget();
+            continue;
+        }
+
+        u32 spriteMask[4] {};
+        buildRenderedMask(operand, spriteMask);
+        if (operand.Kind == WholeSceneCompositorInputKind::AffineOBJGroup)
+        {
+            const bool useSubpixelPresentation =
+                operand.PresentationKind ==
+                    WholeSceneCompositorPresentationKind::AffineSubpixel2x;
+            const GLuint presentationFB = useSubpixelPresentation
+                ? StrictAffineSupersamplePresentationOBJLayerFB
+                : AffinePresentationOBJLayerFB;
+            const int targetScale = useSubpixelPresentation
+                ? ScaleFactor * 2 : ScaleFactor;
+            const int coverageMode = useSubpixelPresentation
+                ? policy.SubpixelCoverageMode
+                : policy.OutputGridCoverageMode;
+            int assembledSlots[128];
+            const bool assembled = policy.UseEnhancedSource && firstOperand == 0 &&
+                WholeSceneScaleHybridStrictAffineOpaqueAssemblies &&
+                PrepareOpaqueOBJAssemblies(spriteMask, assembledSlots, ystart, yend);
+            RenderSpritesToLayer(ystart,
+                                 yend,
+                                 policy.SpriteFilterMode,
+                                 true,
+                                 policy.UseEnhancedSource,
+                                 presentationFB,
+                                 true,
+                                 targetScale,
+                                 useSubpixelPresentation &&
+                                     policy.LinearSubpixelSource,
+                                 false,
+                                 true,
+                                 coverageMode,
+                                 spriteMask,
+                                 useSubpixelPresentation,
+                                 assembled ? assembledSlots : nullptr);
+            if (!useSubpixelPresentation)
+            {
+                // Keep the semantic winner metadata from the first pass, but
+                // replace layer zero with the complete back-to-front affine
+                // union so reconstructed edges reveal lower group members.
+                RenderSpritesToLayer(ystart,
+                                     yend,
+                                     policy.SpriteFilterMode,
+                                     true,
+                                     policy.UseEnhancedSource,
+                                     presentationFB,
+                                     true,
+                                     targetScale,
+                                     false,
+                                     false,
+                                     true,
+                                     coverageMode,
+                                     spriteMask,
+                                     true,
+                                     assembled ? assembledSlots : nullptr);
+            }
+            RenderOrdinaryOBJBandPresentation(
+                orderedCurrentTex,
+                orderedNextFB,
+                ystart,
+                yend,
+                0,
+                useSubpixelPresentation
+                    ? StrictAffineSupersamplePresentationOBJLayerTex
+                    : AffinePresentationOBJLayerTex,
+                !useSubpixelPresentation,
+                useSubpixelPresentation,
+                true,
+                operand.MinTotalPriority / 128);
+            if (useSubpixelPresentation)
+            {
+                WholeSceneExecutionTrace.
+                    OrderedAffineSubpixel2xOperandCount++;
+            }
+            else
+            {
+                WholeSceneExecutionTrace.
+                    OrderedAffineOutputGridOperandCount++;
+            }
+            advanceOrderedTarget();
+            continue;
+        }
+
+        if (operand.Kind ==
+            WholeSceneCompositorInputKind::SemiTransparentOBJ)
+        {
+            const bool useSubpixelPresentation =
+                operand.PresentationKind ==
+                    WholeSceneCompositorPresentationKind::
+                        DSSpecialEffectSubpixel2x;
+            RenderSpritesToLayer(
+                ystart,
+                yend,
+                0,
+                false,
+                false,
+                useSubpixelPresentation
+                    ? StrictAffineSupersamplePresentationOBJLayerFB
+                    : StrictAffineOBJLayerFB,
+                false,
+                useSubpixelPresentation ? ScaleFactor * 2 : ScaleFactor,
+                false,
+                false,
+                false,
+                0,
+                spriteMask);
+            RenderOrdinaryOBJSpecialComposite(
+                orderedCurrentTex,
+                orderedNextFB,
+                ystart,
+                yend,
+                operand.PresentationIndex,
+                operand.MinTotalPriority / 128,
+                useSubpixelPresentation);
+            if (useSubpixelPresentation)
+            {
+                WholeSceneExecutionTrace.
+                    OrderedAffineSubpixel2xOperandCount++;
+            }
+            advanceOrderedTarget();
+            continue;
+        }
+
+        return 0;
+    }
+    return orderedCurrentTex;
+}
+
+bool GLRenderer2D::CopyOrderedOBJPresentationResult(GLuint sourceTex,
+                                                     GLuint targetTex,
+                                                     int ystart,
+                                                     int yend)
+{
+    if (!sourceTex || !targetTex)
+        return false;
+    if (sourceTex == targetTex)
+        return true;
+
+    GLuint sourceFB = 0;
+    if (sourceTex == StrictAffineCandidateTex)
+        sourceFB = StrictAffineCandidateFB;
+    else if (sourceTex == OutputTex)
+        sourceFB = OutputFB;
+    else
+        return false;
+
+    GLuint targetFB = 0;
+    if (targetTex == StrictAffineCandidateTex)
+        targetFB = StrictAffineCandidateFB;
+    else if (targetTex == OutputTex)
+        targetFB = OutputFB;
+    else
+    {
+        targetFB = ArtCNNOutputFB;
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, targetFB);
+        glFramebufferTexture(GL_DRAW_FRAMEBUFFER,
+                             GL_COLOR_ATTACHMENT0,
+                             targetTex,
+                             0);
+    }
+
+    const int y0 = ystart * ScaleFactor;
+    const int y1 = yend * ScaleFactor;
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, sourceFB);
+    glReadBuffer(GL_COLOR_ATTACHMENT0);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, targetFB);
+    glDrawBuffer(GL_COLOR_ATTACHMENT0);
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_STENCIL_TEST);
+    glDisable(GL_BLEND);
+    glDisable(GL_SCISSOR_TEST);
+    glColorMaski(0, GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glDepthMask(GL_FALSE);
+    glBlitFramebuffer(0, y0, ScreenW, y1,
+                      0, y0, ScreenW, y1,
+                      GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    return true;
+}
+
+bool GLRenderer2D::PrepareAffineOverlapDebug(int width, int height)
+{
+    if (!AffineOverlapDebugTex)
+    {
+        glGenTextures(1, &AffineOverlapDebugTex);
+        glGenTextures(1, &AffineOverlapInputDebugTex);
+        glGenFramebuffers(1, &AffineOverlapCopyFB);
+    }
+    if (AffineOverlapDebugWidth == width && AffineOverlapDebugHeight == height)
+        return true;
+    // Lazy diagnostic storage: no allocation or copies with debug views off.
+    glActiveTexture(GL_TEXTURE0);
+    for (int i = 0; i < 2; i++)
+    {
+        glBindTexture(GL_TEXTURE_2D_ARRAY,
+                      i ? AffineOverlapInputDebugTex : AffineOverlapDebugTex);
+        glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTexImage3D(GL_TEXTURE_2D_ARRAY, 0, GL_RGBA8,
+                     width * (i + 1), height * (i + 1), 3, 0,
+                     GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+    }
+    if (glGetError() != GL_NO_ERROR)
+        return false;
+    AffineOverlapDebugWidth = width;
+    AffineOverlapDebugHeight = height;
+    return true;
+}
+
 void GLRenderer2D::RenderCompositorPass(GLuint outputFB, GLuint objLayerTex,
                                         int viewportW, int viewportH,
                                         int ystart, int yend,
@@ -9601,8 +15678,26 @@ void GLRenderer2D::RenderCompositorPass(GLuint outputFB, GLuint objLayerTex,
                                         bool forceOBJDisabled,
                                         bool preserveCompositorConfig,
                                         GLuint capture128Tex,
-                                        GLuint capture256Tex)
+                                        GLuint capture256Tex,
+                                        bool affineSourceEnhancementOnly,
+                                        u32 enhancedBGMask,
+                                        bool useEnhancedOBJPresentationCoverage,
+                                        bool linearEnhancedBGSource,
+                                         bool bilinearAffineBGPresentation,
+                                         u32 affineConstantBackdropProofMask,
+                                         u32 enhancedBGCoverageMask,
+                                         GLuint xbrzPresentationOBJLayerTex,
+                                         bool debugSelector,
+                                         int direct3DEndpointMode,
+                                         bool useScanlineCompositorState,
+                                         u32 reconstructedBGCandidateMask,
+                                         const GLuint* bgLayerTexOverride,
+                                         const GLuint* bgLayerMetaTexOverride,
+                                         const GLuint* enhancedBGLayerTexOverride,
+                                         bool presentationContourPremultiplied)
 {
+    if (outputFB == StrictAffineCandidateFB && !debugSelector)
+        WholeSceneDebugProducts.AffineOverlap = false;
     glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, outputFB);
 
@@ -9610,6 +15705,8 @@ void GLRenderer2D::RenderCompositorPass(GLuint outputFB, GLuint objLayerTex,
     glDisable(GL_STENCIL_TEST);
     glDisable(GL_BLEND);
     glColorMaski(0, GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glColorMaski(1, GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glColorMaski(2, GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
     glDepthMask(GL_FALSE);
 
     glViewport(0, 0, viewportW, viewportH);
@@ -9635,16 +15732,78 @@ void GLRenderer2D::RenderCompositorPass(GLuint outputFB, GLuint objLayerTex,
         return;
     }
 
+    const bool captureOverlap = WholeSceneDebugViewsActive.load(std::memory_order_relaxed) &&
+        outputFB == StrictAffineCandidateFB && !debugSelector &&
+        !forceOBJDisabled && ystart == 0 && yend == 192 &&
+        xbrzPresentationOBJLayerTex != 0 &&
+        xbrzPresentationOBJLayerTex == StrictAffineSupersamplePresentationOBJLayerTex &&
+        viewportW == ScreenW && viewportH == ScreenH &&
+        PrepareAffineOverlapDebug(viewportW, viewportH);
+    GLint previousDrawBuffers[6] {};
+    bool captureOverlapReady = captureOverlap;
+    if (captureOverlap)
+    {
+        for (int i = 0; i < 6; i++)
+            glGetIntegerv(GL_DRAW_BUFFER0 + i, &previousDrawBuffers[i]);
+        for (int i = 0; i < 3; i++)
+        {
+            glFramebufferTextureLayer(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT3 + i,
+                                      AffineOverlapDebugTex, 0, i);
+            glColorMaski(3 + i, GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+        }
+        const GLenum buffers[] = {static_cast<GLenum>(previousDrawBuffers[0]),
+            static_cast<GLenum>(previousDrawBuffers[1]), static_cast<GLenum>(previousDrawBuffers[2]),
+            GL_COLOR_ATTACHMENT3, GL_COLOR_ATTACHMENT4, GL_COLOR_ATTACHMENT5};
+        glDrawBuffers(6, buffers);
+        captureOverlapReady = glCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE;
+        if (!captureOverlapReady)
+        {
+            for (int i = 0; i < 3; i++)
+                glFramebufferTextureLayer(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT3 + i, 0, 0, 0);
+            GLenum restore[6];
+            for (int i = 0; i < 6; i++) restore[i] = previousDrawBuffers[i];
+            glDrawBuffers(6, restore);
+        }
+    }
+
     glUseProgram(CompositorShader);
     glUniform1i(CompositorScaleULoc, compositorScale);
     glUniform1i(CompositorOBJNativeResolutionULoc, objNativeResolution);
     glUniform1i(CompositorLayerFilterModeULoc, layerFilterMode);
     glUniform1i(CompositorLayerFilterNoWrapULoc, layerFilterNoWrap);
-    glUniform1i(CompositorDebugTintULoc, debugTint);
+    glUniform1i(CompositorAffineSourceEnhancementOnlyULoc,
+                affineSourceEnhancementOnly);
+    glUniform1i(CompositorEnhancedBGMaskULoc,
+                static_cast<GLint>(enhancedBGMask));
+    glUniform1i(CompositorDebugTintULoc,
+                debugSelector ? 2 : (debugTint ? 1 : 0));
     glUniform1i(CompositorSplit3DSemanticsULoc,
                 WholeSceneScaleFinalUpscale3DSplitSemantics && direct3DCoverageTex != 0);
     glUniform1i(CompositorSharpenSplit3DCoverageULoc,
                 WholeSceneScaleFinalUpscale3DSharpenSplitCoverage);
+    glUniform1i(CompositorUseEnhancedOBJPresentationCoverageULoc,
+                useEnhancedOBJPresentationCoverage);
+    glUniform1i(CompositorUseXBRZPresentationContourULoc,
+                xbrzPresentationOBJLayerTex != 0);
+    glUniform1i(CompositorPresentationContourPremultipliedULoc,
+                presentationContourPremultiplied);
+    SetUniform1iIfPresent(CompositorShader, "uExplicitAlphaReconstruction",
+        enhancedBGMask ? static_cast<int>(AffineAlpha) : -1);
+    SetUniform1iIfPresent(CompositorShader, "uExplicitLinearRGB",
+        WholeSceneScaleHybridStrictAffineSourceEnhancement && WholeSceneScaleAlgorithm != RendererSettings::GLScaleAlgorithm::XBRZ);
+    glUniform1i(CompositorBilinearAffineBGPresentationULoc,
+                bilinearAffineBGPresentation || enhancedBGMask);
+    glUniform1i(CompositorEnhancedBGCoverageMaskULoc,
+                static_cast<GLint>(enhancedBGCoverageMask));
+    glUniform1i(CompositorReconstructedBGCandidateMaskULoc,
+                static_cast<GLint>(reconstructedBGCandidateMask));
+    glUniform1i(CompositorAffineConstantBackdropProofMaskULoc,
+                static_cast<GLint>(affineConstantBackdropProofMask));
+    glUniform1i(CompositorDirect3DEndpointModeULoc,
+                direct3DEndpointMode);
+    glUniform1i(CompositorUseScanlineStateULoc,
+                useScanlineCompositorState);
+    glUniform1i(CompositorForceOBJDisabledULoc, forceOBJDisabled);
 
     glBindBufferBase(GL_UNIFORM_BUFFER, 20, LayerConfigUBO);
     glBindBufferBase(GL_UNIFORM_BUFFER, 22, ScanlineConfigUBO);
@@ -9657,7 +15816,7 @@ void GLRenderer2D::RenderCompositorPass(GLuint outputFB, GLuint objLayerTex,
                     &ScanlineConfig.uScanline[ystart]);
 
     if (!preserveCompositorConfig)
-        UpdateCompositorConfig();
+        UpdateCompositorConfig(ystart, yend);
     if (preserveCompositorConfig || forceOBJDisabled)
     {
         if (forceOBJDisabled)
@@ -9673,7 +15832,10 @@ void GLRenderer2D::RenderCompositorPass(GLuint outputFB, GLuint objLayerTex,
         if ((i == 0) && (DispCnt & (1<<3)))
             glBindTexture(GL_TEXTURE_2D, direct3DTex ? direct3DTex : Parent.OutputTex3D);
         else
-            glBindTexture(GL_TEXTURE_2D, BGLayerTex[i]);
+            glBindTexture(
+                GL_TEXTURE_2D,
+                bgLayerTexOverride && bgLayerTexOverride[i] != 0
+                    ? bgLayerTexOverride[i] : BGLayerTex[i]);
 
         GLint wrapmode = LayerConfig.uBGConfig[i].Clamp ? GL_CLAMP_TO_BORDER : GL_REPEAT;
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, wrapmode);
@@ -9698,6 +15860,9 @@ void GLRenderer2D::RenderCompositorPass(GLuint outputFB, GLuint objLayerTex,
 
         if ((i == 0) && (DispCnt & (1<<3)))
             glBindTexture(GL_TEXTURE_2D, BlankColorTex);
+        else if (bgLayerMetaTexOverride &&
+                 bgLayerMetaTexOverride[i] != 0)
+            glBindTexture(GL_TEXTURE_2D, bgLayerMetaTexOverride[i]);
         else if (BGLayerMetaTex[i] != 0)
             glBindTexture(GL_TEXTURE_2D, BGLayerMetaTex[i]);
         else
@@ -9711,9 +15876,75 @@ void GLRenderer2D::RenderCompositorPass(GLuint outputFB, GLuint objLayerTex,
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, direct3DWrapMode);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, direct3DWrapMode);
 
+    for (int i = 0; i < 4; i++)
+    {
+        glActiveTexture(GL_TEXTURE13 + i);
+        const GLuint enhancedTex =
+            enhancedBGLayerTexOverride &&
+                    enhancedBGLayerTexOverride[i] != 0
+                ? enhancedBGLayerTexOverride[i]
+                : EnhancedBGLayerTex[i];
+        glBindTexture(GL_TEXTURE_2D, enhancedTex);
+        // Native alpha separately owns logical-map validity. When cached RGB
+        // is sampled linearly, extend its last valid color instead of pulling
+        // the default transparent-black texture border into a partially
+        // covered affine edge. Nearest cached sampling retains the literal
+        // clamped-map border behavior.
+        const GLint wrapmode = LayerConfig.uBGConfig[i].Clamp
+            ? (linearEnhancedBGSource ? GL_CLAMP_TO_EDGE
+                                      : GL_CLAMP_TO_BORDER)
+            : GL_REPEAT;
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, wrapmode);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, wrapmode);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER,
+                        linearEnhancedBGSource ? GL_LINEAR : GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER,
+                        linearEnhancedBGSource ? GL_LINEAR : GL_NEAREST);
+    }
+
+    glActiveTexture(GL_TEXTURE17);
+    glBindTexture(GL_TEXTURE_2D_ARRAY,
+                  xbrzPresentationOBJLayerTex != 0
+                      ? xbrzPresentationOBJLayerTex : objLayerTex);
+
     glBindBuffer(GL_ARRAY_BUFFER, Parent.RectVtxBuffer);
     glBindVertexArray(Parent.RectVtxArray);
     glDrawArrays(GL_TRIANGLES, 0, 2*3);
+
+    if (captureOverlapReady)
+    {
+        // Freeze the consumed array before a later producer can reuse it.
+        glDisable(GL_SCISSOR_TEST);
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, AffineOverlapCopyFB);
+        glReadBuffer(GL_COLOR_ATTACHMENT0);
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, AffineOverlapCopyFB);
+        glDrawBuffer(GL_COLOR_ATTACHMENT1);
+        bool copied = true;
+        for (int i = 0; i < 3; i++)
+        {
+            glFramebufferTextureLayer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                      xbrzPresentationOBJLayerTex, 0, i);
+            glFramebufferTextureLayer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1,
+                                      AffineOverlapInputDebugTex, 0, i);
+            if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
+            {
+                copied = false;
+                break;
+            }
+            glBlitFramebuffer(0, 0, viewportW * 2, viewportH * 2,
+                              0, 0, viewportW * 2, viewportH * 2,
+                              GL_COLOR_BUFFER_BIT, GL_NEAREST);
+        }
+        WholeSceneDebugProducts.AffineOverlap = copied && glGetError() == GL_NO_ERROR;
+        WholeSceneDebugProducts.AffineOverlapPremultiplied = presentationContourPremultiplied;
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, outputFB);
+        for (int i = 0; i < 3; i++)
+            glFramebufferTextureLayer(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT3 + i, 0, 0, 0);
+        GLenum restore[6];
+        for (int i = 0; i < 6; i++) restore[i] = previousDrawBuffers[i];
+        glDrawBuffers(6, restore);
+    }
 
     if (compositorScale != ScaleFactor)
         glUniform1i(CompositorScaleULoc, ScaleFactor);
@@ -9723,10 +15954,47 @@ void GLRenderer2D::RenderCompositorPass(GLuint outputFB, GLuint objLayerTex,
         glUniform1i(CompositorLayerFilterModeULoc, 0);
     if (layerFilterNoWrap)
         glUniform1i(CompositorLayerFilterNoWrapULoc, 0);
-    if (debugTint)
+    if (affineSourceEnhancementOnly)
+        glUniform1i(CompositorAffineSourceEnhancementOnlyULoc, 0);
+    if (enhancedBGMask != 0)
+        glUniform1i(CompositorEnhancedBGMaskULoc, 0);
+    if (debugTint || debugSelector)
         glUniform1i(CompositorDebugTintULoc, 0);
     if (WholeSceneScaleFinalUpscale3DSplitSemantics && direct3DCoverageTex != 0)
         glUniform1i(CompositorSplit3DSemanticsULoc, 0);
+    if (useEnhancedOBJPresentationCoverage)
+        glUniform1i(CompositorUseEnhancedOBJPresentationCoverageULoc, 0);
+    if (xbrzPresentationOBJLayerTex != 0)
+        glUniform1i(CompositorUseXBRZPresentationContourULoc, 0);
+    if (presentationContourPremultiplied)
+        glUniform1i(CompositorPresentationContourPremultipliedULoc, 0);
+    if (bilinearAffineBGPresentation)
+        glUniform1i(CompositorBilinearAffineBGPresentationULoc, 0);
+    if (enhancedBGCoverageMask != 0)
+        glUniform1i(CompositorEnhancedBGCoverageMaskULoc, 0);
+    if (reconstructedBGCandidateMask != 0)
+        glUniform1i(CompositorReconstructedBGCandidateMaskULoc, 0);
+    if (affineConstantBackdropProofMask != 0)
+        glUniform1i(CompositorAffineConstantBackdropProofMaskULoc, 0);
+    if (direct3DEndpointMode != 0)
+        glUniform1i(CompositorDirect3DEndpointModeULoc, 0);
+    if (useScanlineCompositorState)
+        glUniform1i(CompositorUseScanlineStateULoc, 0);
+    if (linearEnhancedBGSource)
+    {
+        for (int i = 0; i < 4; i++)
+        {
+            glActiveTexture(GL_TEXTURE13 + i);
+            glBindTexture(
+                GL_TEXTURE_2D,
+                enhancedBGLayerTexOverride &&
+                        enhancedBGLayerTexOverride[i] != 0
+                    ? enhancedBGLayerTexOverride[i]
+                    : EnhancedBGLayerTex[i]);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        }
+    }
 
     glDisable(GL_SCISSOR_TEST);
 }
@@ -9782,7 +16050,7 @@ void GLRenderer2D::RenderNativePrepass(int ystart, int yend)
                     (yend - ystart) * sizeof(sScanlineConfig::sScanline),
                     &ScanlineConfig.uScanline[ystart]);
 
-    UpdateCompositorConfig();
+    UpdateCompositorConfig(ystart, yend);
 
     for (int i = 0; i < 4; i++)
     {
@@ -9883,18 +16151,36 @@ void GLRenderer2D::RenderNativeExactFinal(int ystart, int yend, bool debugTint, 
     RenderNativeExactFinalToTexture(NativeExactFinalTex, ystart, yend, debugTint, direct3DTex, direct3DCoverageTex);
 }
 
-void GLRenderer2D::RenderNativeExactFinalToTexture(GLuint targetTex, int ystart, int yend, bool debugTint, GLuint direct3DTex, GLuint direct3DCoverageTex, bool preserveCompositorConfig, GLuint capture128Tex, GLuint capture256Tex, bool forceOBJDisabled)
+void GLRenderer2D::RenderNativeExactFinalToTexture(GLuint targetTex, int ystart, int yend, bool debugTint, GLuint direct3DTex, GLuint direct3DCoverageTex, bool preserveCompositorConfig, GLuint capture128Tex, GLuint capture256Tex, bool forceOBJDisabled, GLuint objLayerTex, int direct3DEndpointMode)
 {
     glBindFramebuffer(GL_FRAMEBUFFER, NativeExactFinalFB);
     glFramebufferTexture(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, targetTex, 0);
-    glDrawBuffer(GL_COLOR_ATTACHMENT0);
+    if (direct3DEndpointMode == 2)
+    {
+        glFramebufferTexture(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1,
+                             NativeDirect3DOperatorTex, 0);
+        const GLenum drawBuffers[2] = {
+            GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1
+        };
+        glDrawBuffers(2, drawBuffers);
+    }
+    else
+    {
+        glDrawBuffer(GL_COLOR_ATTACHMENT0);
+    }
 
-    RenderCompositorPass(NativeExactFinalFB, NativeOBJLayerTex, 256, 192, ystart, yend,
+    RenderCompositorPass(NativeExactFinalFB,
+                         objLayerTex ? objLayerTex : NativeOBJLayerTex,
+                         256, 192, ystart, yend,
                          1, 0, false, false, debugTint, direct3DTex,
                          direct3DCoverageTex, forceOBJDisabled, preserveCompositorConfig,
-                         capture128Tex, capture256Tex);
+                         capture128Tex, capture256Tex,
+                         false, 0, false, false, false, 0, 0, 0, false,
+                         direct3DEndpointMode);
 
     glBindFramebuffer(GL_FRAMEBUFFER, NativeExactFinalFB);
+    if (direct3DEndpointMode == 2)
+        glFramebufferTexture(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT1, 0, 0);
     glFramebufferTexture(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, NativeExactFinalTex, 0);
     glDrawBuffer(GL_COLOR_ATTACHMENT0);
 }
@@ -9929,7 +16215,7 @@ void GLRenderer2D::RenderNativeResolvedExactFinalToTexture(GLuint targetTex, GLu
                     192 * sizeof(sScanlineConfig::sScanline),
                     &ScanlineConfig.uScanline[0]);
 
-    UpdateCompositorConfig();
+    UpdateCompositorConfig(0, 192);
 
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, NativeTopColorTex);
@@ -10246,6 +16532,258 @@ bool GLRenderer2D::CanUseCaptureEpochBackgroundForLiveOverlay(int ystart, int ye
            epoch.SourceVisibleBitmapMask == 0;
 }
 
+bool GLRenderer2D::TryPromoteTwoPartAffineOBJPresentation(
+    GLuint targetTex,
+    GLuint highResBackgroundTex,
+    GLuint nativeDirect3DCoverageTex,
+    int ystart,
+    int yend)
+{
+    const StrictAffineSourceEnhancementDecision sourceEnhancement =
+        CurrentStrictAffineSourceEnhancementDecision(true);
+    const StrictAffineSourceEnhancementDecision ordinaryScaling =
+        CurrentStrictAffineOrdinaryScalingDecision(true);
+    if (!targetTex || !highResBackgroundTex ||
+        !WholeSceneScaleHybridStrictAffineHighRes ||
+        ystart != 0 || yend != 192 || ScaleFactor <= 1)
+    {
+        return false;
+    }
+
+    const bool spline36 = sourceEnhancement ==
+        StrictAffineSourceEnhancementDecision::Spline36Inline;
+    const bool artCNN = sourceEnhancement ==
+        StrictAffineSourceEnhancementDecision::ArtCNNCachedAffineSources;
+    const bool cuNNy = sourceEnhancement ==
+        StrictAffineSourceEnhancementDecision::CuNNyCachedAffineSources;
+    const bool cached = IsStrictAffineCachedSource(sourceEnhancement);
+    // xBRZ's established full-scene 2x contract is not equivalent to a local
+    // affine-only resolve over a completed capture-epoch background. Preserve
+    // the selected endpoint representation instead of silently substituting
+    // a different supersampling mode.
+
+    const int sourceModelIndex = artCNN
+        ? WholeSceneArtCNNModelIndex()
+        : (cuNNy
+            ? RendererSettings::GetGLCuNNyModelIndex(
+                  WholeSceneScaleAlgorithm)
+            : -1);
+    const int ordinarySourceModelIndex =
+        ordinaryScaling ==
+            StrictAffineSourceEnhancementDecision::ArtCNNCachedAffineSources
+        ? WholeSceneArtCNNModelIndex()
+        : (ordinaryScaling ==
+               StrictAffineSourceEnhancementDecision::CuNNyCachedAffineSources
+            ? RendererSettings::GetGLCuNNyModelIndex(
+                  WholeSceneScaleAlgorithm)
+            : -1);
+
+    const u32 visibleBGLayers = LayerEnable & 0x0Fu;
+    const int blendEffect = (BlendCnt >> 6) & 0x3;
+    bool supported = !GPU2D.Num &&
+        visibleBGLayers == (1u << 0) &&
+        (DispCnt & (1 << 3)) &&
+        (LayerEnable & (1 << 4)) && OBJEnable &&
+        (DispCnt & 0xE000u) == 0 &&
+        (blendEffect == 0 ||
+        ((blendEffect == 2 || blendEffect == 3) && EVY == 0)) &&
+        NumSprites > 0;
+    int affineOBJCount = 0;
+    u64 affineOAMMask[2] {};
+    if (supported)
+    {
+        for (int sprite = 0; sprite < NumSprites; sprite++)
+        {
+            const auto& source = SpriteConfig.uOAM[sprite];
+            if (source.OBJMode != 0 || source.Type >= 2 || source.Mosaic)
+            {
+                supported = false;
+                break;
+            }
+            if (source.Rotscale >= 32)
+                continue;
+
+            const int oamIndex = SpriteOAMIndex[sprite];
+            if (oamIndex < 0 || oamIndex >= 128)
+            {
+                supported = false;
+                break;
+            }
+            const int oamWord = oamIndex >> 6;
+            const u64 oamBit = 1ull << (oamIndex & 63);
+            if ((affineOAMMask[oamWord] & oamBit) == 0)
+            {
+                affineOAMMask[oamWord] |= oamBit;
+                affineOBJCount++;
+            }
+            if (source.Size[0] <= 0 || source.Size[1] <= 0 ||
+                source.Size[0] > 64 || source.Size[1] > 64 ||
+                source.BoundSize[0] != source.Size[0] * 2 ||
+                source.BoundSize[1] != source.Size[1] * 2)
+            {
+                supported = false;
+                break;
+            }
+        }
+    }
+
+    // This is the first bounded owner: one pulsing hand triangle and one
+    // separate advance arrow. Larger affine sets keep their existing path.
+    if (!supported || affineOBJCount != 2)
+    {
+        return false;
+    }
+    bool enhancedOBJReady = false;
+    if (cached)
+    {
+        enhancedOBJReady = PrepareStrictAffineEnhancedOBJSources(
+            sourceEnhancement,
+            sourceModelIndex);
+    }
+    if (cached && !enhancedOBJReady)
+    {
+        return false;
+    }
+
+    // Use the established operand-excluded recipe. Reconstructing an
+    // ordinary-only endpoint and then inserting an independently resolved
+    // affine surface makes the selected scaler evaluate two different
+    // neighborhoods at the boundary, which is the old Poke Ball halo failure.
+    const u64 savedSemanticAffineMask[2] = {
+        SemanticAffineOBJRoleMask[0], SemanticAffineOBJRoleMask[1]
+    };
+    SemanticAffineOBJRoleMask[0] |= affineOAMMask[0];
+    SemanticAffineOBJRoleMask[1] |= affineOAMMask[1];
+    const StrictAffineOrderedRecipeIntent orderedIntent =
+        BuildStrictAffineOrderedRecipeIntent(ystart,
+                                             yend,
+                                             true,
+                                             true);
+    SemanticAffineOBJRoleMask[0] = savedSemanticAffineMask[0];
+    SemanticAffineOBJRoleMask[1] = savedSemanticAffineMask[1];
+    WholeSceneTrace.StrictAffineOBJOperandPlanRequested =
+        orderedIntent.PlannedOrderedRequested;
+    WholeSceneTrace.StrictAffineOBJOperandPlanRejectionMask =
+        orderedIntent.OperandPlan.RejectionMask;
+    WholeSceneTrace.StrictAffineOBJOperandPlanOperandCount =
+        static_cast<u32>(orderedIntent.OperandPlan.BackToFront.size());
+    WholeSceneTrace.StrictAffineOBJOperandPlanHash =
+        orderedIntent.OperandPlan.PlanHash;
+    for (const auto& operand : orderedIntent.OperandPlan.BackToFront)
+    {
+        if (operand.PresentationIndex >= 0)
+        {
+            WholeSceneTrace.StrictAffineOBJOperandPlanPresentationProductCount =
+                std::max<u32>(
+                    WholeSceneTrace.
+                        StrictAffineOBJOperandPlanPresentationProductCount,
+                    static_cast<u32>(operand.PresentationIndex + 1));
+        }
+    }
+    WholeSceneTrace.StrictAffineOperandExcludedOverlayRequested =
+        orderedIntent.OverlayRecipe.Requested;
+    WholeSceneTrace.StrictAffineOperandExcludedOverlayRejectionMask =
+        orderedIntent.OverlayRecipe.RejectionMask;
+    if (!orderedIntent.PlannedOrderedRequested ||
+        !orderedIntent.OperandPlan.Ready ||
+        !orderedIntent.OrderedRecipe.Ready ||
+        !orderedIntent.OverlayRecipe.Ready)
+    {
+        return false;
+    }
+    for (std::size_t inputIndex = 1;
+         inputIndex < orderedIntent.OrderedRecipe.Inputs.size();
+         inputIndex++)
+    {
+        const auto kind = orderedIntent.OrderedRecipe.Inputs[inputIndex].Kind;
+        if (kind != WholeSceneCompositorInputKind::OrdinaryOBJBand &&
+            kind != WholeSceneCompositorInputKind::AffineOBJGroup)
+        {
+            return false;
+        }
+    }
+    if (!RenderOrdinaryOBJBandProducts(
+            orderedIntent.Classification,
+            ystart,
+            yend,
+            ordinaryScaling,
+            ordinarySourceModelIndex,
+            &orderedIntent.OperandPlan))
+    {
+        return false;
+    }
+    // Capture-epoch endpoint upscaling does not otherwise populate the
+    // high-resolution semantic owner map consumed by ordered presentation.
+    RenderNativeMetaCoverage(ystart, yend);
+
+    u64 excludedOAMHash = 0;
+    if (!RenderStrictAffineOperandExcludedOverlayBase(
+            ystart,
+            yend,
+            orderedIntent.OverlayRecipe,
+            highResBackgroundTex,
+            excludedOAMHash))
+    {
+        return false;
+    }
+    WholeSceneTrace.StrictAffineOperandExcludedOverlayOAMHash =
+        excludedOAMHash;
+    WholeSceneTrace.StrictAffineOBJOperandPlanCleanBG3DBase = true;
+
+    const OrderedOBJPresentationPolicy presentationPolicy =
+        BuildOrderedOBJPresentationPolicy(sourceEnhancement,
+                                          enhancedOBJReady,
+                                          true);
+    const GLuint orderedResult = RenderOrderedOBJPresentationRecipe(
+        orderedIntent.OrderedRecipe,
+        orderedIntent.OverlayRecipe.FirstExcludedOperand,
+        ystart,
+        yend,
+        presentationPolicy);
+    if (!orderedResult ||
+        !CopyOrderedOBJPresentationResult(orderedResult,
+                                          targetTex,
+                                          ystart,
+                                          yend))
+    {
+        return false;
+    }
+
+    // Ordered-base preparation is private, not a change to native/debug
+    // authority. Restore the complete native endpoint products, and only pay
+    // to restore their high-resolution companions when requested.
+    RenderNativeExactFinalToTexture(NativeExactFinalTex,
+                                    ystart,
+                                    yend,
+                                    false,
+                                    NativeOverlayBlack3DTex,
+                                    nativeDirect3DCoverageTex,
+                                    true);
+    RenderNativeExactFinalToTexture(NativeOutputTex,
+                                    ystart,
+                                    yend,
+                                    false,
+                                    NativeOverlayWhite3DTex,
+                                    nativeDirect3DCoverageTex,
+                                    true);
+    if (WholeSceneDebugViewsActive.load(std::memory_order_relaxed))
+    {
+        RenderNativeFinalUpscaleToTexture(NativeExactFinalTex,
+                                          UpscaledExactFinalTex);
+        RenderNativeFinalUpscaleToTexture(NativeOutputTex,
+                                          UpscaledCoverageTex);
+    }
+    WholeSceneExecutionTrace.StrictAffineProductAssessment.
+        OrderedOperandsReady = true;
+    WholeSceneExecutionTrace.StrictAffineProductAssessment.
+        OperandExcludedOverlayReady = true;
+    WholeSceneExecutionTrace.StrictAffinePresentationExecutionKind =
+        WholeSceneStrictAffinePresentationKind::OrderedOperands;
+    WholeSceneExecutionTrace.
+        OperandExcludedOverlayRecipeExecutionObserved = true;
+    return true;
+}
+
 bool GLRenderer2D::RenderCurrentOverlayOverHighResBackgroundToTexture(GLuint targetTex,
                                                                       GLuint highResBackgroundTex,
                                                                       int ystart,
@@ -10266,7 +16804,7 @@ bool GLRenderer2D::RenderCurrentOverlayOverHighResBackgroundToTexture(GLuint tar
     if (ScaleFactor > 1)
         nativeDirect3DTex = ResolveDirect3DToNative(highResBackgroundTex);
 
-    UpdateCompositorConfig();
+    UpdateCompositorConfig(ystart, yend);
     const auto savedCompositorConfig = CompositorConfig;
 
     for (int layer = 0; layer < 4; layer++)
@@ -10292,7 +16830,22 @@ bool GLRenderer2D::RenderCurrentOverlayOverHighResBackgroundToTexture(GLuint tar
     RenderNativeFinalUpscaleToTexture(NativeExactFinalTex, UpscaledExactFinalTex);
     RenderNativeFinalUpscaleToTexture(NativeOutputTex, UpscaledCoverageTex);
 
-    const u16 masterBrightness = GPU2D.Num ? GPU.MasterBrightnessB : GPU.MasterBrightnessA;
+    const u16 legacyMasterBrightness =
+        GPU2D.Num ? GPU.MasterBrightnessB : GPU.MasterBrightnessA;
+    const WholeSceneOutputTransform* plannedMasterBrightness =
+        applyMasterBrightness
+            ? ResolveWholeSceneOutputTransformForExecution(
+                  WholeScenePlan,
+                  WholeSceneOutputTransformKind::MasterBrightness,
+                  ystart,
+                  yend)
+            : nullptr;
+    const bool executePlannedMasterBrightness =
+        plannedMasterBrightness &&
+        plannedMasterBrightness->State == legacyMasterBrightness;
+    const u16 masterBrightness = executePlannedMasterBrightness
+        ? static_cast<u16>(plannedMasterBrightness->State)
+        : legacyMasterBrightness;
     const int brightMode = (masterBrightness >> 14) & 0x3;
     const int brightFactor = std::min<int>(masterBrightness & 0x1F, 16);
     const bool bakeMasterBrightness =
@@ -10317,6 +16870,11 @@ bool GLRenderer2D::RenderCurrentOverlayOverHighResBackgroundToTexture(GLuint tar
                            ystart,
                            yend,
                            true);
+    TryPromoteTwoPartAffineOBJPresentation(compositeTargetTex,
+                                           highResBackgroundTex,
+                                           nativeDirect3DTex,
+                                           ystart,
+                                           yend);
 
     bool masterBrightnessAppliedToOutput = false;
     const bool masterBrightnessApplied =
@@ -10331,6 +16889,17 @@ bool GLRenderer2D::RenderCurrentOverlayOverHighResBackgroundToTexture(GLuint tar
                                             masterBrightness));
     if (outputMasterBrightnessApplied)
         *outputMasterBrightnessApplied = masterBrightnessAppliedToOutput;
+    if (masterBrightnessAppliedToOutput && executePlannedMasterBrightness)
+    {
+        MarkWholeSceneOutputTransformPlanExecuted(
+            WholeScenePlan,
+            WholeSceneExecutionTrace,
+            WholeSceneOutputTransformKind::MasterBrightness,
+            ystart,
+            yend,
+            masterBrightness,
+            plannedMasterBrightness->AuxState);
+    }
 
     CompositorConfig = savedCompositorConfig;
     glBindBuffer(GL_UNIFORM_BUFFER, CompositorConfigUBO);
@@ -10433,9 +17002,6 @@ bool GLRenderer2D::RenderCurrentLayersOverHighResCaptureBGToTexture(GLuint targe
                                 false,
                                 false,
                                 highResUnderlayTex);
-    WholeSceneTrace.SourceACaptureMode = SourceACaptureReplacementMode::CurrentOverlay;
-    WholeSceneTrace.SourceAProductChoice =
-        SourceAProductChoiceReason::UsedBackgroundUnderlayCurrentOverlay;
     WholeSceneTrace.EffectiveSourceABackgroundSource =
         SourceABackgroundSource::FullCaptureProduct;
     WholeSceneTrace.CaptureProductKind = WholeSceneCaptureProductKind::FullCaptureProduct;
@@ -10447,8 +17013,7 @@ bool GLRenderer2D::RenderCurrentLayersOverHighResCaptureBGToTexture(GLuint targe
     product.BackgroundSource = SourceABackgroundSource::FullCaptureProduct;
     product.RenderAction = WholeSceneTrace.CaptureRenderAction;
     product.PresentationClass =
-        CaptureProductPresentationClassForProduct(product.ProductKind,
-                                                 product.RenderAction);
+        WholeSceneCaptureProductPresentationClass::AlreadyPresented;
     RecordChosenCaptureProductTrace(product, {});
 
     auto phaseStart = std::chrono::steady_clock::now();
@@ -10535,9 +17100,6 @@ bool GLRenderer2D::RenderCurrentBGOverlayOverHighResCaptureOBJToTexture(GLuint t
                                 false,
                                 false,
                                 highResUnderlayTex);
-    WholeSceneTrace.SourceACaptureMode = SourceACaptureReplacementMode::CurrentOverlay;
-    WholeSceneTrace.SourceAProductChoice =
-        SourceAProductChoiceReason::UsedBackgroundUnderlayCurrentOverlay;
     WholeSceneTrace.EffectiveSourceABackgroundSource =
         SourceABackgroundSource::FullCaptureProduct;
     WholeSceneTrace.CaptureProductKind = WholeSceneCaptureProductKind::FullCaptureProduct;
@@ -10549,8 +17111,7 @@ bool GLRenderer2D::RenderCurrentBGOverlayOverHighResCaptureOBJToTexture(GLuint t
     product.BackgroundSource = SourceABackgroundSource::FullCaptureProduct;
     product.RenderAction = WholeSceneTrace.CaptureRenderAction;
     product.PresentationClass =
-        CaptureProductPresentationClassForProduct(product.ProductKind,
-                                                 product.RenderAction);
+        WholeSceneCaptureProductPresentationClass::AlreadyPresented;
     RecordChosenCaptureProductTrace(product,
                                     {debug.Bank,
                                      0,
@@ -10911,6 +17472,30 @@ bool GLRenderer2D::EnsureCuNNyWorkTexture(int index, int width, int height)
     return true;
 }
 
+bool GLRenderer2D::EnsureStrictAffineCuNNy2xTexture(int width, int height)
+{
+    if (width <= 0 || height <= 0)
+        return false;
+    if (StrictAffineCuNNy2xWidth == static_cast<u32>(width) &&
+        StrictAffineCuNNy2xHeight == static_cast<u32>(height))
+    {
+        return true;
+    }
+
+    GLint maxTextureSize = 0;
+    glGetIntegerv(GL_MAX_TEXTURE_SIZE, &maxTextureSize);
+    if (width > maxTextureSize || height > maxTextureSize)
+        return false;
+
+    glBindTexture(GL_TEXTURE_2D, StrictAffineCuNNy2xTex);
+    glDefaultTexParams(GL_TEXTURE_2D);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, width, height, 0,
+                 GL_RGBA, GL_HALF_FLOAT, nullptr);
+    StrictAffineCuNNy2xWidth = width;
+    StrictAffineCuNNy2xHeight = height;
+    return true;
+}
+
 void GLRenderer2D::RenderCuNNyComputePass(GLuint shader, GLuint sourceTex, GLuint baseTex, GLuint targetTex,
                                           int sourceWidth, int sourceHeight,
                                           int nativeWidth, int nativeHeight)
@@ -10957,7 +17542,7 @@ bool GLRenderer2D::RenderCuNNy2x(int modelIndex, GLuint sourceTex, GLuint target
 {
     if (modelIndex < 0 || modelIndex >= RendererSettings::GLCuNNyModelCount)
         return false;
-    if (!EnsureCuNNyPrograms())
+    if (!EnsureCuNNyPrograms() || !EnsureArtCNNWorkTextures(256, 192))
         return false;
 
     RenderFullscreenPass(RGBAToYUVAShader, ArtCNNYUVFB, 256, 192, sourceTex, 0);
@@ -11009,17 +17594,394 @@ bool GLRenderer2D::RenderCuNNy2x(int modelIndex, GLuint sourceTex, GLuint target
     return true;
 }
 
-void GLRenderer2D::RenderSpline36(GLuint sourceTex, GLuint targetTex, int width, int height, float sourceShiftX, float sourceShiftY)
+bool GLRenderer2D::RenderCuNNyRGB2x(int modelIndex, GLuint sourceTex,
+                                    GLuint targetTex, int sourceWidth,
+                                    int sourceHeight)
+{
+    if (modelIndex < 0 || modelIndex >= RendererSettings::GLCuNNyModelCount ||
+        sourceWidth <= 0 || sourceHeight <= 0)
+        return false;
+    if (!EnsureCuNNyPrograms())
+        return false;
+
+    const CuNNyModelInfo& model = kCuNNyModels[modelIndex];
+    if (!model.RGB)
+        return false;
+
+    int currentWidth = sourceWidth * model.WorkScaleX;
+    int currentHeight = sourceHeight * model.WorkScaleY;
+    if (!EnsureCuNNyWorkTexture(0, currentWidth, currentHeight))
+        return false;
+
+    RenderCuNNyComputePass(CuNNyInShaders[modelIndex], sourceTex, sourceTex,
+                           CuNNyWorkTex[0], sourceWidth, sourceHeight,
+                           sourceWidth, sourceHeight);
+
+    GLuint currentTex = CuNNyWorkTex[0];
+    int currentIndex = 0;
+    for (int pass = 0; pass < model.ConvPasses; pass++)
+    {
+        const bool lastConv = pass == model.ConvPasses - 1;
+        const int targetWidth = sourceWidth *
+            (lastConv ? model.FinalWorkScaleX : model.WorkScaleX);
+        const int targetHeight = sourceHeight *
+            (lastConv ? model.FinalWorkScaleY : model.WorkScaleY);
+        const int targetIndex = currentIndex == 0 ? 1 : 0;
+        if (!EnsureCuNNyWorkTexture(targetIndex, targetWidth, targetHeight))
+            return false;
+
+        RenderCuNNyComputePass(CuNNyConvShaders[modelIndex][pass], currentTex,
+                               sourceTex, CuNNyWorkTex[targetIndex],
+                               currentWidth, currentHeight,
+                               sourceWidth, sourceHeight);
+        currentTex = CuNNyWorkTex[targetIndex];
+        currentIndex = targetIndex;
+        currentWidth = targetWidth;
+        currentHeight = targetHeight;
+    }
+
+    RenderCuNNyComputePass(CuNNyOutShaders[modelIndex], currentTex, sourceTex,
+                           targetTex, currentWidth, currentHeight,
+                           sourceWidth, sourceHeight);
+    return true;
+}
+
+bool GLRenderer2D::RenderCuNNyRGBAtScale(int modelIndex, GLuint sourceTex,
+                                         GLuint targetTex, int sourceWidth,
+                                         int sourceHeight, int sourceScale)
+{
+    if (sourceScale == 2)
+    {
+        return RenderCuNNyRGB2x(modelIndex, sourceTex, targetTex,
+                                sourceWidth, sourceHeight);
+    }
+    if (sourceScale != 4 ||
+        !EnsureStrictAffineCuNNy2xTexture(sourceWidth * 2,
+                                          sourceHeight * 2) ||
+        !RenderCuNNyRGB2x(modelIndex, sourceTex,
+                          StrictAffineCuNNy2xTex,
+                          sourceWidth, sourceHeight))
+    {
+        return false;
+    }
+
+    // Match the normal CuNNy scale-four chain: the model reconstructs one
+    // two-times level, then Spline36 supplies the continuous final-size source
+    // product before affine placement.
+    RenderSpline36(StrictAffineCuNNy2xTex, targetTex,
+                   sourceWidth * 4, sourceHeight * 4);
+    return true;
+}
+
+bool GLRenderer2D::RenderNNEDI3RGBAtScale(GLuint sourceTex, GLuint targetTex,
+                                           int sourceWidth, int sourceHeight,
+                                           int sourceScale,
+                                           bool alphaOnly,
+                                           bool premultipliedRGB)
+{
+    if (sourceWidth <= 0 || sourceHeight <= 0 ||
+        (sourceScale != 2 && sourceScale != 4) ||
+        !EnsureNNEDI3ComputePrograms())
+        return false;
+
+    // The NNEDI3 compute shaders are dimension-driven. Reuse the transient
+    // scaler work textures for affine logical surfaces and isolated OBJ slots.
+    // Run the same second vertical/horizontal stage used by whole-scene NNEDI3
+    // when the affine source product is four-times, then apply the matching
+    // phase correction. Predict alpha only when NNEDI3 coverage is requested;
+    // other reconstruction modes replace it without using it. Alpha
+    // in targetTex is still not semantic authority: BG and OBJ composition
+    // restore their original native presence separately.
+    // Presentation alpha is a coverage field: constrain prediction to the
+    // bracketing source samples, then bound the phase filter to its local
+    // cell. This prevents new exterior lobes and interior holes without an
+    // alpha cutoff. RGB and the whole-scene NNEDI3 path keep their own rules.
+    const bool predictAlpha = alphaOnly || premultipliedRGB ||
+        AffineAlpha == RendererSettings::AffineAlphaReconstruction::NNEDI3;
+    if (!EnsureCuNNyWorkTexture(0, sourceWidth, sourceHeight * 2) ||
+        !EnsureCuNNyWorkTexture(1, sourceWidth * 2, sourceHeight * 2))
+        return false;
+
+    RenderNNEDI3ComputePass(NNEDI3VerticalComputeShader,
+                            sourceTex,
+                            CuNNyWorkTex[0],
+                            sourceWidth,
+                            sourceHeight,
+                            predictAlpha,
+                            alphaOnly,
+                            true,
+                            premultipliedRGB);
+    RenderNNEDI3ComputePass(NNEDI3HorizontalComputeShader,
+                            CuNNyWorkTex[0],
+                            CuNNyWorkTex[1],
+                            sourceWidth,
+                            sourceHeight * 2,
+                            predictAlpha,
+                            alphaOnly,
+                            true);
+
+    if (sourceScale == 4)
+    {
+        if (!EnsureCuNNyWorkTexture(0,
+                                    sourceWidth * 2,
+                                    sourceHeight * 4))
+            return false;
+
+        RenderNNEDI3ComputePass(NNEDI3VerticalComputeShader,
+                                CuNNyWorkTex[1],
+                                CuNNyWorkTex[0],
+                                sourceWidth * 2,
+                                sourceHeight * 2,
+                                predictAlpha,
+                                alphaOnly,
+                                true);
+
+        if (!EnsureCuNNyWorkTexture(1,
+                                    sourceWidth * 4,
+                                    sourceHeight * 4))
+            return false;
+
+        RenderNNEDI3ComputePass(NNEDI3HorizontalComputeShader,
+                                CuNNyWorkTex[0],
+                                CuNNyWorkTex[1],
+                                sourceWidth * 2,
+                                sourceHeight * 4,
+                                predictAlpha,
+                                alphaOnly,
+                                true);
+        RenderSpline36(CuNNyWorkTex[1], targetTex,
+                       sourceWidth * 4, sourceHeight * 4,
+                       -1.5f, -1.5f, false, true, premultipliedRGB);
+        return true;
+    }
+
+    RenderSpline36(CuNNyWorkTex[1], targetTex,
+                   sourceWidth * 2, sourceHeight * 2,
+                   -0.5f, -0.5f, false, true, premultipliedRGB);
+    return true;
+}
+
+void GLRenderer2D::EnsureReconstructionAlphaTextures(int width, int height, int scale)
+{
+    if (!ReconstructionAlphaWorkTex[0]) glGenTextures(3, ReconstructionAlphaWorkTex);
+    if (width != ReconstructionAlphaWidth || height != ReconstructionAlphaHeight || scale != ReconstructionAlphaScale)
+    {
+        for (int i = 0; i < 3; ++i)
+        {
+            glBindTexture(GL_TEXTURE_2D, ReconstructionAlphaWorkTex[i]);
+            glDefaultTexParams(GL_TEXTURE_2D);
+            int factor = i == 0 ? 1 : scale;
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, width * factor, height * factor,
+                         0, GL_RGBA, GL_HALF_FLOAT, nullptr);
+        }
+        ReconstructionAlphaWidth = width;
+        ReconstructionAlphaHeight = height;
+        ReconstructionAlphaScale = scale;
+    }
+}
+
+bool GLRenderer2D::ReconstructAffineAlpha(GLuint source, GLuint rgb, GLuint target,
+                                          int width, int height, int scale,
+                                          StrictAffineSourceEnhancementDecision rgbEnhancement)
+{
+    using Alpha = RendererSettings::AffineAlphaReconstruction;
+
+    // Matching NNEDI3 and Spline36 RGB passes already reconstruct coverage.
+    // Keep the final sampling/copy step (including its precision) unchanged.
+    // xBRZ RGB edges depend on color and cannot replace mask-only edges.
+    const bool reuseAlpha =
+        (AffineAlpha == Alpha::NNEDI3 && rgbEnhancement ==
+            StrictAffineSourceEnhancementDecision::NNEDI3CachedAffineSources) ||
+        (AffineAlpha == Alpha::Spline36 &&
+            (rgbEnhancement == StrictAffineSourceEnhancementDecision::Spline36CachedAffineSources ||
+             rgbEnhancement == StrictAffineSourceEnhancementDecision::Spline36Inline));
+    if (reuseAlpha && target != rgb)
+    {
+        RenderFullscreenPassToTexture(MidpointAlphaShader, target,
+                                       width * scale, height * scale, rgb, rgb);
+        return true;
+    }
+
+    EnsureReconstructionAlphaTextures(width, height, scale);
+    const GLuint mask = ReconstructionAlphaWorkTex[0];
+    const GLuint alpha = reuseAlpha ? rgb : ReconstructionAlphaWorkTex[1];
+    if (!reuseAlpha)
+    {
+        glUseProgram(ReconstructionAlphaShader);
+        SetUniform1iIfPresent(ReconstructionAlphaShader, "uBilinear", 0);
+        RenderFullscreenPassToTexture(ReconstructionAlphaShader, ReconstructionAlphaWorkTex[0],
+                                       width, height, source, 0);
+        switch (AffineAlpha)
+        {
+        case Alpha::NativeMask:
+        case Alpha::Bilinear:
+            glUseProgram(ReconstructionAlphaShader);
+            SetUniform1iIfPresent(ReconstructionAlphaShader, "uBilinear", AffineAlpha == Alpha::Bilinear);
+            RenderFullscreenPassToTexture(ReconstructionAlphaShader, alpha,
+                                           width * scale, height * scale, mask, 0);
+            break;
+        case Alpha::Spline36:
+            RenderSpline36(mask, alpha, width * scale, height * scale, 0.0f, 0.0f, false, true);
+            break;
+        case Alpha::NNEDI3:
+            if (!RenderNNEDI3RGBAtScale(mask, alpha, width, height, scale, true)) return false;
+            break;
+        case Alpha::XBRZ:
+            if (!RenderXBRZAtScale(mask, alpha, width, height, scale)) return false;
+            break;
+        default:
+            return false;
+        }
+    }
+    // Avoid framebuffer feedback when the caller replaces alpha in its RGB product.
+    GLuint output = target == rgb ? ReconstructionAlphaWorkTex[2] : target;
+    RenderFullscreenPassToTexture(MidpointAlphaShader, output,
+                                   width * scale, height * scale, rgb, alpha);
+    if (output != target)
+        RenderFullscreenPassToTexture(AlphaReplaceShader, target,
+                                       width * scale, height * scale, output, output);
+    return true;
+}
+
+bool GLRenderer2D::RenderStrictAffineCachedRGB(
+    StrictAffineSourceEnhancementDecision sourceEnhancement,
+    int sourceModelIndex,
+    GLuint sourceTex,
+    GLuint targetTex,
+    int sourceWidth,
+    int sourceHeight,
+    int sourceScale)
+{
+    if (sourceEnhancement == StrictAffineSourceEnhancementDecision::NativeCachedAffineSources)
+    {
+        RenderFullscreenPassToTexture(AlphaReplaceShader, targetTex,
+            sourceWidth * sourceScale, sourceHeight * sourceScale, sourceTex, sourceTex);
+        return true;
+    }
+    if (sourceEnhancement == StrictAffineSourceEnhancementDecision::Spline36CachedAffineSources ||
+        sourceEnhancement == StrictAffineSourceEnhancementDecision::Spline36Inline)
+    {
+        // Explicit reconstruction assigns display support to the alpha pass.
+        // Filter the padded RGB through that support instead of clearing it
+        // outside native presence and exposing black through fractional alpha.
+        const bool sharedAlpha = AffineAlpha == RendererSettings::AffineAlphaReconstruction::Spline36;
+        GLuint coverage = 0;
+        if (sharedAlpha)
+        {
+            // Keep the original half-float mask conversion. Filter it beside
+            // RGB with the same weights, rather than running Spline36 twice.
+            EnsureReconstructionAlphaTextures(sourceWidth, sourceHeight, sourceScale);
+            coverage = ReconstructionAlphaWorkTex[0];
+            glUseProgram(ReconstructionAlphaShader);
+            SetUniform1iIfPresent(ReconstructionAlphaShader, "uBilinear", false);
+            RenderFullscreenPassToTexture(ReconstructionAlphaShader, coverage,
+                sourceWidth, sourceHeight, sourceTex, 0);
+        }
+        RenderSpline36(sourceTex, targetTex,
+                       sourceWidth * sourceScale,
+                       sourceHeight * sourceScale,
+                       0.0f, 0.0f, false, sharedAlpha, false, coverage);
+        return true;
+    }
+    if (sourceEnhancement ==
+        StrictAffineSourceEnhancementDecision::ArtCNNCachedAffineSources)
+    {
+        return RenderArtCNNRGBAtScale(sourceModelIndex,
+                                      sourceTex, targetTex,
+                                      sourceWidth, sourceHeight,
+                                      sourceScale);
+    }
+    if (sourceEnhancement ==
+        StrictAffineSourceEnhancementDecision::CuNNyCachedAffineSources)
+    {
+        return RenderCuNNyRGBAtScale(sourceModelIndex, sourceTex, targetTex,
+                                     sourceWidth, sourceHeight, sourceScale);
+    }
+    if (sourceEnhancement ==
+        StrictAffineSourceEnhancementDecision::NNEDI3CachedAffineSources)
+    {
+        return RenderNNEDI3RGBAtScale(sourceTex, targetTex,
+                                      sourceWidth, sourceHeight,
+                                      sourceScale, false,
+                                      NNEDI3PremultipliedRGB &&
+                                      AffineAlpha == RendererSettings::AffineAlphaReconstruction::NNEDI3);
+    }
+    if (sourceEnhancement ==
+        StrictAffineSourceEnhancementDecision::XBRZCachedAffineSources)
+    {
+        return RenderXBRZAtScale(sourceTex, targetTex,
+                                 sourceWidth, sourceHeight,
+                                 sourceScale);
+    }
+    return false;
+}
+
+void GLRenderer2D::RenderSpline36(GLuint sourceTex, GLuint targetTex,
+                                  int width, int height,
+                                  float sourceShiftX, float sourceShiftY,
+                                  bool transparentSourceAware,
+                                  bool boundedCoverageAlpha,
+                                  bool resolvePremultipliedRGB, GLuint coverageSource)
 {
     glUseProgram(Spline36Shader);
     GLint sourceShiftLoc = glGetUniformLocation(Spline36Shader, "uSourceShift");
     if (sourceShiftLoc >= 0)
         glUniform2f(sourceShiftLoc, sourceShiftX, sourceShiftY);
+    GLint transparentSourceAwareLoc =
+        glGetUniformLocation(Spline36Shader, "uTransparentSourceAware");
+    if (transparentSourceAwareLoc >= 0)
+        glUniform1i(transparentSourceAwareLoc, transparentSourceAware);
+    SetUniform1iIfPresent(Spline36Shader, "uBoundedCoverageAlpha", boundedCoverageAlpha);
+    SetUniform1iIfPresent(Spline36Shader, "uResolvePremultipliedRGB", resolvePremultipliedRGB);
 
-    RenderFullscreenPassToTexture(Spline36Shader, targetTex, width, height, sourceTex, 0);
+    SetUniform1iIfPresent(Spline36Shader, "uUseCoverageSource", coverageSource != 0);
+    SetUniform1iIfPresent(Spline36Shader, "AlphaSource", 1);
+    RenderFullscreenPassToTexture(Spline36Shader, targetTex, width, height, sourceTex, coverageSource);
 }
 
-void GLRenderer2D::RenderArtCNNComputePass(GLuint shader, GLuint targetTex, int pass)
+bool GLRenderer2D::EnsureArtCNNWorkTextures(int nativeWidth,
+                                            int nativeHeight)
+{
+    if (nativeWidth <= 0 || nativeHeight <= 0)
+        return false;
+    if (ArtCNNWorkNativeWidth == static_cast<u32>(nativeWidth) &&
+        ArtCNNWorkNativeHeight == static_cast<u32>(nativeHeight))
+    {
+        return true;
+    }
+
+    GLint maxTextureSize = 0;
+    glGetIntegerv(GL_MAX_TEXTURE_SIZE, &maxTextureSize);
+    if (nativeWidth * 2 > maxTextureSize ||
+        nativeHeight * 2 > maxTextureSize)
+    {
+        return false;
+    }
+
+    auto resize = [](GLuint texture, int width, int height)
+    {
+        glBindTexture(GL_TEXTURE_2D, texture);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F,
+                     width, height, 0, GL_RGBA, GL_HALF_FLOAT, nullptr);
+    };
+
+    resize(ArtCNNYUVTex, nativeWidth, nativeHeight);
+    resize(ArtCNNConv0Tex, nativeWidth * 2, nativeHeight * 2);
+    resize(ArtCNNConvWorkTex[0], nativeWidth * 2, nativeHeight * 2);
+    resize(ArtCNNConvWorkTex[1], nativeWidth * 2, nativeHeight * 2);
+    resize(ArtCNNPackedTex, nativeWidth, nativeHeight);
+    resize(ArtCNNLuma2xTex, nativeWidth * 2, nativeHeight * 2);
+    resize(ArtCNNYUVA2xTex, nativeWidth * 2, nativeHeight * 2);
+    resize(ArtCNNRGBA2xTex, nativeWidth * 2, nativeHeight * 2);
+
+    ArtCNNWorkNativeWidth = nativeWidth;
+    ArtCNNWorkNativeHeight = nativeHeight;
+    return true;
+}
+
+void GLRenderer2D::RenderArtCNNComputePass(GLuint shader, GLuint targetTex,
+                                           int pass, int nativeWidth,
+                                           int nativeHeight)
 {
     glDisable(GL_DEPTH_TEST);
     glDisable(GL_STENCIL_TEST);
@@ -11029,7 +17991,7 @@ void GLRenderer2D::RenderArtCNNComputePass(GLuint shader, GLuint targetTex, int 
     glDisable(GL_SCISSOR_TEST);
 
     glUseProgram(shader);
-    SetArtCNNComputeSizeUniforms(shader, 256, 192);
+    SetArtCNNComputeSizeUniforms(shader, nativeWidth, nativeHeight);
 
     for (int unit = 0; unit < (int)kArtCNNSamplerUniformCount; unit++)
         BindTextureUnit(unit, 0);
@@ -11064,8 +18026,8 @@ void GLRenderer2D::RenderArtCNNComputePass(GLuint shader, GLuint targetTex, int 
     }
 
     glBindImageTexture(0, targetTex, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA16F);
-    const int dispatchWidth = (pass == 7) ? 512 : 256;
-    const int dispatchHeight = (pass == 7) ? 384 : 192;
+    const int dispatchWidth = (pass == 7) ? nativeWidth * 2 : nativeWidth;
+    const int dispatchHeight = (pass == 7) ? nativeHeight * 2 : nativeHeight;
     glDispatchCompute((GLuint)((dispatchWidth + 7) / 8), (GLuint)((dispatchHeight + 7) / 8), 1);
     glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT |
                     GL_TEXTURE_FETCH_BARRIER_BIT |
@@ -11076,28 +18038,60 @@ void GLRenderer2D::RenderArtCNNComputePass(GLuint shader, GLuint targetTex, int 
 
 bool GLRenderer2D::RenderArtCNN2x(int modelIndex, GLuint sourceTex, GLuint targetTex)
 {
+    return RenderArtCNNRGBAtScale(modelIndex, sourceTex, targetTex,
+                                  256, 192, ScaleFactor);
+}
+
+bool GLRenderer2D::RenderArtCNNRGBAtScale(int modelIndex, GLuint sourceTex,
+                                          GLuint targetTex, int sourceWidth,
+                                          int sourceHeight, int sourceScale)
+{
     if (modelIndex < 0 || modelIndex >= RendererSettings::GLArtCNNModelCount)
         return false;
-    if (!EnsureArtCNNComputePrograms())
+    if (sourceWidth <= 0 || sourceHeight <= 0 || sourceScale < 2 ||
+        !EnsureArtCNNComputePrograms() ||
+        !EnsureArtCNNWorkTextures(sourceWidth, sourceHeight))
         return false;
 
-    RenderFullscreenPass(RGBAToYUVAShader, ArtCNNYUVFB, 256, 192, sourceTex, 0);
-    RenderArtCNNComputePass(ArtCNNConvShaders[modelIndex][0], ArtCNNConv0Tex, 0);
-    RenderArtCNNComputePass(ArtCNNConvShaders[modelIndex][1], ArtCNNConvWorkTex[0], 1);
-    RenderArtCNNComputePass(ArtCNNConvShaders[modelIndex][2], ArtCNNConvWorkTex[1], 2);
-    RenderArtCNNComputePass(ArtCNNConvShaders[modelIndex][3], ArtCNNConvWorkTex[0], 3);
-    RenderArtCNNComputePass(ArtCNNConvShaders[modelIndex][4], ArtCNNConvWorkTex[1], 4);
-    RenderArtCNNComputePass(ArtCNNConvShaders[modelIndex][5], ArtCNNConvWorkTex[0], 5);
-    RenderArtCNNComputePass(ArtCNNConvShaders[modelIndex][6], ArtCNNPackedTex, 6);
-    RenderArtCNNComputePass(ArtCNNDepthToSpaceShaders[modelIndex], ArtCNNLuma2xTex, 7);
+    const int width2x = sourceWidth * 2;
+    const int height2x = sourceHeight * 2;
+    RenderFullscreenPass(RGBAToYUVAShader, ArtCNNYUVFB,
+                         sourceWidth, sourceHeight, sourceTex, 0);
+    RenderArtCNNComputePass(ArtCNNConvShaders[modelIndex][0],
+                            ArtCNNConv0Tex, 0, sourceWidth, sourceHeight);
+    RenderArtCNNComputePass(ArtCNNConvShaders[modelIndex][1],
+                            ArtCNNConvWorkTex[0], 1,
+                            sourceWidth, sourceHeight);
+    RenderArtCNNComputePass(ArtCNNConvShaders[modelIndex][2],
+                            ArtCNNConvWorkTex[1], 2,
+                            sourceWidth, sourceHeight);
+    RenderArtCNNComputePass(ArtCNNConvShaders[modelIndex][3],
+                            ArtCNNConvWorkTex[0], 3,
+                            sourceWidth, sourceHeight);
+    RenderArtCNNComputePass(ArtCNNConvShaders[modelIndex][4],
+                            ArtCNNConvWorkTex[1], 4,
+                            sourceWidth, sourceHeight);
+    RenderArtCNNComputePass(ArtCNNConvShaders[modelIndex][5],
+                            ArtCNNConvWorkTex[0], 5,
+                            sourceWidth, sourceHeight);
+    RenderArtCNNComputePass(ArtCNNConvShaders[modelIndex][6],
+                            ArtCNNPackedTex, 6,
+                            sourceWidth, sourceHeight);
+    RenderArtCNNComputePass(ArtCNNDepthToSpaceShaders[modelIndex],
+                            ArtCNNLuma2xTex, 7,
+                            sourceWidth, sourceHeight);
 
-    RenderSpline36(ArtCNNYUVTex, ArtCNNYUVA2xTex, 512, 384);
+    RenderSpline36(ArtCNNYUVTex, ArtCNNYUVA2xTex, width2x, height2x);
 
-    GLuint rgba2xTarget = (ScaleFactor == 2) ? targetTex : ArtCNNRGBA2xTex;
-    RenderFullscreenPassToTexture(ArtCNNYUVAToRGBA2xShader, rgba2xTarget, 512, 384, ArtCNNYUVA2xTex, ArtCNNLuma2xTex);
+    GLuint rgba2xTarget = sourceScale == 2 ? targetTex : ArtCNNRGBA2xTex;
+    RenderFullscreenPassToTexture(ArtCNNYUVAToRGBA2xShader, rgba2xTarget,
+                                  width2x, height2x,
+                                  ArtCNNYUVA2xTex, ArtCNNLuma2xTex);
 
-    if (ScaleFactor > 2)
-        RenderSpline36(ArtCNNRGBA2xTex, targetTex, ScreenW, ScreenH);
+    if (sourceScale > 2)
+        RenderSpline36(ArtCNNRGBA2xTex, targetTex,
+                       sourceWidth * sourceScale,
+                       sourceHeight * sourceScale);
     return true;
 }
 
@@ -11125,8 +18119,290 @@ bool GLRenderer2D::RenderCuNNy2xGuarded(int modelIndex, GLuint sourceTex, GLuint
     return true;
 }
 
+bool GLRenderer2D::PrepareStrictAffineOrdinaryOBJNativeStack(
+    StrictAffineSourceEnhancementDecision sourceEnhancement,
+    int sourceModelIndex,
+    int ystart,
+    int yend)
+{
+    const bool spline36 = sourceEnhancement ==
+        StrictAffineSourceEnhancementDecision::Spline36Inline;
+    const bool artcnn = sourceEnhancement ==
+        StrictAffineSourceEnhancementDecision::ArtCNNCachedAffineSources;
+    const bool cuNNy = sourceEnhancement ==
+        StrictAffineSourceEnhancementDecision::CuNNyCachedAffineSources;
+    const bool nnedi3 = sourceEnhancement ==
+        StrictAffineSourceEnhancementDecision::NNEDI3CachedAffineSources;
+    const bool xbrz = sourceEnhancement ==
+        StrictAffineSourceEnhancementDecision::XBRZCachedAffineSources;
+    if (!spline36 && !artcnn && !cuNNy && !nnedi3 && !xbrz)
+        return false;
+
+    // The normal native stack already owns ordinary OBJ edge reconstruction,
+    // window/effect metadata, and the selected scaler's boundary behavior.
+    // Reuse that product; only its ordinary-OBJ winner will be merged later.
+    RenderNativePrepass(ystart, yend);
+
+    if (spline36)
+    {
+        RenderNativeUpscale(0, 192);
+        return true;
+    }
+
+    if (nnedi3)
+    {
+        RenderNativeUpscale(0, 192);
+        return RenderNNEDI32xGuarded(
+            NativeTopColorTex, UpscaledTopColorTex, false);
+    }
+
+    if (xbrz)
+    {
+        RenderNativeUpscale(0, 192);
+        RenderXBRZGuarded(NativeTopColorTex,
+                          UpscaledTopColorTex,
+                          false);
+        return true;
+    }
+
+    if (sourceModelIndex < 0)
+    {
+        return false;
+    }
+
+    if (artcnn)
+    {
+        RenderNativeUpscale(0, 192);
+        return RenderArtCNN2xGuarded(sourceModelIndex,
+                                     NativeTopColorTex,
+                                     UpscaledTopColorTex,
+                                     false);
+    }
+
+    // CuNNy's post-scale boundary guard consumes the native-stack metadata.
+    // Generate the complete Spline36 stack first: CuNNy replaces top color,
+    // while the affine presentation underlay may need the reconstructed
+    // semantic second color when native top is the affine OBJ being removed.
+    RenderNativeUpscale(0, 192);
+    return RenderCuNNy2xGuarded(sourceModelIndex,
+                                NativeTopColorTex,
+                                UpscaledTopColorTex,
+                                false);
+}
+
+void GLRenderer2D::RenderStrictAffineOrdinaryOBJComposite(
+    int ystart,
+    int yend,
+    u32 nativeStackBGMask,
+    GLuint baseTex,
+    GLuint targetFB,
+    bool buildAffineUnderlay)
+{
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, targetFB);
+    glDrawBuffer(GL_COLOR_ATTACHMENT0);
+
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_STENCIL_TEST);
+    glDisable(GL_BLEND);
+    glColorMaski(0, GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glDepthMask(GL_FALSE);
+    glViewport(0, 0, ScreenW, ScreenH);
+    glEnable(GL_SCISSOR_TEST);
+    glScissor(0, ystart * ScaleFactor, ScreenW,
+              (yend - ystart) * ScaleFactor);
+
+    glUseProgram(StrictAffineOrdinaryOBJCompositeShader);
+    glUniform1i(StrictAffineOrdinaryOBJCompositeScaleULoc, ScaleFactor);
+    glUniform1i(StrictAffineOrdinaryOBJCompositeNativeStackBGMaskULoc,
+                static_cast<GLint>(nativeStackBGMask));
+    glUniform1i(StrictAffineOrdinaryOBJCompositeDebugTintULoc,
+                WholeSceneScaleDebugTint);
+    glUniform1i(StrictAffineOrdinaryOBJCompositeBuildUnderlayULoc,
+                buildAffineUnderlay);
+    u32 ordinaryEquivalentMask[4];
+    GetOrdinaryEquivalentAffineSpriteMask(ordinaryEquivalentMask);
+    glUniform4ui(StrictAffineOrdinaryOBJCompositeOrdinaryEquivalentMaskULoc,
+                 ordinaryEquivalentMask[0], ordinaryEquivalentMask[1],
+                 ordinaryEquivalentMask[2], ordinaryEquivalentMask[3]);
+    glBindBufferBase(GL_UNIFORM_BUFFER, 23, CompositorConfigUBO);
+
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, baseTex);
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, UpscaledTopColorTex);
+    glActiveTexture(GL_TEXTURE2);
+    glBindTexture(GL_TEXTURE_2D, UpscaledSecondColorTex);
+    glActiveTexture(GL_TEXTURE3);
+    glBindTexture(GL_TEXTURE_2D, UpscaledMetaTex);
+    glActiveTexture(GL_TEXTURE4);
+    glBindTexture(GL_TEXTURE_2D, UpscaledCoverageTex);
+    glActiveTexture(GL_TEXTURE5);
+    glBindTexture(GL_TEXTURE_2D_ARRAY, NativeOBJLayerTex);
+    glActiveTexture(GL_TEXTURE6);
+    glBindTexture(GL_TEXTURE_2D_ARRAY, StrictAffineOBJLayerTex);
+
+    glBindBuffer(GL_ARRAY_BUFFER, Parent.RectVtxBuffer);
+    glBindVertexArray(Parent.RectVtxArray);
+    glDrawArrays(GL_TRIANGLES, 0, 2 * 3);
+
+    if (buildAffineUnderlay)
+        glUniform1i(StrictAffineOrdinaryOBJCompositeBuildUnderlayULoc, 0);
+    glDisable(GL_SCISSOR_TEST);
+}
+
+void GLRenderer2D::RenderStrictAffineMaskedOBJMask(int ystart, int yend,
+                                                   u32 ownerMask)
+{
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, StrictAffineMaskedOBJMaskFB);
+    glDrawBuffer(GL_COLOR_ATTACHMENT0);
+
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_STENCIL_TEST);
+    glDisable(GL_BLEND);
+    glColorMaski(0, GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glColorMaski(1, GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glColorMaski(2, GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glDepthMask(GL_FALSE);
+    glViewport(0, 0, ScreenW, ScreenH);
+    glEnable(GL_SCISSOR_TEST);
+    glScissor(0, ystart * ScaleFactor, ScreenW,
+              (yend - ystart) * ScaleFactor);
+
+    glUseProgram(StrictAffineMaskedOBJMaskShader);
+    glUniform1i(StrictAffineMaskedOBJMaskScaleULoc, ScaleFactor);
+    const GLint shaderOwnerMask = ownerMask == static_cast<u32>(-1)
+        ? -1
+        : (ownerMask == static_cast<u32>(-2)
+            ? -2
+            : static_cast<GLint>(ownerMask));
+    glUniform1i(StrictAffineMaskedOBJMaskOwnerULoc, shaderOwnerMask);
+
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, UpscaledMetaTex);
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D_ARRAY, NativeOBJLayerTex);
+    glActiveTexture(GL_TEXTURE2);
+    glBindTexture(GL_TEXTURE_2D_ARRAY, StrictAffineOBJLayerTex);
+
+    glBindBuffer(GL_ARRAY_BUFFER, Parent.RectVtxBuffer);
+    glBindVertexArray(Parent.RectVtxArray);
+    glDrawArrays(GL_TRIANGLES, 0, 2 * 3);
+
+    if (ownerMask != 0)
+        glUniform1i(StrictAffineMaskedOBJMaskOwnerULoc, 0);
+    glDisable(GL_SCISSOR_TEST);
+}
+
+void GLRenderer2D::RenderStrictAffineMaskedOBJMLAA(int ystart,
+                                                   int yend,
+                                                   GLuint sourceTex,
+                                                   GLuint targetFB,
+                                                   bool debugCoverage)
+{
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, targetFB);
+    glDrawBuffer(GL_COLOR_ATTACHMENT0);
+
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_STENCIL_TEST);
+    glDisable(GL_BLEND);
+    glColorMaski(0, GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glDepthMask(GL_FALSE);
+    glViewport(0, 0, ScreenW, ScreenH);
+    glEnable(GL_SCISSOR_TEST);
+    glScissor(0, ystart * ScaleFactor, ScreenW,
+              (yend - ystart) * ScaleFactor);
+
+    glUseProgram(StrictAffineMaskedOBJMLAAShader);
+    glUniform1i(StrictAffineMaskedOBJMLAAScaleULoc, ScaleFactor);
+    glUniform1i(StrictAffineMaskedOBJMLAADebugCoverageULoc,
+                debugCoverage);
+
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, sourceTex);
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, StrictAffineMaskedOBJMaskTex);
+
+    glBindBuffer(GL_ARRAY_BUFFER, Parent.RectVtxBuffer);
+    glBindVertexArray(Parent.RectVtxArray);
+    glDrawArrays(GL_TRIANGLES, 0, 2 * 3);
+
+    if (debugCoverage)
+        glUniform1i(StrictAffineMaskedOBJMLAADebugCoverageULoc, 0);
+
+    glDisable(GL_SCISSOR_TEST);
+}
+
+void GLRenderer2D::RenderAffineOBJPresentationComposite(
+    int ystart,
+    int yend,
+    bool subpixelPresentationCoverage,
+    bool premultipliedSubpixelPresentation)
+{
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, StrictAffineCandidateFB);
+    glDrawBuffer(GL_COLOR_ATTACHMENT0);
+
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_STENCIL_TEST);
+    glDisable(GL_BLEND);
+    glColorMaski(0, GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glDepthMask(GL_FALSE);
+    glViewport(0, 0, ScreenW, ScreenH);
+    glEnable(GL_SCISSOR_TEST);
+    glScissor(0, ystart * ScaleFactor, ScreenW,
+              (yend - ystart) * ScaleFactor);
+
+    glUseProgram(AffineOBJPresentationCompositeShader);
+    glBindBufferBase(GL_UNIFORM_BUFFER, 23, CompositorConfigUBO);
+    glUniform1i(AffineOBJPresentationCompositeScaleULoc, ScaleFactor);
+    glUniform1i(AffineOBJPresentationCompositeSubpixelCoverageULoc,
+                subpixelPresentationCoverage);
+    if (AffineOBJPresentationCompositePremultipliedSubpixelULoc >= 0)
+    {
+        glUniform1i(AffineOBJPresentationCompositePremultipliedSubpixelULoc,
+                    premultipliedSubpixelPresentation);
+    }
+
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, OutputTex);
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D_ARRAY, AffinePresentationOBJLayerTex);
+    glActiveTexture(GL_TEXTURE2);
+    glBindTexture(GL_TEXTURE_2D, UpscaledMetaTex);
+    glActiveTexture(GL_TEXTURE3);
+    glBindTexture(GL_TEXTURE_2D_ARRAY, NativeOBJLayerTex);
+    glActiveTexture(GL_TEXTURE4);
+    glBindTexture(GL_TEXTURE_2D_ARRAY, StrictAffineOBJLayerTex);
+    glActiveTexture(GL_TEXTURE5);
+    glBindTexture(GL_TEXTURE_2D, AffinePresentationUnderlayTex);
+    glActiveTexture(GL_TEXTURE6);
+    glBindTexture(GL_TEXTURE_2D_ARRAY,
+                  StrictAffineSupersamplePresentationOBJLayerTex);
+
+    glBindBuffer(GL_ARRAY_BUFFER, Parent.RectVtxBuffer);
+    glBindVertexArray(Parent.RectVtxArray);
+    glDrawArrays(GL_TRIANGLES, 0, 2 * 3);
+
+    if (subpixelPresentationCoverage)
+        glUniform1i(AffineOBJPresentationCompositeSubpixelCoverageULoc, 0);
+    if (premultipliedSubpixelPresentation &&
+        AffineOBJPresentationCompositePremultipliedSubpixelULoc >= 0)
+    {
+        glUniform1i(AffineOBJPresentationCompositePremultipliedSubpixelULoc,
+                    0);
+    }
+    glDisable(GL_SCISSOR_TEST);
+}
+
 void GLRenderer2D::RenderNNEDI3ComputePass(GLuint shader, GLuint sourceTex, GLuint targetTex,
-                                           int sourceWidth, int sourceHeight)
+                                           int sourceWidth, int sourceHeight,
+                                           bool predictAlpha,
+                                           bool alphaOnly,
+                                           bool boundedCoverageAlpha,
+                                           bool premultiplyInput)
 {
     glDisable(GL_DEPTH_TEST);
     glDisable(GL_STENCIL_TEST);
@@ -11137,6 +18413,10 @@ void GLRenderer2D::RenderNNEDI3ComputePass(GLuint shader, GLuint sourceTex, GLui
 
     glUseProgram(shader);
     SetUniform2iIfPresent(shader, "uSrcSize", sourceWidth, sourceHeight);
+    SetUniform1iIfPresent(shader, "uPredictAlpha", predictAlpha);
+    SetUniform1iIfPresent(shader, "uAlphaOnly", alphaOnly);
+    SetUniform1iIfPresent(shader, "uBoundedCoverageAlpha", boundedCoverageAlpha);
+    SetUniform1iIfPresent(shader, "uPremultiplyInput", premultiplyInput);
 
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, sourceTex);
@@ -11150,18 +18430,26 @@ void GLRenderer2D::RenderNNEDI3ComputePass(GLuint shader, GLuint sourceTex, GLui
     glActiveTexture(GL_TEXTURE0);
 }
 
-bool GLRenderer2D::RenderNNEDI32x(GLuint sourceTex, GLuint targetTex)
+bool GLRenderer2D::RenderNNEDI32x(GLuint sourceTex, GLuint targetTex,
+                                  bool predictAlpha)
 {
-    if (!EnsureNNEDI3ComputePrograms())
+    if (!EnsureNNEDI3ComputePrograms() ||
+        !EnsureArtCNNWorkTextures(256, 192))
         return false;
 
-    RenderNNEDI3ComputePass(NNEDI3VerticalComputeShader, sourceTex, NNEDI3VerticalTex, 256, 192);
-    RenderNNEDI3ComputePass(NNEDI3HorizontalComputeShader, NNEDI3VerticalTex, ArtCNNLuma2xTex, 256, 384);
+    RenderNNEDI3ComputePass(NNEDI3VerticalComputeShader, sourceTex,
+                            NNEDI3VerticalTex, 256, 192, predictAlpha);
+    RenderNNEDI3ComputePass(NNEDI3HorizontalComputeShader, NNEDI3VerticalTex,
+                            ArtCNNLuma2xTex, 256, 384, predictAlpha);
 
     if (ScaleFactor >= 4)
     {
-        RenderNNEDI3ComputePass(NNEDI3VerticalComputeShader, ArtCNNLuma2xTex, NNEDI3Vertical4xTex, 512, 384);
-        RenderNNEDI3ComputePass(NNEDI3HorizontalComputeShader, NNEDI3Vertical4xTex, NNEDI3Luma4xTex, 512, 768);
+        RenderNNEDI3ComputePass(NNEDI3VerticalComputeShader, ArtCNNLuma2xTex,
+                                NNEDI3Vertical4xTex, 512, 384,
+                                predictAlpha);
+        RenderNNEDI3ComputePass(NNEDI3HorizontalComputeShader,
+                                NNEDI3Vertical4xTex, NNEDI3Luma4xTex,
+                                512, 768, predictAlpha);
 
         const int targetWidth = (ScaleFactor == 4) ? 1024 : ScreenW;
         const int targetHeight = (ScaleFactor == 4) ? 768 : ScreenH;
@@ -11228,10 +18516,58 @@ bool GLRenderer2D::RenderNNEDI32xGuarded(GLuint sourceTex, GLuint targetTex, boo
     return true;
 }
 
+bool GLRenderer2D::EnsureXBRZInfoTexture(int width, int height)
+{
+    if (width <= 0 || height <= 0)
+        return false;
+    if (XBRZInfoWidth == static_cast<u32>(width) &&
+        XBRZInfoHeight == static_cast<u32>(height))
+        return true;
+
+    GLint maxTextureSize = 0;
+    glGetIntegerv(GL_MAX_TEXTURE_SIZE, &maxTextureSize);
+    if (width > maxTextureSize || height > maxTextureSize)
+        return false;
+
+    glBindTexture(GL_TEXTURE_2D, XBRZInfoTex);
+    glDefaultTexParams(GL_TEXTURE_2D);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0,
+                 GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+    glBindFramebuffer(GL_FRAMEBUFFER, XBRZInfoFB);
+    glFramebufferTexture(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                         XBRZInfoTex, 0);
+    glDrawBuffer(GL_COLOR_ATTACHMENT0);
+    XBRZInfoWidth = width;
+    XBRZInfoHeight = height;
+    return true;
+}
+
+bool GLRenderer2D::RenderXBRZAtScale(GLuint sourceTex, GLuint targetTex,
+                                     int sourceWidth, int sourceHeight,
+                                     int sourceScale)
+{
+    if (sourceScale < 2 ||
+        !EnsureXBRZInfoTexture(sourceWidth, sourceHeight))
+        return false;
+
+    RenderFullscreenPass(XBRZPreprocessShader,
+                         XBRZInfoFB,
+                         sourceWidth,
+                         sourceHeight,
+                         sourceTex,
+                         0);
+    RenderFullscreenPassToTexture(XBRZFreescaleShader,
+                                  targetTex,
+                                  sourceWidth * sourceScale,
+                                  sourceHeight * sourceScale,
+                                  sourceTex,
+                                  XBRZInfoTex);
+    return true;
+}
+
 void GLRenderer2D::RenderXBRZ(GLuint sourceTex, GLuint targetTex)
 {
-    RenderFullscreenPass(XBRZPreprocessShader, XBRZInfoFB, 256, 192, sourceTex, 0);
-    RenderFullscreenPassToTexture(XBRZFreescaleShader, targetTex, ScreenW, ScreenH, sourceTex, XBRZInfoTex);
+    RenderXBRZAtScale(sourceTex, targetTex, 256, 192, ScaleFactor);
 }
 
 void GLRenderer2D::RenderXBRZGuarded(GLuint sourceTex, GLuint targetTex, bool secondLayer)
@@ -11302,7 +18638,7 @@ void GLRenderer2D::RenderNativeResolveToTexture(GLuint targetTex,
                     (yend - ystart) * sizeof(sScanlineConfig::sScanline),
                     &ScanlineConfig.uScanline[ystart]);
 
-    UpdateCompositorConfig();
+    UpdateCompositorConfig(ystart, yend);
 
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, UpscaledTopColorTex);
@@ -11347,6 +18683,8 @@ GLuint GLRenderer2D::ResolveDirect3DToNative(GLuint sourceTex)
     glDisable(GL_STENCIL_TEST);
     glDisable(GL_BLEND);
     glColorMaski(0, GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glColorMaski(1, GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glColorMaski(2, GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
     glDepthMask(GL_FALSE);
 
     glViewport(0, 0, 256, 192);
@@ -11693,6 +19031,185 @@ void GLRenderer2D::EnsureWholeSceneOverlayEndpoints(GLuint nativeDirect3DTex)
     WholeSceneOverlayEndpointSourceTex = nativeDirect3DTex;
 }
 
+bool GLRenderer2D::RenderStrictAffineOperandExcludedOverlayBase(
+    int ystart,
+    int yend,
+    const WholeSceneOperandExcludedOverlayRecipe& recipe,
+    GLuint highResDirect3DTex,
+    u64& excludedOAMHash)
+{
+    excludedOAMHash = 0;
+    if (!recipe.Ready || recipe.YStart != ystart || recipe.YEnd != yend ||
+        ystart != 0 || yend != 192 || !highResDirect3DTex ||
+        !NativeOperandExcludedOBJLayerFB ||
+        !NativeOperandExcludedOBJLayerTex)
+    {
+        return false;
+    }
+
+    const u64 excludedOAMMask[2] = {
+        recipe.ExcludedOAMMask[0], recipe.ExcludedOAMMask[1]
+    };
+    if ((excludedOAMMask[0] | excludedOAMMask[1]) == 0)
+        return false;
+
+    u32 includedSpriteMask[4] {};
+    u64 observedExcludedOAMMask[2] {};
+    for (int sprite = 0; sprite < NumSprites; sprite++)
+    {
+        const int oamIndex = SpriteOAMIndex[sprite];
+        if (oamIndex < 0 || oamIndex >= 128)
+            continue;
+        const int word = oamIndex >> 6;
+        const u64 bit = 1ull << (oamIndex & 63);
+        if ((excludedOAMMask[word] & bit) != 0)
+        {
+            observedExcludedOAMMask[word] |= bit;
+            continue;
+        }
+        includedSpriteMask[sprite >> 5] |= 1u << (sprite & 31);
+    }
+    if (observedExcludedOAMMask[0] != excludedOAMMask[0] ||
+        observedExcludedOAMMask[1] != excludedOAMMask[1])
+    {
+        return false;
+    }
+
+    // Hash the exact removed set independently from the plan hash. A trace
+    // mismatch therefore exposes either an incomplete endpoint exclusion or
+    // an operand-plan publication error.
+    constexpr u64 fnvOffset = 1469598103934665603ull;
+    constexpr u64 fnvPrime = 1099511628211ull;
+    excludedOAMHash = fnvOffset;
+    for (u64 value : excludedOAMMask)
+    {
+        for (int byte = 0; byte < 8; byte++)
+        {
+            excludedOAMHash ^= (value >> (byte * 8)) & 0xFFu;
+            excludedOAMHash *= fnvPrime;
+        }
+    }
+    if (!excludedOAMHash)
+        excludedOAMHash = 1;
+
+    RenderSpritesToLayer(0,
+                         192,
+                         0,
+                         false,
+                         false,
+                         NativeOperandExcludedOBJLayerFB,
+                         false,
+                         1,
+                         false,
+                         false,
+                         false,
+                         0,
+                         includedSpriteMask);
+
+    GLuint nativeDirect3DTex = highResDirect3DTex;
+    if (ScaleFactor > 1)
+    {
+        nativeDirect3DTex = ResolveDirect3DToNative(highResDirect3DTex);
+        WholeSceneTrace.Native3DResolveValid = true;
+        WholeSceneTrace.Native3DSemanticsValid = true;
+        WholeSceneTrace.Native3DSource =
+            WholeSceneNative3DSource::HighResResolved;
+    }
+    else
+    {
+        WholeSceneTrace.Native3DSource =
+            WholeSceneNative3DSource::NativeRendered;
+    }
+    if (!nativeDirect3DTex)
+        return false;
+
+    auto phaseStart = std::chrono::steady_clock::now();
+    // Keep native-resolved Direct3D alpha out of every image reconstructed by
+    // a nonlinear scaler. These three stable probes encode the compositor
+    // with Direct3D absent, opaque black, and opaque white. The final pass
+    // applies the real high-resolution alpha after reconstruction.
+    RenderNativeExactFinalToTexture(NativeExactFinalTex,
+                                    ystart,
+                                    yend,
+                                    false,
+                                    NativeOverlayBlack3DTex,
+                                    nativeDirect3DTex,
+                                    false,
+                                    0,
+                                    0,
+                                    false,
+                                    NativeOperandExcludedOBJLayerTex,
+                                    1);
+    AddWholeSceneUpdateTiming(WholeSceneUpdateTiming.OverlayBlackExactFinal,
+                              ElapsedUS(phaseStart));
+    phaseStart = std::chrono::steady_clock::now();
+    RenderNativeExactFinalToTexture(NativeOutputTex,
+                                    ystart,
+                                    yend,
+                                    false,
+                                    NativeOverlayWhite3DTex,
+                                    nativeDirect3DTex,
+                                    false,
+                                    0,
+                                    0,
+                                    false,
+                                    NativeOperandExcludedOBJLayerTex,
+                                    2);
+    AddWholeSceneUpdateTiming(WholeSceneUpdateTiming.OverlayWhiteExactFinal,
+                              ElapsedUS(phaseStart));
+    phaseStart = std::chrono::steady_clock::now();
+    RenderNativeExactFinalToTexture(NativeOverlayTrueFinalTex,
+                                    ystart,
+                                    yend,
+                                    false,
+                                    nativeDirect3DTex,
+                                    nativeDirect3DTex,
+                                    false,
+                                    0,
+                                    0,
+                                    false,
+                                    NativeOperandExcludedOBJLayerTex,
+                                    3);
+    AddWholeSceneUpdateTiming(WholeSceneUpdateTiming.OverlayTrueExactFinal,
+                              ElapsedUS(phaseStart));
+
+    phaseStart = std::chrono::steady_clock::now();
+    RenderNativeFinalUpscaleToTexture(NativeExactFinalTex,
+                                      UpscaledExactFinalTex);
+    RenderNativeFinalUpscaleToTexture(NativeOutputTex,
+                                      UpscaledCoverageTex);
+    RenderNativeFinalUpscaleToTexture(NativeOverlayTrueFinalTex,
+                                      UpscaledOverlayOpaqueWhiteTex);
+    AddWholeSceneUpdateTiming(WholeSceneUpdateTiming.FinalizerUpscale,
+                              ElapsedUS(phaseStart));
+
+    phaseStart = std::chrono::steady_clock::now();
+    RenderOverlayComposite(UpscaledExactFinalTex,
+                           UpscaledCoverageTex,
+                           highResDirect3DTex,
+                           false,
+                           0,
+                           0,
+                           0,
+                           0,
+                           false,
+                           0,
+                           StrictAffineCandidateTex,
+                           false,
+                           0,
+                           ystart,
+                           yend,
+                           true,
+                           true,
+                           UpscaledOverlayOpaqueWhiteTex,
+                           NativeDirect3DSemanticsTex,
+                           NativeDirect3DOperatorTex,
+                           true);
+    AddWholeSceneUpdateTiming(WholeSceneUpdateTiming.FinalizerComposite,
+                              ElapsedUS(phaseStart));
+    return true;
+}
+
 void GLRenderer2D::RenderOverlayComposite(GLuint overlayBlackTex,
                                           GLuint overlayWhiteTex,
                                           GLuint direct3DTex,
@@ -11708,7 +19225,12 @@ void GLRenderer2D::RenderOverlayComposite(GLuint overlayBlackTex,
                                           int hybridDebugMode,
                                           int ystart,
                                           int yend,
-                                          bool direct3DPresentationSpace)
+                                          bool direct3DPresentationSpace,
+                                          bool straightDirect3DColor,
+                                          GLuint overlayOpaqueWhiteTex,
+                                          GLuint native3DSemanticsTex,
+                                          GLuint native3DOperatorTex,
+                                          bool explicit3DOperator)
 {
     glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
     if (targetTex)
@@ -11744,6 +19266,13 @@ void GLRenderer2D::RenderOverlayComposite(GLuint overlayBlackTex,
     glUniform1i(debugTintULoc, forceDebugTint || WholeSceneScaleDebugTint);
     glUniform1i(legacyUnderlayULoc, WholeSceneScaleOverlayLegacyUnderlay);
     glUniform1i(direct3DPresentationSpaceULoc, direct3DPresentationSpace);
+    if (!conservativeHybrid)
+    {
+        glUniform1i(OverlayCompositeStraightDirect3DColorULoc,
+                    straightDirect3DColor);
+        glUniform1i(OverlayCompositeExplicit3DOperatorULoc,
+                    explicit3DOperator);
+    }
     if (conservativeHybrid)
     {
         const u32 dispmode = (DispCnt >> 16) & (GPU2D.Num ? 0x1u : 0x3u);
@@ -11769,6 +19298,24 @@ void GLRenderer2D::RenderOverlayComposite(GLuint overlayBlackTex,
 
     glActiveTexture(GL_TEXTURE2);
     glBindTexture(GL_TEXTURE_2D, direct3DTex);
+
+    if (!conservativeHybrid)
+    {
+        glActiveTexture(GL_TEXTURE3);
+        glBindTexture(GL_TEXTURE_2D,
+                      overlayOpaqueWhiteTex
+                          ? overlayOpaqueWhiteTex : BlankColorTex);
+
+        glActiveTexture(GL_TEXTURE4);
+        glBindTexture(GL_TEXTURE_2D,
+                      native3DSemanticsTex
+                          ? native3DSemanticsTex : BlankColorTex);
+
+        glActiveTexture(GL_TEXTURE5);
+        glBindTexture(GL_TEXTURE_2D,
+                      native3DOperatorTex
+                          ? native3DOperatorTex : BlankColorTex);
+    }
 
     if (conservativeHybrid)
     {
@@ -11875,7 +19422,8 @@ void GLRenderer2D::RenderScreenWholeSceneLegacy(int ystart, int yend, bool clean
         RenderNativeExactFinal(ystart, yend);
         AddWholeSceneUpdateTiming(WholeSceneUpdateTiming.NativeExactFinal, ElapsedUS(phaseStart));
         WholeSceneTrace.NativeExactFinalValid = true;
-        RecordWholeSceneNativeProductChunk(ystart, yend);
+        RecordWholeSceneNativeProductChunk(
+            ystart, yend, WholeScenePlan.SelectedRepresentationProduct);
     }
     RenderNativeUpscale(ystart, yend);
     RenderNativeResolve(ystart, yend);
@@ -11891,6 +19439,1402 @@ void GLRenderer2D::RenderScreenWholeSceneHighRes(int ystart, int yend)
                          WholeSceneHighResLayerFilterNoWrap(),
                          false,
                          WholeSceneScaleDebugTint);
+}
+
+void GLRenderer2D::RecordStrictAffineConstantBackdropUnderlayProofs(
+    int ystart,
+    int yend)
+{
+    for (int bg = 2; bg <= 3; bg++)
+    {
+        if ((LayerEnable & (1u << bg)) == 0)
+            continue;
+
+        const u32 type = LayerConfig.uBGConfig[bg].Type;
+        if (type != 2 && type != 3)
+            continue;
+
+        WholeSceneTrace.StrictAffineUnderlayCandidateBGMask |= 1u << bg;
+        u32& rejectReasons = bg == 2
+            ? WholeSceneTrace.StrictAffineBG2UnderlayRejectReasons
+            : WholeSceneTrace.StrictAffineBG3UnderlayRejectReasons;
+        u32& backdropColor = bg == 2
+            ? WholeSceneTrace.StrictAffineBG2UnderlayBackdropColor
+            : WholeSceneTrace.StrictAffineBG3UnderlayBackdropColor;
+
+        if (ystart < 0 || yend > 192 || ystart >= yend)
+        {
+            rejectReasons |= StrictAffineUnderlayRejectInvalidRange;
+            continue;
+        }
+
+        backdropColor = ScanlineConfig.uScanline[ystart].BackColor;
+        for (int line = ystart + 1; line < yend; line++)
+        {
+            if (ScanlineConfig.uScanline[line].BackColor != backdropColor)
+            {
+                rejectReasons |= StrictAffineUnderlayRejectBackdropVaries;
+                break;
+            }
+        }
+
+        const u32 targetPriority = BGCnt[bg] & 0x3u;
+        for (int other = 0; other < 4; other++)
+        {
+            if (other == bg || (LayerEnable & (1u << other)) == 0)
+                continue;
+
+            const u32 otherPriority = BGCnt[other] & 0x3u;
+            const bool otherIsLower =
+                otherPriority > targetPriority ||
+                (otherPriority == targetPriority && other > bg);
+            if (otherIsLower)
+            {
+                rejectReasons |= StrictAffineUnderlayRejectLowerBG;
+                break;
+            }
+        }
+
+        if ((LayerEnable & (1u << 4)) && OBJEnable && NumSprites > 0)
+        {
+            for (int sprite = 0; sprite < NumSprites; sprite++)
+            {
+                const auto& source = SpriteConfig.uOAM[sprite];
+                if (source.OBJMode != 2 && source.BGPrio > targetPriority)
+                {
+                    rejectReasons |= StrictAffineUnderlayRejectLowerOBJ;
+                    break;
+                }
+            }
+        }
+
+        // Folding a constant backdrop into reconstructed affine RGB is safe
+        // across brightness effects only when the logical affine layer and
+        // backdrop have identical Target-1 membership. Semi-transparent OBJ
+        // can still force alpha blending, so Target-2 membership must agree
+        // independently.
+        const u32 target1Mask = BlendCnt & 0x3Fu;
+        const bool bgIsTarget1 = (target1Mask & (1u << bg)) != 0;
+        const bool backdropIsTarget1 = (target1Mask & (1u << 5)) != 0;
+        if (bgIsTarget1 != backdropIsTarget1)
+            rejectReasons |= StrictAffineUnderlayRejectTarget1Mismatch;
+        const u32 target2Mask = (BlendCnt >> 8) & 0x3Fu;
+        const bool bgIsTarget2 = (target2Mask & (1u << bg)) != 0;
+        const bool backdropIsTarget2 = (target2Mask & (1u << 5)) != 0;
+        if (bgIsTarget2 != backdropIsTarget2)
+            rejectReasons |= StrictAffineUnderlayRejectTarget2Mismatch;
+
+        if (rejectReasons == StrictAffineUnderlayRejectNone)
+            WholeSceneTrace.StrictAffineConstantBackdropProofBGMask |= 1u << bg;
+    }
+}
+
+void GLRenderer2D::RenderScreenWholeSceneStrictAffineHighRes(int ystart, int yend)
+{
+    ResetWholeSceneRenderTrace();
+    WholeSceneTrace.StrictAffineOBJOperandPlanRequested =
+        StrictAffineOrderedAssessment.PlannedOrderedRequested;
+    WholeSceneTrace.StrictAffineOBJOperandPlanRejectionMask =
+        StrictAffineOrderedAssessment.OperandPlan.RejectionMask;
+    WholeSceneTrace.StrictAffineOBJOperandPlanOperandCount =
+        static_cast<u32>(
+            StrictAffineOrderedAssessment.OperandPlan.BackToFront.size());
+    RecordWholeSceneRenderTrace(WholeSceneRenderPath::StrictAffineHighRes,
+                                ystart,
+                                yend,
+                                true,
+                                false,
+                                false,
+                                Parent.OutputTex3D);
+
+    const StrictAffineSourceEnhancementDecision sourceEnhancement =
+        CurrentStrictAffineSourceEnhancementDecision();
+    const StrictAffineSourceEnhancementDecision ordinaryScaling =
+        CurrentStrictAffineOrdinaryScalingDecision();
+    WholeSceneTrace.StrictAffineSourceEnhancement = sourceEnhancement;
+    RecordStrictAffineConstantBackdropUnderlayProofs(ystart, yend);
+    const bool applySpline36SourceEnhancement =
+        sourceEnhancement ==
+        StrictAffineSourceEnhancementDecision::Spline36Inline;
+    const bool applyArtCNNSourceEnhancement =
+        sourceEnhancement ==
+        StrictAffineSourceEnhancementDecision::ArtCNNCachedAffineSources;
+    const bool applyCuNNySourceEnhancement =
+        sourceEnhancement ==
+        StrictAffineSourceEnhancementDecision::CuNNyCachedAffineSources;
+    const bool applyNNEDI3SourceEnhancement =
+        sourceEnhancement ==
+        StrictAffineSourceEnhancementDecision::NNEDI3CachedAffineSources;
+    const bool applyXBRZSourceEnhancement =
+        sourceEnhancement ==
+        StrictAffineSourceEnhancementDecision::XBRZCachedAffineSources;
+    const bool applyCachedSourceEnhancement =
+        IsStrictAffineCachedSource(sourceEnhancement);
+    const bool applySpline36OrdinaryScaling =
+        ordinaryScaling ==
+        StrictAffineSourceEnhancementDecision::Spline36Inline;
+    const bool applyArtCNNOrdinaryScaling =
+        ordinaryScaling ==
+        StrictAffineSourceEnhancementDecision::ArtCNNCachedAffineSources;
+    const bool applyCuNNyOrdinaryScaling =
+        ordinaryScaling ==
+        StrictAffineSourceEnhancementDecision::CuNNyCachedAffineSources;
+    const bool applyNNEDI3OrdinaryScaling =
+        ordinaryScaling ==
+        StrictAffineSourceEnhancementDecision::NNEDI3CachedAffineSources;
+    const bool applyXBRZOrdinaryScaling =
+        ordinaryScaling ==
+        StrictAffineSourceEnhancementDecision::XBRZCachedAffineSources;
+    const bool applyOrdinaryScaling =
+        applySpline36OrdinaryScaling || applyArtCNNOrdinaryScaling ||
+        applyCuNNyOrdinaryScaling || applyNNEDI3OrdinaryScaling ||
+        applyXBRZOrdinaryScaling;
+    const bool applyAffineOBJSubpixel2x =
+        (WholeSceneScaleHybridStrictAffineOBJSubpixel2x &&
+         (applySpline36SourceEnhancement || applyCachedSourceEnhancement));
+    const bool linearSupersampleCachedSource =
+        applyCachedSourceEnhancement && !applyXBRZSourceEnhancement;
+    const u32 blendEffect = (BlendCnt >> 6) & 0x3u;
+    const StrictAffineHighResEligibilityInputs strictEligibilityInputs =
+        BuildStrictAffineHighResEligibilityInputs(
+            ystart, yend, WholeScenePlan.RequiredChannels);
+    const bool resolvedBitmapOBJMaterial =
+        HasStrictAffineResolvedBitmapOBJMaterial(strictEligibilityInputs);
+    const bool resolvedTextBGAlphaBlend =
+        HasStrictAffineResolvedTextBGAlphaBlend(strictEligibilityInputs);
+    const bool inertAlphaBlend =
+        HasStrictAffineInertAlphaBlend(strictEligibilityInputs);
+    u32 ordinaryTextBGMask = 0;
+    u32 affineBGMask = 0;
+    for (int layer = 0; layer < 4; layer++)
+    {
+        const int type = LayerConfig.uBGConfig[layer].Type;
+        if (type == 0 || type == 1)
+            ordinaryTextBGMask |= 1u << layer;
+        else if (type == 2 || type == 3)
+            affineBGMask |= 1u << layer;
+    }
+    // Reconstruct every enabled ordinary text BG in the already-admitted
+    // strict range. Native ownership, priority, effects, windows, and the
+    // final owner mask still decide whether any reconstructed pixel can
+    // contribute; broadening this source mask grants no scene authority.
+    // This deliberately includes a text underlay exposed by a transformed
+    // affine BG, such as Pokemon Diamond's trainer-card transition.
+    const u32 companionTextBGMask =
+        ChooseStrictAffineCompanionTextBGMask(
+            LayerEnable,
+            ordinaryTextBGMask,
+            WholeSceneScaleHybridStrictAffineTopTextBG,
+            blendEffect,
+            resolvedBitmapOBJMaterial,
+            resolvedTextBGAlphaBlend,
+            inertAlphaBlend);
+    const bool applyBilinearAffineBGPresentation =
+        (applySpline36SourceEnhancement ||
+         applyArtCNNSourceEnhancement ||
+         applyCuNNySourceEnhancement ||
+         applyNNEDI3SourceEnhancement ||
+         applyXBRZSourceEnhancement);
+    const u32 target1Mask = BlendCnt & 0x3Fu;
+    const u32 target2Mask = (BlendCnt >> 8) & 0x3Fu;
+    const u32 affineConstantBackdropPrecomposeRequestBGMask =
+        ChooseStrictAffineConstantBackdropCompositeMask(
+            WholeSceneTrace.StrictAffineConstantBackdropProofBGMask,
+            applyBilinearAffineBGPresentation,
+            blendEffect,
+            target1Mask,
+            target2Mask,
+            EVY,
+            resolvedTextBGAlphaBlend);
+    bool enhancedOBJReady = false;
+    u32 enhancedBGMask = 0;
+    u32 ordinaryEnhancedBGMask = 0;
+
+    const int sourceModelIndex = applyArtCNNSourceEnhancement
+        ? WholeSceneArtCNNModelIndex()
+        : (applyCuNNySourceEnhancement
+            ? RendererSettings::GetGLCuNNyModelIndex(WholeSceneScaleAlgorithm)
+            : -1);
+    const int ordinarySourceModelIndex = applyArtCNNOrdinaryScaling
+        ? WholeSceneArtCNNModelIndex()
+        : (applyCuNNyOrdinaryScaling
+            ? RendererSettings::GetGLCuNNyModelIndex(WholeSceneScaleAlgorithm)
+            : -1);
+    if (applySpline36SourceEnhancement &&
+        WholeSceneDebugViewsActive.load(std::memory_order_relaxed))
+    {
+        // Production Spline36 remains inline. While auxiliary debug products
+        // are requested, sample the same bounded source-reconstruction kernel
+        // on a regular logical-source grid for inspection before placement.
+        const int debugSourceScale = ScaleFactor >= 4 ? 4 : 2;
+        PrepareStrictAffineEnhancedBGSources(sourceEnhancement,
+                                             -1,
+                                             debugSourceScale,
+                                             false,
+                                             affineConstantBackdropPrecomposeRequestBGMask,
+                                             0,
+                                             affineBGMask);
+    }
+    if (applyCachedSourceEnhancement)
+    {
+        enhancedBGMask = PrepareStrictAffineEnhancedBGSources(
+            sourceEnhancement,
+            sourceModelIndex,
+            0,
+            true,
+            affineConstantBackdropPrecomposeRequestBGMask,
+            0,
+            affineBGMask);
+    }
+
+    if (applyOrdinaryScaling && companionTextBGMask != 0)
+    {
+        ordinaryEnhancedBGMask = PrepareStrictAffineEnhancedBGSources(
+            ordinaryScaling,
+            ordinarySourceModelIndex,
+            applySpline36OrdinaryScaling
+                ? (ScaleFactor >= 4 ? 4 : 2)
+                : 0,
+            true,
+            0,
+            companionTextBGMask,
+            companionTextBGMask);
+    }
+
+    const u32 compositorEnhancedBGMask =
+        enhancedBGMask | ordinaryEnhancedBGMask;
+    const u32 enhancedTextBGMask =
+        compositorEnhancedBGMask & companionTextBGMask;
+    // Reconstructed RGB is a safe input to the already-proven DS EVA/EVB
+    // equation. Reconstructed coverage would instead introduce a fractional
+    // third operand, so alpha-blended text BGs retain native ownership.
+    const u32 reconstructedCoverageEligibleTextBGMask =
+        blendEffect == 1 ? 0u : enhancedTextBGMask;
+    const u32 bilinearResolvedTextBGCoverageMask =
+        ChooseStrictAffineResolvedTextBGBilinearCoverageMask(
+            enhancedTextBGMask,
+            target1Mask,
+            applyOrdinaryScaling,
+            resolvedTextBGAlphaBlend);
+    // Admit the independently reconstructed coverage in every eligible BG
+    // slot, then order fractional candidates before winner-local effects.
+    const u32 establishedTextBGCoverageMask =
+        (applyXBRZOrdinaryScaling
+            ? (reconstructedCoverageEligibleTextBGMask & 0x3u) : 0u) |
+        bilinearResolvedTextBGCoverageMask;
+    const u32 reconstructedTextBGCandidateMask =
+        reconstructedCoverageEligibleTextBGMask;
+    const u32 reconstructedTextBGCoverageMask =
+        establishedTextBGCoverageMask | reconstructedTextBGCandidateMask;
+    const u32 directionalTextBGMask =
+        enhancedTextBGMask & ~reconstructedTextBGCoverageMask;
+    const bool applyDirectionalTextBGAA =
+        WholeSceneScaleHybridStrictAffineMaskedOBJMLAA &&
+        directionalTextBGMask != 0;
+
+    const u32 affinePresentationEligibleBGMask =
+        applySpline36SourceEnhancement ? 0xFu : enhancedBGMask;
+    const u32 affineConstantBackdropCompositeBGMask =
+        affineConstantBackdropPrecomposeRequestBGMask &
+        affinePresentationEligibleBGMask;
+    WholeSceneTrace.StrictAffineConstantBackdropCompositeBGMask =
+        affineConstantBackdropCompositeBGMask;
+
+    if (applyCachedSourceEnhancement &&
+        (LayerEnable & (1u << 4)) && OBJEnable && NumSprites > 0)
+    {
+        enhancedOBJReady = PrepareStrictAffineEnhancedOBJSources(
+            sourceEnhancement,
+            sourceModelIndex);
+    }
+
+    const bool objVisible =
+        (LayerEnable & (1u << 4)) && OBJEnable && NumSprites > 0;
+
+    bool affineOBJPresentationCandidateReady = false;
+    if (enhancedOBJReady ||
+        (applyAffineOBJSubpixel2x &&
+         (applySpline36SourceEnhancement || enhancedOBJReady)))
+    {
+        // Build one complete transformed affine-OBJ presentation surface.
+        // It is inserted later over a resolved no-affine underlay rather than
+        // being split into native body and reconstructed fringe.
+        RenderSpritesToLayer(ystart,
+                             yend,
+                             applySpline36SourceEnhancement ? 1 : 0,
+                             true,
+                             enhancedOBJReady,
+                             AffinePresentationOBJLayerFB,
+                             true,
+                             ScaleFactor,
+                             false,
+                             false,
+                             true,
+                             ChooseAffineOBJOutputGridCoverageMode(
+                                 applyXBRZSourceEnhancement));
+        affineOBJPresentationCandidateReady = true;
+    }
+    bool hasOrdinaryOBJ = false;
+    bool hasUnsupportedOrdinaryOBJ = false;
+    bool hasUnmergeableOrdinaryOBJ = false;
+    bool hasOrdinaryEquivalentAffineOBJ = false;
+    bool hasTransformedAffineOBJ = false;
+    bool hasSemiTransparentAffineOBJ = false;
+    if (objVisible)
+    {
+        for (int sprite = 0; sprite < NumSprites; sprite++)
+        {
+            const auto& source = SpriteConfig.uOAM[sprite];
+            if (source.OBJMode == 1 &&
+                source.Rotscale != static_cast<u32>(-1))
+            {
+                hasSemiTransparentAffineOBJ = true;
+            }
+            if (source.OBJMode != 2 &&
+                source.Rotscale == static_cast<u32>(-1))
+            {
+                hasOrdinaryOBJ = true;
+                hasUnsupportedOrdinaryOBJ |= source.OBJMode != 0;
+                hasUnmergeableOrdinaryOBJ |=
+                    source.Type >= 2 || source.Mosaic;
+            }
+            hasOrdinaryEquivalentAffineOBJ |=
+                IsOrdinaryEquivalentAffineSprite(sprite);
+            hasTransformedAffineOBJ |=
+                source.OBJMode != 2 &&
+                source.Rotscale != static_cast<u32>(-1) &&
+                !IsOrdinaryEquivalentAffineSprite(sprite);
+        }
+    }
+    // A currently transformed sprite is intrinsically an affine semantic
+    // operand.  The continuity mask extends that role across a brief exact-
+    // identity crossing; it must not be the sole way the role is admitted.
+    const bool hasSemanticAffineOBJ =
+        hasTransformedAffineOBJ ||
+        SemanticAffineOBJRoleMask[0] != 0 ||
+        SemanticAffineOBJRoleMask[1] != 0;
+    if (WholeSceneDebugViewsActive.load(std::memory_order_relaxed) &&
+        objVisible && (DispCnt & 0xE000u) == 0)
+    {
+        WholeScene2DAffineOBJDebugEvidence bandEvidence;
+        CaptureAffineOBJDebugEvidence(bandEvidence);
+        RenderOrdinaryOBJBandProducts(
+            bandEvidence.OrdinaryBands,
+            ystart,
+            yend,
+            ordinaryScaling,
+            ordinarySourceModelIndex);
+    }
+
+    // A mixed Direct3D/text/affine-OBJ scene has no affine BG to enhance, but
+    // its text BG winners must retain the selected whole-scene reconstruction
+    // while affine OBJ stays in the output-resolution compositor. The bounded
+    // policy admits this mask only for the effect-free full-frame topology.
+    bool hasDirect3D = false;
+    bool hasAffineBG = false;
+    u32 nativeStackBGMask = 0;
+    for (int layer = 0; layer < 4; layer++)
+    {
+        if ((LayerEnable & (1u << layer)) == 0)
+            continue;
+
+        const u32 type = LayerConfig.uBGConfig[layer].Type;
+        hasDirect3D |= type == 6;
+        hasAffineBG |= type == 2 || type == 3;
+        if (type <= 1)
+            nativeStackBGMask |= 1u << layer;
+    }
+    if (!hasDirect3D || hasAffineBG)
+        nativeStackBGMask = 0;
+
+    const bool activeOBJWindow = HasActiveOBJWindowParticipant();
+    const bool resolvedOBJSurfaceRequested = ShouldResolveOrdinaryOBJSurface(
+        objVisible, hasOrdinaryOBJ, applyOrdinaryScaling,
+        activeOBJWindow, ystart, yend);
+    WholeSceneTrace.StrictAffineResolvedOBJRequested =
+        resolvedOBJSurfaceRequested;
+    const bool resolvedOBJSurfaceReady =
+        resolvedOBJSurfaceRequested &&
+        RenderResolvedOrdinaryOBJProduct(ystart,
+                                         yend,
+                                         ordinaryScaling,
+                                         ordinarySourceModelIndex);
+    WholeSceneTrace.StrictAffineResolvedOBJOrdinaryProductReady =
+        resolvedOBJSurfaceReady;
+
+    auto buildSemanticCompositorRecipe =
+        [&](bool includeOBJ, bool resolvedOBJ)
+    {
+        WholeSceneSemanticCompositorRecipeInputs inputs;
+        inputs.YStart = ystart;
+        inputs.YEnd = yend;
+        inputs.OutputScale = ScaleFactor;
+        inputs.RowEpochIdentity =
+            BuildWholeSceneRowEpochIdentity(ystart, yend);
+        inputs.EnabledBGMask = LayerEnable & 0xFu;
+        inputs.EnhancedBGMask = compositorEnhancedBGMask;
+        inputs.ReconstructedBGCoverageMask =
+            reconstructedTextBGCoverageMask;
+        for (int layer = 0; layer < 4; layer++)
+        {
+            const u32 layerBit = 1u << layer;
+            if ((inputs.EnabledBGMask & layerBit) == 0)
+                continue;
+            if (LayerConfig.uBGConfig[layer].Type == 6)
+                inputs.Direct3DBGMask |= layerBit;
+            else
+                inputs.BGProductsAvailableMask |= layerBit;
+            inputs.BGSourceGeneration[layer] =
+                BGLayerSourceGeneration[layer];
+        }
+        inputs.Direct3DProductAvailable =
+            inputs.Direct3DBGMask == 0 || Parent.OutputTex3D != 0;
+        inputs.OBJEnabled = includeOBJ && objVisible;
+        inputs.OBJProductAvailable = inputs.OBJEnabled;
+        inputs.ResolvedOBJProduct = inputs.OBJEnabled && resolvedOBJ;
+        inputs.OBJSourceGeneration = SpriteSourceGeneration;
+        inputs.EffectState = WholeScenePlan.CompositorEffectState;
+        return BuildWholeSceneSemanticCompositorRecipe(inputs);
+    };
+    const WholeSceneCompositorRecipe orderedSemanticBaseRecipe =
+        buildSemanticCompositorRecipe(false, false);
+
+    bool ordinaryOBJOverAffineBGReady = false;
+    bool ordinaryOBJPreservedBehindReady = false;
+    bool ordinaryOBJOperandPlanReady = false;
+    WholeSceneOBJOperandPlan ordinaryOBJOperandPlan;
+    WholeSceneCompositorRecipe ordinaryOBJCompositorRecipe;
+    u32 ordinaryOBJPreservedBehindMask[4] {};
+    const bool ordinaryOBJOverAffineBGRequested =
+        !resolvedOBJSurfaceReady &&
+        StrictAffineOrderedAssessment.OrdinaryBandEligible;
+    const bool ordinaryOBJNoAffineOperandPlanRequested =
+        !resolvedOBJSurfaceReady &&
+        StrictAffineOrderedAssessment.NoAffineExtensionEligible;
+    const bool ordinaryOBJOperandPlanRequested =
+        StrictAffineOrderedAssessment.Assessed &&
+        (hasSemanticAffineOBJ || ordinaryOBJNoAffineOperandPlanRequested) &&
+        StrictAffineOrderedAssessment.OrderedRecipe.Ready;
+    // A resolved ordinary-OBJ product is not a substitute for the ordered
+    // plan in mixed Direct3D/text scenes. The plan may prove that an OBJ-free
+    // endpoint-overlay base can reconstruct the text-BG boundary against 3D,
+    // then reinsert the excluded OBJ suffix. Keep that proof available even
+    // when the generic resolved-OBJ surface was prepared successfully.
+    WholeSceneTrace.StrictAffineOBJOperandPlanRequested |=
+        ordinaryOBJOperandPlanRequested;
+    WholeSceneTrace.StrictAffineOBJOperandPlanNoAffineExtension =
+        ordinaryOBJNoAffineOperandPlanRequested;
+    if (ordinaryOBJOverAffineBGRequested ||
+        ordinaryOBJOperandPlanRequested)
+    {
+        const auto& classification =
+            StrictAffineOrderedAssessment.Classification;
+        const bool atomicRecipe =
+            StrictAffineOrderedAssessment.AtomicRecipe;
+        const bool preservedBehindRecipe =
+            StrictAffineOrderedAssessment.PreservedBehindRecipe;
+        ordinaryOBJOperandPlan = StrictAffineOrderedAssessment.OperandPlan;
+        WholeSceneTrace.StrictAffineOBJOperandPlanSpecialIsolationReady =
+            ordinaryOBJNoAffineOperandPlanRequested &&
+            (ordinaryOBJOperandPlan.RejectionMask &
+             OBJOperandPlanRejectUnisolatedSpecial) == 0;
+        WholeSceneTrace.StrictAffineOBJOperandPlanRejectionMask =
+            ordinaryOBJOperandPlan.RejectionMask;
+        WholeSceneTrace.StrictAffineOBJOperandPlanOperandCount =
+            static_cast<u32>(ordinaryOBJOperandPlan.BackToFront.size());
+        WholeSceneTrace.StrictAffineOBJOperandPlanHash =
+            ordinaryOBJOperandPlan.PlanHash;
+        for (const auto& operand : ordinaryOBJOperandPlan.BackToFront)
+        {
+            if (operand.PresentationIndex >= 0)
+            {
+                WholeSceneTrace.StrictAffineOBJOperandPlanPresentationProductCount =
+                    std::max<u32>(
+                        WholeSceneTrace.StrictAffineOBJOperandPlanPresentationProductCount,
+                        static_cast<u32>(operand.PresentationIndex + 1));
+            }
+        }
+        WholeSceneCompositorRecipeInputs recipeInputs;
+        recipeInputs.YStart = ystart;
+        recipeInputs.YEnd = yend;
+        recipeInputs.OutputScale = ScaleFactor;
+        recipeInputs.RowEpochIdentity =
+            orderedSemanticBaseRecipe.RowEpochIdentity;
+        recipeInputs.Capabilities.CompletedBase = true;
+        recipeInputs.Capabilities.OrdinaryOBJBand = true;
+        recipeInputs.Capabilities.AffineOBJGroup = true;
+        recipeInputs.AffineOBJSubpixel2x = applyAffineOBJSubpixel2x;
+        // The current special-OBJ operator is exact only when every possible
+        // layer-below source is admitted as target 2. Keep that compatibility
+        // rule in the recipe resolver rather than in the GL execution loop.
+        recipeInputs.Capabilities.SemiTransparentOBJ =
+            (target2Mask & 0x3Fu) == 0x3Fu;
+        recipeInputs.CompletedBaseIdentity =
+            ordinaryOBJOperandPlan.PlanHash ^
+            (static_cast<u64>(LayerEnable) << 32) ^ DispCnt;
+        recipeInputs.CompletedBaseRecipeHash =
+            orderedSemanticBaseRecipe.RecipeHash;
+        for (int layer = 0; layer < 4; layer++)
+        {
+            recipeInputs.CompletedBaseIdentity *= 1099511628211ull;
+            recipeInputs.CompletedBaseIdentity ^=
+                BGLayerSourceGeneration[layer];
+        }
+        recipeInputs.SourceGeneration = SpriteSourceGeneration;
+        recipeInputs.EffectState = WholeScenePlan.CompositorEffectState;
+        ordinaryOBJCompositorRecipe = BuildWholeSceneOBJCompositorRecipe(
+            ordinaryOBJOperandPlan, recipeInputs);
+        const bool operandPlanRecipe =
+            ordinaryOBJOperandPlanRequested &&
+            ordinaryOBJCompositorRecipe.Ready;
+        const bool boundedRecipe = atomicRecipe || preservedBehindRecipe ||
+                                   operandPlanRecipe;
+        if (boundedRecipe)
+        {
+            const WholeSceneOBJOperandPlan* productPlan =
+                operandPlanRecipe ? &ordinaryOBJOperandPlan : nullptr;
+            bool needsScaledBandProducts = productPlan == nullptr;
+            if (productPlan)
+            {
+                for (const auto& operand : productPlan->BackToFront)
+                {
+                    if (operand.PresentationIndex >= 0)
+                    {
+                        needsScaledBandProducts = true;
+                        break;
+                    }
+                }
+            }
+            const bool productMatches =
+                !needsScaledBandProducts ||
+                (OrdinaryOBJBandProductsValid &&
+                OrdinaryOBJBandScaledProductsValid &&
+                OrdinaryOBJBandProducts.Summary.ClassificationHash ==
+                    classification.Summary.ClassificationHash &&
+                OrdinaryOBJOperandPlanHash ==
+                    (productPlan ? productPlan->PlanHash : 0));
+            const bool productReady = productMatches ||
+                RenderOrdinaryOBJBandProducts(classification,
+                                              ystart,
+                                              yend,
+                                              ordinaryScaling,
+                                              ordinarySourceModelIndex,
+                                              productPlan);
+            const bool scaledProductsReady =
+                productReady &&
+                (!needsScaledBandProducts ||
+                 (OrdinaryOBJBandScaledProductsValid &&
+                  OrdinaryOBJBandScaledWidth == static_cast<u32>(ScreenW) &&
+                  OrdinaryOBJBandScaledHeight == static_cast<u32>(ScreenH)));
+            ordinaryOBJOverAffineBGReady =
+                scaledProductsReady &&
+                (atomicRecipe || preservedBehindRecipe);
+            ordinaryOBJPreservedBehindReady =
+                ordinaryOBJOverAffineBGReady && preservedBehindRecipe;
+            ordinaryOBJOperandPlanReady =
+                scaledProductsReady && operandPlanRecipe;
+            if (ordinaryOBJPreservedBehindReady)
+            {
+                for (const auto& member : classification.Members)
+                {
+                    if (member.RejectionMask != OBJBandRejectNonNormalMode ||
+                        (member.OBJMode != 1 && member.OBJMode != 3) ||
+                        member.RenderedIndex < 0 || member.RenderedIndex >= 128)
+                    {
+                        continue;
+                    }
+                    ordinaryOBJPreservedBehindMask[member.RenderedIndex >> 5] |=
+                        1u << (member.RenderedIndex & 31);
+                }
+            }
+        }
+    }
+
+    WholeSceneOrderedPresentationExecutionOutcome
+        orderedPresentationExecutionOutcome =
+            ResolveWholeSceneOrderedPresentationExecution(
+                WholeScenePlan,
+                WholeSceneRecipePreparation.OrderedPresentation,
+                orderedSemanticBaseRecipe,
+                ordinaryOBJCompositorRecipe,
+                ordinaryOBJOperandPlanReady);
+    ordinaryOBJOperandPlanReady =
+        orderedPresentationExecutionOutcome.Disposition ==
+            WholeSceneCompositorExecutionDisposition::PlannedRecipe ||
+        orderedPresentationExecutionOutcome.Disposition ==
+            WholeSceneCompositorExecutionDisposition::PreparedRecipeFallback;
+    ordinaryOBJCompositorRecipe =
+        orderedPresentationExecutionOutcome.EffectiveRecipe;
+
+    const bool affineOBJAtomicPresentationRequested =
+        affineOBJPresentationCandidateReady &&
+        !hasSemiTransparentAffineOBJ &&
+        blendEffect == 0 &&
+        (DispCnt & 0xE000u) == 0;
+    const bool directionalOBJAARequested =
+        WholeSceneScaleHybridStrictAffineMaskedOBJMLAA;
+    const bool affinePresentationOwnsContour =
+        affineOBJPresentationCandidateReady ||
+        (applyXBRZSourceEnhancement && enhancedOBJReady);
+    // A mode-1 affine winner may need an ordinary OBJ as target 2. The atomic
+    // presentation insertion is deliberately disabled for that case until
+    // its subpixel blend equation is represented by an ordered operand plan.
+    const bool ordinaryOBJStackBlendSafe =
+        !hasSemiTransparentAffineOBJ;
+    // Extend the existing NNEDI3 RGBA experiment to a single transparent
+    // post-OAM ordinary-OBJ surface. Keep special-alpha OBJ and active DS
+    // color effects on the established semantic stack until their edge
+    // equations can be represented without guessing outside native coverage.
+    const bool transformedOBJMLAARequested =
+        directionalOBJAARequested && hasTransformedAffineOBJ &&
+        !affinePresentationOwnsContour && !hasSemiTransparentAffineOBJ;
+    // A mode-1 affine winner must see the real lower OBJ/BG participant when
+    // exact EVA/EVB is evaluated. Keep all OBJ classes in the output-resolution
+    // compositor for that frame; splitting ordinary OBJ into the later native-
+    // stack merge could replace an overlapping target-2 OBJ with the BG.
+    // A ready generic operand plan already causes the strict compositor to
+    // publish an OBJ-free, output-resolution BG/3D base below. Keep that base
+    // for mixed Direct3D/text scenes instead of replacing it with Native
+    // Stack: Native Stack has ordinary OBJ burned in and its nearest owner
+    // metadata clips reconstructed text-BG contours.
+    bool operandPlanCleanBG3DBaseReady =
+        ordinaryOBJOperandPlanReady && nativeStackBGMask != 0 &&
+        ordinaryOBJStackBlendSafe;
+    WholeSceneTrace.StrictAffineOperandExcludedOverlayRequested =
+        ordinaryOBJOperandPlanRequested && hasDirect3D && !hasAffineBG;
+    WholeSceneOperandExcludedOverlayInputs overlayRecipeInputs;
+    overlayRecipeInputs.Requested =
+        WholeSceneTrace.StrictAffineOperandExcludedOverlayRequested;
+    overlayRecipeInputs.OrderedProductsAvailable =
+        ordinaryOBJOperandPlanReady;
+    overlayRecipeInputs.Direct3D = hasDirect3D;
+    overlayRecipeInputs.AffineBG = hasAffineBG;
+    overlayRecipeInputs.WindowActive = (DispCnt & 0xE000u) != 0;
+    overlayRecipeInputs.EffectActive =
+        blendEffect != 0 || hasSemiTransparentAffineOBJ;
+    overlayRecipeInputs.YStart = ystart;
+    overlayRecipeInputs.YEnd = yend;
+    overlayRecipeInputs.OutputScale = ScaleFactor;
+    WholeSceneOperandExcludedOverlayRecipe operandExcludedOverlayRecipe =
+        BuildWholeSceneOperandExcludedOverlayRecipe(
+            ordinaryOBJCompositorRecipe, overlayRecipeInputs);
+    WholeSceneTrace.StrictAffineOperandExcludedOverlayRejectionMask =
+        operandExcludedOverlayRecipe.RejectionMask;
+    WholeSceneOperandExcludedOverlayExecutionOutcome
+        operandExcludedOverlayExecutionOutcome =
+            ResolveWholeSceneOperandExcludedOverlayExecution(
+                WholeScenePlan,
+                WholeSceneRecipePreparation.OperandExcludedOverlay,
+                operandExcludedOverlayRecipe);
+    operandExcludedOverlayRecipe =
+        operandExcludedOverlayExecutionOutcome.EffectiveRecipe;
+    bool operandExcludedOverlayEligible =
+        operandExcludedOverlayExecutionOutcome.Disposition ==
+            WholeSceneCompositorExecutionDisposition::PlannedRecipe ||
+        operandExcludedOverlayExecutionOutcome.Disposition ==
+            WholeSceneCompositorExecutionDisposition::PreparedRecipeFallback;
+    const std::size_t operandExcludedOverlayStart =
+        operandExcludedOverlayRecipe.FirstExcludedOperand;
+    bool operandExcludedOverlayBaseReady = false;
+    const bool ordinaryOBJNativeStackRequested =
+        !resolvedOBJSurfaceReady &&
+        !ordinaryOBJOverAffineBGReady && !ordinaryOBJOperandPlanReady &&
+         ordinaryOBJStackBlendSafe &&
+         (hasOrdinaryOBJ || hasOrdinaryEquivalentAffineOBJ ||
+          nativeStackBGMask != 0 ||
+          affineOBJAtomicPresentationRequested);
+    bool semanticMaskStackReady = false;
+    if (ordinaryOBJNativeStackRequested)
+    {
+        semanticMaskStackReady = PrepareStrictAffineOrdinaryOBJNativeStack(
+            ordinaryScaling,
+            ordinarySourceModelIndex,
+            ystart,
+            yend);
+    }
+    else if (applyDirectionalTextBGAA || transformedOBJMLAARequested ||
+             (resolvedOBJSurfaceReady && directionalOBJAARequested &&
+              hasOrdinaryOBJ && ordinaryOBJStackBlendSafe))
+    {
+        // Directional text-BG and ordinary-OBJ AA need only the nearest
+        // semantic owner map.  A unified resolved OBJ surface still needs
+        // this product: reconstructed ordinary alpha is authoritative inside
+        // the native winner, but it cannot assign OAM priority to predictor
+        // fringe outside binary native coverage.  Masked MLAA owns only that
+        // final semantic silhouette instead of inferring a fringe owner.
+        // Build the existing metadata product without running a second
+        // neural whole-stack reconstruction merely to obtain the mask.
+        RenderNativePrepass(ystart, yend);
+        RenderNativeUpscale(0, 192);
+        semanticMaskStackReady = true;
+    }
+    const bool ordinaryOBJNativeStackReady =
+        ordinaryOBJNativeStackRequested && semanticMaskStackReady;
+    WholeSceneTrace.StrictAffineOBJOperandPlanCleanBG3DBase =
+        operandPlanCleanBG3DBaseReady;
+    const bool affineOBJAtomicPresentationReady =
+        affineOBJAtomicPresentationRequested &&
+        ordinaryOBJNativeStackReady;
+    const bool affineOBJInsertionReady = affineOBJAtomicPresentationReady;
+    bool affineOBJSubpixelPresentationReady = false;
+    bool affineOBJSubpixelPresentationPremultiplied = false;
+    if (affineOBJPresentationCandidateReady &&
+        applyAffineOBJSubpixel2x &&
+        EnsureStrictAffineSupersampleTargets(ScreenW * 2, ScreenH * 2))
+    {
+        const bool useScalerAlpha =
+            applyXBRZSourceEnhancement ||
+        applyNNEDI3SourceEnhancement;
+        RenderSpritesToLayer(
+            ystart,
+            yend,
+            applySpline36SourceEnhancement ? 1 : 0,
+            true,
+            enhancedOBJReady,
+            StrictAffineSupersamplePresentationOBJLayerFB,
+            true,
+            ScaleFactor * 2,
+            linearSupersampleCachedSource,
+            false,
+            true,
+            ChooseAffineOBJSubpixelCoverageMode(useScalerAlpha));
+        if (!ordinaryOBJOperandPlanReady)
+        {
+            u32 assemblyMask[4] = {~0u, ~0u, ~0u, ~0u};
+            int assembledSlots[128];
+            const bool assembled = WholeSceneScaleHybridStrictAffineOpaqueAssemblies &&
+            enhancedOBJReady &&
+                PrepareOpaqueOBJAssemblies(assemblyMask, assembledSlots, ystart, yend);
+            // Retain the depth-selected semantic metadata, then replace only
+            // the presentation color with the normal-affine premultiplied
+            // union. Ordered plans build the same union per admitted
+            // priority partition below, so avoid a redundant full pass.
+            RenderSpritesToLayer(
+                ystart,
+                yend,
+                applySpline36SourceEnhancement ? 1 : 0,
+                true,
+                enhancedOBJReady,
+                StrictAffineSupersamplePresentationOBJLayerFB,
+                true,
+                ScaleFactor * 2,
+                linearSupersampleCachedSource,
+                false,
+                true,
+                ChooseAffineOBJSubpixelCoverageMode(useScalerAlpha),
+                assembled ? assemblyMask : nullptr,
+                true,
+                assembled ? assembledSlots : nullptr);
+            affineOBJSubpixelPresentationPremultiplied = true;
+        }
+        affineOBJSubpixelPresentationReady = true;
+    }
+    const bool orderedAffineSubpixelRequired =
+        WholeSceneCompositorRecipePresentationCount(
+            ordinaryOBJCompositorRecipe,
+            WholeSceneCompositorPresentationKind::AffineSubpixel2x) != 0 ||
+        WholeSceneCompositorRecipePresentationCount(
+            ordinaryOBJCompositorRecipe,
+            WholeSceneCompositorPresentationKind::
+                DSSpecialEffectSubpixel2x) != 0;
+    if (ordinaryOBJOperandPlanReady && orderedAffineSubpixelRequired &&
+        !affineOBJSubpixelPresentationReady)
+    {
+        orderedPresentationExecutionOutcome =
+            ResolveWholeSceneOrderedPresentationExecution(
+                WholeScenePlan,
+                WholeSceneRecipePreparation.OrderedPresentation,
+                orderedSemanticBaseRecipe,
+                ordinaryOBJCompositorRecipe,
+                false);
+        ordinaryOBJOperandPlanReady = false;
+        operandPlanCleanBG3DBaseReady = false;
+        operandExcludedOverlayEligible = false;
+        operandExcludedOverlayExecutionOutcome.Disposition =
+            WholeSceneCompositorExecutionDisposition::Unavailable;
+        operandExcludedOverlayExecutionOutcome.Reason =
+            WholeSceneCompositorExecutionReason::DependencyMismatch;
+        WholeSceneTrace.StrictAffineOBJOperandPlanCleanBG3DBase = false;
+    }
+    const bool ordinaryOBJMLAARequested =
+        directionalOBJAARequested && hasOrdinaryOBJ &&
+        ordinaryOBJStackBlendSafe;
+    const bool directionalTextBGAAReady =
+        applyDirectionalTextBGAA && semanticMaskStackReady;
+    WholeSceneTrace.StrictAffineOrdinaryOBJNativeStack =
+        ordinaryOBJNativeStackReady;
+
+    // OBJ source reconstruction belongs before OAM affine placement. Rebuild
+    // the path-12 OBJ input only after OutputPlan has selected path 12.
+    GLuint strictAffineOBJTex = OBJLayerTex;
+    if (resolvedOBJSurfaceReady)
+    {
+        // Rebuild the authoritative all-OBJ winner surface with the selected
+        // affine source treatment, then substitute the one reconstructed
+        // ordinary-only OAM resolve without changing flags, priority, mode or
+        // semantic presence.
+        if (applySpline36SourceEnhancement)
+            RenderSpritesToLayer(ystart, yend, 1, true);
+        else if (enhancedOBJReady)
+            RenderSpritesToLayer(ystart, yend, 0, true, true);
+        else
+            RenderSpritesToLayer(ystart, yend, 0, true, false);
+        RenderResolvedOBJMerge(OBJLayerTex);
+        WholeSceneTrace.StrictAffineResolvedOBJMergeExecuted = true;
+        strictAffineOBJTex = StrictAffineOBJLayerTex;
+    }
+    else if (semanticMaskStackReady || ordinaryOBJOverAffineBGReady ||
+         ordinaryOBJOperandPlanReady)
+    {
+        if (ordinaryOBJPreservedBehindReady)
+        {
+            // Keep the proven-behind special roles in the normal semantic
+            // compositor. Their mode-1/mode-3 effect is resolved against the
+            // real BG underlay before the reconstructed normal band—proven in
+            // front of their complete total-priority range—is inserted.
+            RenderSpritesToLayer(ystart,
+                                 yend,
+                                 0,
+                                 false,
+                                 false,
+                                 StrictAffineOBJLayerFB,
+                                 false,
+                                 0,
+                                 false,
+                                 false,
+                                 false,
+                                 0,
+                                 ordinaryOBJPreservedBehindMask);
+        }
+        else
+        {
+            RenderSpritesToLayer(ystart,
+                                 yend,
+                                 applySpline36SourceEnhancement ? 1 : 0,
+                                 applySpline36SourceEnhancement,
+                                 enhancedOBJReady,
+                                 StrictAffineOBJLayerFB,
+                                 true,
+                                 0,
+                                 false,
+                                 true);
+        }
+        strictAffineOBJTex = StrictAffineOBJLayerTex;
+    }
+    else if (applySpline36SourceEnhancement && objVisible)
+    {
+        RenderSpritesToLayer(ystart, yend, 1, true);
+    }
+    else if (enhancedOBJReady)
+    {
+        RenderSpritesToLayer(ystart, yend, 0, true, true);
+    }
+
+    const WholeSceneCompositorRecipe builtSemanticCompositorRecipe =
+        buildSemanticCompositorRecipe(
+            !ordinaryOBJOperandPlanReady,
+            resolvedOBJSurfaceReady);
+    const WholeSceneCompositorExecutionOutcome semanticExecutionOutcome =
+        ResolveWholeSceneCompositorExecution(
+            WholeScenePlan,
+            WholeSceneRecipePreparation.Compositor,
+            builtSemanticCompositorRecipe);
+    const WholeSceneCompositorRecipe& semanticCompositorRecipe =
+        semanticExecutionOutcome.EffectiveRecipe;
+    const bool useStrictCandidateBindings =
+        semanticExecutionOutcome.Disposition ==
+        WholeSceneCompositorExecutionDisposition::
+            StrictCandidateBindingsFallback;
+    const u32 semanticEnhancedBGMask = useStrictCandidateBindings
+        ? compositorEnhancedBGMask
+        : WholeSceneCompositorRecipeEnhancedBGMask(semanticCompositorRecipe);
+    const u32 semanticCoverageBGMask = useStrictCandidateBindings
+        ? reconstructedTextBGCoverageMask
+        : WholeSceneCompositorRecipeReconstructedBGCoverageMask(
+              semanticCompositorRecipe);
+    const u32 semanticCandidateBGMask =
+        reconstructedTextBGCandidateMask & semanticCoverageBGMask;
+    const bool semanticResolvedOBJ = useStrictCandidateBindings
+        ? resolvedOBJSurfaceReady
+        : WholeSceneCompositorRecipeHasInput(
+              semanticCompositorRecipe,
+              WholeSceneCompositorInputKind::ResolvedOBJSurface);
+    const GLuint semanticCompositorOBJTex =
+        !useStrictCandidateBindings && semanticResolvedOBJ
+            ? StrictAffineOBJLayerTex : strictAffineOBJTex;
+
+    if (operandExcludedOverlayEligible)
+    {
+        u64 excludedOAMHash = 0;
+        operandExcludedOverlayBaseReady =
+            RenderStrictAffineOperandExcludedOverlayBase(
+                ystart,
+                yend,
+                operandExcludedOverlayRecipe,
+                Parent.OutputTex3D,
+                excludedOAMHash);
+        WholeSceneTrace.StrictAffineOperandExcludedOverlayOAMHash =
+            excludedOAMHash;
+        if (!operandExcludedOverlayBaseReady)
+        {
+            WholeSceneTrace.StrictAffineOperandExcludedOverlayRejectionMask |=
+                StrictAffineOperandExcludedOverlayRejectRender;
+            RecordWholeSceneOperandExcludedOverlayRenderFailure(
+                operandExcludedOverlayExecutionOutcome);
+        }
+    }
+    ObserveWholeSceneOutputPlanOperandExcludedOverlayRecipeExecution(
+        WholeSceneRecipePreparation.OperandExcludedOverlay,
+        WholeSceneExecutionTrace,
+        operandExcludedOverlayExecutionOutcome,
+        operandExcludedOverlayBaseReady);
+
+    if (affineOBJInsertionReady)
+    {
+        // Build the scene with affine/ordinary OBJ suppressed. The native
+        // stack merge below restores the bounded atomic affine presentation
+        // over one private underlay before OutputTex is reused for the
+        // semantic final. Reconstructed coverage therefore sees one coherent
+        // layer-below operand. Generic ordered plans do not use this branch.
+        RenderCompositorPass(OutputFB,
+                             semanticCompositorOBJTex,
+                             ScreenW,
+                             ScreenH,
+                             ystart,
+                             yend,
+                             ScaleFactor,
+                             applySpline36SourceEnhancement ? 1 : 0,
+                             applySpline36SourceEnhancement &&
+                                 WholeSceneScaleNoWrapFilterTaps,
+                             false,
+                             WholeSceneScaleDebugTint,
+                             0,
+                             0,
+                             true,
+                             false,
+                             0,
+                             0,
+                             applySpline36SourceEnhancement,
+                             semanticEnhancedBGMask,
+                             false,
+                             false,
+                             applyBilinearAffineBGPresentation,
+                             affineConstantBackdropCompositeBGMask,
+                             semanticCoverageBGMask,
+                             0,
+                             false,
+                             0,
+                             false,
+                             semanticCandidateBGMask);
+    }
+
+    // Produce the semantic affine base independently of OutputTex. When an
+    // operand plan is available, keep reconstructed OBJ presentation out of
+    // this pass: each admitted operand is inserted exactly once in semantic
+    // order. If stack preparation failed, retain the established immediate-
+    // compositor presentation fallback.
+    if (!operandExcludedOverlayBaseReady)
+    {
+        RenderCompositorPass(StrictAffineCandidateFB,
+                             semanticCompositorOBJTex,
+                             ScreenW,
+                             ScreenH,
+                             ystart,
+                             yend,
+                             ScaleFactor,
+                             applySpline36SourceEnhancement ? 1 : 0,
+                             applySpline36SourceEnhancement &&
+                                 WholeSceneScaleNoWrapFilterTaps,
+                             false,
+                             WholeSceneScaleDebugTint,
+                             0,
+                             0,
+                             ordinaryOBJOperandPlanReady,
+                             false,
+                             0,
+                             0,
+                             applySpline36SourceEnhancement,
+                             semanticEnhancedBGMask,
+                             semanticResolvedOBJ ||
+                                 (!ordinaryOBJOperandPlanReady &&
+                                  !affineOBJAtomicPresentationReady &&
+                                  applyXBRZSourceEnhancement && enhancedOBJReady),
+                             false,
+                             applyBilinearAffineBGPresentation,
+                             affineConstantBackdropCompositeBGMask,
+                             semanticCoverageBGMask,
+                             !ordinaryOBJOperandPlanReady &&
+                                     !affineOBJAtomicPresentationReady &&
+                                     affineOBJPresentationCandidateReady
+                                  ? (affineOBJSubpixelPresentationReady
+                                      ? StrictAffineSupersamplePresentationOBJLayerTex
+                                      : AffinePresentationOBJLayerTex)
+                                  : 0,
+                             false,
+                             0,
+                             false,
+                             semanticCandidateBGMask,
+                             nullptr,
+                             nullptr,
+                             nullptr,
+                             affineOBJSubpixelPresentationPremultiplied);
+        ObserveWholeSceneOutputPlanCompositorRecipeExecution(
+            WholeSceneRecipePreparation.Compositor,
+            WholeSceneExecutionTrace,
+            semanticExecutionOutcome);
+    }
+    const int y0 = ystart * ScaleFactor;
+    const int y1 = yend * ScaleFactor;
+
+    WholeSceneStrictAffineProductAssessment productAssessment;
+    productAssessment.SemanticRecipeReady = semanticCompositorRecipe.Ready;
+    productAssessment.ResolvedOBJSurfaceReady = resolvedOBJSurfaceReady;
+    productAssessment.OrderedOperandsReady = ordinaryOBJOperandPlanReady;
+    productAssessment.OperandExcludedOverlayReady =
+        operandExcludedOverlayBaseReady;
+    productAssessment.AtomicOrdinaryBandReady = ordinaryOBJOverAffineBGReady;
+    productAssessment.NativeStackReady = ordinaryOBJNativeStackReady;
+    productAssessment.AffineOBJInsertionReady = affineOBJInsertionReady;
+    productAssessment.AffineOBJSubpixel2xReady =
+        affineOBJSubpixelPresentationReady;
+    const WholeSceneStrictAffinePresentationOutcome presentationOutcome =
+        ResolveWholeSceneStrictAffinePresentationExecution(productAssessment);
+    ObserveWholeSceneStrictAffinePresentationExecution(
+        WholeSceneExecutionTrace, productAssessment, presentationOutcome);
+
+    if (presentationOutcome.Kind ==
+        WholeSceneStrictAffinePresentationKind::OrderedOperands)
+    {
+        // Ordered OBJ passes use native layer ownership to resolve Target-2
+        // blending and front-BG occlusion. This path can bypass native-stack
+        // upscaling entirely, leaving UpscaledMetaTex from an earlier frame
+        // or a different presentation path. Refresh the semantic map before
+        // inserting sprites, without scaling the native color stack.
+        RenderNativePrepass(ystart, yend);
+        RenderNativeMetaCoverage(ystart, yend);
+
+        // Execute the policy-owned operand list over the OBJ-free strict
+        // BG/3D candidate, from back to front. Strict, deferred and capture-
+        // epoch execution now share the same scaler-aware operand renderer.
+        const OrderedOBJPresentationPolicy orderedPolicy =
+            BuildOrderedOBJPresentationPolicy(
+                sourceEnhancement,
+                enhancedOBJReady,
+                false);
+        const GLuint orderedResult = RenderOrderedOBJPresentationRecipe(
+            ordinaryOBJCompositorRecipe,
+            operandExcludedOverlayBaseReady
+                ? operandExcludedOverlayStart : 0,
+            ystart,
+            yend,
+            orderedPolicy);
+        if (orderedResult)
+        {
+            CopyOrderedOBJPresentationResult(orderedResult,
+                                             StrictAffineCandidateTex,
+                                             ystart,
+                                             yend);
+            CopyOrderedOBJPresentationResult(orderedResult,
+                                             OutputTex,
+                                             ystart,
+                                             yend);
+        }
+        else
+        {
+            CopyOrderedOBJPresentationResult(StrictAffineCandidateTex,
+                                             OutputTex,
+                                             ystart,
+                                             yend);
+        }
+        ObserveWholeSceneOutputPlanOrderedPresentationRecipeExecution(
+            WholeSceneRecipePreparation.OrderedPresentation,
+            WholeSceneExecutionTrace,
+            orderedPresentationExecutionOutcome);
+    }
+    else if (presentationOutcome.Kind ==
+             WholeSceneStrictAffinePresentationKind::AtomicOrdinaryBand)
+    {
+        // The bounded recipe proves this single assembled ordinary band is
+        // above every enabled BG. It either has no special ordinary competitor
+        // or every retained mode-1/mode-3 role is wholly behind the band and
+        // has already been resolved by the semantic compositor. Insert the
+        // selected-scaler RGBA band atomically. Spline36
+        // reconstructs RGBA directly, CuNNy carries ArtCNN's two-stage
+        // Spline36 alpha contract, and ArtCNN/NNEDI3/xBRZ retain their existing
+        // scaler alpha.
+        RenderOrdinaryOBJBandPresentation(StrictAffineCandidateTex,
+                                           OutputFB,
+                                           ystart,
+                                           yend);
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, OutputFB);
+        glReadBuffer(GL_COLOR_ATTACHMENT0);
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, StrictAffineCandidateFB);
+        glDrawBuffer(GL_COLOR_ATTACHMENT0);
+        glDisable(GL_SCISSOR_TEST);
+        glBlitFramebuffer(0, y0, ScreenW, y1,
+                          0, y0, ScreenW, y1,
+                          GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    }
+    else if (presentationOutcome.Kind ==
+             WholeSceneStrictAffinePresentationKind::NativeStackComposite)
+    {
+        if (presentationOutcome.AffineOBJInsertion)
+        {
+            RenderStrictAffineOrdinaryOBJComposite(
+                ystart,
+                yend,
+                nativeStackBGMask,
+                OutputTex,
+                AffinePresentationUnderlayFB,
+                true);
+        }
+
+        RenderStrictAffineOrdinaryOBJComposite(ystart,
+                                               yend,
+                                               nativeStackBGMask,
+                                               StrictAffineCandidateTex,
+                                               OutputFB,
+                                               false);
+
+        if (presentationOutcome.AffineOBJInsertion)
+        {
+            // Insert the complete affine presentation after its lower stack
+            // and all upper-priority admission information have resolved.
+            // The presentation surface consumes scaler RGB plus
+            // subpixel/bilinear presentation coverage.
+            RenderAffineOBJPresentationComposite(
+                ystart,
+                yend,
+                affineOBJSubpixelPresentationReady,
+                affineOBJSubpixelPresentationPremultiplied);
+            glBindFramebuffer(GL_READ_FRAMEBUFFER, StrictAffineCandidateFB);
+            glReadBuffer(GL_COLOR_ATTACHMENT0);
+            glBindFramebuffer(GL_DRAW_FRAMEBUFFER, OutputFB);
+            glDrawBuffer(GL_COLOR_ATTACHMENT0);
+            glDisable(GL_SCISSOR_TEST);
+            glBlitFramebuffer(0, y0, ScreenW, y1,
+                              0, y0, ScreenW, y1,
+                              GL_COLOR_BUFFER_BIT, GL_NEAREST);
+        }
+        else
+        {
+            // Keep the debug/export candidate identical to the selected output.
+            glBindFramebuffer(GL_READ_FRAMEBUFFER, OutputFB);
+            glReadBuffer(GL_COLOR_ATTACHMENT0);
+            glBindFramebuffer(GL_DRAW_FRAMEBUFFER, StrictAffineCandidateFB);
+            glDrawBuffer(GL_COLOR_ATTACHMENT0);
+            glDisable(GL_SCISSOR_TEST);
+            glBlitFramebuffer(0, y0, ScreenW, y1,
+                              0, y0, ScreenW, y1,
+                              GL_COLOR_BUFFER_BIT, GL_NEAREST);
+        }
+    }
+    else
+    {
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, StrictAffineCandidateFB);
+        glReadBuffer(GL_COLOR_ATTACHMENT0);
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, OutputFB);
+        glDrawBuffer(GL_COLOR_ATTACHMENT0);
+        glDisable(GL_DEPTH_TEST);
+        glDisable(GL_STENCIL_TEST);
+        glDisable(GL_BLEND);
+        glDisable(GL_SCISSOR_TEST);
+        glColorMaski(0, GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+        glDepthMask(GL_FALSE);
+        glBlitFramebuffer(0, y0, ScreenW, y1,
+                          0, y0, ScreenW, y1,
+                          GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    }
+
+    const bool directionalOBJAAReady =
+        semanticMaskStackReady &&
+        (ordinaryOBJMLAARequested || transformedOBJMLAARequested);
+    if (!operandExcludedOverlayBaseReady && directionalOBJAAReady)
+    {
+        // Presentation-only ping-pong: use the fully resolved strict output
+        // as both sides of the edge reconstruction, then publish the
+        // directional candidate. Scaler-derived affine coverage and semantic
+        // MLAA are mutually exclusive only for the same contour. Ordinary/UI
+        // OBJ remain in the mask when reconstructed affine OBJ owns its edge.
+        const bool ordinaryContourRequested =
+            ordinaryOBJMLAARequested;
+        const u32 objOwnerMode = ordinaryContourRequested
+            ? (transformedOBJMLAARequested
+                ? static_cast<u32>(-2)
+                : static_cast<u32>(-1))
+            : 0u;
+        RenderStrictAffineMaskedOBJMask(ystart, yend, objOwnerMode);
+        RenderStrictAffineMaskedOBJMLAA(ystart,
+                                        yend,
+                                        OutputTex,
+                                        StrictAffineCandidateFB);
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, StrictAffineCandidateFB);
+        glReadBuffer(GL_COLOR_ATTACHMENT0);
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, OutputFB);
+        glDrawBuffer(GL_COLOR_ATTACHMENT0);
+        glDisable(GL_DEPTH_TEST);
+        glDisable(GL_STENCIL_TEST);
+        glDisable(GL_BLEND);
+        glDisable(GL_SCISSOR_TEST);
+        glColorMaski(0, GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+        glDepthMask(GL_FALSE);
+        glBlitFramebuffer(0, y0, ScreenW, y1,
+                          0, y0, ScreenW, y1,
+                          GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    }
+
+    if (!operandExcludedOverlayBaseReady && directionalTextBGAAReady)
+    {
+        // Keep the selected scaler's RGB only under binary text-BG ownership,
+        // then perform the same thin directional contour correction used by
+        // semantic OBJ MLAA. Unlike the retired full-boundary experiment,
+        // this never stretches one native alpha transition across ScaleFactor
+        // output pixels.
+        RenderStrictAffineMaskedOBJMask(ystart, yend, directionalTextBGMask);
+        RenderStrictAffineMaskedOBJMLAA(ystart,
+                                        yend,
+                                        OutputTex,
+                                        StrictAffineCandidateFB);
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, StrictAffineCandidateFB);
+        glReadBuffer(GL_COLOR_ATTACHMENT0);
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, OutputFB);
+        glDrawBuffer(GL_COLOR_ATTACHMENT0);
+        glDisable(GL_DEPTH_TEST);
+        glDisable(GL_STENCIL_TEST);
+        glDisable(GL_BLEND);
+        glDisable(GL_SCISSOR_TEST);
+        glColorMaski(0, GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+        glDepthMask(GL_FALSE);
+        glBlitFramebuffer(0, y0, ScreenW, y1,
+                          0, y0, ScreenW, y1,
+                          GL_COLOR_BUFFER_BIT, GL_NEAREST);
+
+        if (WholeSceneDebugViewsActive.load(std::memory_order_relaxed))
+        {
+            glBindFramebuffer(GL_FRAMEBUFFER, ArtCNNOutputFB);
+            glFramebufferTexture(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                 HybridForegroundAlphaTex, 0);
+            glDrawBuffer(GL_COLOR_ATTACHMENT0);
+            RenderStrictAffineMaskedOBJMLAA(ystart,
+                                            yend,
+                                            OutputTex,
+                                            ArtCNNOutputFB,
+                                            true);
+            WholeSceneDebugProducts.HybridForegroundAlpha = ystart == 0 && yend == 192;
+        }
+    }
+
+    if (WholeSceneDebugViewsActive.load(std::memory_order_relaxed))
+    {
+        // The conservative-hybrid selector is otherwise unavailable while
+        // path 12 owns the frame. Re-evaluate the exact strict compositor
+        // inputs into its private debug texture, encoding the selected
+        // semantic owner and visualCoverage1 instead of RGB. This deliberately
+        // represents the base selector before ordered operand insertion and
+        // masked output AA, so a hard source-alpha corner cannot be mistaken
+        // for a later hybrid fallback.
+        glBindFramebuffer(GL_FRAMEBUFFER, ArtCNNOutputFB);
+        glFramebufferTexture(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                             HybridSelectorTex, 0);
+        glDrawBuffer(GL_COLOR_ATTACHMENT0);
+        RenderCompositorPass(ArtCNNOutputFB,
+                             semanticCompositorOBJTex,
+                             ScreenW,
+                             ScreenH,
+                             ystart,
+                             yend,
+                             ScaleFactor,
+                             applySpline36SourceEnhancement ? 1 : 0,
+                             applySpline36SourceEnhancement &&
+                                 WholeSceneScaleNoWrapFilterTaps,
+                             false,
+                             false,
+                             0,
+                             0,
+                             ordinaryOBJOperandPlanReady,
+                             false,
+                             0,
+                             0,
+                             applySpline36SourceEnhancement,
+                             semanticEnhancedBGMask,
+                             semanticResolvedOBJ ||
+                                 (!ordinaryOBJOperandPlanReady &&
+                                  !affineOBJAtomicPresentationReady &&
+                                  applyXBRZSourceEnhancement && enhancedOBJReady),
+                             false,
+                             applyBilinearAffineBGPresentation,
+                             affineConstantBackdropCompositeBGMask,
+                             semanticCoverageBGMask,
+                             !ordinaryOBJOperandPlanReady &&
+                                     !affineOBJAtomicPresentationReady &&
+                                     affineOBJPresentationCandidateReady
+                                  ? (affineOBJSubpixelPresentationReady
+                                      ? StrictAffineSupersamplePresentationOBJLayerTex
+                                      : AffinePresentationOBJLayerTex)
+                                  : 0,
+                             true,
+                             0,
+                             false,
+                             semanticCandidateBGMask,
+                             nullptr,
+                             nullptr,
+                             nullptr,
+                             affineOBJSubpixelPresentationPremultiplied);
+        WholeSceneDebugProducts.HybridSelector = ystart == 0 && yend == 192;
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, OutputFB);
+    }
+
+    WholeSceneTrace.StrictAffineCandidateValid = true;
+}
+
+void GLRenderer2D::RenderStrictAffineDebugProducts(int ystart, int yend)
+{
+    if (!WholeSceneDebugViewsActive.load(std::memory_order_relaxed))
+        return;
+
+    const u64 requiredChannels =
+        BuildWholeSceneRequiredChannelMask(ystart, yend);
+    const StrictAffineHighResEligibilityInputs inputs =
+        BuildStrictAffineHighResEligibilityInputs(
+            ystart,
+            yend,
+            requiredChannels);
+    const StrictAffineDebugProductClass debugClass =
+        ChooseStrictAffineDebugProductClass(inputs);
+    WholeSceneTrace.StrictAffineDebugClass = debugClass;
+    if (debugClass == StrictAffineDebugProductClass::None)
+        return;
+
+    if (!WholeSceneTrace.StrictAffineCandidateValid)
+    {
+        RenderCompositorPass(StrictAffineCandidateFB,
+                             OBJLayerTex,
+                             ScreenW,
+                             ScreenH,
+                             ystart,
+                             yend,
+                             ScaleFactor,
+                             0,
+                             false,
+                             false,
+                             WholeSceneScaleDebugTint,
+                             0,
+                             0,
+                             false,
+                             true);
+        WholeSceneTrace.StrictAffineCandidateValid = true;
+    }
+
+    RenderNativePrepass(ystart, yend);
+    WholeSceneTrace.StrictAffineNativeReferenceValid = true;
+
+    // Both diagnostic passes target private FBOs. Restore the normal output
+    // target so enabling the debug dialog cannot alter later presentation.
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, OutputFB);
+    glDrawBuffer(GL_COLOR_ATTACHMENT0);
+    glViewport(0, 0, ScreenW, ScreenH);
+    glDisable(GL_SCISSOR_TEST);
 }
 
 void GLRenderer2D::ApplyRouteProductLookupToSourceAChoice(SourceACaptureReplacementChoice& choice,
@@ -11909,15 +20853,47 @@ void GLRenderer2D::ApplyRouteProductLookupToSourceAChoice(SourceACaptureReplacem
     choice.RouteProductCurrentPresentationHash = lookup.Identity.CurrentOverlayPresentationHash;
     choice.RouteProductStableFrames = lookup.StableFrames;
     choice.RouteProductPresentationClass = lookup.PresentationClass;
-    choice.RouteProductStoredMasterBrightness = lookup.StoredMasterBrightness;
-    choice.RouteProductHasStoredEffectState = lookup.HasStoredEffectState;
     choice.RouteProductKind = CaptureProductKindForRouteLookup(lookup.Source);
     choice.RouteProductProof = CaptureProofKindForRouteLookup(lookup.Source);
 }
 
-GLRenderer2D::SourceACaptureReplacementChoice GLRenderer2D::ChooseSourceACaptureReplacement(int ystart, int yend)
+GLRenderer2D::SourceACaptureReplacementExecutionInput
+GLRenderer2D::PrepareSourceACaptureReplacementExecutionInput(int ystart,
+                                                             int yend)
 {
-    SourceACaptureReplacementChoice choice = {};
+    SourceACaptureReplacementExecutionInput input = {};
+    if (CanUseWholeSceneMixedCaptureBackedOBJOverlayPath())
+    {
+        input.Kind = SourceACaptureReplacementExecutionKind::
+            MixedCaptureBackedOBJOverlay;
+        return input;
+    }
+    if (!GPU2D.Num && CanUseWholeSceneMixedSourceACaptureBGPath())
+    {
+        input.Kind =
+            SourceACaptureReplacementExecutionKind::MixedSourceACaptureBG;
+        return input;
+    }
+
+    input.Kind = SourceACaptureReplacementExecutionKind::SelectedProduct;
+    SourceACaptureReplacementChoice& choice = input.Choice;
+    const auto finishPreparation = [&]()
+    {
+        input.Primary = AssessSourceACaptureProduct(choice,
+                                                    input.Selection,
+                                                    input.Selection.Primary,
+                                                    ystart,
+                                                    yend);
+        input.AfterOverlayFailure = AssessSourceACaptureProduct(
+            choice,
+            input.Selection,
+            input.Selection.AfterOverlayFailure,
+            ystart,
+            yend);
+        WholeSceneExecutionTrace.SourceASelectionObserved = true;
+        WholeSceneExecutionTrace.SourceASelection = input.Selection;
+        return input;
+    };
     choice.FullProductTex = VisibleHighResCaptureFullTex();
     choice.CaptureBank = VisibleSingleHighResCaptureBank();
     choice.FullProductCaptureBank = choice.CaptureBank;
@@ -11972,8 +20948,6 @@ GLRenderer2D::SourceACaptureReplacementChoice GLRenderer2D::ChooseSourceACapture
         visibleBGMask != 0 &&
         (visibleBGMask & ~sourceAOnlyCaptureBGMask) == 0 &&
         !objVisible;
-    choice.MainEngineCapturedBGOnly = mainEngineCapturedBGOnly;
-
     const bool subEngineFullFrameCaptureConsumer =
         GPU2D.Num &&
         ystart == 0 &&
@@ -11982,7 +20956,6 @@ GLRenderer2D::SourceACaptureReplacementChoice GLRenderer2D::ChooseSourceACapture
     const bool subEngineCapturedBGOnly =
         subEngineFullFrameCaptureConsumer &&
         (LayerEnable & (1 << 4)) == 0;
-    choice.SubEngineCaptureBackedBGOnly = subEngineCapturedBGOnly;
     const VisibleOBJCaptureDebug objCaptureDebug = BuildVisibleOBJCaptureDebug();
     const bool fullFrameRange = ystart == 0 && yend == 192;
     const bool trackedVRAMDisplayRoute =
@@ -12009,11 +20982,10 @@ GLRenderer2D::SourceACaptureReplacementChoice GLRenderer2D::ChooseSourceACapture
         objCaptureDebug.ProductAvailable;
     choice.SubEngineCapturedSourceAOnly =
         subEngineCapturedBGOnly || subEngineCapturedOBJOnly;
-    choice.SubEngineCapturedOBJOnly = subEngineCapturedOBJOnly;
 
     if (!choice.SubEngineCapturedSourceAOnly &&
-        !choice.MainEngineCapturedBGOnly)
-        return choice;
+        !mainEngineCapturedBGOnly)
+        return finishPreparation();
 
     const auto& event = Parent.HighResDisplayCapture256Event[choice.CaptureBank];
     choice.BackgroundTex =
@@ -12054,7 +21026,7 @@ GLRenderer2D::SourceACaptureReplacementChoice GLRenderer2D::ChooseSourceACapture
     routePreferenceInputs.DirectFinalBottomConsumer =
         choice.DirectFinalBottomConsumer;
     routePreferenceInputs.SubEngineCaptureBackedBGOnly =
-        choice.SubEngineCaptureBackedBGOnly;
+        subEngineCapturedBGOnly;
     routePreferenceInputs.HasRouteProduct = choice.RouteProductTex != 0;
     routePreferenceInputs.RouteProductKind = choice.RouteProductKind;
     routePreferenceInputs.RouteProductProof = choice.RouteProductProof;
@@ -12092,10 +21064,6 @@ GLRenderer2D::SourceACaptureReplacementChoice GLRenderer2D::ChooseSourceACapture
             static_cast<u32>(GLRenderer::HighResCaptureRejectReason::None);
     routePreferenceInputs.FullProductEventSourceOBJVisible =
         choice.FullProductEventSourceOBJ;
-    choice.PreferExactRouteProduct =
-        ShouldPreferSourceAExactRouteProductForDirectBottom(
-            routePreferenceInputs);
-
     SourceAExactFullProductPreferenceInputs preferenceInputs = {};
     bool currentScreenSwap = GPU.ScreenSwap;
     Parent.GetFinalPassScreenSwapForRange(ystart, yend, currentScreenSwap);
@@ -12123,25 +21091,14 @@ GLRenderer2D::SourceACaptureReplacementChoice GLRenderer2D::ChooseSourceACapture
             static_cast<u32>(GLRenderer::HighResCaptureRejectReason::None);
     preferenceInputs.FullProductEventSourceOBJVisible =
         choice.FullProductEventSourceOBJ;
-    const bool preferExactFullProductForDirectBottom =
-        ShouldPreferSourceAExactFullProductForDirectBottom(preferenceInputs);
-    choice.PreferExactFullProduct = preferExactFullProductForDirectBottom;
-    choice.AllowExactFullProductCapturePresentation =
-        (choice.DirectFinalBottomConsumer ||
-         (choice.DirectFinalDisplayConsumer && choice.SubEngineCapturedOBJOnly) ||
-         (choice.DirectFinalDisplayConsumer &&
-          choice.MainEngineCapturedBGOnly &&
-          preferenceInputs.FullProductEventRouteMatches)) &&
-        (choice.SubEngineCapturedSourceAOnly || choice.MainEngineCapturedBGOnly) &&
-        choice.FullProductTex != 0 &&
-        choice.FullProductEventValid &&
-        preferenceInputs.FullProductEventFullEquivalent &&
-        preferenceInputs.FullProductEventCleanEngineA2DOutput &&
-        preferenceInputs.FullProductEventAccepted;
-
+    const SourceACaptureSelectionPreference exactProductPreference =
+        ChooseSourceAExactProductPreference(preferenceInputs,
+                                            routePreferenceInputs);
     SourceACurrentOverlayEligibilityInputs overlayInputs = {};
     overlayInputs.HasBackgroundTexture = choice.BackgroundTex != 0;
-    overlayInputs.PreferExactFullProductForDirectBottom = preferExactFullProductForDirectBottom;
+    overlayInputs.PreferExactFullProductForDirectBottom =
+        exactProductPreference ==
+        SourceACaptureSelectionPreference::ExactFullProduct;
     overlayInputs.SourceIsCleanEngineA2DOutput =
         event.SourceKind == GLRenderer::HighResCaptureSourceKind::CleanEngineA2DOutput;
     overlayInputs.RendererCanCompositeCurrentOverlay =
@@ -12157,8 +21114,49 @@ GLRenderer2D::SourceACaptureReplacementChoice GLRenderer2D::ChooseSourceACapture
         GPU2D.Num != 0 &&
         choice.DirectFinalDisplayConsumer &&
         !choice.DirectFinalBottomConsumer;
-    choice.CanUseCurrentOverlay = CanUseSourceACurrentOverlay(overlayInputs);
-    return choice;
+    const bool canUseCurrentOverlay =
+        CanUseSourceACurrentOverlay(overlayInputs);
+
+    SourceACaptureResolutionInputs resolutionInputs = {};
+    resolutionInputs.HasRouteProduct = choice.RouteProductTex != 0;
+    resolutionInputs.RouteProductCompositionMismatch =
+        choice.RouteProductTex != 0 &&
+        choice.RouteProductPresentationClass ==
+            WholeSceneCaptureProductPresentationClass::RawContent &&
+        choice.RouteProductCurrentPresentationHash != 0 &&
+        choice.CurrentPresentationHash != 0 &&
+        !DoesCaptureProductPresentationMatchRequest(
+            choice.RouteProductCurrentPresentationHash,
+            choice.CurrentPresentationHash);
+    resolutionInputs.CanUseCurrentOverlay = canUseCurrentOverlay;
+    resolutionInputs.HasFullProduct = choice.FullProductTex != 0;
+    SourceAFullProductPresentationProofInputs fullProductProofInputs = {};
+    fullProductProofInputs.DirectFinalBottomConsumer =
+        choice.DirectFinalBottomConsumer;
+    fullProductProofInputs.DirectFinalDisplayConsumer =
+        choice.DirectFinalDisplayConsumer;
+    fullProductProofInputs.SubEngineCapturedOBJOnly =
+        subEngineCapturedOBJOnly;
+    fullProductProofInputs.MainEngineCapturedBGOnly =
+        mainEngineCapturedBGOnly;
+    fullProductProofInputs.FullProductEventRouteMatches =
+        preferenceInputs.FullProductEventRouteMatches;
+    fullProductProofInputs.SubEngineCapturedSourceAOnly =
+        choice.SubEngineCapturedSourceAOnly;
+    fullProductProofInputs.HasFullProduct = choice.FullProductTex != 0;
+    fullProductProofInputs.FullProductEventValid = choice.FullProductEventValid;
+    fullProductProofInputs.FullProductEventFullEquivalent =
+        preferenceInputs.FullProductEventFullEquivalent;
+    fullProductProofInputs.FullProductEventCleanEngineA2DOutput =
+        preferenceInputs.FullProductEventCleanEngineA2DOutput;
+    fullProductProofInputs.FullProductEventAccepted =
+        preferenceInputs.FullProductEventAccepted;
+    resolutionInputs.FullProductPresentationProof =
+        ProveSourceAFullProductPresentation(fullProductProofInputs);
+    resolutionInputs.Preference = exactProductPreference;
+    input.Selection =
+        ChooseSourceACaptureSelectionDecision(resolutionInputs);
+    return finishPreparation();
 }
 
 void GLRenderer2D::BlitWholeSceneCaptureProduct(GLuint sourceTex,
@@ -12174,8 +21172,24 @@ void GLRenderer2D::BlitWholeSceneCaptureProduct(GLuint sourceTex,
     // master-brightness approximation below: natively the consuming engine's
     // color effect is the only compositor-stage transform on this content,
     // and the engine's own master brightness still runs in the final pass.
-    const u16 consumerColorEffect =
-        ConsumerFullScreenBrightnessColorEffect(BlendCnt, EVY);
+    const WholeSceneOutputTransform* plannedColorEffect =
+        ResolveWholeSceneOutputTransformForExecution(
+            WholeScenePlan,
+            WholeSceneOutputTransformKind::CompositorColorEffect,
+            ystart,
+            yend);
+    const bool executePlannedColorEffect =
+        plannedColorEffect &&
+        plannedColorEffect->State == BlendCnt &&
+        plannedColorEffect->AuxState == EVY &&
+        ConsumerFullScreenBrightnessColorEffect(
+            static_cast<u16>(plannedColorEffect->State),
+            static_cast<u8>(plannedColorEffect->AuxState)) != 0;
+    const u16 consumerColorEffect = executePlannedColorEffect
+        ? ConsumerFullScreenBrightnessColorEffect(
+              static_cast<u16>(plannedColorEffect->State),
+              static_cast<u8>(plannedColorEffect->AuxState))
+        : 0;
     if (consumerColorEffect != 0 &&
         sourceTex != OutputTex &&
         ApplyMasterBrightnessToTexture(OutputTex,
@@ -12186,14 +21200,39 @@ void GLRenderer2D::BlitWholeSceneCaptureProduct(GLuint sourceTex,
                                        yend,
                                        consumerColorEffect))
     {
+        if (executePlannedColorEffect)
+        {
+            MarkWholeSceneOutputTransformPlanExecuted(
+                WholeScenePlan,
+                WholeSceneExecutionTrace,
+                WholeSceneOutputTransformKind::CompositorColorEffect,
+                ystart,
+                yend,
+                plannedColorEffect->State,
+                plannedColorEffect->AuxState);
+        }
         RecordOutputPresentationMasterBrightness(
             WholeSceneCaptureEffectOwner::CurrentEngineColorEffect,
             consumerColorEffect);
         return;
     }
 
-    const int brightMode = (presentationMasterBrightness >> 14) & 0x3;
-    const int brightFactor = std::min<int>(presentationMasterBrightness & 0x1F, 16);
+    const WholeSceneOutputTransform* plannedMasterBrightness =
+        applyPresentationMasterBrightness
+            ? ResolveWholeSceneOutputTransformForExecution(
+                  WholeScenePlan,
+                  WholeSceneOutputTransformKind::MasterBrightness,
+                  ystart,
+                  yend)
+            : nullptr;
+    const bool executePlannedMasterBrightness =
+        plannedMasterBrightness &&
+        plannedMasterBrightness->State == presentationMasterBrightness;
+    const u16 executedMasterBrightness = executePlannedMasterBrightness
+        ? static_cast<u16>(plannedMasterBrightness->State)
+        : presentationMasterBrightness;
+    const int brightMode = (executedMasterBrightness >> 14) & 0x3;
+    const int brightFactor = std::min<int>(executedMasterBrightness & 0x1F, 16);
     if (applyPresentationMasterBrightness &&
         sourceTex != OutputTex &&
         (brightMode == 1 || brightMode == 2) &&
@@ -12204,10 +21243,21 @@ void GLRenderer2D::BlitWholeSceneCaptureProduct(GLuint sourceTex,
                                        ScreenH,
                                        ystart,
                                        yend,
-                                       presentationMasterBrightness))
+                                       executedMasterBrightness))
     {
+        if (executePlannedMasterBrightness)
+        {
+            MarkWholeSceneOutputTransformPlanExecuted(
+                WholeScenePlan,
+                WholeSceneExecutionTrace,
+                WholeSceneOutputTransformKind::MasterBrightness,
+                ystart,
+                yend,
+                executedMasterBrightness,
+                plannedMasterBrightness->AuxState);
+        }
         RecordOutputPresentationMasterBrightness(presentationEffectOwner,
-                                                 presentationMasterBrightness);
+                                                 executedMasterBrightness);
         return;
     }
 
@@ -12232,19 +21282,6 @@ void GLRenderer2D::BlitWholeSceneCaptureProduct(GLuint sourceTex,
                       GL_COLOR_BUFFER_BIT, GL_NEAREST);
 }
 
-void GLRenderer2D::BlitWholeSceneSourceAReplacement(GLuint sourceTex,
-                                                    int ystart,
-                                                    int yend,
-                                                    bool applySourceAMasterBrightness)
-{
-    BlitWholeSceneCaptureProduct(sourceTex,
-                                 ystart,
-                                 yend,
-                                 GPU.MasterBrightnessA,
-                                 applySourceAMasterBrightness,
-                                 WholeSceneCaptureEffectOwner::SourceA);
-}
-
 void GLRenderer2D::BlitWholeSceneHandoffProduct(const GLCaptureProductResolution& product,
                                                 int ystart,
                                                 int yend)
@@ -12266,187 +21303,178 @@ void GLRenderer2D::BlitWholeSceneSourceAProduct(const GLCaptureProductResolution
                                                 int ystart,
                                                 int yend)
 {
-    const bool applyPresentationEffect =
-        ShouldApplySourceAReplacementPresentationEffect(product.PresentationClass,
-                                                       WholeSceneTrace.CaptureRequestKind,
-                                                       GPU2D.Num != 0);
-    BlitWholeSceneSourceAReplacement(product.Tex,
-                                     ystart,
-                                     yend,
-                                     applyPresentationEffect);
+    // A Source-A capture product is raw content. The consuming engine's
+    // planned final-presentation transform owns master brightness; baking
+    // Engine A's register into this blit gives the effect two owners.
+    BlitWholeSceneCaptureProduct(product.Tex,
+                                 ystart,
+                                 yend,
+                                 0,
+                                 false,
+                                 WholeSceneCaptureEffectOwner::None);
 }
 
-void GLRenderer2D::RenderScreenWholeSceneCaptureBackedHybridFallback(int ystart, int yend)
+GLRenderer2D::PreparedCaptureBackedExecution
+GLRenderer2D::PrepareSourceAExecution(
+    const SourceACaptureReplacementExecutionInput& input) const
 {
-    RenderScreenWholeSceneOverlayOperator(ystart, yend);
-    RenderScreenWholeSceneFinalizeOverlayOperatorFullFrame(true, ystart, yend);
+    if (input.Kind == SourceACaptureReplacementExecutionKind::
+                          MixedCaptureBackedOBJOverlay)
+    {
+        return SourceAMixedCaptureBackedOBJOverlayExecution{};
+    }
+
+    if (input.Kind ==
+        SourceACaptureReplacementExecutionKind::MixedSourceACaptureBG)
+    {
+        return SourceAMixedCaptureBackedBGExecution{};
+    }
+
+    if (input.Kind != SourceACaptureReplacementExecutionKind::SelectedProduct)
+        return SourceAUnavailableExecution{&input};
+
+    if (input.Selection.Primary ==
+        SourceACaptureResolutionKind::BackgroundOverlay)
+    {
+        return input.Primary.Product.Accepted
+            ? PreparedCaptureBackedExecution{
+                  SourceABackgroundOverlayExecution{&input}}
+            : PreparedCaptureBackedExecution{
+                  SourceAUnavailableExecution{&input}};
+    }
+
+    const bool directProduct =
+        input.Selection.Primary == SourceACaptureResolutionKind::RouteProduct ||
+        input.Selection.Primary == SourceACaptureResolutionKind::FullProduct;
+    if (directProduct && input.Primary.Product.Accepted)
+        return SourceADirectProductExecution{&input, &input.Primary};
+
+    return SourceAUnavailableExecution{&input};
 }
 
-void GLRenderer2D::RenderScreenWholeSceneSourceACaptureReplacement(int ystart, int yend)
+GLRenderer2D::PreparedCaptureBackedExecution
+GLRenderer2D::PrepareCaptureEpochExecution(
+    const CaptureEpochOverlayExecutionInput& input) const
 {
-    if (CanUseWholeSceneMixedCaptureBackedOBJOverlayPath())
+    if (input.EvidenceValid && input.EpochIdentityMatches &&
+        input.Product.Accepted)
     {
-        if (RenderCurrentBGOverlayOverHighResCaptureOBJToTexture(OutputTex, ystart, yend))
-            return;
-
-        RenderScreenWholeSceneCaptureBackedHybridFallback(ystart, yend);
-        return;
+        return CaptureEpochCurrentOverlayExecution{&input};
     }
 
-    if (!GPU2D.Num &&
-        CanUseWholeSceneMixedSourceACaptureBGPath())
-    {
-        if (RenderCurrentLayersOverHighResCaptureBGToTexture(OutputTex, ystart, yend))
-            return;
-
-        RenderScreenWholeSceneCaptureBackedHybridFallback(ystart, yend);
-        return;
-    }
-
-    const SourceACaptureReplacementChoice choice = ChooseSourceACaptureReplacement(ystart, yend);
-    auto makeResolutionInputs = [&](bool allowCurrentOverlay = true)
-    {
-        SourceACaptureResolutionInputs inputs = {};
-        inputs.HasRouteProduct = choice.RouteProductTex != 0;
-        inputs.RouteProductNeedsRePresentation =
-            choice.RouteProductTex != 0 &&
-            choice.RouteProductPresentationClass ==
-                WholeSceneCaptureProductPresentationClass::RawContent &&
-            choice.RouteProductCurrentPresentationHash != 0 &&
-            choice.CurrentPresentationHash != 0 &&
-            !DoesCaptureProductPresentationMatchRequest(
-                choice.RouteProductCurrentPresentationHash,
-                choice.CurrentPresentationHash);
-        inputs.CanUseCurrentOverlay = choice.CanUseCurrentOverlay;
-        inputs.HasFullProduct = choice.FullProductTex != 0;
-        inputs.PreferExactFullProduct = choice.PreferExactFullProduct;
-        inputs.PreferExactRouteProduct = choice.PreferExactRouteProduct;
-        inputs.AllowCurrentOverlay = allowCurrentOverlay;
-        return inputs;
-    };
-
-    SourceACaptureResolutionKind resolutionKind =
-        ChooseSourceACaptureResolutionKind(makeResolutionInputs());
-
-    if (resolutionKind == SourceACaptureResolutionKind::RouteProduct)
-    {
-        const GLCaptureProductResolution product =
-            RecordSourceARouteProductChoiceTrace(choice, ystart, yend);
-        if (!product.Accepted)
-        {
-            RenderScreenWholeSceneCaptureBackedHybridFallback(ystart, yend);
-            RecordSourceARejectedChoiceTrace(choice, ystart, yend);
-            return;
-        }
-
-        BlitWholeSceneSourceAProduct(product, ystart, yend);
-        return;
-    }
-
-    if (resolutionKind == SourceACaptureResolutionKind::BackgroundOverlay)
-    {
-        const GLCaptureProductResolution product =
-            RecordSourceABackgroundOverlayChoiceTrace(choice, ystart, yend);
-        if (!product.Accepted)
-        {
-            RenderScreenWholeSceneCaptureBackedHybridFallback(ystart, yend);
-            RecordSourceARejectedChoiceTrace(choice, ystart, yend);
-            return;
-        }
-
-        bool outputMasterBrightnessApplied = false;
-        if (choice.MainRenderer->RenderCurrentOverlayOverHighResBackgroundToTexture(OutputTex,
-                                                                                    product.Tex,
-                                                                                    ystart,
-                                                                                    yend,
-                                                                                    true,
-                                                                                    nullptr,
-                                                                                    &outputMasterBrightnessApplied))
-        {
-            if (outputMasterBrightnessApplied)
-            {
-                RecordOutputPresentationMasterBrightness(WholeSceneCaptureEffectOwner::SourceA,
-                                                         GPU.MasterBrightnessA);
-            }
-            WholeSceneTrace.SourceACaptureMode = SourceACaptureReplacementMode::CurrentOverlay;
-            return;
-        }
-        WholeSceneTrace.SourceACaptureMode = SourceACaptureReplacementMode::FullProductAfterOverlayFailed;
-        WholeSceneTrace.SourceAProductChoice =
-            SourceAProductChoiceReason::RejectedCurrentOverlayKeyMismatch;
-        resolutionKind = ChooseSourceACaptureResolutionKind(makeResolutionInputs(false));
-    }
-
-    if (resolutionKind == SourceACaptureResolutionKind::RejectedFallback)
-    {
-        RenderScreenWholeSceneCaptureBackedHybridFallback(ystart, yend);
-        RecordSourceARejectedChoiceTrace(choice, ystart, yend);
-        return;
-    }
-
-    if (resolutionKind != SourceACaptureResolutionKind::FullProduct)
-    {
-        RenderScreenWholeSceneCaptureBackedHybridFallback(ystart, yend);
-        RecordSourceARejectedChoiceTrace(choice, ystart, yend);
-        return;
-    }
-
-    const GLCaptureProductResolution product =
-        RecordSourceAFullProductChoiceTrace(choice, ystart, yend);
-    if (!product.Accepted)
-    {
-        RenderScreenWholeSceneCaptureBackedHybridFallback(ystart, yend);
-        RecordSourceARejectedChoiceTrace(choice, ystart, yend);
-        return;
-    }
-
-    BlitWholeSceneSourceAProduct(product, ystart, yend);
+    return CaptureBackedOverlayFallbackExecution{};
 }
 
-void GLRenderer2D::RenderScreenWholeSceneCaptureEpochOverlay(int ystart, int yend)
+GLRenderer2D::PreparedCaptureBackedExecution
+GLRenderer2D::PrepareCaptureBackedExecution(
+    const WholeSceneCaptureBackedPlan& plan,
+    const SourceACaptureReplacementExecutionInput& sourceAInput,
+    const CaptureEpochOverlayExecutionInput& captureEpochInput,
+    int ystart,
+    int yend)
 {
-    int routeSlot = -1;
-    if (!CanUseCaptureEpochBackgroundForLiveOverlay(ystart, yend, routeSlot))
+    switch (plan.Kind)
     {
-        RenderScreenWholeSceneOverlayOperator(ystart, yend);
-        return;
+    case WholeSceneCaptureBackedPlanKind::SourceACaptureReplacement:
+        return PrepareSourceAExecution(sourceAInput);
+    case WholeSceneCaptureBackedPlanKind::CaptureEpochOverlay:
+        return PrepareCaptureEpochExecution(captureEpochInput);
+    case WholeSceneCaptureBackedPlanKind::CaptureBackedHandoff:
+        return PrepareCaptureBackedHandoffExecution(ystart, yend);
+    case WholeSceneCaptureBackedPlanKind::None:
+        return std::monostate{};
     }
 
-    const auto& epoch = Parent.ActiveCaptureBackgroundEpoch[routeSlot];
-    const u32 currentPresentationHash = CapturePresentationHash();
-    const u32 captureRequest = GPU.CaptureCnt;
-    CaptureEpochOverlayCurrentInputs planInputs = {};
-    planInputs.CurrentSource3DSerial = Parent.Output3DSerial;
-    planInputs.CurrentSource3DSceneHash = Parent.Output3DSceneHash;
-    planInputs.CurrentPresentationHash = currentPresentationHash;
-    planInputs.EpochCaptureBank = epoch.CaptureBank;
-    planInputs.EpochSource3DSerial = epoch.Source3DSerial;
-    planInputs.EpochSource3DSceneHash = epoch.Source3DSceneHash;
-    planInputs.CaptureRequestConsumesCurrentComposite =
-        !GPU2D.Num &&
-        (captureRequest & (1u << 31)) &&
-        Parent.IsSourceAOnlyFullDisplayCapture(captureRequest);
-    planInputs.CaptureRequestBank = (captureRequest >> 16) & 0x3u;
-    const CaptureEpochOverlayCurrentPlan plan =
-        MakeCaptureEpochOverlayCurrentPlan(planInputs);
+    return std::monostate{};
+}
+
+GLRenderer2D::CaptureEpochOverlayExecutionInput
+GLRenderer2D::PrepareCaptureEpochOverlayExecutionInput(
+    const WholeSceneCaptureBackedPlan& capturePlan,
+    int ystart,
+    int yend)
+{
+    CaptureEpochOverlayExecutionInput input = {};
+    const auto& evidence = capturePlan.Evidence;
+    input.RouteSlot = evidence.ProductRef.RouteSlot;
+    input.EvidenceValid = evidence.Available && evidence.ContentProven &&
+                          evidence.PresentationProven &&
+                          input.RouteSlot >= 0 && input.RouteSlot < 2;
+    if (!input.EvidenceValid)
+        return input;
+
+    const auto& epoch = Parent.ActiveCaptureBackgroundEpoch[input.RouteSlot];
+    input.EpochIdentityMatches =
+        epoch.Valid &&
+        epoch.Serial == evidence.AuthorizationEpochSerial &&
+        epoch.CaptureBank == evidence.AuthorizationCaptureBank &&
+        epoch.ConsumerRouteSlot == static_cast<u32>(input.RouteSlot);
+    if (!input.EpochIdentityMatches)
+        return input;
+
+    input.CurrentPresentationHash =
+        evidence.ProductRef.CurrentPresentationHash;
+    input.CaptureRequest = evidence.CaptureCnt;
+    input.Plan.BackgroundSource = evidence.ProductRef.BackgroundSource;
+    input.Plan.BackgroundEpochSerial =
+        evidence.ProductRef.BackgroundEpochSerial;
+    input.Plan.Source3DSerial = evidence.Source3DSerial;
+    input.Plan.Source3DSceneHash = evidence.Source3DSceneHash;
+    input.Plan.PresentationHash =
+        evidence.ProductRef.CapturePresentationHash;
+    input.Plan.CanPublishRouteProduct = evidence.CanPublishRouteProduct;
+    input.Plan.CaptureBank = evidence.ProductRef.CaptureBank;
+    input.EpochSerial = epoch.Serial;
+    input.EpochCaptureBank = epoch.CaptureBank;
+    input.EpochSourcePresentationHash = epoch.SourcePresentationHash;
+    input.EpochSourceKind = static_cast<u32>(epoch.SourceKind);
+    input.EpochProductMask = epoch.ProductMask;
+
+    const u32 productCaptureBank = input.Plan.CanPublishRouteProduct
+        ? input.Plan.CaptureBank
+        : epoch.CaptureBank;
+    input.Request = ::melonDS::MakeLiveOverlayProducerCaptureRequest(
+        ystart,
+        yend,
+        input.RouteSlot,
+        productCaptureBank,
+        input.Plan.BackgroundEpochSerial,
+        input.Plan.PresentationHash,
+        input.CurrentPresentationHash);
+    input.Result = ::melonDS::MakeBackgroundCapturePolicyResult(
+        input.Plan.BackgroundSource,
+        WholeSceneCaptureRenderAction::CompositeCurrentOverlay,
+        WholeSceneCaptureAuthority::CaptureEpochBackgroundCurrentOverlay);
+    input.Product = AssessCaptureProduct(
+        input.Result,
+        input.Request,
+        BackgroundCaptureProductSources(Parent.OutputTex3D));
+    input.TraceIdentity =
+        {static_cast<int>(productCaptureBank),
+         input.Plan.BackgroundEpochSerial,
+         0,
+         0,
+         0,
+         input.Plan.PresentationHash,
+         input.CurrentPresentationHash};
+    return input;
+}
+
+void GLRenderer2D::ExecuteCaptureEpochCurrentOverlay(
+    const CaptureEpochOverlayExecutionInput& input,
+    int ystart,
+    int yend)
+{
+    const int routeSlot = input.RouteSlot;
+    const CaptureEpochOverlayCurrentPlan& plan = input.Plan;
+    const u32 currentPresentationHash = input.CurrentPresentationHash;
+    const u32 captureRequest = input.CaptureRequest;
 
     const SourceABackgroundSource backgroundSource = plan.BackgroundSource;
-    const GLuint backgroundTex = Parent.OutputTex3D;
     const u64 routeProductBackgroundSerial = plan.BackgroundEpochSerial;
     const u64 routeProductSource3DSerial = plan.Source3DSerial;
     const u32 routeProductSource3DSceneHash = plan.Source3DSceneHash;
     const u32 routeProductPresentationHash = plan.PresentationHash;
-    const u16 backgroundStoredMasterBrightness = 0;
-    const bool backgroundHasStoredEffectState = false;
-    const auto& previousRoutePresentation = CaptureBackedRoute[routeSlot].Presentation;
-    const bool canPromoteLiveRouteProduct =
-        plan.CanPublishRouteProduct &&
-        routeProductSource3DSceneHash != 0 &&
-         previousRoutePresentation.Valid &&
-         previousRoutePresentation.Source3DSceneHash == routeProductSource3DSceneHash &&
-         previousRoutePresentation.SourcePresentationHash == routeProductPresentationHash &&
-         previousRoutePresentation.CurrentOverlayPresentationHash == currentPresentationHash;
-
     if (plan.CanPublishRouteProduct)
     {
         UpdateCaptureBackedRoutePresentation(routeSlot,
@@ -12458,39 +21486,80 @@ void GLRenderer2D::RenderScreenWholeSceneCaptureEpochOverlay(int ystart, int yen
                                              currentPresentationHash);
     }
 
-    const GLCaptureProductResolution product =
-        RecordCaptureEpochOverlayTrace(routeSlot,
-                                       plan.CanPublishRouteProduct
-                                           ? plan.CaptureBank
-                                           : epoch.CaptureBank,
-                                       backgroundSource,
-                                       backgroundTex,
-                                       epoch.Serial,
-                                       routeProductBackgroundSerial,
-                                       routeProductPresentationHash,
-                                       currentPresentationHash,
-                                       backgroundStoredMasterBrightness,
-                                       backgroundHasStoredEffectState,
-                                       ystart,
-                                       yend);
-
-    if (!product.Accepted)
-    {
-        RenderScreenWholeSceneOverlayOperator(ystart, yend);
-        return;
-    }
+    RecordCaptureEpochOverlayTrace(input, ystart, yend);
 
     GLuint rawRouteProductTex = OutputTex;
 
     bool outputMasterBrightnessApplied = false;
     if (RenderCurrentOverlayOverHighResBackgroundToTexture(OutputTex,
-                                                           product.Tex,
+                                                           input.Product.Tex,
                                                            ystart,
                                                            yend,
                                                            false,
                                                            &rawRouteProductTex,
                                                            &outputMasterBrightnessApplied))
     {
+        WholeSceneCaptureRepresentationEvidence observedEvidence = {};
+        observedEvidence.Available = true;
+        observedEvidence.ContentProven =
+            routeProductSource3DSerial != 0 &&
+            routeProductSource3DSceneHash != 0;
+        // This observation verifies the content and phase selected before
+        // execution; it cannot create either proof after the fact.
+        observedEvidence.PresentationProven = currentPresentationHash != 0;
+        observedEvidence.ProductRef.Kind = input.Product.ProductKind;
+        observedEvidence.ProductRef.BackgroundSource =
+            input.Product.BackgroundSource;
+        observedEvidence.ProductRef.RouteSlot = routeSlot;
+        observedEvidence.ProductRef.CaptureBank = plan.CanPublishRouteProduct
+            ? plan.CaptureBank
+            : input.EpochCaptureBank;
+        observedEvidence.ProductRef.CaptureEventSerial = 0;
+        observedEvidence.ProductRef.BackgroundEpochSerial =
+            routeProductBackgroundSerial;
+        observedEvidence.ProductRef.CapturePresentationHash =
+            routeProductPresentationHash;
+        observedEvidence.ProductRef.CurrentPresentationHash =
+            currentPresentationHash;
+        observedEvidence.ProofKind = CaptureProofKindForBackgroundSource(
+            backgroundSource);
+        observedEvidence.AuthorizationProofKind =
+            WholeSceneCaptureProofKind::ActiveBackgroundEpoch;
+        observedEvidence.AuthorizationEpochSerial = input.EpochSerial;
+        observedEvidence.AuthorizationCaptureBank = input.EpochCaptureBank;
+        observedEvidence.AuthorizationPresentationHash =
+            input.EpochSourcePresentationHash;
+        observedEvidence.Source3DSerial = routeProductSource3DSerial;
+        observedEvidence.Source3DSceneHash = routeProductSource3DSceneHash;
+        observedEvidence.SourceKind = input.EpochSourceKind;
+        observedEvidence.ProductMask = input.EpochProductMask;
+        observedEvidence.OutputEffectOwner =
+            WholeSceneCaptureEffectOwner::CurrentEngineColorEffect;
+        observedEvidence.OutputEffectState =
+            static_cast<u32>(BlendCnt) |
+            (static_cast<u32>(EVA) << 16) |
+            (static_cast<u32>(EVB) << 21) |
+            (static_cast<u32>(EVY) << 26);
+        observedEvidence.OutputPreMaster = !outputMasterBrightnessApplied;
+        const u32 captureMode = (captureRequest >> 29) & 0x3u;
+        const u32 captureEVB =
+            std::min<u32>((captureRequest >> 8) & 0x1Fu, 16u);
+        observedEvidence.CaptureUsesSourceB =
+            captureMode == 1 || (captureMode == 2 && captureEVB > 0);
+        observedEvidence.CaptureCnt = captureRequest;
+        observedEvidence.CaptureConsumesSelectedPresentation =
+            GPU.CaptureEnable &&
+            (captureRequest & (1u << 31)) &&
+            ((captureRequest >> 24) & 0x1u) == 0;
+        observedEvidence.CaptureInputProven =
+            observedEvidence.CaptureConsumesSelectedPresentation &&
+            !observedEvidence.CaptureUsesSourceB;
+        observedEvidence.CanPublishRouteProduct = plan.CanPublishRouteProduct;
+        ObserveWholeSceneCaptureRepresentationEvidence(
+            WholeScenePlan,
+            WholeSceneExecutionTrace,
+            observedEvidence);
+
         if (outputMasterBrightnessApplied)
         {
             const u16 masterBrightness = GPU2D.Num ? GPU.MasterBrightnessB : GPU.MasterBrightnessA;
@@ -12510,52 +21579,208 @@ void GLRenderer2D::RenderScreenWholeSceneCaptureEpochOverlay(int ystart, int yen
                                                          ystart,
                                                          yend);
         }
-        if (!canPromoteLiveRouteProduct)
-        {
-            WholeSceneTrace.SourceAProductChoice =
-                SourceAProductChoiceReason::DeferredLiveScenePromotion;
-        }
-
         return;
     }
 
-    WholeSceneTrace.SourceAProductChoice = SourceAProductChoiceReason::FallbackNormalHybrid;
-    RenderScreenWholeSceneOverlayOperator(ystart, yend);
+    ExecutePreparedCaptureBackedExecution(
+        CaptureBackedOverlayFallbackExecution{}, ystart, yend);
 }
 
-bool GLRenderer2D::TryRenderHandoffBackgroundOverlayProduct(const WholeSceneCaptureRequest& request,
-                                                            int handoffSlot,
-                                                            const HandoffBackgroundChoice& background,
-                                                            int ystart,
-                                                            int yend)
+void GLRenderer2D::ExecutePreparedCaptureBackedExecution(
+    const PreparedCaptureBackedExecution& execution,
+    int ystart,
+    int yend)
 {
-    if (background.Authority != WholeSceneCaptureAuthority::CaptureEventBackground ||
-        !background.Tex)
-    {
-        return false;
-    }
+    std::visit(
+        [&](const auto& operation)
+        {
+            using Operation = std::decay_t<decltype(operation)>;
+            if constexpr (std::is_same_v<Operation, std::monostate>)
+            {
+                return;
+            }
+            else if constexpr (std::is_same_v<
+                                   Operation,
+                                   SourceAMixedCaptureBackedOBJOverlayExecution>)
+            {
+                if (!RenderCurrentBGOverlayOverHighResCaptureOBJToTexture(
+                        OutputTex, ystart, yend))
+                {
+                    ExecutePreparedCaptureBackedExecution(
+                        CaptureBackedOverlayFallbackExecution{true},
+                        ystart,
+                        yend);
+                }
+            }
+            else if constexpr (std::is_same_v<
+                                   Operation,
+                                   SourceAMixedCaptureBackedBGExecution>)
+            {
+                if (!RenderCurrentLayersOverHighResCaptureBGToTexture(
+                        OutputTex, ystart, yend))
+                {
+                    ExecutePreparedCaptureBackedExecution(
+                        CaptureBackedOverlayFallbackExecution{true},
+                        ystart,
+                        yend);
+                }
+            }
+            else if constexpr (std::is_same_v<Operation,
+                                              SourceADirectProductExecution>)
+            {
+                const auto& input = *operation.Input;
+                const auto& assessment = *operation.Assessment;
+                RecordSourceACaptureProductAssessmentTrace(input.Choice,
+                                                           assessment,
+                                                           ystart,
+                                                           yend);
+                BlitWholeSceneSourceAProduct(assessment.Product,
+                                             ystart,
+                                             yend);
+            }
+            else if constexpr (std::is_same_v<
+                                   Operation,
+                                   SourceABackgroundOverlayExecution>)
+            {
+                const auto& input = *operation.Input;
+                RecordSourceACaptureProductAssessmentTrace(input.Choice,
+                                                           input.Primary,
+                                                           ystart,
+                                                           yend);
+                if (input.Choice.MainRenderer &&
+                    input.Choice.MainRenderer->
+                        RenderCurrentOverlayOverHighResBackgroundToTexture(
+                            OutputTex,
+                            input.Primary.Product.Tex,
+                            ystart,
+                            yend,
+                            false,
+                            nullptr,
+                            nullptr))
+                {
+                    return;
+                }
 
-    const u32 currentPresentationHash = CapturePresentationHash();
-    const GLCaptureProductResolution product =
-        RecordHandoffBackgroundOverlayTrace(request,
-                                            background.Source,
-                                            background.Authority,
-                                            background.Tex,
-                                            background.BackgroundEpochSerial,
-                                            background.PresentationHash,
-                                            currentPresentationHash,
-                                            background.StoredMasterBrightness,
-                                            background.HasStoredEffectState,
-                                            ystart,
-                                            yend);
-    if (!product.Accepted)
-        return false;
+                const bool directFallback =
+                    input.Selection.AfterOverlayFailure ==
+                        SourceACaptureResolutionKind::RouteProduct ||
+                    input.Selection.AfterOverlayFailure ==
+                        SourceACaptureResolutionKind::FullProduct;
+                const PreparedCaptureBackedExecution fallback =
+                    directFallback &&
+                            input.AfterOverlayFailure.Product.Accepted
+                        ? PreparedCaptureBackedExecution{
+                              SourceADirectProductExecution{
+                                  &input, &input.AfterOverlayFailure}}
+                        : PreparedCaptureBackedExecution{
+                              SourceAUnavailableExecution{&input}};
+                ExecutePreparedCaptureBackedExecution(fallback,
+                                                      ystart,
+                                                      yend);
+            }
+            else if constexpr (std::is_same_v<Operation,
+                                              SourceAUnavailableExecution>)
+            {
+                ExecutePreparedCaptureBackedExecution(
+                    CaptureBackedOverlayFallbackExecution{true},
+                    ystart,
+                    yend);
+                RecordSourceARejectedChoiceTrace(operation.Input->Choice,
+                                                 ystart,
+                                                 yend);
+            }
+            else if constexpr (std::is_same_v<
+                                   Operation,
+                                   CaptureEpochCurrentOverlayExecution>)
+            {
+                ExecuteCaptureEpochCurrentOverlay(*operation.Input,
+                                                  ystart,
+                                                  yend);
+            }
+            else if constexpr (std::is_same_v<
+                                   Operation,
+                                   CaptureBackedOverlayFallbackExecution>)
+            {
+                RenderScreenWholeSceneOverlayOperator(ystart, yend);
+                if (operation.FinalizeFullFrame)
+                {
+                    RenderScreenWholeSceneFinalizeOverlayOperatorFullFrame(
+                        true, ystart, yend);
+                }
+            }
+            else if constexpr (std::is_same_v<
+                                   Operation,
+                                   CaptureBackedCurrentExecution>)
+            {
+                RenderScreenCurrent(ystart,
+                                    yend,
+                                    true,
+                                    operation.Reason);
+            }
+            else if constexpr (std::is_same_v<
+                                   Operation,
+                                   HandoffDirectProductExecution>)
+            {
+                RecordHandoffCaptureProductAssessmentTrace(
+                    operation.Assessment, ystart, yend);
+                CaptureBackedHandoff.ReuseDecision = operation.ReuseReason;
+                UpdateCaptureBackedRoutePresentation(
+                    operation.RouteSlot,
+                    operation.PresentationMode,
+                    operation.BackgroundEpochSerial,
+                    operation.CaptureBank,
+                    operation.Source3DSceneHash,
+                    operation.CapturePresentationHash,
+                    operation.CurrentPresentationHash);
+                BlitWholeSceneHandoffProduct(
+                    operation.Assessment.Product, ystart, yend);
+            }
+            else if constexpr (std::is_same_v<
+                                   Operation,
+                                   HandoffBackgroundOverlayExecution>)
+            {
+                if (!ExecuteHandoffBackgroundOverlay(operation,
+                                                     ystart,
+                                                     yend))
+                {
+                    ExecutePreparedCaptureBackedExecution(
+                        HandoffHybridCompositeExecution{
+                            operation.Request, operation.Background},
+                        ystart,
+                        yend);
+                }
+            }
+            else if constexpr (std::is_same_v<
+                                   Operation,
+                                   HandoffHybridCompositeExecution>)
+            {
+                RenderHandoffHybridComposite(operation.Request,
+                                             operation.Background,
+                                             ystart,
+                                             yend);
+            }
+        },
+        execution);
+}
+
+bool GLRenderer2D::ExecuteHandoffBackgroundOverlay(
+    const HandoffBackgroundOverlayExecution& execution,
+    int ystart,
+    int yend)
+{
+    const HandoffBackgroundChoice& background = execution.Background;
+    const HandoffCaptureProductAssessment& assessment =
+        execution.Assessment;
+    const int handoffSlot = execution.RouteSlot;
+    const u32 currentPresentationHash =
+        assessment.Resolution.Request.CurrentPresentationHash;
+    RecordHandoffCaptureProductAssessmentTrace(assessment, ystart, yend);
 
     GLuint rawRouteProductTex = OutputTex;
 
     bool outputMasterBrightnessApplied = false;
     if (RenderCurrentOverlayOverHighResBackgroundToTexture(OutputTex,
-                                                           product.Tex,
+                                                           assessment.Product.Tex,
                                                            ystart,
                                                            yend,
                                                            false,
@@ -12588,14 +21813,15 @@ bool GLRenderer2D::TryRenderHandoffBackgroundOverlayProduct(const WholeSceneCapt
         return true;
     }
 
-    WholeSceneTrace.SourceAProductChoice = SourceAProductChoiceReason::FallbackNormalHybrid;
     return false;
 }
 
-bool GLRenderer2D::TryPrepareStableHandoffLiveBackground(int handoffSlot,
-                                                         HandoffBackgroundChoice& background,
-                                                         int ystart,
-                                                         int yend)
+GLRenderer2D::PreparedCaptureBackedExecution
+GLRenderer2D::PrepareStableHandoffLiveExecution(
+    const WholeSceneCaptureRequest& request,
+    int handoffSlot,
+    int ystart,
+    int yend)
 {
     auto phaseStart = std::chrono::steady_clock::now();
     const u32 visibleBGLayers = CaptureBackedHandoff.CurrentKey.LayerEnable & 0x0Fu;
@@ -12632,8 +21858,7 @@ bool GLRenderer2D::TryPrepareStableHandoffLiveBackground(int handoffSlot,
     if (!updatedSnapshot)
     {
         CaptureBackedHandoff.ReuseDecision = CaptureBackedHandoffReuseReason::RejectedNoSnapshot;
-        RenderScreenWholeSceneCaptureBackedHybridFallback(ystart, yend);
-        return false;
+        return CaptureBackedOverlayFallbackExecution{true};
     }
 
     CaptureBackedHandoff.BackgroundUpdated = true;
@@ -12645,14 +21870,16 @@ bool GLRenderer2D::TryPrepareStableHandoffLiveBackground(int handoffSlot,
     // alternation.
     if (!CaptureBackedRoute[handoffSlot].HasCapturedPhase)
     {
-        RenderScreenCurrent(ystart, yend, true,
-                            WholeSceneCurrentPathReason::CaptureBackedLiveBeforeCapturedPhase);
-        return false;
+        return CaptureBackedCurrentExecution{
+            WholeSceneCurrentPathReason::
+                CaptureBackedLiveBeforeCapturedPhase};
     }
 
-    background =
+    const HandoffBackgroundChoice background =
         MakeHandoffSnapshotBackgroundChoice(CaptureBackedRouteGL[handoffSlot].Handoff3DTex);
-    return true;
+    return PrepareHandoffBackgroundExecution(request,
+                                             handoffSlot,
+                                             background);
 }
 
 void GLRenderer2D::RenderHandoffHybridComposite(const WholeSceneCaptureRequest& request,
@@ -12688,7 +21915,7 @@ void GLRenderer2D::RenderHandoffHybridComposite(const WholeSceneCaptureRequest& 
                              ystart,
                              yend);
 
-    UpdateCompositorConfig();
+    UpdateCompositorConfig(ystart, yend);
     const auto savedCompositorConfig = CompositorConfig;
 
     // This path handles games that alternate between live BG0/3D and a
@@ -12827,13 +22054,73 @@ void GLRenderer2D::RenderScreenWholeSceneFinalUpscale(int ystart, int yend, bool
     RenderNativeExactFinal(ystart, yend, WholeSceneScaleDebugTint, direct3DTex, direct3DCoverageTex);
     AddWholeSceneUpdateTiming(WholeSceneUpdateTiming.NativeExactFinal, ElapsedUS(phaseStart));
     WholeSceneTrace.NativeExactFinalValid = true;
-    RecordWholeSceneNativeProductChunk(ystart, yend);
+    RecordWholeSceneNativeProductChunk(
+        ystart, yend, WholeScenePlan.SelectedRepresentationProduct);
+}
+
+void GLRenderer2D::RenderScreenWholeSceneNativeExactFloor(int ystart, int yend)
+{
+    ResetWholeSceneRenderTrace();
+
+    auto phaseStart = std::chrono::steady_clock::now();
+    RenderNativePrepass(ystart, yend);
+    AddWholeSceneUpdateTiming(WholeSceneUpdateTiming.NativePrepass,
+                              ElapsedUS(phaseStart));
+
+    GLuint direct3DTex = 0;
+    GLuint direct3DCoverageTex = 0;
+    bool highRes3D = false;
+    PrepareFinalUpscaleNative3DInput(direct3DTex,
+                                     direct3DCoverageTex,
+                                     highRes3D);
+    RecordWholeSceneRenderTrace(WholeSceneRenderPath::NativeExactFloor,
+                                ystart,
+                                yend,
+                                highRes3D,
+                                false,
+                                highRes3D,
+                                direct3DTex);
+
+    phaseStart = std::chrono::steady_clock::now();
+    RenderNativeExactFinal(ystart,
+                           yend,
+                           WholeSceneScaleDebugTint,
+                           direct3DTex,
+                           direct3DCoverageTex);
+    AddWholeSceneUpdateTiming(WholeSceneUpdateTiming.NativeExactFinal,
+                              ElapsedUS(phaseStart));
+    WholeSceneTrace.NativeExactFinalValid = true;
+
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, NativeExactFinalFB);
+    glFramebufferTexture(GL_READ_FRAMEBUFFER,
+                         GL_COLOR_ATTACHMENT0,
+                         NativeExactFinalTex,
+                         0);
+    glReadBuffer(GL_COLOR_ATTACHMENT0);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, OutputFB);
+    glDrawBuffer(GL_COLOR_ATTACHMENT0);
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_STENCIL_TEST);
+    glDisable(GL_BLEND);
+    glDisable(GL_SCISSOR_TEST);
+    glColorMaski(0, GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glDepthMask(GL_FALSE);
+    glBlitFramebuffer(0,
+                      ystart,
+                      256,
+                      yend,
+                      0,
+                      ystart * ScaleFactor,
+                      ScreenW,
+                      yend * ScaleFactor,
+                      GL_COLOR_BUFFER_BIT,
+                      GL_NEAREST);
 }
 
 void GLRenderer2D::RenderScreenWholeSceneOverlayOperator(int ystart, int yend)
 {
     ResetWholeSceneRenderTrace();
-    const HybridSourceDecision sourceDecision = ChooseHybridSourceDecision();
+    const WholeSceneOutputSelectorPlan& selector = WholeScenePlan.Selector;
 
     auto phaseStart = std::chrono::steady_clock::now();
     RenderNativePrepass(ystart, yend);
@@ -12861,9 +22148,9 @@ void GLRenderer2D::RenderScreenWholeSceneOverlayOperator(int ystart, int yend)
     else
         WholeSceneTrace.Native3DSource = WholeSceneNative3DSource::NativeRendered;
 
-    if (sourceDecision.EffectiveConservativeHybrid &&
+    if (selector.EffectiveConservativeHybrid &&
         WholeSceneScaleCaptureBacked &&
-        sourceDecision.ActiveDirect3D)
+        selector.ActiveDirect3D)
     {
         CaptureBackedHandoffRouteKey handoffKey = BuildCaptureBackedHandoffRouteKey(ystart, yend);
         const int handoffSlot = CaptureBackedHandoffRouteSlot(handoffKey);
@@ -12885,10 +22172,10 @@ void GLRenderer2D::RenderScreenWholeSceneOverlayOperator(int ystart, int yend)
         }
     }
 
-    RecordWholeSceneRenderTrace(sourceDecision.Path, ystart, yend,
+    RecordWholeSceneRenderTrace(WholeScenePlan.SelectedPath, ystart, yend,
                                 highRes3D, false, highRes3D, nativeDirect3DTex);
 
-    if (sourceDecision.RenderNativeFallback)
+    if (selector.RenderNativeFallback)
     {
         phaseStart = std::chrono::steady_clock::now();
         RenderNativeExactFinal(ystart, yend);
@@ -12896,11 +22183,12 @@ void GLRenderer2D::RenderScreenWholeSceneOverlayOperator(int ystart, int yend)
         WholeSceneTrace.NativeExactFinalValid = true;
     }
 
-    RecordWholeSceneNativeProductChunk(ystart, yend);
+    RecordWholeSceneNativeProductChunk(
+        ystart, yend, WholeScenePlan.SelectedRepresentationProduct);
 
-    if (sourceDecision.EffectiveConservativeHybrid)
+    if (selector.EffectiveConservativeHybrid)
     {
-        if (sourceDecision.RenderForeground2DBase)
+        if (selector.RenderForeground2DBase)
         {
             auto phaseStart = std::chrono::steady_clock::now();
             glBindFramebuffer(GL_FRAMEBUFFER, ArtCNNOutputFB);
@@ -12916,7 +22204,7 @@ void GLRenderer2D::RenderScreenWholeSceneOverlayOperator(int ystart, int yend)
             AddWholeSceneUpdateTiming(WholeSceneUpdateTiming.Hybrid2DBaseCandidate, ElapsedUS(phaseStart));
         }
 
-        if (sourceDecision.RenderForegroundCandidate)
+        if (selector.RenderForegroundCandidate)
         {
             auto phaseStart = std::chrono::steady_clock::now();
             glBindFramebuffer(GL_FRAMEBUFFER, ArtCNNOutputFB);
@@ -12935,7 +22223,8 @@ void GLRenderer2D::RenderScreenWholeSceneOverlayOperator(int ystart, int yend)
 
 }
 
-void GLRenderer2D::RenderScreenWholeSceneCaptureBackedHandoff(int ystart, int yend)
+GLRenderer2D::PreparedCaptureBackedExecution
+GLRenderer2D::PrepareCaptureBackedHandoffExecution(int ystart, int yend)
 {
     ResetWholeSceneRenderTrace();
 
@@ -12947,45 +22236,26 @@ void GLRenderer2D::RenderScreenWholeSceneCaptureBackedHandoff(int ystart, int ye
     const WholeSceneCaptureRequest handoffRequestBase =
         ::melonDS::MakeHandoffConsumerCaptureRequest(ystart, yend, handoffSlot);
 
-    HandoffBackgroundChoice handoffBackground = {};
     if (IsStableCaptureBackedHandoffLiveUpdate(CaptureBackedHandoff.CurrentKey))
     {
-        if (!TryPrepareStableHandoffLiveBackground(handoffSlot,
-                                                   handoffBackground,
-                                                   ystart,
-                                                   yend))
-        {
-            return;
-        }
+        return PrepareStableHandoffLiveExecution(handoffRequestBase,
+                                                handoffSlot,
+                                                ystart,
+                                                yend);
     }
-    else if (CaptureBackedHandoff.CurrentKey.Phase == CaptureBackedHandoffPhase::Live3D)
+    if (CaptureBackedHandoff.CurrentKey.Phase ==
+        CaptureBackedHandoffPhase::Live3D)
     {
         // A live 3D phase with a bitmap upload is useful for the current frame,
         // but not safe as a reusable replacement for a captured BG phase.
         CaptureBackedHandoff.ReuseDecision = CaptureBackedHandoffReuseReason::RejectedUnstableLivePhase;
-        RenderScreenWholeSceneCaptureBackedHybridFallback(ystart, yend);
-        return;
-    }
-    else
-    {
-        const HandoffBackgroundResolveResult resolution =
-            ResolveCapturedHandoffBackgroundChoice(handoffRequestBase, handoffSlot, ystart, yend);
-        if (resolution.Finished)
-            return;
-
-        handoffBackground = resolution.Background;
+        return CaptureBackedOverlayFallbackExecution{true};
     }
 
-    if (TryRenderHandoffBackgroundOverlayProduct(handoffRequestBase,
-                                                 handoffSlot,
-                                                 handoffBackground,
-                                                 ystart,
-                                                 yend))
-    {
-        return;
-    }
-
-    RenderHandoffHybridComposite(handoffRequestBase, handoffBackground, ystart, yend);
+    return PrepareCapturedHandoffExecution(handoffRequestBase,
+                                           handoffSlot,
+                                           ystart,
+                                           yend);
 }
 
 void GLRenderer2D::RenderScreenWholeSceneFinalizeFinalUpscaleFullFrame()
@@ -13059,6 +22329,7 @@ void GLRenderer2D::RenderScreenWholeSceneFinalizeOverlayOperatorFullFrame(bool c
         RenderOverlayDebugTexture(NativeOverlayConfidenceTex, 256, 192,
                                   NativeExactFinalTex, NativeOutputTex,
                                   nativeDirect3DTex, NativeOverlayTrueFinalTex, 3);
+        WholeSceneDebugProducts.OverlayNative = true;
     }
 
     const bool useHybridLegacyCandidate =
@@ -13100,6 +22371,7 @@ void GLRenderer2D::RenderScreenWholeSceneFinalizeOverlayOperatorFullFrame(bool c
         RenderOverlayDebugTexture(UpscaledOverlayOwnershipTex, ScreenW, ScreenH,
                                   UpscaledExactFinalTex, UpscaledCoverageTex,
                                   highResDirect3DTex, NativeOverlayTrueFinalTex, 4);
+        WholeSceneDebugProducts.OverlayScaled = true;
     }
 
     GLuint nativeRole3DTex = nativeDirect3DTex;
@@ -13192,6 +22464,10 @@ void GLRenderer2D::RenderScreenWholeSceneFinalizeOverlayOperatorFullFrame(bool c
                                0,
                                192);
         AddWholeSceneUpdateTiming(WholeSceneUpdateTiming.FinalizerComposite, ElapsedUS(phaseStart));
+        WholeSceneDebugProducts.HybridSelector = true;
+        WholeSceneDebugProducts.HybridCoverageMiss = true;
+        WholeSceneDebugProducts.HybridForegroundAlpha = true;
+        WholeSceneDebugProducts.HybridFinalSource = true;
     }
 
     WholeSceneTrace.YStart = ystart;
@@ -13214,14 +22490,40 @@ void GLRenderer2D::RenderScreenWholeSceneFinalizeFullFrame()
         IsWholeSceneCaptureBackedHandoffGuardActive() &&
         WholeSceneTrace.Path == WholeSceneRenderPath::ConservativeHybridUpscale &&
         WholeSceneNativeProductsFrameComplete &&
+        WholeSceneNativeProductRowIdentityValid &&
+        WholeSceneNativeProductIdentityRows == 192 &&
+        WholeSceneNativeProductFrameIdentity != 0 &&
         !WholeSceneFullFrameFinalizerUnsafeFrame;
 
     if (!CanFinalizeWholeSceneNativeProducts() && !allowCaptureBackedCadenceFinalize)
     {
-        const WholeSceneCaptureBackedPlan capturePlan =
+        WholeSceneCaptureBackedPlan capturePlan =
             ChooseWholeSceneCaptureBackedPlan(LastLine, 192);
         if (capturePlan.Stage == WholeSceneCaptureBackedPlanStage::AfterGeneralFallbacks)
-            RenderScreenWholeSceneCaptureBackedPlan(capturePlan, LastLine, 192);
+        {
+            const SourceACaptureReplacementExecutionInput sourceAInput =
+                capturePlan.Kind ==
+                        WholeSceneCaptureBackedPlanKind::SourceACaptureReplacement
+                    ? PrepareSourceACaptureReplacementExecutionInput(LastLine,
+                                                                     192)
+                    : SourceACaptureReplacementExecutionInput{};
+            const CaptureEpochOverlayExecutionInput captureEpochInput =
+                capturePlan.Kind ==
+                        WholeSceneCaptureBackedPlanKind::CaptureEpochOverlay
+                    ? PrepareCaptureEpochOverlayExecutionInput(capturePlan,
+                                                               LastLine,
+                                                               192)
+                    : CaptureEpochOverlayExecutionInput{};
+            const PreparedCaptureBackedExecution execution =
+                PrepareCaptureBackedExecution(capturePlan,
+                                              sourceAInput,
+                                              captureEpochInput,
+                                              LastLine,
+                                              192);
+            ExecutePreparedCaptureBackedExecution(execution,
+                                                  LastLine,
+                                                  192);
+        }
         else
         {
             const int currentStart = ChooseIncompleteFinalizerCurrentStart({
@@ -13249,10 +22551,91 @@ void GLRenderer2D::RenderScreenWholeSceneFinalizeFullFrame()
         RenderScreenWholeSceneFinalizeOverlayOperatorFullFrame(false);
         break;
     case WholeSceneRenderPath::ConservativeHybridUpscale:
-        RenderScreenWholeSceneFinalizeOverlayOperatorFullFrame(true);
+        // The selected path records the requested whole-scene mode, while
+        // the selector records whether hybrid operands are actually valid
+        // for this presentation.  Active 3D can deliberately suppress the
+        // hybrid branch; in that case its candidate textures were not
+        // rendered and must not be sampled by the full-frame finalizer.
+        RenderScreenWholeSceneFinalizeOverlayOperatorFullFrame(
+            WholeScenePlan.Selector.EffectiveConservativeHybrid);
         break;
     default:
         break;
+    }
+
+    const DeferredScanlineStrictAffinePlan deferredStrictPlan =
+        BuildDeferredScanlineStrictAffinePlan();
+    WholeSceneTrace.DeferredScanlineStrictAffineEvaluated = true;
+    WholeSceneTrace.DeferredScanlineStrictAffineEligible =
+        deferredStrictPlan.Assessment.Eligible;
+    WholeSceneTrace.DeferredScanlineStrictAffineReason =
+        deferredStrictPlan.Assessment.BlockReason;
+    bool historicalSourcesValid =
+        DeferredStrictAffineHistoricalSourceEpochCount != 0 &&
+        !DeferredStrictAffineHistoricalSourceEpochOverflow;
+    u32 historicalNativeBGMask = 0;
+    u32 historicalEnhancedBGMask = 0;
+    for (u32 epoch = 0;
+         epoch < DeferredStrictAffineHistoricalSourceEpochCount;
+         epoch++)
+    {
+        historicalSourcesValid &=
+            DeferredStrictAffineHistoricalSourceEpochs[epoch].Valid;
+        historicalNativeBGMask |=
+            DeferredStrictAffineHistoricalSourceEpochs[epoch].NativeBGMask;
+        historicalEnhancedBGMask |=
+            DeferredStrictAffineHistoricalSourceEpochs[epoch].EnhancedBGMask;
+    }
+    WholeSceneTrace.DeferredStrictAffineHistoricalSourceAttempted =
+        DeferredStrictAffineHistoricalSourceEpochCount != 0 ||
+        DeferredStrictAffineHistoricalSourceEpochOverflow;
+    WholeSceneTrace.DeferredStrictAffineHistoricalSourceValid =
+        historicalSourcesValid;
+    WholeSceneTrace.DeferredStrictAffineHistoricalSourceUsed =
+        deferredStrictPlan.Assessment.HistoricalSourceUsed;
+    WholeSceneTrace.DeferredStrictAffineHistoricalSourceYEnd =
+        DeferredStrictAffineHistoricalSourceEpochCount != 0
+            ? DeferredStrictAffineHistoricalSourceEpochs[
+                  DeferredStrictAffineHistoricalSourceEpochCount - 1].YEnd
+            : 0;
+    WholeSceneTrace.DeferredStrictAffineHistoricalNativeBGMask =
+        historicalNativeBGMask;
+    WholeSceneTrace.DeferredStrictAffineHistoricalEnhancedBGMask =
+        historicalEnhancedBGMask;
+    WholeSceneTrace.DeferredStrictAffineRowSourceEpochCount =
+        deferredStrictPlan.SourceEpochCount;
+    WholeSceneTrace.DeferredStrictAffineFirstSourceTransitionY =
+        deferredStrictPlan.FirstSourceTransitionY;
+    WholeSceneTrace.DeferredStrictAffineFirstRowSourceGeneration =
+        deferredStrictPlan.FirstRowSourceGeneration;
+    WholeSceneTrace.DeferredStrictAffineLiveSourceGeneration =
+        deferredStrictPlan.LiveSourceGeneration;
+    if (deferredStrictPlan.Assessment.Eligible)
+    {
+        const WholeSceneOutputPlan outputPlan =
+            BuildDeferredScanlineStrictAffineOutputPlan(deferredStrictPlan);
+        if (outputPlan.Valid &&
+            outputPlan.SelectedPath ==
+                WholeSceneRenderPath::StrictAffineHighRes &&
+            outputPlan.ExecutionKind ==
+                WholeSceneOutputExecutionKind::SelectedRepresentation)
+        {
+            const WholeSceneOutputPlan previousPlan = WholeScenePlan;
+            WholeScenePlan = outputPlan;
+            if (RenderDeferredScanlineStrictAffine(deferredStrictPlan))
+            {
+                ObserveWholeSceneOutputPlanExecution(
+                    WholeScenePlan,
+                    WholeSceneExecutionTrace,
+                    WholeSceneTrace.Path,
+                    WholeSceneTrace.CurrentReason,
+                    WholeSceneOutputExecutionKind::SelectedRepresentation);
+            }
+            else
+            {
+                WholeScenePlan = previousPlan;
+            }
+        }
     }
 
     const auto end = std::chrono::steady_clock::now();
@@ -13261,94 +22644,970 @@ void GLRenderer2D::RenderScreenWholeSceneFinalizeFullFrame()
     UpdateWholeSceneTraceFrameSplitState();
 }
 
+WholeSceneOutputPlan GLRenderer2D::BuildDeferredScanlineStrictAffineOutputPlan(
+    const DeferredScanlineStrictAffinePlan& deferredPlan) const
+{
+    WholeSceneOutputPlanInputs inputs = {};
+    inputs.YStart = 0;
+    inputs.YEnd = 192;
+    inputs.SelectPathFromFacts = true;
+    inputs.PathDecisionInputs.CanUseScalePath = true;
+    inputs.HasScaleDecision = true;
+    inputs.SelectScaleFromFacts = true;
+    inputs.ScaleCandidateInputs.StrictAffineHighResAvailable = true;
+    inputs.ScaleCandidateInputs.StrictAffineBlockReason =
+        StrictAffineHighResBlockReason::None;
+    inputs.ScaleCandidateInputs.ConservativeHybridMode = true;
+    inputs.ScaleCandidateInputs.FinalNativeAvailable = true;
+    inputs.ConsideredRepresentationMask =
+        WholeSceneOutputRepresentationBit(
+            WholeSceneOutputRepresentationKind::StrictAffineHighRes) |
+        WholeSceneOutputRepresentationBit(
+            WholeSceneOutputRepresentationKind::FinalNative);
+    inputs.OutputScale = ScaleFactor;
+    inputs.RequiredChannels = deferredPlan.RequiredChannels;
+    inputs.RepresentationSourceGeneration =
+        deferredPlan.Assessment.SourceGeneration;
+    inputs.RepresentationRowEpochIdentity =
+        BuildWholeSceneRowEpochIdentity(0, 192);
+    inputs.BlendCnt = BlendCnt;
+    inputs.EVA = EVA;
+    inputs.EVB = EVB;
+    inputs.EVY = EVY;
+    if (deferredPlan.OBJVisible)
+    {
+        for (int i = 0; i < NumSprites; i++)
+        {
+            const u32 mode = SpriteConfig.uOAM[i].OBJMode;
+            if (mode == 1)
+                inputs.SemiTransparentOBJModeMask |= 1u << 0;
+            else if (mode == 3)
+                inputs.SemiTransparentOBJModeMask |= 1u << 1;
+        }
+    }
+    inputs.MasterBrightness = GPU2D.Num
+        ? Parent.MasterBrightnessB
+        : Parent.MasterBrightnessA;
+    const u16 frameStartMasterBrightness = GPU2D.Num
+        ? Parent.FrameStartMasterBrightnessB
+        : Parent.FrameStartMasterBrightnessA;
+    if (frameStartMasterBrightness == inputs.MasterBrightness)
+    {
+        inputs.MasterBrightnessYStart = 0;
+        inputs.MasterBrightnessYEnd = 192;
+    }
+    inputs.CaptureCnt = Parent.CaptureCnt;
+    inputs.DisplayMode =
+        (DispCnt >> 16) & (GPU2D.Num ? 0x1u : 0x3u);
+    bool screenSwap = GPU.ScreenSwap;
+    if (!Parent.GetFinalPassScreenSwapForRange(0, 192, screenSwap))
+    {
+        inputs.PhysicalTarget = WholeScenePhysicalTarget::Mixed;
+    }
+    else
+    {
+        const bool finalBottom = GPU2D.Num == (screenSwap ? 1u : 0u);
+        inputs.PhysicalTarget = finalBottom
+            ? WholeScenePhysicalTarget::Bottom
+            : WholeScenePhysicalTarget::Top;
+    }
+    return ::melonDS::BuildWholeSceneOutputPlan(inputs);
+}
+
+bool GLRenderer2D::RenderDeferredScanlineStrictAffine(
+    const DeferredScanlineStrictAffinePlan& deferredPlan)
+{
+    const StrictAffineSourceEnhancementDecision sourceEnhancement =
+        CurrentStrictAffineSourceEnhancementDecision(true);
+    const StrictAffineSourceEnhancementDecision ordinaryScaling =
+        CurrentStrictAffineOrdinaryScalingDecision(true);
+    const int sourceModelIndex = sourceEnhancement ==
+            StrictAffineSourceEnhancementDecision::ArtCNNCachedAffineSources
+        ? WholeSceneArtCNNModelIndex()
+        : (sourceEnhancement ==
+               StrictAffineSourceEnhancementDecision::CuNNyCachedAffineSources
+            ? RendererSettings::GetGLCuNNyModelIndex(
+                  WholeSceneScaleAlgorithm)
+            : -1);
+    const int ordinarySourceModelIndex = ordinaryScaling ==
+            StrictAffineSourceEnhancementDecision::ArtCNNCachedAffineSources
+        ? WholeSceneArtCNNModelIndex()
+        : (ordinaryScaling ==
+               StrictAffineSourceEnhancementDecision::CuNNyCachedAffineSources
+            ? RendererSettings::GetGLCuNNyModelIndex(
+                  WholeSceneScaleAlgorithm)
+            : -1);
+    bool resolvedOrdinaryOBJReady = false;
+    bool resolvedOrdinaryOBJReused = false;
+    u32 resolvedOrdinaryOBJRejectionMask = 0;
+    if (deferredPlan.RequiresResolvedOrdinaryOBJ)
+    {
+        WholeSceneTrace.StrictAffineResolvedOBJRequested = true;
+        resolvedOrdinaryOBJReady = RenderResolvedOrdinaryOBJProduct(
+            0, 192, ordinaryScaling, ordinarySourceModelIndex);
+        WholeSceneTrace.StrictAffineResolvedOBJOrdinaryProductReady =
+            resolvedOrdinaryOBJReady;
+        resolvedOrdinaryOBJReused =
+            WholeSceneTrace.StrictAffineResolvedOBJOrdinaryProductReused;
+        resolvedOrdinaryOBJRejectionMask =
+            WholeSceneTrace.StrictAffineResolvedOBJRejectionMask;
+        if (!resolvedOrdinaryOBJReady)
+            return false;
+    }
+
+    WholeSceneRecipePreparation = {};
+    WholeSceneExecutionTrace = {};
+    const bool nativeExactFinalValid = WholeSceneTrace.NativeExactFinalValid;
+    StrictAffineVisibleBGMask = deferredPlan.AffineBGMask;
+    StrictAffineTransformedBGMask = deferredPlan.AffineBGMask;
+    StrictAffineIdentityEquivalentBGMask = 0;
+    StrictAffineHasAffineOBJ = deferredPlan.HasAffineOBJ;
+    StrictAffineHighResolutionGeometryRequired = true;
+
+    ResetWholeSceneRenderTrace();
+    WholeSceneTrace.NativeExactFinalValid = nativeExactFinalValid;
+    WholeSceneTrace.StrictAffineDebugClass =
+        StrictAffineDebugProductClass::ProductionEligible;
+    WholeSceneTrace.DeferredScanlineStrictAffineEvaluated = true;
+    WholeSceneTrace.DeferredScanlineStrictAffineEligible = true;
+    WholeSceneTrace.DeferredScanlineStrictAffineReason =
+        DeferredScanlineStrictAffineBlockReason::None;
+    bool historicalSourcesValid =
+        DeferredStrictAffineHistoricalSourceEpochCount != 0 &&
+        !DeferredStrictAffineHistoricalSourceEpochOverflow;
+    u32 historicalNativeBGMask = 0;
+    u32 historicalEnhancedBGMask = 0;
+    for (u32 epoch = 0;
+         epoch < DeferredStrictAffineHistoricalSourceEpochCount;
+         epoch++)
+    {
+        historicalSourcesValid &=
+            DeferredStrictAffineHistoricalSourceEpochs[epoch].Valid;
+        historicalNativeBGMask |=
+            DeferredStrictAffineHistoricalSourceEpochs[epoch].NativeBGMask;
+        historicalEnhancedBGMask |=
+            DeferredStrictAffineHistoricalSourceEpochs[epoch].EnhancedBGMask;
+    }
+    WholeSceneTrace.DeferredStrictAffineHistoricalSourceAttempted =
+        DeferredStrictAffineHistoricalSourceEpochCount != 0 ||
+        DeferredStrictAffineHistoricalSourceEpochOverflow;
+    WholeSceneTrace.DeferredStrictAffineHistoricalSourceValid =
+        historicalSourcesValid;
+    WholeSceneTrace.DeferredStrictAffineHistoricalSourceUsed =
+        deferredPlan.Assessment.HistoricalSourceUsed;
+    WholeSceneTrace.DeferredStrictAffineHistoricalSourceYEnd =
+        DeferredStrictAffineHistoricalSourceEpochCount != 0
+            ? DeferredStrictAffineHistoricalSourceEpochs[
+                  DeferredStrictAffineHistoricalSourceEpochCount - 1].YEnd
+            : 0;
+    WholeSceneTrace.DeferredStrictAffineHistoricalNativeBGMask =
+        historicalNativeBGMask;
+    WholeSceneTrace.DeferredStrictAffineHistoricalEnhancedBGMask =
+        historicalEnhancedBGMask;
+    WholeSceneTrace.DeferredStrictAffineRowSourceEpochCount =
+        deferredPlan.SourceEpochCount;
+    WholeSceneTrace.DeferredStrictAffineFirstSourceTransitionY =
+        deferredPlan.FirstSourceTransitionY;
+    WholeSceneTrace.DeferredStrictAffineFirstRowSourceGeneration =
+        deferredPlan.FirstRowSourceGeneration;
+    WholeSceneTrace.DeferredStrictAffineLiveSourceGeneration =
+        deferredPlan.LiveSourceGeneration;
+    WholeSceneTrace.StrictAffineResolvedOBJRequested =
+        deferredPlan.RequiresResolvedOrdinaryOBJ;
+    WholeSceneTrace.StrictAffineResolvedOBJOrdinaryProductReady =
+        resolvedOrdinaryOBJReady;
+    WholeSceneTrace.StrictAffineResolvedOBJOrdinaryProductReused =
+        resolvedOrdinaryOBJReused;
+    WholeSceneTrace.StrictAffineResolvedOBJRejectionMask =
+        resolvedOrdinaryOBJRejectionMask;
+    WholeSceneTrace.StrictAffineDeferredOrdinaryOBJCandidateRequested =
+        deferredPlan.RequiresResolvedOrdinaryOBJ;
+    WholeSceneTrace.StrictAffineDeferredOrdinaryOBJCandidateProductReady =
+        resolvedOrdinaryOBJReady;
+    RecordWholeSceneRenderTrace(WholeSceneRenderPath::StrictAffineHighRes,
+                                0,
+                                192,
+                                true,
+                                false,
+                                false,
+                                Parent.OutputTex3D);
+
+    WholeSceneTrace.StrictAffineSourceEnhancement = sourceEnhancement;
+    const bool spline36 = sourceEnhancement ==
+        StrictAffineSourceEnhancementDecision::Spline36Inline;
+    const bool nnedi3 = sourceEnhancement ==
+        StrictAffineSourceEnhancementDecision::NNEDI3CachedAffineSources;
+    const bool xbrz = sourceEnhancement ==
+        StrictAffineSourceEnhancementDecision::XBRZCachedAffineSources;
+    const bool cached = IsStrictAffineCachedSource(sourceEnhancement);
+    const bool affineOBJSubpixel2x =
+        WholeSceneScaleHybridStrictAffineOBJSubpixel2x &&
+        (spline36 || cached);
+    const bool linearSupersampleCachedSource = cached && !xbrz;
+    const u32 companionTextBGMask =
+        WholeSceneScaleHybridStrictAffineTopTextBG
+            ? deferredPlan.TextBGMask
+            : 0u;
+    u32 enhancedBGMask = 0;
+    if (cached)
+    {
+        enhancedBGMask = PrepareStrictAffineEnhancedBGSources(
+            sourceEnhancement,
+            sourceModelIndex,
+            0,
+            true,
+            0,
+            companionTextBGMask,
+            deferredPlan.VisibleBGMask);
+    }
+    const u32 compositorEnhancedBGMask = enhancedBGMask |
+        (spline36 ? companionTextBGMask : 0u);
+    const u32 enhancedTextBGMask =
+        compositorEnhancedBGMask & companionTextBGMask;
+    const u32 establishedTextCoverageMask =
+        xbrz
+            ? (enhancedTextBGMask & 0x3u)
+            : 0u;
+    const u32 reconstructedTextCandidateMask =
+        enhancedTextBGMask;
+    const u32 reconstructedTextCoverageMask =
+        establishedTextCoverageMask | reconstructedTextCandidateMask;
+    const u32 directionalTextBGMask =
+        enhancedTextBGMask & ~reconstructedTextCoverageMask;
+    const bool applyDeferredDirectionalTextBGAA =
+        WholeSceneScaleHybridStrictAffineMaskedOBJMLAA &&
+        directionalTextBGMask != 0;
+    WholeSceneTrace.StrictAffineDeferredTextBGAARequested =
+        applyDeferredDirectionalTextBGAA;
+
+    bool enhancedOBJReady = false;
+    if (cached && deferredPlan.OBJVisible)
+    {
+        enhancedOBJReady = PrepareStrictAffineEnhancedOBJSources(
+            sourceEnhancement,
+            sourceModelIndex);
+    }
+
+    // Source history is row-local, but the frame still owns one stable OAM
+    // epoch. Build the same semantic OBJ order used by the ordinary strict
+    // executor and apply it after the historical/live BG rows have formed one
+    // completed OBJ-free base.
+    UpdateSemanticAffineOBJRoleContinuity();
+    StrictAffineOrderedAssessment =
+        BuildStrictAffineOrderedRecipeIntent(0, 192);
+    bool deferredOrderedAffineOBJReady =
+        StrictAffineOrderedAssessment.PlannedOrderedRequested &&
+        StrictAffineOrderedAssessment.OperandPlan.Ready &&
+        StrictAffineOrderedAssessment.OrderedRecipe.Ready;
+    if (deferredOrderedAffineOBJReady)
+    {
+        for (std::size_t inputIndex = 1;
+             inputIndex <
+                 StrictAffineOrderedAssessment.OrderedRecipe.Inputs.size();
+             inputIndex++)
+        {
+            const auto kind = StrictAffineOrderedAssessment.
+                OrderedRecipe.Inputs[inputIndex].Kind;
+            if (kind != WholeSceneCompositorInputKind::AffineOBJGroup &&
+                kind != WholeSceneCompositorInputKind::SemiTransparentOBJ)
+            {
+                deferredOrderedAffineOBJReady = false;
+                break;
+            }
+        }
+    }
+    const bool deferredOrderedSubpixel2xRequired =
+        deferredOrderedAffineOBJReady &&
+        (WholeSceneCompositorRecipePresentationCount(
+             StrictAffineOrderedAssessment.OrderedRecipe,
+             WholeSceneCompositorPresentationKind::AffineSubpixel2x) != 0 ||
+         WholeSceneCompositorRecipePresentationCount(
+             StrictAffineOrderedAssessment.OrderedRecipe,
+             WholeSceneCompositorPresentationKind::
+                 DSSpecialEffectSubpixel2x) != 0);
+    if (deferredOrderedSubpixel2xRequired &&
+        !EnsureStrictAffineSupersampleTargets(ScreenW * 2, ScreenH * 2))
+    {
+        deferredOrderedAffineOBJReady = false;
+    }
+    WholeSceneTrace.StrictAffineOBJOperandPlanRequested =
+        StrictAffineOrderedAssessment.PlannedOrderedRequested;
+    WholeSceneTrace.StrictAffineOBJOperandPlanRejectionMask =
+        StrictAffineOrderedAssessment.OperandPlan.RejectionMask;
+    WholeSceneTrace.StrictAffineOBJOperandPlanOperandCount =
+        static_cast<u32>(
+            StrictAffineOrderedAssessment.OperandPlan.BackToFront.size());
+    if (deferredOrderedAffineOBJReady)
+    {
+        // The deferred native rows already contain the real per-scanline top
+        // and underlay owners. Material-alpha and front-BG admission consume
+        // their upscaled metadata; do not read whichever prior frame happened
+        // to last populate UpscaledMetaTex.
+        RenderNativeMetaCoverage(0, 192);
+    }
+    GLuint compositorOBJTex = OBJLayerTex;
+    if (deferredPlan.OBJVisible)
+    {
+        if (spline36)
+            RenderSpritesToLayer(0, 192, 1, true);
+        else if (enhancedOBJReady)
+            RenderSpritesToLayer(0, 192, 0, true, true);
+        else
+            RenderSpritesToLayer(0, 192, 0, true, false);
+
+        if (resolvedOrdinaryOBJReady)
+        {
+            RenderResolvedOBJMerge(OBJLayerTex);
+            WholeSceneTrace.StrictAffineResolvedOBJMergeExecuted = true;
+            WholeSceneTrace.StrictAffineDeferredOrdinaryOBJCandidateEvaluated =
+                true;
+            compositorOBJTex = StrictAffineOBJLayerTex;
+        }
+    }
+
+    // A scanline-split frame still owns one stable OAM/source epoch. Preserve
+    // the selected affine-OBJ presentation used by the ordinary strict
+    // executor instead of silently dropping it while the deferred compositor
+    // reconstructs per-row BG/effect state. The output-grid bilinear product
+    // is the cheaper peer of the localized 2x product and uses the same
+    // semantic compositor insertion below.
+    bool affineOBJOutputGridPresentationReady = false;
+    if (!deferredOrderedAffineOBJReady &&
+        deferredPlan.HasAffineOBJ &&
+        (spline36 || enhancedOBJReady))
+    {
+        RenderSpritesToLayer(
+            0,
+            192,
+            spline36 ? 1 : 0,
+            true,
+            enhancedOBJReady,
+            AffinePresentationOBJLayerFB,
+            true,
+            ScaleFactor,
+            false,
+            false,
+            true,
+            3);
+        // Preserve the top-winner flags/identity written above, but replace
+        // layer 0 with one back-to-front premultiplied normal-affine band.
+        // Fractional edges then resolve over lower affine members of the same
+        // assembly instead of exposing the scene beneath the entire group.
+        RenderSpritesToLayer(
+            0,
+            192,
+            spline36 ? 1 : 0,
+            true,
+            enhancedOBJReady,
+            AffinePresentationOBJLayerFB,
+            true,
+            ScaleFactor,
+            false,
+            false,
+            true,
+            3,
+            nullptr,
+            true);
+        affineOBJOutputGridPresentationReady = true;
+    }
+    bool affineOBJSubpixelPresentationReady = false;
+    bool affineOBJSubpixelPresentationPremultiplied = false;
+    if (!deferredOrderedAffineOBJReady &&
+        deferredPlan.HasAffineOBJ &&
+        affineOBJSubpixel2x &&
+        EnsureStrictAffineSupersampleTargets(ScreenW * 2, ScreenH * 2))
+    {
+        const bool useScalerAlpha = xbrz || nnedi3;
+        RenderSpritesToLayer(
+            0,
+            192,
+            spline36 ? 1 : 0,
+            true,
+            enhancedOBJReady,
+            StrictAffineSupersamplePresentationOBJLayerFB,
+            true,
+            ScaleFactor * 2,
+            linearSupersampleCachedSource,
+            false,
+            true,
+            ChooseAffineOBJSubpixelCoverageMode(useScalerAlpha));
+        u32 assemblyMask[4] = {~0u, ~0u, ~0u, ~0u};
+        int assembledSlots[128];
+        const bool assembled = WholeSceneScaleHybridStrictAffineOpaqueAssemblies &&
+            enhancedOBJReady &&
+            PrepareOpaqueOBJAssemblies(assemblyMask, assembledSlots, 0, 192);
+        // Keep the depth-selected flags, OAM identity and priority in layers
+        // 1/2, but replace layer 0 with one back-to-front premultiplied union
+        // of supported normal affine OBJ. Shared OAM boundaries then remain
+        // covered while the four subpixels still resolve the real semantic
+        // underlay and effects independently.
+        RenderSpritesToLayer(
+            0,
+            192,
+            spline36 ? 1 : 0,
+            true,
+            enhancedOBJReady,
+            StrictAffineSupersamplePresentationOBJLayerFB,
+            true,
+            ScaleFactor * 2,
+            linearSupersampleCachedSource,
+            false,
+            true,
+            ChooseAffineOBJSubpixelCoverageMode(useScalerAlpha),
+            assembled ? assemblyMask : nullptr,
+            true,
+            assembled ? assembledSlots : nullptr);
+        affineOBJSubpixelPresentationReady = true;
+        affineOBJSubpixelPresentationPremultiplied = true;
+    }
+    WholeSceneExecutionTrace.StrictAffineProductAssessment.
+        AffineOBJSubpixel2xReady = affineOBJSubpixelPresentationReady;
+
+    const bool bilinearAffineBGPresentation =
+        (spline36 || cached);
+    const bool historicalSourceUsed =
+        deferredPlan.Assessment.HistoricalSourceUsed;
+    if (historicalSourceUsed)
+    {
+        if (DeferredStrictAffineHistoricalSourceEpochOverflow ||
+            deferredPlan.Assessment.HistoricalSourceEpochCount !=
+                DeferredStrictAffineHistoricalSourceEpochCount)
+        {
+            return false;
+        }
+        for (u32 epochIndex = 0;
+             epochIndex < DeferredStrictAffineHistoricalSourceEpochCount;
+             epochIndex++)
+        {
+            const auto& historicalEpoch =
+                DeferredStrictAffineHistoricalSourceEpochs[epochIndex];
+            const u32 requiredHistoricalEnhancedMask =
+                cached
+                    ? (compositorEnhancedBGMask &
+                       historicalEpoch.NativeBGMask)
+                    : 0u;
+            if (!historicalEpoch.Valid ||
+                historicalEpoch.SpriteGeneration != SpriteSourceGeneration ||
+                historicalEpoch.SourceEnhancement != sourceEnhancement ||
+                historicalEpoch.SourceModelIndex != sourceModelIndex ||
+                (requiredHistoricalEnhancedMask &
+                 ~historicalEpoch.EnhancedBGMask) != 0)
+            {
+                return false;
+            }
+        }
+    }
+
+    auto renderBand = [&](int ystart,
+                          int yend,
+                          const GLuint* bgOverride,
+                          const GLuint* bgMetaOverride,
+                          const GLuint* enhancedBGOverride)
+    {
+        const GLuint deferredPresentationTex =
+            deferredOrderedAffineOBJReady
+                ? 0
+                : (affineOBJSubpixelPresentationReady
+                       ? StrictAffineSupersamplePresentationOBJLayerTex
+                       : (affineOBJOutputGridPresentationReady
+                              ? AffinePresentationOBJLayerTex : 0));
+        RenderCompositorPass(StrictAffineCandidateFB,
+                             compositorOBJTex,
+                             ScreenW,
+                             ScreenH,
+                             ystart,
+                             yend,
+                             ScaleFactor,
+                             spline36 ? 1 : 0,
+                             spline36 && WholeSceneScaleNoWrapFilterTaps,
+                             false,
+                             WholeSceneScaleDebugTint,
+                             0,
+                             0,
+                             deferredOrderedAffineOBJReady,
+                             false,
+                             0,
+                             0,
+                             spline36,
+                             compositorEnhancedBGMask,
+                             resolvedOrdinaryOBJReady ||
+                                 (xbrz && enhancedOBJReady),
+                             false,
+                             bilinearAffineBGPresentation,
+                             0,
+                             reconstructedTextCoverageMask,
+                             deferredPresentationTex,
+                             false,
+                             0,
+                             true,
+                             reconstructedTextCandidateMask,
+                             bgOverride,
+                             bgMetaOverride,
+                             enhancedBGOverride,
+                             affineOBJOutputGridPresentationReady ||
+                                 affineOBJSubpixelPresentationPremultiplied);
+    };
+
+    if (historicalSourceUsed)
+    {
+        int liveYStart = 0;
+        for (u32 epochIndex = 0;
+             epochIndex < DeferredStrictAffineHistoricalSourceEpochCount;
+             epochIndex++)
+        {
+            const auto& historicalEpoch =
+                DeferredStrictAffineHistoricalSourceEpochs[epochIndex];
+            GLuint historicalBGOverride[4] = {};
+            GLuint historicalBGMetaOverride[4] = {};
+            GLuint historicalEnhancedBGOverride[4] = {};
+            for (int layer = 0; layer < 4; layer++)
+            {
+                const u32 layerBit = 1u << layer;
+                if ((historicalEpoch.NativeBGMask & layerBit) != 0)
+                {
+                    historicalBGOverride[layer] =
+                        DeferredStrictAffineHistoricalBGLayerTex
+                            [epochIndex][layer];
+                    historicalBGMetaOverride[layer] =
+                        DeferredStrictAffineHistoricalBGLayerMetaTex
+                            [epochIndex][layer];
+                }
+                if ((historicalEpoch.EnhancedBGMask & layerBit) != 0)
+                {
+                    historicalEnhancedBGOverride[layer] =
+                        DeferredStrictAffineHistoricalEnhancedBGLayerTex
+                            [epochIndex][layer];
+                }
+            }
+            renderBand(historicalEpoch.YStart,
+                       historicalEpoch.YEnd,
+                       historicalBGOverride,
+                       historicalBGMetaOverride,
+                       historicalEnhancedBGOverride);
+            liveYStart = historicalEpoch.YEnd;
+        }
+        renderBand(liveYStart, 192, nullptr, nullptr, nullptr);
+    }
+    else
+    {
+        renderBand(0, 192, nullptr, nullptr, nullptr);
+    }
+
+    if (deferredOrderedAffineOBJReady)
+    {
+        const OrderedOBJPresentationPolicy orderedPolicy =
+            BuildOrderedOBJPresentationPolicy(sourceEnhancement,
+                                              enhancedOBJReady,
+                                              false);
+        const GLuint orderedResult = RenderOrderedOBJPresentationRecipe(
+            StrictAffineOrderedAssessment.OrderedRecipe,
+            0,
+            0,
+            192,
+            orderedPolicy);
+        if (!orderedResult ||
+            !CopyOrderedOBJPresentationResult(orderedResult,
+                                              StrictAffineCandidateTex,
+                                              0,
+                                              192))
+        {
+            return false;
+        }
+        WholeSceneExecutionTrace.StrictAffineProductAssessment.
+            OrderedOperandsReady = true;
+        WholeSceneExecutionTrace.StrictAffineProductAssessment.
+            AffineOBJSubpixel2xReady = deferredOrderedSubpixel2xRequired;
+    }
+
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, StrictAffineCandidateFB);
+    glReadBuffer(GL_COLOR_ATTACHMENT0);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, OutputFB);
+    glDrawBuffer(GL_COLOR_ATTACHMENT0);
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_STENCIL_TEST);
+    glDisable(GL_BLEND);
+    glDisable(GL_SCISSOR_TEST);
+    glColorMaski(0, GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glDepthMask(GL_FALSE);
+    glBlitFramebuffer(0, 0, ScreenW, ScreenH,
+                      0, 0, ScreenW, ScreenH,
+                      GL_COLOR_BUFFER_BIT, GL_NEAREST);
+
+    if (applyDeferredDirectionalTextBGAA)
+    {
+        // NativeTop/Second/Meta were accumulated with the actual per-row
+        // scanline history before deferred strict execution. Upscale only the
+        // semantic metadata, then apply the same thin owner-masked contour
+        // pass as the ordinary full-frame strict path. The completed strict
+        // RGB remains the source, so high-resolution affine BG placement is
+        // not replaced by a native whole-scene upscale.
+        RenderNativeMetaCoverage(0, 192);
+        RenderStrictAffineMaskedOBJMask(0, 192, directionalTextBGMask);
+        RenderStrictAffineMaskedOBJMLAA(0,
+                                        192,
+                                        OutputTex,
+                                        StrictAffineCandidateFB);
+
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, StrictAffineCandidateFB);
+        glReadBuffer(GL_COLOR_ATTACHMENT0);
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, OutputFB);
+        glDrawBuffer(GL_COLOR_ATTACHMENT0);
+        glDisable(GL_DEPTH_TEST);
+        glDisable(GL_STENCIL_TEST);
+        glDisable(GL_BLEND);
+        glDisable(GL_SCISSOR_TEST);
+        glColorMaski(0, GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+        glDepthMask(GL_FALSE);
+        glBlitFramebuffer(0, 0, ScreenW, ScreenH,
+                          0, 0, ScreenW, ScreenH,
+                          GL_COLOR_BUFFER_BIT, GL_NEAREST);
+        WholeSceneTrace.StrictAffineDeferredTextBGAAExecuted = true;
+    }
+    WholeSceneTrace.StrictAffineCandidateValid = true;
+    return true;
+}
+
 void GLRenderer2D::RenderScreenWholeScene(int ystart, int yend)
 {
-    const WholeSceneScaleDecision decision = ChooseWholeSceneScaleDecision(ystart, yend);
-    switch (decision.Reason)
+    // Step 4 makes the admitted OutputPlan path authoritative. The legacy
+    // scale decision is still recorded as the initial candidate and reason,
+    // but it is not recomputed after capability admission.
+    switch (WholeScenePlan.SelectedPath)
     {
-    case WholeSceneScaleDecisionReason::HighResCompositor:
+    case WholeSceneRenderPath::HighResCompositor:
         RenderScreenWholeSceneHighRes(ystart, yend);
         break;
-    case WholeSceneScaleDecisionReason::SourceACaptureOnlyReplacement:
-        RenderScreenWholeSceneSourceACaptureReplacement(ystart, yend);
+    case WholeSceneRenderPath::StrictAffineHighRes:
+        RenderScreenWholeSceneStrictAffineHighRes(ystart, yend);
         break;
-    case WholeSceneScaleDecisionReason::CaptureBackedBeforeGeneralFallbacks:
-        RenderScreenWholeSceneCaptureBackedPlan(decision.CapturePlan, ystart, yend);
+    case WholeSceneRenderPath::SourceACaptureReplacement:
+        // Capture-backed representations are dispatched through the typed
+        // execution decision before reaching this ordinary renderer switch.
         break;
-    case WholeSceneScaleDecisionReason::HybridFragmentationFinalUpscale:
-        RenderScreenWholeSceneFinalUpscale(ystart, yend, true);
+    case WholeSceneRenderPath::CaptureBackedHandoff:
+    case WholeSceneRenderPath::CaptureEpochOverlay:
+        // Capture-backed representations use the dedicated pre-dispatch
+        // execution kind and cannot reach this selected-representation path.
         break;
-    case WholeSceneScaleDecisionReason::OverlayOperator:
+    case WholeSceneRenderPath::OverlayOperatorUpscale:
+    case WholeSceneRenderPath::ConservativeHybridUpscale:
         RenderScreenWholeSceneOverlayOperator(ystart, yend);
         break;
-    case WholeSceneScaleDecisionReason::FinalNativeUpscale:
-        RenderScreenWholeSceneFinalUpscale(ystart, yend);
+    case WholeSceneRenderPath::FinalNativeUpscale:
+        RenderScreenWholeSceneFinalUpscale(
+            ystart,
+            yend,
+            WholeScenePlan.ScaleReason ==
+                WholeSceneScaleDecisionReason::HybridFragmentationFinalUpscale);
         break;
-    case WholeSceneScaleDecisionReason::LegacyNativeUpscale:
+    case WholeSceneRenderPath::LegacyNativeUpscale:
         RenderScreenWholeSceneLegacy(ystart, yend);
         break;
-    case WholeSceneScaleDecisionReason::None:
+    case WholeSceneRenderPath::NativeExactFloor:
+        RenderScreenWholeSceneNativeExactFloor(ystart, yend);
+        break;
+    case WholeSceneRenderPath::Current:
+    case WholeSceneRenderPath::PhysicalFinalPostprocessInput:
+    case WholeSceneRenderPath::None:
         break;
     }
 }
 
-WholeSceneScaleDecision GLRenderer2D::ChooseWholeSceneScaleDecision(int ystart, int yend) const
+void GLRenderer2D::ResetStrictAffineGeometryDemand()
 {
-    WholeSceneScaleDecision decision = {};
+    StrictAffineBGRoleValidMask = 0;
+    StrictAffineVisibleBGMask = 0;
+    StrictAffineIdentityEquivalentBGMask = 0;
+    StrictAffineTransformedBGMask = 0;
+    memset(StrictAffineIdentityStableFrames,
+           0,
+           sizeof(StrictAffineIdentityStableFrames));
+    StrictAffineHasAffineOBJ = false;
+    StrictAffineHighResolutionGeometryRequired = true;
+    for (auto& key : StrictAffineBGRoleKeys)
+        key = {};
+}
 
-    if (CanUseWholeSceneHighResPath())
+bool GLRenderer2D::IsStrictAffineBGIdentityEquivalentForRange(
+    int layer,
+    int ystart,
+    int yend) const
+{
+    if (layer < 2 || layer > 3 || ystart < 0 || yend > 192 ||
+        ystart >= yend)
     {
-        decision.Reason = WholeSceneScaleDecisionReason::HighResCompositor;
-        decision.Path = WholeSceneRenderPath::HighResCompositor;
-        return decision;
+        return false;
     }
 
-    if (CanUseWholeSceneScalePath() &&
-        WholeSceneScaleMode == RendererSettings::WholeScene2DScaleMode::ConservativeHybridUpscale &&
-        CanUseWholeSceneMixedSourceACaptureBGPath())
+    const int rotIndex = layer - 2;
+    for (int y = ystart; y < yend; y++)
     {
-        decision.Reason = WholeSceneScaleDecisionReason::SourceACaptureOnlyReplacement;
-        decision.Path = WholeSceneRenderPath::SourceACaptureReplacement;
-        return decision;
+        const auto& scanline = ScanlineConfig.uScanline[y];
+        if (static_cast<s16>(scanline.BGRotscale[rotIndex][0]) != 0x100 ||
+            static_cast<s16>(scanline.BGRotscale[rotIndex][1]) != 0 ||
+            static_cast<s16>(scanline.BGRotscale[rotIndex][2]) != 0 ||
+            static_cast<s16>(scanline.BGRotscale[rotIndex][3]) != 0x100 ||
+            (scanline.BGOffset[layer][0] & 0xFF) != 0 ||
+            (scanline.BGOffset[layer][1] & 0xFF) != 0 ||
+            scanline.BGMosaicEnable[layer] != 0)
+        {
+            return false;
+        }
     }
 
-    if (CanUseWholeSceneScalePath() &&
-        CanUseWholeSceneMixedCaptureBackedOBJOverlayPath())
+    return true;
+}
+
+void GLRenderer2D::UpdateStrictAffineGeometryDemand(int ystart, int yend)
+{
+    if (ystart != 0 || yend != 192)
+        return;
+
+    u32 visibleAffineBGMask = 0;
+    u32 identityEquivalentBGMask = 0;
+    u32 settledIdentityBGMask = 0;
+    u32 previousTransformedBGMask = StrictAffineTransformedBGMask;
+    constexpr u8 IdentitySettleFrames = 4;
+
+    for (int layer = 0; layer < 4; layer++)
     {
-        decision.Reason = WholeSceneScaleDecisionReason::SourceACaptureOnlyReplacement;
-        decision.Path = WholeSceneRenderPath::SourceACaptureReplacement;
-        return decision;
+        const u32 layerBit = 1u << layer;
+        if ((LayerEnable & layerBit) == 0)
+            continue;
+
+        const auto& cfg = LayerConfig.uBGConfig[layer];
+        if (cfg.Type != 2 && cfg.Type != 3)
+            continue;
+
+        visibleAffineBGMask |= layerBit;
+        StrictAffineBGRoleKey role = {};
+        role.Size[0] = cfg.Size[0];
+        role.Size[1] = cfg.Size[1];
+        role.Type = cfg.Type;
+        role.PalOffset = cfg.PalOffset;
+        role.TileOffset = cfg.TileOffset;
+        role.MapOffset = cfg.MapOffset;
+        role.Clamp = cfg.Clamp;
+
+        if ((StrictAffineBGRoleValidMask & layerBit) == 0 ||
+            !(StrictAffineBGRoleKeys[layer] == role))
+        {
+            // A disabled or structurally repurposed BG starts a new lifetime.
+            previousTransformedBGMask &= ~layerBit;
+            StrictAffineIdentityStableFrames[layer] = 0;
+            StrictAffineBGRoleKeys[layer] = role;
+        }
+        StrictAffineBGRoleValidMask |= layerBit;
+
+        if (IsStrictAffineBGIdentityEquivalentForRange(layer, ystart, yend))
+        {
+            identityEquivalentBGMask |= layerBit;
+            if ((previousTransformedBGMask & layerBit) != 0)
+            {
+                StrictAffineIdentityStableFrames[layer] = std::min<u8>(
+                    IdentitySettleFrames,
+                    StrictAffineIdentityStableFrames[layer] + 1);
+                if (StrictAffineIdentityStableFrames[layer] >=
+                    IdentitySettleFrames)
+                {
+                    settledIdentityBGMask |= layerBit;
+                }
+            }
+        }
+        else
+        {
+            StrictAffineIdentityStableFrames[layer] = 0;
+        }
     }
 
-    if (CanUseWholeSceneScalePath() &&
-        CanUseWholeSceneCaptureOnlyHighResPath(ystart, yend))
+    StrictAffineBGRoleValidMask &= visibleAffineBGMask;
+    for (int layer = 0; layer < 4; layer++)
     {
-        decision.Reason = WholeSceneScaleDecisionReason::SourceACaptureOnlyReplacement;
-        decision.Path = WholeSceneRenderPath::SourceACaptureReplacement;
-        return decision;
+        if ((visibleAffineBGMask & (1u << layer)) == 0)
+            StrictAffineIdentityStableFrames[layer] = 0;
     }
 
-    if (CanUseWholeSceneOverlayOperatorPath())
+    bool hasAffineOBJ = false;
+    if ((LayerEnable & (1u << 4)) != 0 && OBJEnable && NumSprites > 0)
     {
-        WholeSceneOverlayScaleDecisionInputs inputs = {};
-        inputs.CapturePlan = ChooseWholeSceneCaptureBackedPlan(ystart, yend);
-        inputs.ConservativeHybridMode =
-            WholeSceneScaleMode == RendererSettings::WholeScene2DScaleMode::ConservativeHybridUpscale;
-        inputs.HybridFragmentationGuardActive =
-            inputs.ConservativeHybridMode && IsWholeSceneHybridFragmentationGuardActive();
-        return ::melonDS::ChooseWholeSceneOverlayScaleDecision(inputs);
+        for (int sprite = 0; sprite < NumSprites; sprite++)
+        {
+            if (SpriteConfig.uOAM[sprite].Rotscale != static_cast<u32>(-1))
+            {
+                hasAffineOBJ = true;
+                break;
+            }
+        }
     }
 
-    if (CanUseWholeSceneFinalUpscalePath())
+    StrictAffineGeometryDemandInputs inputs = {};
+    inputs.VisibleAffineBGMask = visibleAffineBGMask;
+    inputs.IdentityEquivalentAffineBGMask = identityEquivalentBGMask;
+    inputs.PreviousTransformedAffineBGMask = previousTransformedBGMask;
+    inputs.SettledIdentityAffineBGMask = settledIdentityBGMask;
+    inputs.HasAffineOBJ = hasAffineOBJ;
+    const StrictAffineGeometryDemandResult result =
+        ::melonDS::UpdateStrictAffineGeometryDemand(inputs);
+
+    StrictAffineVisibleBGMask = visibleAffineBGMask;
+    StrictAffineIdentityEquivalentBGMask = identityEquivalentBGMask;
+    StrictAffineTransformedBGMask = result.TransformedAffineBGMask;
+    StrictAffineHasAffineOBJ = hasAffineOBJ;
+    StrictAffineHighResolutionGeometryRequired =
+        result.HighResolutionGeometryRequired;
+}
+
+StrictAffineHighResEligibilityInputs
+GLRenderer2D::BuildStrictAffineHighResEligibilityInputs(
+    int ystart,
+    int yend,
+    u64 requiredChannels) const
+{
+    StrictAffineHighResEligibilityInputs inputs = {};
+    inputs.FeatureEnabled = WholeSceneScaleHybridStrictAffineHighRes;
+    inputs.ConservativeHybridMode =
+        WholeSceneScaleMode ==
+        RendererSettings::WholeScene2DScaleMode::ConservativeHybridUpscale;
+    inputs.ScalePathAvailable = CanUseWholeSceneScalePath();
+    inputs.OutputScale = ScaleFactor;
+    inputs.YStart = ystart;
+    inputs.YEnd = yend;
+    const u32 displayMode =
+        (DispCnt >> 16) & (GPU2D.Num ? 0x1u : 0x3u);
+    inputs.DisplayModeComposited = displayMode == 1;
+    inputs.SnapshotCoherent =
+        !WholeSceneFullFrameFinalizerUnsafeFrame &&
+        !IsWholeSceneCurrentFragmentationGuardActive() &&
+        !IsWholeSceneHybridFragmentationGuardActive();
+    inputs.CandidateTargetAvailable =
+        StrictAffineCandidateTex != 0 && StrictAffineCandidateFB != 0;
+    inputs.HighResolutionGeometryRequired =
+        StrictAffineHighResolutionGeometryRequired;
+
+    for (int layer = 0; layer < 4; layer++)
     {
-        decision.Reason = WholeSceneScaleDecisionReason::FinalNativeUpscale;
-        decision.Path = WholeSceneRenderPath::FinalNativeUpscale;
-        return decision;
+        if ((LayerEnable & (1u << layer)) == 0)
+            continue;
+        inputs.VisibleLayerMask |= 1u << layer;
+        const u32 type = LayerConfig.uBGConfig[layer].Type;
+        if (type == 2)
+            inputs.TiledAffineBGMask |= 1u << layer;
+        else if (type == 3)
+            inputs.ExtendedTiledAffineBGMask |= 1u << layer;
+        else if (type <= 1)
+            inputs.TextTiledBGMask |= 1u << layer;
+        else if (type == 6)
+            inputs.Direct3DLayerMask |= 1u << layer;
+    }
+    if ((LayerEnable & (1u << 4)) && OBJEnable && NumSprites > 0)
+        inputs.VisibleLayerMask |= 1u << 4;
+
+    inputs.AlphaBlendTarget1Mask = BlendCnt & 0x3Fu;
+    inputs.AlphaBlendTarget2Mask = (BlendCnt >> 8) & 0x3Fu;
+    inputs.ColorEffectMode = (BlendCnt >> 6) & 0x3u;
+    inputs.ColorEffectFactor = std::min<u32>(EVY, 16u);
+    inputs.AlphaBlendOrdinaryOBJPrioritySafe = true;
+    if ((inputs.VisibleLayerMask & (1u << 4)) != 0)
+    {
+        const u32 visibleTarget1BGs =
+            inputs.AlphaBlendTarget1Mask & LayerEnable & 0xFu;
+        for (int sprite = 0; sprite < NumSprites; sprite++)
+        {
+            const auto& source = SpriteConfig.uOAM[sprite];
+            const bool ordinary =
+                source.Rotscale == static_cast<u32>(-1);
+            if (source.OBJMode == 1)
+            {
+                if (ordinary)
+                    inputs.HasSemiTransparentOrdinaryOBJ = true;
+                else
+                    inputs.HasSemiTransparentAffineOBJ = true;
+            }
+            else if (source.OBJMode == 3)
+            {
+                // Direct-color bitmap OBJ carries authored material alpha in
+                // PalOffset. Keep it distinct from both geometric coverage
+                // and mode-1 EVA/EVB so the OBJ-only strict route can resolve
+                // the material against its actual semantic underlay.
+                if (source.Type == 2)
+                {
+                    if (ordinary)
+                        inputs.HasBitmapOrdinaryOBJ = true;
+                    else
+                        inputs.HasBitmapAffineOBJ = true;
+                }
+                else
+                {
+                    inputs.HasUnsupportedSemiTransparentOBJ = true;
+                }
+            }
+
+            if (source.OBJMode == 2 ||
+                !ordinary)
+            {
+                continue;
+            }
+
+            inputs.HasOrdinaryOBJ = true;
+            for (int bg = 0; bg < 4; bg++)
+            {
+                if ((visibleTarget1BGs & (1u << bg)) == 0)
+                    continue;
+
+                // At equal DS priority OBJ is evaluated after BG and wins.
+                // A numerically larger OBJ priority could instead sit below
+                // the target-1 BG, which the affine-only OBJ candidate does
+                // not yet model as an alpha-blend operand.
+                if (source.BGPrio > (BGCnt[bg] & 0x3u))
+                    inputs.AlphaBlendOrdinaryOBJPrioritySafe = false;
+            }
+        }
     }
 
-    decision.Reason = WholeSceneScaleDecisionReason::LegacyNativeUpscale;
-    decision.Path = WholeSceneRenderPath::LegacyNativeUpscale;
-    return decision;
+    inputs.RequiredChannels = requiredChannels;
+    return inputs;
+}
+
+WholeSceneScaleCandidateInputs GLRenderer2D::BuildWholeSceneScaleCandidateInputs(
+    int ystart,
+    int yend,
+    const WholeSceneCaptureBackedPlan& capturePlan,
+    u64 requiredChannels) const
+{
+    WholeSceneScaleCandidateInputs inputs = {};
+    const bool canUseScalePath = CanUseWholeSceneScalePath();
+    inputs.ConservativeHybridMode =
+        WholeSceneScaleMode ==
+        RendererSettings::WholeScene2DScaleMode::ConservativeHybridUpscale;
+    inputs.HighResCompositorAvailable = CanUseWholeSceneHighResPath();
+    const StrictAffineHighResEligibilityInputs strictAffineInputs =
+        BuildStrictAffineHighResEligibilityInputs(
+            ystart,
+            yend,
+            requiredChannels);
+    inputs.StrictAffineBlockReason =
+        ChooseStrictAffineHighResBlockReason(strictAffineInputs);
+    inputs.StrictAffineHighResAvailable =
+        inputs.StrictAffineBlockReason == StrictAffineHighResBlockReason::None;
+    inputs.IdentityEquivalentAffineWholeSceneAvailable =
+        inputs.StrictAffineBlockReason ==
+            StrictAffineHighResBlockReason::
+                HighResolutionGeometryNotRequired &&
+        StrictAffineVisibleBGMask != 0 &&
+        StrictAffineVisibleBGMask == StrictAffineIdentityEquivalentBGMask;
+    inputs.SourceACaptureReplacementAvailable =
+        canUseScalePath &&
+        ((inputs.ConservativeHybridMode &&
+          CanUseWholeSceneMixedSourceACaptureBGPath()) ||
+         CanUseWholeSceneMixedCaptureBackedOBJOverlayPath() ||
+         CanUseWholeSceneCaptureOnlyHighResPath(ystart, yend));
+    inputs.OverlayOperatorAvailable = CanUseWholeSceneOverlayOperatorPath();
+    inputs.FinalNativeAvailable = CanUseWholeSceneFinalUpscalePath();
+    inputs.HybridFragmentationGuardActive =
+        inputs.ConservativeHybridMode &&
+        IsWholeSceneHybridFragmentationGuardActive();
+    inputs.CapturePlan = capturePlan;
+    return inputs;
 }
 
 GLRenderer2D::WholeSceneCaptureBackedPlan GLRenderer2D::ChooseWholeSceneCaptureBackedPlan(int ystart, int yend) const
@@ -13381,105 +23640,1081 @@ GLRenderer2D::WholeSceneCaptureBackedPlan GLRenderer2D::ChooseWholeSceneCaptureB
 
     if (captureEpochOverlayAvailable)
     {
-        return MakeWholeSceneCaptureEpochOverlayPlan(captureEpochOverlayRouteSlot);
+        WholeSceneCaptureBackedPlan plan =
+            MakeWholeSceneCaptureEpochOverlayPlan(captureEpochOverlayRouteSlot);
+        const auto& epoch =
+            Parent.ActiveCaptureBackgroundEpoch[captureEpochOverlayRouteSlot];
+        const u32 currentPresentationHash = CapturePresentationHash();
+        const u32 captureRequest = Parent.CaptureCnt;
+        CaptureEpochOverlayCurrentInputs currentInputs = {};
+        currentInputs.CurrentSource3DSerial = Parent.Output3DSerial;
+        currentInputs.CurrentSource3DSceneHash = Parent.Output3DSceneHash;
+        currentInputs.CurrentPresentationHash = currentPresentationHash;
+        currentInputs.EpochCaptureBank = epoch.CaptureBank;
+        currentInputs.EpochSource3DSerial = epoch.Source3DSerial;
+        currentInputs.EpochSource3DSceneHash = epoch.Source3DSceneHash;
+        currentInputs.CaptureRequestConsumesCurrentComposite =
+            !GPU2D.Num &&
+            (captureRequest & (1u << 31)) &&
+            Parent.IsSourceAOnlyFullDisplayCapture(captureRequest);
+        currentInputs.CaptureRequestBank = (captureRequest >> 16) & 0x3u;
+        const CaptureEpochOverlayCurrentPlan currentPlan =
+            MakeCaptureEpochOverlayCurrentPlan(currentInputs);
+
+        const u32 captureMode = (captureRequest >> 29) & 0x3u;
+        const u32 captureEVB =
+            std::min<u32>((captureRequest >> 8) & 0x1Fu, 16u);
+        const bool captureUsesSourceB =
+            captureMode == 1 || (captureMode == 2 && captureEVB > 0);
+        const bool captureConsumesSelectedPresentation =
+            GPU.CaptureEnable &&
+            (captureRequest & (1u << 31)) &&
+            ((captureRequest >> 24) & 0x1u) == 0;
+
+        auto& evidence = plan.Evidence;
+        evidence.Available = true;
+        evidence.ContentProven =
+            currentPlan.Source3DSerial != 0 &&
+            currentPlan.Source3DSceneHash != 0;
+        // This producer owns the current engine color-effect phase and emits
+        // Output2D before master brightness. Pixel-operation capability stays
+        // in the independent channel partition; this proves only phase.
+        evidence.PresentationProven = currentPlan.PresentationHash != 0;
+        evidence.ProductRef.Kind = CaptureProductKindForBackgroundSource(
+            SourceABackgroundSource::ParentOutputTex3D);
+        evidence.ProductRef.BackgroundSource =
+            SourceABackgroundSource::ParentOutputTex3D;
+        evidence.ProductRef.RouteSlot = captureEpochOverlayRouteSlot;
+        evidence.ProductRef.CaptureBank = currentPlan.CanPublishRouteProduct
+            ? currentPlan.CaptureBank
+            : epoch.CaptureBank;
+        // The epoch authorizes this live producer, but the selected pixels are
+        // current Output3D rather than an exact historical event product.
+        evidence.ProductRef.CaptureEventSerial = 0;
+        evidence.ProductRef.BackgroundEpochSerial =
+            currentPlan.BackgroundEpochSerial;
+        evidence.ProductRef.CapturePresentationHash =
+            currentPlan.PresentationHash;
+        evidence.ProductRef.CurrentPresentationHash =
+            currentPresentationHash;
+        evidence.ProofKind = CaptureProofKindForBackgroundSource(
+            SourceABackgroundSource::ParentOutputTex3D);
+        evidence.AuthorizationProofKind =
+            WholeSceneCaptureProofKind::ActiveBackgroundEpoch;
+        evidence.AuthorizationEpochSerial = epoch.Serial;
+        evidence.AuthorizationCaptureBank = epoch.CaptureBank;
+        evidence.AuthorizationPresentationHash = epoch.SourcePresentationHash;
+        evidence.Source3DSerial = currentPlan.Source3DSerial;
+        evidence.Source3DSceneHash = currentPlan.Source3DSceneHash;
+        evidence.SourceKind = static_cast<u32>(epoch.SourceKind);
+        evidence.ProductMask = epoch.ProductMask;
+        evidence.OutputEffectOwner =
+            WholeSceneCaptureEffectOwner::CurrentEngineColorEffect;
+        evidence.OutputEffectState =
+            static_cast<u32>(BlendCnt) |
+            (static_cast<u32>(EVA) << 16) |
+            (static_cast<u32>(EVB) << 21) |
+            (static_cast<u32>(EVY) << 26);
+        evidence.OutputPreMaster = true;
+        evidence.CaptureCnt = captureRequest;
+        evidence.CaptureConsumesSelectedPresentation =
+            captureConsumesSelectedPresentation;
+        evidence.CaptureUsesSourceB = captureUsesSourceB;
+        evidence.CaptureInputProven =
+            captureConsumesSelectedPresentation && !captureUsesSourceB;
+        evidence.CanPublishRouteProduct = currentPlan.CanPublishRouteProduct;
+        return plan;
     }
 
     return {};
 }
 
-void GLRenderer2D::RenderScreenWholeSceneCaptureBackedPlan(const WholeSceneCaptureBackedPlan& plan, int ystart, int yend)
-{
-    switch (plan.Kind)
-    {
-    case WholeSceneCaptureBackedPlanKind::CaptureBackedHandoff:
-        RenderScreenWholeSceneCaptureBackedHandoff(ystart, yend);
-        break;
-    case WholeSceneCaptureBackedPlanKind::SourceACaptureReplacement:
-        RenderScreenWholeSceneSourceACaptureReplacement(ystart, yend);
-        break;
-    case WholeSceneCaptureBackedPlanKind::CaptureEpochOverlay:
-        RenderScreenWholeSceneCaptureEpochOverlay(ystart, yend);
-        break;
-    case WholeSceneCaptureBackedPlanKind::None:
-        break;
-    }
-}
-
-WholeScenePathDecision GLRenderer2D::ChooseWholeScenePathDecision(int ystart, int yend) const
+WholeScenePathDecisionInputs GLRenderer2D::BuildWholeScenePathDecisionInputs(
+    int ystart,
+    int yend) const
 {
     WholeScenePathDecisionInputs inputs = {};
     inputs.CapturePlan = ChooseWholeSceneCaptureBackedPlan(ystart, yend);
     inputs.CanUseScalePath = CanUseWholeSceneScalePath();
-    inputs.ChunkedUnsafeOverlayAvailable =
-        inputs.CanUseScalePath &&
-        WholeSceneFullFrameFinalizerUnsafeFrame &&
-        WholeSceneScaleFragmentationFallback == RendererSettings::WholeScene2DFragmentationFallback::Off &&
-        CanUseWholeSceneOverlayOperatorPath() &&
-        !IsWholeSceneCaptureBackedHandoffGuardActive();
+    // Reject an already incompatible native-product epoch before deferring
+    // more sections. A partial display pass can consume them before VBlank.
+    // Use the current compositor fallback here; keep split-legacy eligibility
+    // unchanged so this does not add repeated per-section upscaling.
+    const bool rowOwnedDeferredFinalizer =
+        CanUseWholeSceneRowOwnedDeferredFinalizerPath() &&
+        CanDeferWholeSceneNativeProductEpoch(
+            WholeSceneNativeProductEpochValid,
+            WholeSceneNativeProductEpochInvalidReason);
     inputs.CurrentFallbackAvailable =
         inputs.CanUseScalePath &&
-        (WholeSceneFullFrameFinalizerUnsafeFrame ||
+        ((WholeSceneFullFrameFinalizerUnsafeFrame &&
+          !rowOwnedDeferredFinalizer) ||
          IsWholeSceneCurrentFragmentationGuardActive());
     inputs.PhysicalFinalPostprocessNativeInputAvailable =
         CanUsePhysicalFinalPostprocessNativeInputPath();
     inputs.HybridPresentationGuardActive =
         IsWholeSceneHybridPresentationGuardActive(ystart, yend);
     inputs.SplitLegacyFallbackAvailable = CanUseWholeSceneSplitLegacyFallbackPath();
-    inputs.ConservativeHybridMode =
-        WholeSceneScaleMode == RendererSettings::WholeScene2DScaleMode::ConservativeHybridUpscale;
+    return inputs;
+}
 
-    return ::melonDS::ChooseWholeScenePathDecision(inputs);
+u32 GLRenderer2D::BuildWholeSceneConsideredRepresentationMask(
+    const WholeSceneCaptureBackedPlan& pathCapturePlan,
+    const WholeSceneCaptureBackedPlan& scaleCapturePlan,
+    bool strictAffineAvailable) const
+{
+    u32 mask = WholeSceneOutputRepresentationBit(
+        WholeSceneOutputRepresentationKind::Current);
+    auto addPath = [&](WholeSceneRenderPath path)
+    {
+        mask |= WholeSceneOutputRepresentationBit(
+            WholeSceneOutputRepresentationForPath(path));
+    };
+    auto addCapturePlan = [&](const WholeSceneCaptureBackedPlan& plan)
+    {
+        addPath(WholeSceneRenderPathForCaptureBackedPlanKind(plan.Kind));
+    };
+
+    if (CanUseWholeSceneScalePath())
+        addPath(WholeSceneRenderPath::LegacyNativeUpscale);
+    if (CanUseWholeSceneHighResPath())
+        addPath(WholeSceneRenderPath::HighResCompositor);
+    if (strictAffineAvailable)
+        addPath(WholeSceneRenderPath::StrictAffineHighRes);
+    // The exact native compositor product is a producible later-stage
+    // candidate for every ordinary whole-scene scale path, not only when the
+    // user selected Final Native Upscale as the initial preference.
+    if (CanUseWholeSceneScalePath())
+        addPath(WholeSceneRenderPath::FinalNativeUpscale);
+    if (CanUseWholeSceneOverlayOperatorPath())
+    {
+        addPath(WholeSceneScaleMode == RendererSettings::WholeScene2DScaleMode::ConservativeHybridUpscale
+            ? WholeSceneRenderPath::ConservativeHybridUpscale
+            : WholeSceneRenderPath::OverlayOperatorUpscale);
+    }
+    if (CanUsePhysicalFinalPostprocessNativeInputPath())
+        addPath(WholeSceneRenderPath::PhysicalFinalPostprocessInput);
+    if (CanUseWholeSceneNativeExactFloorPath())
+        addPath(WholeSceneRenderPath::NativeExactFloor);
+
+    addCapturePlan(pathCapturePlan);
+    addCapturePlan(scaleCapturePlan);
+
+    return mask;
+}
+
+bool GLRenderer2D::HasActiveOBJWindowParticipant() const
+{
+    bool participant = false;
+    for (int sprite = 0; sprite < NumSprites; sprite++)
+    {
+        if (SpriteConfig.uOAM[sprite].OBJMode == 2)
+        {
+            participant = true;
+            break;
+        }
+    }
+    return HasStrictAffineActiveOBJWindow(
+        (DispCnt & (1u << 15)) != 0,
+        (LayerEnable & (1u << 4)) != 0 && OBJEnable,
+        participant);
+}
+
+u64 GLRenderer2D::BuildWholeSceneRequiredChannelMask(int ystart, int yend) const
+{
+    auto channel = [](WholeSceneOutputChannel value)
+    {
+        return static_cast<u64>(value);
+    };
+
+    u64 required = 0;
+    u32 participantCount = 0;
+    bool paletteSource = false;
+    bool mosaicActive = false;
+
+    for (int layer = 0; layer < 4; layer++)
+    {
+        if ((LayerEnable & (1u << layer)) == 0)
+            continue;
+
+        participantCount++;
+        const u32 type = LayerConfig.uBGConfig[layer].Type;
+        if (type == 6)
+            required |= channel(WholeSceneOutputChannel::Direct3D);
+        else if (type <= 1)
+        {
+            required |= channel(WholeSceneOutputChannel::TextBGGeometry);
+            paletteSource = true;
+        }
+        else
+        {
+            required |= channel(WholeSceneOutputChannel::AffineBGGeometry);
+            if (type <= 4)
+                paletteSource = true;
+        }
+
+        mosaicActive = mosaicActive ||
+            ((BGCnt[layer] & (1u << 6)) != 0 && GPU2D.BGMosaicSize[0] > 0);
+    }
+
+    if ((LayerEnable & (1u << 4)) && OBJEnable && NumSprites > 0)
+    {
+        required |= channel(WholeSceneOutputChannel::OBJGeometry);
+        participantCount++;
+
+        for (int i = 0; i < NumSprites; i++)
+        {
+            const auto& sprite = SpriteConfig.uOAM[i];
+            if (sprite.Rotscale != static_cast<u32>(-1))
+                required |= channel(WholeSceneOutputChannel::AffineOBJGeometry);
+            if (sprite.OBJMode == 1 || sprite.OBJMode == 3)
+                required |= channel(WholeSceneOutputChannel::SemiTransparentOBJ);
+            if (sprite.Type <= 1)
+                paletteSource = true;
+        }
+        mosaicActive = mosaicActive || SpriteUseMosaic;
+    }
+
+    if (participantCount > 1)
+        required |= channel(WholeSceneOutputChannel::Priority);
+    if (DispCnt & ((1u << 13) | (1u << 14)))
+        required |= channel(WholeSceneOutputChannel::Windows);
+    if (HasActiveOBJWindowParticipant())
+        required |= channel(WholeSceneOutputChannel::OBJWindow);
+    if (mosaicActive)
+        required |= channel(WholeSceneOutputChannel::Mosaic);
+    if (paletteSource)
+        required |= channel(WholeSceneOutputChannel::Palette);
+
+    const u32 blendMode = (BlendCnt >> 6) & 0x3u;
+    const u32 target1 = BlendCnt & 0x3Fu;
+    if ((blendMode == 2 || blendMode == 3) && EVY > 0 && target1 != 0)
+        required |= channel(WholeSceneOutputChannel::ColorEffect);
+    if (blendMode == 1 && target1 != 0 && ((BlendCnt >> 8) & 0x3Fu) != 0)
+        required |= channel(WholeSceneOutputChannel::AlphaBlend);
+
+    const u32 displayMode = (DispCnt >> 16) & (GPU2D.Num ? 0x1u : 0x3u);
+    const u32 captureSize = (Parent.CaptureCnt >> 20) & 0x3u;
+    const int captureHeight = captureSize == 0
+        ? 128
+        : static_cast<int>(64 * captureSize);
+    const bool captureRangeActive = ystart < captureHeight && yend > 0;
+    if (!GPU2D.Num && GPU.CaptureEnable && captureRangeActive)
+    {
+        required |= channel(WholeSceneOutputChannel::DisplayCapture);
+        const u32 captureMode = (Parent.CaptureCnt >> 29) & 0x3u;
+        const bool usesSourceB =
+            captureMode == 1 ||
+            (captureMode == 2 && ((Parent.CaptureCnt >> 8) & 0x1Fu) != 0);
+        if (usesSourceB && ((Parent.CaptureCnt >> 25) & 0x1u) == 0)
+            required |= channel(WholeSceneOutputChannel::CaptureFeedback);
+    }
+    if (!GPU2D.Num && displayMode == 2)
+        required |= channel(WholeSceneOutputChannel::VRAMDisplay);
+
+    // These stages are explicit even when their selected state is the normal
+    // no-op route. This keeps their line/chunk ownership visible in the plan.
+    required |= channel(WholeSceneOutputChannel::DisplaySelection);
+    required |= channel(WholeSceneOutputChannel::PhysicalRouting);
+
+    const u16 masterBrightness = GPU2D.Num
+        ? Parent.MasterBrightnessB
+        : Parent.MasterBrightnessA;
+    const u32 brightnessMode = (masterBrightness >> 14) & 0x3u;
+    const u32 brightnessFactor = std::min<u32>(masterBrightness & 0x1Fu, 16u);
+    if ((brightnessMode == 1 || brightnessMode == 2) && brightnessFactor > 0)
+        required |= channel(WholeSceneOutputChannel::MasterBrightness);
+
+    return required;
+}
+
+u64 GLRenderer2D::BuildWholeSceneRepresentationSourceGeneration() const
+{
+    constexpr u64 offset = 1469598103934665603ull;
+    constexpr u64 prime = 1099511628211ull;
+    u64 hash = offset;
+    auto mix = [&](u64 value)
+    {
+        for (int byte = 0; byte < 8; byte++)
+        {
+            hash ^= value & 0xFFu;
+            hash *= prime;
+            value >>= 8;
+        }
+    };
+    for (u64 generation : BGLayerSourceGeneration)
+        mix(generation);
+    mix(SpriteSourceGeneration);
+    return hash == 0 ? 1 : hash;
+}
+
+u64 GLRenderer2D::BuildWholeSceneRowSourceGeneration(
+    int y,
+    const u64* bgSourceGenerations,
+    u64 objSourceGeneration) const
+{
+    if (y < 0 || y >= 192)
+        return 0;
+
+    constexpr u64 offset = 1469598103934665603ull;
+    constexpr u64 prime = 1099511628211ull;
+    u64 hash = offset;
+    auto mix = [&](u64 value)
+    {
+        for (int byte = 0; byte < 8; byte++)
+        {
+            hash ^= value & 0xFFu;
+            hash *= prime;
+            value >>= 8;
+        }
+    };
+
+    const auto& row = ScanlineConfig.uScanline[y];
+    const u64* generations = bgSourceGenerations
+        ? bgSourceGenerations : BGLayerSourceGeneration;
+    for (int layer = 0; layer < 4; layer++)
+    {
+        // Direct3D and capture-backed layers do not consume BGLayerTex. The
+        // deferred strict path independently rejects capture-backed row state.
+        if (row.BGPrio[layer] == 0xFFFFFFFFu ||
+            LayerConfig.uBGConfig[layer].Type >= 6)
+            continue;
+        mix(static_cast<u64>(layer + 1));
+        mix(generations[layer]);
+    }
+
+    bool rowHasDrawableOBJ = false;
+    if (row.EnableOBJ)
+    {
+        for (int sprite = 0; sprite < NumSprites; sprite++)
+        {
+            const auto& source = SpriteConfig.uOAM[sprite];
+            if (source.OBJMode == 2)
+                continue;
+            const int ypos = static_cast<s32>(source.Position[1]);
+            const int height = static_cast<int>(source.BoundSize[1]);
+            const bool directCoverage =
+                ypos < y + 1 && ypos + height > y;
+            const int wrappedY = ypos & 0xFF;
+            const bool wrappedCoverage =
+                wrappedY < y + 1 && wrappedY + height > y;
+            if (directCoverage || wrappedCoverage)
+            {
+                rowHasDrawableOBJ = true;
+                break;
+            }
+        }
+    }
+    if (rowHasDrawableOBJ)
+    {
+        mix(5);
+        mix(objSourceGeneration != 0
+                ? objSourceGeneration : SpriteSourceGeneration);
+    }
+    return hash == 0 ? 1 : hash;
+}
+
+u64 GLRenderer2D::BuildWholeSceneRowEpochIdentity(
+    int ystart,
+    int yend) const
+{
+    if (ystart < 0 || yend <= ystart || yend > 192)
+        return 0;
+
+    constexpr u64 offset = 1469598103934665603ull;
+    constexpr u64 prime = 1099511628211ull;
+    u64 hash = offset;
+    auto mix = [&](u64 value)
+    {
+        for (int byte = 0; byte < 8; byte++)
+        {
+            hash ^= value & 0xFFu;
+            hash *= prime;
+            value >>= 8;
+        }
+    };
+
+    mix(static_cast<u64>(ystart));
+    mix(static_cast<u64>(yend));
+    mix(DispCnt);
+    mix(LayerEnable);
+    mix(OBJEnable);
+    mix(BlendCnt);
+    mix(EVA);
+    mix(EVB);
+    mix(EVY);
+    mix(GPU2D.Num ? Parent.MasterBrightnessB : Parent.MasterBrightnessA);
+    for (int layer = 0; layer < 4; layer++)
+        mix(BGCnt[layer]);
+
+    // Hash the semantic state consumed by the scanline compositor, not just
+    // the register snapshot at the end of the range. Natural coordinate
+    // progression is intentionally included: the identity describes this
+    // exact ordered row epoch and therefore cannot be reused for another
+    // range whose window, mosaic, affine or backdrop history differs.
+    for (int y = ystart; y < yend; y++)
+    {
+        const auto& row = ScanlineConfig.uScanline[y];
+        for (int layer = 0; layer < 4; layer++)
+        {
+            for (int component = 0; component < 4; component++)
+                mix(static_cast<u32>(row.BGOffset[layer][component]));
+        }
+        for (int affine = 0; affine < 2; affine++)
+        {
+            for (int component = 0; component < 4; component++)
+                mix(static_cast<u32>(row.BGRotscale[affine][component]));
+        }
+        mix(row.BackColor);
+        mix(row.WinRegs);
+        mix(row.WinMask);
+        for (int component = 0; component < 4; component++)
+            mix(static_cast<u32>(row.WinPos[component]));
+        for (int layer = 0; layer < 4; layer++)
+            mix(row.BGMosaicEnable[layer]);
+        for (int component = 0; component < 4; component++)
+            mix(static_cast<u32>(row.MosaicSize[component]));
+        for (int layer = 0; layer < 4; layer++)
+            mix(row.BGPrio[layer]);
+        mix(row.EnableOBJ);
+        mix(row.Enable3D);
+        mix(row.BlendCnt);
+        mix(row.BlendEffect);
+        for (int component = 0; component < 4; component++)
+            mix(row.BlendCoef[component]);
+        mix(static_cast<u32>(SpriteScanlineConfig.uMosaicLine[y]));
+    }
+
+    return hash == 0 ? 1 : hash;
+}
+
+WholeSceneCompositorRecipe
+GLRenderer2D::BuildStrictAffineSemanticRecipeIntent(
+    int ystart,
+    int yend,
+    bool includeOBJ,
+    bool strictPathSelectedOverride) const
+{
+    WholeSceneSemanticCompositorRecipeInputs inputs;
+    inputs.YStart = ystart;
+    inputs.YEnd = yend;
+    inputs.OutputScale = ScaleFactor;
+    inputs.RowEpochIdentity =
+        BuildWholeSceneRowEpochIdentity(ystart, yend);
+    inputs.EnabledBGMask = LayerEnable & 0xFu;
+
+    u32 affineBGMask = 0;
+    u32 ordinaryTextBGMask = 0;
+    for (int layer = 0; layer < 4; layer++)
+    {
+        const u32 layerBit = 1u << layer;
+        if ((inputs.EnabledBGMask & layerBit) == 0)
+            continue;
+
+        const int type = LayerConfig.uBGConfig[layer].Type;
+        if (type == 6)
+            inputs.Direct3DBGMask |= layerBit;
+        else
+            inputs.BGProductsAvailableMask |= layerBit;
+        if (type == 2 || type == 3)
+            affineBGMask |= layerBit;
+        if (type == 0 || type == 1)
+            ordinaryTextBGMask |= layerBit;
+        inputs.BGSourceGeneration[layer] = BGLayerSourceGeneration[layer];
+    }
+    inputs.Direct3DProductAvailable = true;
+
+    const StrictAffineSourceEnhancementDecision sourceEnhancement =
+        CurrentStrictAffineSourceEnhancementDecision(
+            strictPathSelectedOverride);
+    const StrictAffineSourceEnhancementDecision ordinaryScaling =
+        CurrentStrictAffineOrdinaryScalingDecision(
+            strictPathSelectedOverride);
+    const bool ordinarySpline36 = ordinaryScaling ==
+        StrictAffineSourceEnhancementDecision::Spline36Inline;
+    const bool ordinaryArtCNN = ordinaryScaling ==
+        StrictAffineSourceEnhancementDecision::ArtCNNCachedAffineSources;
+    const bool ordinaryCuNNy = ordinaryScaling ==
+        StrictAffineSourceEnhancementDecision::CuNNyCachedAffineSources;
+    const bool ordinaryNNEDI3 = ordinaryScaling ==
+        StrictAffineSourceEnhancementDecision::NNEDI3CachedAffineSources;
+    const bool ordinaryXBRZ = ordinaryScaling ==
+        StrictAffineSourceEnhancementDecision::XBRZCachedAffineSources;
+    const bool ordinaryScaled = ordinarySpline36 || ordinaryArtCNN ||
+        ordinaryCuNNy || ordinaryNNEDI3 || ordinaryXBRZ;
+    const bool cached = IsStrictAffineCachedSource(sourceEnhancement);
+    const u32 blendEffect = (BlendCnt >> 6) & 0x3u;
+    const StrictAffineHighResEligibilityInputs strictEligibilityInputs =
+        BuildStrictAffineHighResEligibilityInputs(
+            ystart, yend, WholeScenePlan.RequiredChannels);
+    const bool resolvedBitmapOBJMaterial =
+        HasStrictAffineResolvedBitmapOBJMaterial(strictEligibilityInputs);
+    const bool resolvedTextBGAlphaBlend =
+        HasStrictAffineResolvedTextBGAlphaBlend(strictEligibilityInputs);
+    const bool inertAlphaBlend =
+        HasStrictAffineInertAlphaBlend(strictEligibilityInputs);
+    const u32 companionTextBGMask =
+        ChooseStrictAffineCompanionTextBGMask(
+            LayerEnable,
+            ordinaryTextBGMask,
+            WholeSceneScaleHybridStrictAffineTopTextBG,
+            blendEffect,
+            resolvedBitmapOBJMaterial,
+            resolvedTextBGAlphaBlend,
+            inertAlphaBlend);
+    inputs.EnhancedBGMask = (cached ? affineBGMask : 0u) |
+        (ordinaryScaled ? companionTextBGMask : 0u);
+    const u32 enhancedTextBGMask =
+        inputs.EnhancedBGMask & companionTextBGMask;
+    const u32 reconstructedCoverageEligibleTextBGMask =
+        blendEffect == 1 ? 0u : enhancedTextBGMask;
+    const u32 bilinearResolvedTextBGCoverageMask =
+        ChooseStrictAffineResolvedTextBGBilinearCoverageMask(
+            enhancedTextBGMask,
+            strictEligibilityInputs.AlphaBlendTarget1Mask,
+            ordinaryScaled,
+            resolvedTextBGAlphaBlend);
+    const u32 establishedTextCoverageMask =
+        (ordinaryXBRZ
+            ? (reconstructedCoverageEligibleTextBGMask & 0x3u)
+            : 0u) |
+        bilinearResolvedTextBGCoverageMask;
+    const u32 reconstructedTextCandidateMask =
+        reconstructedCoverageEligibleTextBGMask;
+    inputs.ReconstructedBGCoverageMask =
+        establishedTextCoverageMask | reconstructedTextCandidateMask;
+
+    bool hasOrdinaryOBJ = false;
+    if (includeOBJ &&
+        (LayerEnable & (1u << 4)) && OBJEnable && NumSprites > 0)
+    {
+        inputs.OBJEnabled = true;
+        for (int sprite = 0; sprite < NumSprites; sprite++)
+        {
+            const auto& source = SpriteConfig.uOAM[sprite];
+            hasOrdinaryOBJ |=
+                source.OBJMode != 2 &&
+                source.Rotscale == static_cast<u32>(-1);
+        }
+    }
+    const bool activeOBJWindow = HasActiveOBJWindowParticipant();
+    inputs.ResolvedOBJProduct = ShouldResolveOrdinaryOBJSurface(
+        inputs.OBJEnabled, hasOrdinaryOBJ, ordinaryScaled,
+        activeOBJWindow, ystart, yend);
+    inputs.OBJProductAvailable = inputs.OBJEnabled;
+    inputs.OBJSourceGeneration = SpriteSourceGeneration;
+    inputs.EffectState = WholeScenePlan.CompositorEffectState;
+    return BuildWholeSceneSemanticCompositorRecipe(inputs);
+}
+
+StrictAffineOrderedRecipeIntent
+GLRenderer2D::BuildStrictAffineOrderedRecipeIntent(
+    int ystart,
+    int yend,
+    bool strictPathSelectedOverride,
+    bool allowNoopBrightness) const
+{
+    StrictAffineOrderedRecipeIntent intent;
+    intent.Assessed = true;
+    intent.SemanticBaseRecipe =
+        BuildStrictAffineSemanticRecipeIntent(
+            ystart, yend, false, strictPathSelectedOverride);
+
+    const StrictAffineSourceEnhancementDecision sourceEnhancement =
+        CurrentStrictAffineSourceEnhancementDecision(
+            strictPathSelectedOverride);
+    const StrictAffineSourceEnhancementDecision ordinaryScaling =
+        CurrentStrictAffineOrdinaryScalingDecision(
+            strictPathSelectedOverride);
+    const bool spline36 = sourceEnhancement ==
+        StrictAffineSourceEnhancementDecision::Spline36Inline;
+    const bool cached = IsStrictAffineCachedSource(sourceEnhancement);
+    const bool sourceEnhanced = spline36 || cached;
+    const bool ordinaryScaled =
+        ordinaryScaling ==
+            StrictAffineSourceEnhancementDecision::Spline36Inline ||
+        ordinaryScaling ==
+            StrictAffineSourceEnhancementDecision::ArtCNNCachedAffineSources ||
+        ordinaryScaling ==
+            StrictAffineSourceEnhancementDecision::CuNNyCachedAffineSources ||
+        ordinaryScaling ==
+            StrictAffineSourceEnhancementDecision::NNEDI3CachedAffineSources ||
+        ordinaryScaling ==
+            StrictAffineSourceEnhancementDecision::XBRZCachedAffineSources;
+    const bool geometryOnlyOrderedPresentation =
+        strictPathSelectedOverride &&
+        sourceEnhancement ==
+            StrictAffineSourceEnhancementDecision::Disabled;
+    // Resolve the ordered sprite band once after composing its subpixels.
+    const bool affineSubpixel2x = sourceEnhanced &&
+        WholeSceneScaleHybridStrictAffineOBJSubpixel2x;
+
+    const bool objVisible =
+        (LayerEnable & (1u << 4)) && OBJEnable && NumSprites > 0;
+    bool hasOrdinaryOBJ = false;
+    bool hasUnsupportedOrdinaryOBJ = false;
+    bool hasUnmergeableOrdinaryOBJ = false;
+    bool hasOrdinaryEquivalentAffineOBJ = false;
+    bool hasTransformedAffineOBJ = false;
+    if (objVisible)
+    {
+        for (int sprite = 0; sprite < NumSprites; sprite++)
+        {
+            const auto& source = SpriteConfig.uOAM[sprite];
+            if (source.OBJMode != 2 &&
+                source.Rotscale == static_cast<u32>(-1))
+            {
+                hasOrdinaryOBJ = true;
+                hasUnsupportedOrdinaryOBJ |= source.OBJMode != 0;
+                hasUnmergeableOrdinaryOBJ |=
+                    source.Type >= 2 || source.Mosaic;
+            }
+            hasOrdinaryEquivalentAffineOBJ |=
+                IsOrdinaryEquivalentAffineSprite(sprite);
+            hasTransformedAffineOBJ |=
+                source.OBJMode != 2 &&
+                source.Rotscale != static_cast<u32>(-1) &&
+                !IsOrdinaryEquivalentAffineSprite(sprite);
+        }
+    }
+    const bool hasSemanticAffineOBJ =
+        hasTransformedAffineOBJ ||
+        SemanticAffineOBJRoleMask[0] != 0 ||
+        SemanticAffineOBJRoleMask[1] != 0;
+    const bool activeOBJWindow = HasActiveOBJWindowParticipant();
+
+    bool hasDirect3D = false;
+    bool hasAffineBG = false;
+    u32 enabledBGMask = 0;
+    u32 bgPriority[4] {};
+    for (int layer = 0; layer < 4; layer++)
+    {
+        if ((LayerEnable & (1u << layer)) == 0)
+            continue;
+        enabledBGMask |= 1u << layer;
+        bgPriority[layer] = BGCnt[layer] & 0x3u;
+        const u32 type = LayerConfig.uBGConfig[layer].Type;
+        hasDirect3D |= type == 6;
+        hasAffineBG |= type == 2 || type == 3;
+    }
+
+    const bool resolvedOBJExpected = ShouldResolveOrdinaryOBJSurface(
+        objVisible, hasOrdinaryOBJ, ordinaryScaled,
+        activeOBJWindow, ystart, yend);
+    const u32 target1Mask = BlendCnt & 0x3Fu;
+    const u32 blendEffect = (BlendCnt >> 6) & 0x3u;
+    const bool orderedOBJEffectSupported =
+        (target1Mask & (1u << 4)) == 0 ||
+        blendEffect == 0 || blendEffect == 2 || blendEffect == 3;
+    intent.OrdinaryBandEligible =
+        objVisible && hasOrdinaryOBJ && hasAffineBG &&
+        !hasUnmergeableOrdinaryOBJ &&
+        !hasOrdinaryEquivalentAffineOBJ && !hasTransformedAffineOBJ &&
+        ystart == 0 && yend == 192 &&
+        !activeOBJWindow &&
+        orderedOBJEffectSupported && ordinaryScaled;
+    intent.NoAffineExtensionEligible =
+        intent.OrdinaryBandEligible &&
+        hasUnsupportedOrdinaryOBJ && !hasSemanticAffineOBJ;
+    const bool orderedEligible =
+        objVisible && (hasOrdinaryOBJ || hasSemanticAffineOBJ) &&
+        (hasSemanticAffineOBJ || intent.NoAffineExtensionEligible) &&
+        !hasUnmergeableOrdinaryOBJ &&
+        ystart == 0 && yend == 192 &&
+        // WIN0/WIN1 are retained per row by the presentation operators.
+        // OBJ-window still needs the semantic OBJ-window mask as an operand.
+        !activeOBJWindow &&
+        orderedOBJEffectSupported &&
+        (ordinaryScaled || geometryOnlyOrderedPresentation);
+    intent.PlannedOrderedRequested =
+        orderedEligible &&
+        (hasSemanticAffineOBJ || !resolvedOBJExpected);
+    if (!orderedEligible)
+    {
+        if (!objVisible || !hasSemanticAffineOBJ)
+            intent.OperandPlan.RejectionMask |=
+                OBJOperandPlanRejectNoAffineOBJ;
+        if (hasUnmergeableOrdinaryOBJ ||
+            activeOBJWindow ||
+            !orderedOBJEffectSupported)
+        {
+            intent.OperandPlan.RejectionMask |=
+                OBJOperandPlanRejectUnsupportedSpecial;
+        }
+        if (ystart != 0 || yend != 192 ||
+            (!ordinaryScaled && !geometryOnlyOrderedPresentation))
+            intent.OperandPlan.RejectionMask |=
+                OBJOperandPlanRejectClassification;
+        return intent;
+    }
+
+    WholeScene2DAffineOBJDebugEvidence evidence;
+    CaptureAffineOBJDebugEvidence(evidence);
+    WholeSceneOBJOperandPlanOptions options;
+    options.AllowNoAffineOBJ = intent.NoAffineExtensionEligible;
+    options.SpecialIsolationMargin = 8;
+    intent.OperandPlan =
+        BuildWholeSceneOBJForegroundOperandPlan(
+            evidence.OrdinaryBands, enabledBGMask, bgPriority, options);
+    intent.Classification = evidence.OrdinaryBands;
+    intent.AtomicRecipe = IsWholeSceneOBJBandSingleForegroundRecipe(
+        intent.Classification, enabledBGMask, bgPriority);
+    intent.PreservedBehindRecipe =
+        IsWholeSceneOBJBandSingleForegroundPreservedBehindRecipe(
+            intent.Classification, enabledBGMask, bgPriority);
+
+    WholeSceneCompositorRecipeInputs recipeInputs;
+    recipeInputs.YStart = ystart;
+    recipeInputs.YEnd = yend;
+    recipeInputs.OutputScale = ScaleFactor;
+    recipeInputs.RowEpochIdentity =
+        intent.SemanticBaseRecipe.RowEpochIdentity;
+    recipeInputs.Capabilities.CompletedBase = true;
+    recipeInputs.Capabilities.OrdinaryOBJBand = true;
+    recipeInputs.Capabilities.AffineOBJGroup = true;
+    recipeInputs.AffineOBJSubpixel2x = affineSubpixel2x;
+    // The special-OBJ operator validates the actual native underlay mask at
+    // each output pixel, so support does not require every possible DS layer
+    // (including an unreachable backdrop) to be configured as Target 2.
+    recipeInputs.Capabilities.SemiTransparentOBJ = true;
+    recipeInputs.CompletedBaseIdentity =
+        intent.OperandPlan.PlanHash ^
+        (static_cast<u64>(LayerEnable) << 32) ^ DispCnt;
+    recipeInputs.CompletedBaseRecipeHash =
+        intent.SemanticBaseRecipe.RecipeHash;
+    for (int layer = 0; layer < 4; layer++)
+    {
+        recipeInputs.CompletedBaseIdentity *= 1099511628211ull;
+        recipeInputs.CompletedBaseIdentity ^=
+            BGLayerSourceGeneration[layer];
+    }
+    recipeInputs.SourceGeneration = SpriteSourceGeneration;
+    recipeInputs.EffectState = WholeScenePlan.CompositorEffectState;
+    intent.OrderedRecipe = BuildWholeSceneOBJCompositorRecipe(
+        intent.OperandPlan, recipeInputs);
+
+    WholeSceneOperandExcludedOverlayInputs overlayInputs;
+    overlayInputs.Requested =
+        intent.PlannedOrderedRequested && hasDirect3D && !hasAffineBG;
+    overlayInputs.OrderedProductsAvailable = intent.OrderedRecipe.Ready;
+    overlayInputs.Direct3D = hasDirect3D;
+    overlayInputs.AffineBG = hasAffineBG;
+    overlayInputs.WindowActive = (DispCnt & 0xE000u) != 0;
+    bool hasSemiTransparentAffineOBJ = false;
+    for (int sprite = 0; sprite < NumSprites; sprite++)
+    {
+        const auto& source = SpriteConfig.uOAM[sprite];
+        hasSemiTransparentAffineOBJ |=
+            source.OBJMode == 1 &&
+            source.Rotscale != static_cast<u32>(-1);
+    }
+    const bool noopBrightness = allowNoopBrightness &&
+        (blendEffect == 2 || blendEffect == 3) && EVY == 0;
+    overlayInputs.EffectActive =
+        (blendEffect != 0 && !noopBrightness) ||
+        hasSemiTransparentAffineOBJ;
+    overlayInputs.YStart = ystart;
+    overlayInputs.YEnd = yend;
+    overlayInputs.OutputScale = ScaleFactor;
+    intent.OverlayRecipe = BuildWholeSceneOperandExcludedOverlayRecipe(
+        intent.OrderedRecipe, overlayInputs);
+    return intent;
+}
+
+WholeSceneOutputPlan GLRenderer2D::BuildWholeSceneOutputPlan(
+    int ystart,
+    int yend,
+    const WholeScenePathDecisionInputs& pathInputs) const
+{
+    WholeSceneOutputPlanInputs inputs = {};
+    inputs.YStart = ystart;
+    inputs.YEnd = yend;
+    inputs.SelectPathFromFacts = true;
+    inputs.PathDecisionInputs = pathInputs;
+    inputs.RequiredChannels = BuildWholeSceneRequiredChannelMask(ystart, yend);
+    inputs.RepresentationSourceGeneration =
+        BuildWholeSceneRepresentationSourceGeneration();
+    inputs.RepresentationRowEpochIdentity =
+        BuildWholeSceneRowEpochIdentity(ystart, yend);
+
+    if (pathInputs.CanUseScalePath)
+    {
+        inputs.HasScaleDecision = true;
+        inputs.SelectScaleFromFacts = true;
+        inputs.ScaleCandidateInputs = BuildWholeSceneScaleCandidateInputs(
+            ystart,
+            yend,
+            pathInputs.CapturePlan,
+            inputs.RequiredChannels);
+    }
+
+    inputs.ConsideredRepresentationMask =
+        BuildWholeSceneConsideredRepresentationMask(
+            pathInputs.CapturePlan,
+            inputs.ScaleCandidateInputs.CapturePlan,
+            inputs.ScaleCandidateInputs.StrictAffineHighResAvailable);
+    inputs.SelectorConfigured =
+        CanUseWholeSceneOverlayOperatorPath() ||
+        pathInputs.CapturePlan.Kind != WholeSceneCaptureBackedPlanKind::None ||
+        (inputs.HasScaleDecision &&
+         inputs.ScaleCandidateInputs.CapturePlan.Kind !=
+             WholeSceneCaptureBackedPlanKind::None);
+    inputs.HybridDecision = ChooseHybridSourceDecision();
+    inputs.WindowEdgeAssist = WholeSceneScaleHybridWindowEdgeAssist;
+    inputs.Target2AlphaBlendAssist = WholeSceneScaleHybridTarget2AlphaBlendAssist;
+    inputs.NativeEffectGuard = WholeSceneScaleHybridNativeEffectGuard;
+    inputs.CleanLegacyCandidateEnabled = WholeSceneScaleHybridCleanLegacyCandidate;
+    inputs.CleanLegacyBlockReason = ChooseHybridCleanLegacyBlockReason(
+        BuildHybridCleanLegacyEligibilityInputs());
+    inputs.OutputScale = ScaleFactor;
+    inputs.BlendCnt = BlendCnt;
+    inputs.EVA = EVA;
+    inputs.EVB = EVB;
+    inputs.EVY = EVY;
+    if ((LayerEnable & (1u << 4)) && OBJEnable && NumSprites > 0)
+    {
+        for (int i = 0; i < NumSprites; i++)
+        {
+            const u32 mode = SpriteConfig.uOAM[i].OBJMode;
+            if (mode == 1)
+                inputs.SemiTransparentOBJModeMask |= 1u << 0;
+            else if (mode == 3)
+                inputs.SemiTransparentOBJModeMask |= 1u << 1;
+        }
+    }
+    inputs.MasterBrightness = GPU2D.Num
+        ? Parent.MasterBrightnessB
+        : Parent.MasterBrightnessA;
+    const u16 frameStartMasterBrightness = GPU2D.Num
+        ? Parent.FrameStartMasterBrightnessB
+        : Parent.FrameStartMasterBrightnessA;
+    if (frameStartMasterBrightness == inputs.MasterBrightness)
+    {
+        inputs.MasterBrightnessYStart = 0;
+        inputs.MasterBrightnessYEnd = 192;
+    }
+    inputs.CaptureCnt = Parent.CaptureCnt;
+    inputs.DisplayMode =
+        (DispCnt >> 16) & (GPU2D.Num ? 0x1u : 0x3u);
+    bool screenSwap = GPU.ScreenSwap;
+    const bool routeUniform =
+        Parent.GetFinalPassScreenSwapForRange(ystart, yend, screenSwap);
+    if (!routeUniform)
+        inputs.PhysicalTarget = WholeScenePhysicalTarget::Mixed;
+    else
+    {
+        const bool finalBottom = GPU2D.Num == (screenSwap ? 1u : 0u);
+        inputs.PhysicalTarget = finalBottom
+            ? WholeScenePhysicalTarget::Bottom
+            : WholeScenePhysicalTarget::Top;
+    }
+
+    inputs.HasPhysicalPresentationBrightness =
+        WholeScenePhysicalPresentationBrightnessActive;
+    inputs.PhysicalPresentationBrightness =
+        WholeScenePhysicalPresentationBrightnessState;
+    inputs.PhysicalPresentationBrightnessYStart = 0;
+    inputs.PhysicalPresentationBrightnessYEnd = 192;
+
+    return ::melonDS::BuildWholeSceneOutputPlan(inputs);
 }
 
 void GLRenderer2D::RenderScreen(int ystart, int yend)
 {
     const auto start = std::chrono::steady_clock::now();
 
-    const WholeScenePathDecision decision = ChooseWholeScenePathDecision(ystart, yend);
-    switch (decision.Reason)
+    UpdateStrictAffineGeometryDemand(ystart, yend);
+
+    const WholeScenePathDecisionInputs pathInputs =
+        BuildWholeScenePathDecisionInputs(ystart, yend);
+    WholeSceneRecipePreparation = {};
+    WholeSceneExecutionTrace = {};
+    StrictAffineOrderedAssessment = {};
+    WholeScenePlan = BuildWholeSceneOutputPlan(ystart, yend, pathInputs);
+    if (WholeScenePlan.SelectedPath ==
+        WholeSceneRenderPath::StrictAffineHighRes)
     {
-    case WholeScenePathDecisionReason::CaptureBackedProducerDuringHybridGuard:
-    case WholeScenePathDecisionReason::CaptureBackedBeforeGeneralFallbacks:
-    case WholeScenePathDecisionReason::CaptureBackedAfterGeneralFallbacks:
-        RenderScreenWholeSceneCaptureBackedPlan(decision.CapturePlan, ystart, yend);
+        // Affine-role continuity is a frame fact, not a side effect of the
+        // strict executor. Observe it once before dispatch so the plan and
+        // renderer build their recipes from the same role identity.
+        UpdateSemanticAffineOBJRoleContinuity();
+        const WholeSceneCompositorRecipe recipeIntent =
+            BuildStrictAffineSemanticRecipeIntent(
+                WholeScenePlan.ExecutionYStart,
+                WholeScenePlan.ExecutionYEnd);
+        WholeSceneRecipePreparation.Compositor =
+            PrepareWholeSceneCompositorRecipeBinding(
+                WholeScenePlan, recipeIntent);
+        StrictAffineOrderedAssessment =
+            BuildStrictAffineOrderedRecipeIntent(
+                WholeScenePlan.ExecutionYStart,
+                WholeScenePlan.ExecutionYEnd);
+        // Preserve rejected ordered-assessment evidence as well as successful
+        // execution evidence. Otherwise a dormant recipe reports all zeros
+        // and hides the actual semantic gate which prevented selection.
+        WholeSceneTrace.StrictAffineOBJOperandPlanRequested =
+            StrictAffineOrderedAssessment.PlannedOrderedRequested;
+        WholeSceneTrace.StrictAffineOBJOperandPlanRejectionMask =
+            StrictAffineOrderedAssessment.OperandPlan.RejectionMask;
+        WholeSceneTrace.StrictAffineOBJOperandPlanOperandCount =
+            static_cast<u32>(
+                StrictAffineOrderedAssessment.OperandPlan.BackToFront.size());
+        u32 assessedPresentationProductCount = 0;
+        for (const auto& operand :
+             StrictAffineOrderedAssessment.OperandPlan.BackToFront)
+        {
+            if (operand.PresentationIndex >= 0)
+            {
+                assessedPresentationProductCount = std::max(
+                    assessedPresentationProductCount,
+                    static_cast<u32>(operand.PresentationIndex + 1));
+            }
+        }
+        WholeSceneTrace.StrictAffineOBJOperandPlanPresentationProductCount =
+            assessedPresentationProductCount;
+        if (StrictAffineOrderedAssessment.PlannedOrderedRequested &&
+            StrictAffineOrderedAssessment.OrderedRecipe.Ready)
+        {
+            WholeSceneRecipePreparation.OrderedPresentation =
+                PrepareWholeSceneOrderedPresentationRecipeBinding(
+                    WholeScenePlan,
+                    WholeSceneRecipePreparation.Compositor,
+                    StrictAffineOrderedAssessment.SemanticBaseRecipe,
+                    StrictAffineOrderedAssessment.OrderedRecipe);
+        }
+        if (StrictAffineOrderedAssessment.OverlayRecipe.Ready)
+        {
+            WholeSceneRecipePreparation.OperandExcludedOverlay =
+                PrepareWholeSceneOperandExcludedOverlayRecipeBinding(
+                    WholeScenePlan,
+                    WholeSceneRecipePreparation.Compositor,
+                    WholeSceneRecipePreparation.OrderedPresentation,
+                    StrictAffineOrderedAssessment.OverlayRecipe);
+        }
+    }
+    const SourceACaptureReplacementExecutionInput sourceAExecutionInput =
+        WholeScenePlan.SelectedPath ==
+                WholeSceneRenderPath::SourceACaptureReplacement ||
+            WholeScenePlan.CapturePlan.Kind ==
+                WholeSceneCaptureBackedPlanKind::SourceACaptureReplacement
+            ? PrepareSourceACaptureReplacementExecutionInput(
+                  WholeScenePlan.ExecutionYStart,
+                  WholeScenePlan.ExecutionYEnd)
+            : SourceACaptureReplacementExecutionInput{};
+    const CaptureEpochOverlayExecutionInput captureEpochExecutionInput =
+        WholeScenePlan.ExecutionKind ==
+                WholeSceneOutputExecutionKind::CaptureBackedPlan &&
+            WholeScenePlan.CapturePlan.Kind ==
+                WholeSceneCaptureBackedPlanKind::CaptureEpochOverlay
+            ? PrepareCaptureEpochOverlayExecutionInput(
+                  WholeScenePlan.CapturePlan,
+                  WholeScenePlan.ExecutionYStart,
+                  WholeScenePlan.ExecutionYEnd)
+            : CaptureEpochOverlayExecutionInput{};
+    const PreparedCaptureBackedExecution captureBackedExecution =
+        WholeScenePlan.SelectedPath ==
+                WholeSceneRenderPath::SourceACaptureReplacement
+            ? PrepareSourceAExecution(sourceAExecutionInput)
+            : PrepareCaptureBackedExecution(WholeScenePlan.CapturePlan,
+                                            sourceAExecutionInput,
+                                            captureEpochExecutionInput,
+                                            WholeScenePlan.ExecutionYStart,
+                                            WholeScenePlan.ExecutionYEnd);
+
+    WholeSceneOutputExecutionKind executedExecutionKind =
+        WholeSceneOutputExecutionKind::None;
+    switch (WholeScenePlan.ExecutionKind)
+    {
+    case WholeSceneOutputExecutionKind::Current:
+        executedExecutionKind = WholeSceneOutputExecutionKind::Current;
+        RenderScreenCurrent(
+            WholeScenePlan.ExecutionYStart,
+            WholeScenePlan.ExecutionYEnd,
+            WholeScenePlan.ExecutionCurrentFragmentationFallback,
+            WholeScenePlan.CurrentReason);
         break;
-    case WholeScenePathDecisionReason::HybridPresentationGuard:
-        RenderScreenCurrent(0, 192, false, decision.CurrentReason);
+    case WholeSceneOutputExecutionKind::SelectedRepresentation:
+        executedExecutionKind =
+            WholeSceneOutputExecutionKind::SelectedRepresentation;
+        if (WholeScenePlan.SelectedPath ==
+            WholeSceneRenderPath::SourceACaptureReplacement)
+        {
+            ExecutePreparedCaptureBackedExecution(
+                captureBackedExecution,
+                WholeScenePlan.ExecutionYStart,
+                WholeScenePlan.ExecutionYEnd);
+        }
+        else
+        {
+            RenderScreenWholeScene(WholeScenePlan.ExecutionYStart,
+                                   WholeScenePlan.ExecutionYEnd);
+        }
         break;
-    case WholeScenePathDecisionReason::ChunkedUnsafeOverlay:
-        RenderScreenWholeSceneOverlayOperator(ystart, yend);
-        RenderScreenWholeSceneFinalizeOverlayOperatorFullFrame(decision.ConservativeHybrid,
-                                                              ystart,
-                                                              yend);
+    case WholeSceneOutputExecutionKind::CaptureBackedPlan:
+        executedExecutionKind = WholeSceneOutputExecutionKind::CaptureBackedPlan;
+        ExecutePreparedCaptureBackedExecution(
+            captureBackedExecution,
+            WholeScenePlan.ExecutionYStart,
+            WholeScenePlan.ExecutionYEnd);
         break;
-    case WholeScenePathDecisionReason::PhysicalFinalPostprocessNativeInput:
-        RenderScreenPhysicalFinalPostprocessNativeInput(ystart, yend);
+    case WholeSceneOutputExecutionKind::PhysicalFinalPostprocessNativeInput:
+        executedExecutionKind = WholeSceneOutputExecutionKind::
+            PhysicalFinalPostprocessNativeInput;
+        RenderScreenPhysicalFinalPostprocessNativeInput(
+            WholeScenePlan.ExecutionYStart,
+            WholeScenePlan.ExecutionYEnd);
         break;
-    case WholeScenePathDecisionReason::SplitLegacyFallback:
-        RenderScreenWholeSceneLegacy(ystart, yend);
-        break;
-    case WholeScenePathDecisionReason::FragmentationOrUnsafeFrameCurrentFallback:
-        RenderScreenCurrent(ystart, yend, true, decision.CurrentReason);
-        break;
-    case WholeScenePathDecisionReason::WholeSceneScale:
-        RenderScreenWholeScene(ystart, yend);
-        break;
-    case WholeScenePathDecisionReason::ScalePathUnavailable:
-        RenderScreenCurrent(ystart, yend, false, decision.CurrentReason);
-        break;
-    case WholeScenePathDecisionReason::None:
+    case WholeSceneOutputExecutionKind::None:
         break;
     }
+
+    RenderStrictAffineDebugProducts(WholeScenePlan.ExecutionYStart,
+                                    WholeScenePlan.ExecutionYEnd);
 
     const auto end = std::chrono::steady_clock::now();
     WholeSceneTrace.RenderTimeUS =
         static_cast<u64>(std::chrono::duration_cast<std::chrono::microseconds>(end - start).count());
+
+    const u64 colorEffectBit =
+        static_cast<u64>(WholeSceneOutputChannel::ColorEffect);
+    if ((WholeScenePlan.RequiredChannels & colorEffectBit) != 0)
+    {
+        WholeSceneOutputTransformObservation observation = {};
+        observation.Kind = WholeSceneOutputTransformKind::CompositorColorEffect;
+        observation.YStart = WholeSceneTrace.YStart;
+        observation.YEnd = WholeSceneTrace.YEnd;
+        observation.State = BlendCnt;
+        observation.AuxState = EVY;
+        observation.PlanApplied =
+            IsWholeSceneOutputTransformPlanExecuted(
+                WholeScenePlan,
+                WholeSceneExecutionTrace,
+                WholeSceneOutputTransformKind::CompositorColorEffect,
+                WholeSceneTrace.YStart,
+                WholeSceneTrace.YEnd,
+                BlendCnt,
+                EVY);
+        observation.LegacyApplied =
+            WholeSceneTrace.Path != WholeSceneRenderPath::None &&
+            !observation.PlanApplied;
+        ObserveWholeSceneOutputTransform(WholeScenePlan,
+                                         WholeSceneExecutionTrace,
+                                         observation);
+    }
+
+    ObserveWholeSceneOutputPlanExecution(
+        WholeScenePlan,
+        WholeSceneExecutionTrace,
+        WholeSceneTrace.Path,
+        WholeSceneTrace.CurrentReason,
+        executedExecutionKind);
 }
 
 void GLRenderer2D::DrawSprites(u32 line)
 {
     u32 oammask = 1 << GPU2D.Num;
     bool dirty = false;
+    bool sourceArtDirty = false;
     bool screenon = IsScreenOn();
 
     SpriteScanlineConfig.uMosaicLine[line] = GPU2D.OBJMosaicLine;
@@ -13536,11 +24771,13 @@ void GLRenderer2D::DrawSprites(u32 line)
                         GL_RED_INTEGER, GL_UNSIGNED_BYTE,
                         &vram[start * 1024]);
         dirty = true;
+        sourceArtDirty = true;
     }
 
     if ((GPU.OAMDirty & oammask) || SpriteConfigDirty)
     {
         memcpy(OAM, &GPU.OAM[GPU2D.Num ? 0x400 : 0], 0x400);
+        WideOBJWindowProofBits = WideOBJWindowProof(OAM);
         GPU.OAMDirty &= ~oammask;
         SpriteConfigDirty = false;
         dirty = true;
@@ -13550,6 +24787,10 @@ void GLRenderer2D::DrawSprites(u32 line)
     // so it will be able to do the actual sprite rendering
     if (dirty)
         SpriteDirty = true;
+    if (sourceArtDirty)
+    {
+        SpriteSourceGeneration++;
+    }
 }
 
 }

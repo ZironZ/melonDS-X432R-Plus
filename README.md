@@ -4,7 +4,8 @@
 <a href="https://www.gnu.org/licenses/gpl-3.0" alt="License: GPLv3"><img src="https://img.shields.io/badge/License-GPL%20v3-%23ff554d.svg"></a>
 </p>
 
-melonDS X432R+ is an experimental fork of [melonDS](https://github.com/melonDS-emu/melonDS). 
+melonDS X432R+ is an experimental fork of
+[melonDS](https://github.com/melonDS-emu/melonDS).
 It is like the old DeSmuME X432R fork, but for users that want to 
 upscale 2D graphics and 3D textures.
 
@@ -25,127 +26,181 @@ some of the features and things will look noticeably better.
 - `Hybrid Upscale`, the main 2D scaling mode, which tries to combine sharp 3D
   with cleaner scaled 2D. When different things make scaling unsafe, it falls
   back to the low-res image for those pixels.
-- `Postprocessing Upscale`, the other major mode, which scales up a downscaled
-  3D image. This is less likely to have weird scaling issues than the Hybrid
-  mode, but the 3D will look soft.
-- An OpenGL MSAA option.
+- `Postprocessing Upscale`, the other major mode, which scales the 2D and 3D
+  together as one image. This is less likely to have weird scaling issues than
+  the Hybrid mode, but the 3D usually looks softer.
+- A widescreen option.
+- `3D anti-aliasing` for Classic OpenGL and Compute.
 - A screen sharpening filter for blurry output.
 - Debug tools for whole-scene 2D, texture-scaling inspection, timings, 
   replays, and renderer comparison.
-- FMV fixes. Some FMVs were broken in the beta build I forked.
+- Renderer and FMV fixes.
 
-All the work in this fork targets the OpenGL renderers. The software
-renderer wasn't touched (besides the FMV fixes that apply to it too).
+Most of the enhancements in this fork are GPU-based and require the Classic
+OpenGL or Compute renderer.
 
 ## How It Looks
 
 <p align="center">
   <b>Mario Kart</b><br>
-  No Upscale vs. X432R+ Upscale<br>
-  Hybrid Upscale + Anisotropic Filtering + Texture Scaling + 3D MSAA, ArtCNN DN<br>
-  <img src="hybrid-comparison.webp" alt="No upscale vs X432R+ upscale comparison">
+  4x internal resolution (Compute Renderer), with and without
+  X432R+ enhancements<br>
+  Hybrid Upscale + 16x Anisotropic Filtering + Texture Scaling, using NNEDI3<br>
+  <img src="hybrid-comparison.webp" alt="Mario Kart DS at 4x internal resolution, alternating between the base image and X432R+ enhancements">
 </p>
 
-## Recommended Setup
-
-For normal use:
+## Getting Started
 
 1. Open Config -> Video settings.
-2. Use `OpenGL (Compute shader)`.
-3. Set `Resolution scale` to the value you normally want, such as 4x.
-4. Enable `Whole-scene 2D scaling`.
-5. Set the mode to `Hybrid Upscale`.
-6. Click `Recommended Settings`.
+2. Use `OpenGL (Compute shader)`, or `OpenGL (Classic)` on macOS.
+3. Click `Recommended settings`.
+4. Try other upscaling algorithms and adjust `Internal resolution` to suit
+   your game and GPU.
 
-The compute shader renderer needs OpenGL 4.3. The neural scalers (ArtCNN,
-NNEDI3, and CuNNy) are also much heavier than Spline36, so older GPUs may
-struggle with them at higher resolution scales.
+The recommended settings use Hybrid Upscale at 4x resolution with Spline36.
+They are a starting point. Performance depends on the game and your hardware.
+They set up the advanced options too, so you don't need to go through all of
+those yourself.
 
-`Recommended Settings` does not force every feature on. The button mainly 
-resets the advanced settings to what worked best in my testing.
+Texture upscaling is left off because it can cause slowdowns, but it is worth
+trying. The example above has it on and uses NNEDI3. Try a few algorithms and
+see what you like. It really depends on the game. If things run too slowly,
+see the suggestions under **If things run slowly** below.
+
+Your widescreen layout, sharpening, and LCD ghosting are left as you set them.
+Your renderer is also kept, except that Recommended settings selects Classic
+when Compute isn't supported. If you don't like the changes, click `Cancel`
+before closing the dialog.
+
+The Compute renderer requires a GPU that supports OpenGL 4.3. The native macOS
+build uses Classic OpenGL and cannot use the ArtCNN, ArtCNN DN, NNEDI3, or CuNNy
+algorithms, which require compute shaders. Spline36 and xBRZ are available.
 
 The video settings dialog also has helpful tooltips. Click the `?` button
 in the dialog, then click a setting to see what it does.
 
-## Which Settings To Try
+## Settings
 
-- `Hybrid Upscale`
-  - Use it for: High-res whole-scene scaling. Preserves high-resolution 3D 
-    where safe and improves 2D when it isn't risky to do it.
-  - Tradeoff: Best looking, but also the most complex. It just doesn't work right
-    in some games.
-- `Postprocessing Upscale`
-  - Use it for: Safe whole-scene scaling. It scales the final image drawn by 
-    melonDS. It can look good in games that draw 2D images with 3D textures
-    (e.g. Final Fantasy Tactics A2 or Professor Layton)
-  - Tradeoff: 3D will look low resolution or blurry.
-- `3D MSAA`
-  - Use it for: Removing jagged edges.
-  - Tradeoff: Mostly useless in the compute renderer since that one does this by
-    default. May cause stray black lines in games that use 3D textures as 2D art
-    (e.g. New Super Mario Bros.).
-- `Anisotropic filtering`
-  - Use it for: Reducing shimmer on slanted or distant 3D textured surfaces.
-  - Tradeoff: Can make games look a bit blurry. Can cause texture-edge
-    artifacts.
-- `3D texture scaling`
-  - Use it for: Upscaling textures. In some games where the textures are right
-    up in your face this can make them look far better.
-  - Tradeoff: Higher risk. It can stutter or produce texture-edge artifacts.
-- `Reduce 2D texture artifacts`
-  - Use it for: Cleaning up thin lines, blocky textures, or stray pixels on UI
-    and sprites after enabling anisotropic filtering or texture scaling.
-  - Tradeoff: Can be a performance hit, and it will not fix every game.
+The recommended settings are a starting point. From there, try changing one
+thing at a time so you can see what difference it makes.
 
-`3D texture scaling` and `Anisotropic filtering` are worth testing in most
-games, but both might cause texture-edge artifacts (weird lines all over the
-place). Anisotropic filtering is less of a performance hit than texture
-scaling. You will likely want to have either `Frequent-change protection` or
-`Deferred scaling` on if you are using texture scaling to prevent framerate drops.
-If cutout edges look blocky with texture scaling on, try
+### Screen upscaling
+
+`Hybrid Upscale` keeps high-resolution 3D while improving the 2D artwork around
+it. It works well in many games, but some effects are difficult to handle.
+Parts of the image may stay at their original detail when scaling them would
+look worse.
+
+If Hybrid looks wrong, try `Postprocessing Upscale`. It scales the 2D and 3D
+together as one image, which avoids some of those problems, but usually makes
+the 3D look softer. It can work particularly well in games that use 3D textures
+to draw 2D artwork, such as Final Fantasy Tactics A2 or Professor Layton.
+
+If 2D and 3D edges don't line up properly in Postprocessing, try
+`Render 3D at native resolution`. Normally, Postprocessing renders the 3D at
+high resolution and then reduces it before upscaling everything together.
+This option renders the 3D at the original DS resolution instead. You lose
+some 3D detail, but certain games look better this way.
+
+### Texture filtering and upscaling
+
+`Anisotropic filtering` helps reduce shimmer on slanted or distant textured
+surfaces. It is usually less demanding than texture upscaling.
+
+`Upscale textures`, on the `3D textures` tab, is worth trying when textures
+are right up in your face. It can make them look much better, but it can also
+cause stutter.
+
+Both options can leave thin lines or stray pixels around texture edges,
+particularly on UI and sprites. Try `Reduce 2D texture artifacts` if this
+happens. It can cost performance and won't fix every game, so sometimes turning
+filtering or texture upscaling off is the better choice.
+
+If transparent edges look blocky with texture upscaling on, try
 `Cleaner transparent edges`.
 
-Algorithm-wise, `ArtCNN DN` usually looks the best in my opinion.<br>
-`NNEDI3` is an alternative when `ArtCNN DN` doesn't work with a game's art style.<br>
-`ArtCNN` is sharper if you like that look.<br>
-`CuNNy` is similar to `ArtCNN`, but a bit less sharp.<br>
-`XBRZ` will hide texture scaling artifacts the best.<br> 
-`Spline36` will be the fastest and least likely to kill your GPU.<br> 
+### Choosing an algorithm
 
-Advanced modes such as `Presentation Overlay Upscale`, `Native Stack Upscale`
-and `High-resolution Compositor` are mostly for comparison and debugging.
-However, some games may look better in `Presentation Overlay Upscale`
-or `Native Stack Upscale` than they do in `Hybrid Upscale`.
+Texture and screen upscaling have separate algorithm choices. You can use the
+same one for both, or mix them. Try a few and see what suits the game's artwork.
 
-If you get slowdowns when using 2D scaling, try either changing your
-scaling algorithm, or changing the fragmented-frame fallback setting.
+Algorithm-wise, none of them are perfect.<br>
+`Spline36` is usually a low-cost option. It smooths pixel edges but leaves the
+underlying blockiness visible.<br>
+`xBRZ` rounds off pixel-art shapes. It can look clean and crisp, but small
+details may become smudged or distorted.<br>
+`ArtCNN` gives a sharp, detailed look, but can make noisy textures and rough
+edges stand out.<br>
+`ArtCNN DN` gives a smoother, cleaner look, sometimes at the expense of fine
+detail.<br>
+`NNEDI3` smooths edges and diagonals with less reshaping than xBRZ. It can look
+soft, especially around small text.<br>
+`CuNNy` gives a crisp look with more visible pixel structure than ArtCNN in
+some scenes. Text and fine details can look cleaner or rougher depending on
+the artwork.<br>
 
-By default, `Postprocessing Upscale` mode renders 3D at high resolution and
-then downsamples it, unless `Render 3D at native resolution` is checked.
-To reduce shimmering it can be helpful to enable either 3D texture scaling or
-anisotropic filtering. Also, sometimes the game will look better (less blurry)
-in `Postprocessing Upscale` mode when you toggle `Render 3D at native resolution`
-and turn `3D MSAA` on. `OpenGL (Classic)` can also sometimes look better than
-`OpenGL (Compute shader)` or vice versa.
+### If things run slowly
 
-If the output looks too blurry, turn on `Screen sharpening`.
+Try lowering `Internal resolution` first. Spline36 is often a good choice for
+performance, but try xBRZ too. It can be faster on some hardware and in some
+scenes, including with Hybrid.
+
+If Hybrid is still too slow, enable `Advanced settings` and try
+`Native Stack Upscale` or `Presentation Overlay Upscale` on the `2D & screen`
+tab. Both keep high-resolution 3D but use simpler approaches to scaling and
+combining the 2D graphics.
+
+They can be faster, but parts of the picture may look wrong, even in simple
+scenes. Try both to see whether either works well with your game. Hybrid
+handles more of these cases correctly, which is why it is recommended.
+
+If texture upscaling causes stutter, try `Limit upscaling of changing textures`
+or `Defer texture upscaling`. The first uses simpler scaling for rapidly
+changing textures. The second leaves some new textures at their original
+detail until they are reused and stable enough to upscale.
+
+For slowdowns caused by screen upscaling, you can also enable
+`Advanced settings` and adjust `Slowdown fallback` on the `2D & screen` tab.
+
+### Anti-aliasing and final image settings
+
+`3D anti-aliasing` smooths jagged 3D edges. Classic OpenGL uses MSAA. Compute
+forces the DS anti-aliasing effect on. When unchecked, it follows the game's
+setting. If the game already enables it, checking this makes no additional
+difference in Compute.
+
+It is worth trying, including with Postprocessing, but it can cause stray
+dark or bright lines in some games. Classic and Compute can also look
+different, so try the other renderer if something looks wrong.
+
+If the image looks too blurry, choose a `Screen sharpening` level under
+`Final image` on the `General` tab.
+
+In the same section, `LCD ghosting` blends frames to mimic how the original
+DS screen softens changes from one image to the next. It helps with flickering
+effects in games such as Hotel Dusk, though `Natural blur` can also leave trails
+when things move.
 
 ## Known Limits
 
 - Hybrid Upscale is conservative on purpose. Native-looking output may be a
   fallback just because the alternative looks far worse. It is not automatically
   a bug.
-- Edge cases involving blending, screen masks, display capture, and brightness 
+- Edge cases involving blending, screen masks, display capture, and brightness
   effects are all things that can cause the 2D scaling to fall back.
-- Scrolling and affine scenes are often scaled poorly.
-- Text may look darker after scaling with most algorithms except xBRZ. This is
-  mostly unavoidable with how the scaling is done.
-- 3D texture scaling is optional and performance-sensitive. Deferred scaling and
-  frequent-change protection help, but you may still get hitches.
-- You will see the edges of textures and get weird-looking UI at times with 
-  anisotropic filtering and texture scaling. This is not easily fixed, but
-  `Reduce 2D texture artifacts` helps in some games.
-- 3D MSAA will sometimes cause sporadic black or bright lines to appear.
+- Text may look darker after scaling with most algorithms except xBRZ.
+- 3D texture scaling is optional and performance-sensitive.
+  `Defer texture upscaling` and `Limit upscaling of changing textures` help,
+  but you may still get hitches.
+- Anisotropic filtering and texture scaling can leave thin lines, stray pixels,
+  or weird-looking UI around texture edges. `Reduce 2D texture artifacts` helps
+  in some games, but you may need to turn filtering or texture scaling off.
+- Widescreen is still experimental. It can reveal missing scenery or things
+  the game wasn't meant to show, and the extra screen area can look wrong or
+  flicker during fades and transitions. Menus, logos, and borders may stay at
+  their original size instead of filling the wider screen.
+- `3D anti-aliasing` will sometimes cause sporadic black or bright lines to
+  appear.
 
 ## BIOS, Firmware, And Games
 

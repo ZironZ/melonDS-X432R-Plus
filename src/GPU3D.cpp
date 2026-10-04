@@ -16,6 +16,7 @@
     with melonDS. If not, see http://www.gnu.org/licenses/.
 */
 
+#include "WideMelon.h"
 #include <stdio.h>
 #include <string.h>
 #include <algorithm>
@@ -158,6 +159,7 @@ void Vertex::DoSavestate(Savestate* file) noexcept
     file->VarArray(FinalPosition, sizeof(FinalPosition));
     file->VarArray(FinalColor, sizeof(FinalColor));
     file->VarArray(HiresPosition, sizeof(HiresPosition));
+    if (!file->Saving) NativeSourceValid = false;
 }
 
 void GPU3D::ResetRenderingState() noexcept
@@ -413,6 +415,11 @@ void GPU3D::DoSavestate(Savestate* file) noexcept
     for(int i = 0; i < 2048*2; i++)
     {
         Polygon* poly = &PolygonRAM[i];
+        if (!file->Saving)
+        {
+            poly->UnclippedSource.Valid = false;
+            poly->WideOrthographic = false;
+        }
 
         // this is a bit ugly, but eh
         // we can't save the pointers as-is, that's a bad idea
@@ -807,6 +814,14 @@ void ClipSegment(Vertex* outbuf, Vertex* vin, Vertex* vout)
 
     if (attribs)
     {
+        outbuf->NativeSourceValid = vin->NativeSourceValid && vout->NativeSourceValid;
+        if (outbuf->NativeSourceValid)
+        {
+            outbuf->NativeClipX = vin->NativeClipX +
+                ((s64(vout->NativeClipX) - vin->NativeClipX) * factor_num) / factor_den;
+            outbuf->NativeClipY = vin->NativeClipY +
+                ((s64(vout->NativeClipY) - vin->NativeClipY) * factor_num) / factor_den;
+        }
         INTERPOLATE(Color[0]);
         INTERPOLATE(Color[1]);
         INTERPOLATE(Color[2]);
@@ -1065,6 +1080,44 @@ void GPU3D::SubmitPolygon() noexcept
         // TODO
     }
 
+    // Preserve source coordinates for flat quads before clipping destroys
+    // their off-screen origin. Native rasterization continues to use only
+    // the clipped vertices below.
+    Polygon::UnclippedQuadSource sourceQuad {};
+    bool flatQuad = nverts == 4;
+    bool needsClip = false;
+    for (int i = 0; i < nverts && flatQuad; i++)
+    {
+        const auto& v = clippedvertices[i];
+        const auto& first = clippedvertices[0];
+        flatQuad = !v.Clipped && v.Position[3] > 0 && v.Position[3] <= 0xFFFFFF &&
+            v.Position[3] == first.Position[3] && v.Position[2] == first.Position[2];
+        if (WideMelon::Enabled()) flatQuad &= v.NativeSourceValid;
+        for (int c = 0; c < 3; c++) flatQuad &= v.Color[c] == first.Color[c];
+        for (int c = 0; c < 3; c++)
+            needsClip |= s64(v.Position[c]) < -s64(v.Position[3]) || v.Position[c] > v.Position[3];
+    }
+    if (flatQuad && (needsClip || WideMelon::Enabled()))
+    {
+        sourceQuad.Valid = true;
+        for (int i = 0; i < 4; i++)
+        {
+            const auto& v = clippedvertices[i];
+            const s64 w = v.Position[3];
+            const s64 x = Polygon::UnclippedQuadSource::ProjectAxis(
+                WideMelon::Enabled() ? v.NativeClipX : v.Position[0], w, Viewport[4], Viewport[0]);
+            const s64 y = Polygon::UnclippedQuadSource::ProjectAxis(
+                -s64(WideMelon::Vertical() ? v.NativeClipY : v.Position[1]), w, Viewport[5], Viewport[3]);
+            // Bound auxiliary coordinates before conversion; large/perspective
+            // geometry simply retains the normal texture path.
+            if (x < -8192 || x > 8192 || y < -8192 || y > 8192) sourceQuad.Valid = false;
+            sourceQuad.Position[i][0] = s32(x);
+            sourceQuad.Position[i][1] = s32(y);
+            sourceQuad.UV[i][0] = v.TexCoords[0];
+            sourceQuad.UV[i][1] = v.TexCoords[1];
+        }
+    }
+
     // clipping
 
     nverts = ClipPolygon<true>(*this, clippedvertices, nverts, clipstart);
@@ -1134,7 +1187,23 @@ void GPU3D::SubmitPolygon() noexcept
 
             vtx->HiresPosition[0] = posX & 0x1FFF;
             vtx->HiresPosition[1] = posY & 0xFFF;
+            if (vtx->NativeSourceValid)
+            {
+                const s64 nativeX = Polygon::UnclippedQuadSource::ProjectAxis(vtx->NativeClipX, w, Viewport[4], Viewport[0]);
+                // Reject wrapped geometry; off-screen source X itself is valid
+                // for newly visible pieces in the wider viewport.
+                vtx->NativeSourceValid = nativeX >= -8192 && nativeX <= 8192 && posX == (posX & 0x1FFF);
+                vtx->NativeSourcePosition[0] = s32(nativeX);
+                vtx->NativeSourcePosition[1] = vtx->HiresPosition[1];
+                if (WideMelon::Vertical())
+                {
+                    const s64 nativeY = Polygon::UnclippedQuadSource::ProjectAxis(-s64(vtx->NativeClipY), w, Viewport[5], Viewport[3]);
+                    vtx->NativeSourceValid &= nativeY >= -8192 && nativeY <= 8192 && posY == (posY & 0xFFF);
+                    vtx->NativeSourcePosition[1] = s32(nativeY);
+                }
+            }
         }
+        else vtx->NativeSourceValid = false;
     }
 
     // zero-dot W check:
@@ -1190,6 +1259,9 @@ void GPU3D::SubmitPolygon() noexcept
     }
 
     Polygon* poly = &CurPolygonRAM[NumPolygons++];
+    poly->UnclippedSource = sourceQuad;
+    poly->WideOrthographic = WideMelon::Enabled() && flatQuad &&
+        ProjMatrix[3] == 0 && ProjMatrix[7] == 0 && ProjMatrix[11] == 0 && ProjMatrix[15] != 0;
     poly->NumVertices = 0;
 
     poly->Attr = CurPolygonAttr;
@@ -1349,6 +1421,12 @@ void GPU3D::SubmitVertex() noexcept
     vertextrans->Position[1] = (vertex[0]*ClipMatrix[1] + vertex[1]*ClipMatrix[5] + vertex[2]*ClipMatrix[9] + vertex[3]*ClipMatrix[13]) >> 12;
     vertextrans->Position[2] = (vertex[0]*ClipMatrix[2] + vertex[1]*ClipMatrix[6] + vertex[2]*ClipMatrix[10] + vertex[3]*ClipMatrix[14]) >> 12;
     vertextrans->Position[3] = (vertex[0]*ClipMatrix[3] + vertex[1]*ClipMatrix[7] + vertex[2]*ClipMatrix[11] + vertex[3]*ClipMatrix[15]) >> 12;
+
+    vertextrans->NativeSourceValid = WideMelon::Enabled();
+    vertextrans->NativeClipX = vertextrans->Position[0];
+    vertextrans->NativeClipY = vertextrans->Position[1];
+    vertextrans->Position[0] = WideMelon::ProjectX(vertextrans->Position[0]);
+    vertextrans->Position[1] = WideMelon::ProjectY(vertextrans->Position[1]);
 
     // this probably shouldn't be.
     // the way color is handled during clipping needs investigation. TODO
@@ -1571,6 +1649,12 @@ void GPU3D::BoxTest(const u32* params) noexcept
         cube[i].Position[1] = ((s64)x*ClipMatrix[1] + (s64)y*ClipMatrix[5] + (s64)z*ClipMatrix[9] + (s64)0x1000*ClipMatrix[13]) >> 12;
         cube[i].Position[2] = ((s64)x*ClipMatrix[2] + (s64)y*ClipMatrix[6] + (s64)z*ClipMatrix[10] + (s64)0x1000*ClipMatrix[14]) >> 12;
         cube[i].Position[3] = ((s64)x*ClipMatrix[3] + (s64)y*ClipMatrix[7] + (s64)z*ClipMatrix[11] + (s64)0x1000*ClipMatrix[15]) >> 12;
+    }
+
+    for (auto& v : cube)
+    {
+        v.Position[0] = WideMelon::ProjectX(v.Position[0]);
+        v.Position[1] = WideMelon::ProjectY(v.Position[1]);
     }
 
     // front face (-Z)
@@ -2490,6 +2574,16 @@ static u32 HashRenderScene(const GPU3D& gpu3D) noexcept
         mixS32(poly->XTop);
         mixS32(poly->XBottom);
         mix(poly->SortKey);
+        if (WideMelon::Enabled()) mix(poly->WideOrthographic);
+        if (poly->UnclippedSource.Valid)
+        {
+            mix(0x554E434Cu);
+            for (int v = 0; v < 4; v++) for (int axis = 0; axis < 2; axis++)
+            {
+                mixS32(poly->UnclippedSource.Position[v][axis]);
+                mix(static_cast<u16>(poly->UnclippedSource.UV[v][axis]));
+            }
+        }
 
         for (u32 v = 0; v < poly->NumVertices && v < 10; v++)
         {
@@ -2513,6 +2607,11 @@ static u32 HashRenderScene(const GPU3D& gpu3D) noexcept
                 mixS32(color);
             for (s32 coord : vertex->HiresPosition)
                 mixS32(coord);
+            if (vertex->NativeSourceValid)
+            {
+                mix(0x57494445u);
+                for (s32 coord : vertex->NativeSourcePosition) mixS32(coord);
+            }
         }
     }
 

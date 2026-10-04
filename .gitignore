@@ -11,6 +11,13 @@ cmake-build*
 cmake-build-debug
 compile_commands.json
 test/policy/replay-local/
+/test/policy/replay-expectations/
+/test/policy/recorded-csv/
+/test/debug-export/*.md
+/test/renderer/*.md
+/test/renderer/*.py
+/test/renderer/__pycache__/
+/md/
 .idea
 .cache
 

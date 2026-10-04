@@ -17,6 +17,8 @@
 */
 
 #include "GPU_OpenGL.h"
+#include "WideMelon.h"
+#include "GPU3D_Texture2DPolicy.h"
 
 #include <algorithm>
 #include <assert.h>
@@ -507,8 +509,8 @@ GLRenderer3D::GLRenderer3D(melonDS::GPU3D& gpu3D, GLRenderer& parent) noexcept :
     TextureScaleFactor = 1;
 
     // GLRenderer3D::Init() will be used to actually initialize the renderer;
-    // The various glDelete* functions silently ignore invalid IDs,
-    // so we can just let the destructor clean up a half-initialized renderer.
+    // Unallocated resource handles are zero, so the destructor can safely
+    // clean up a partially initialized renderer.
 }
 
 bool GLRenderer3D::Init()
@@ -680,6 +682,14 @@ bool GLRenderer3D::Init()
     glGenTextures(1, &MSAAAttrBufferTex);
 
     Parent.OutputTex3D = ColorBufferTex;
+    if (WideMelon::Enabled())
+    {
+        glGenTextures(1, &NativeCenterTex);
+        SetupDefaultTexParams(NativeCenterTex);
+        glGenFramebuffers(1, &NativeCenterFB);
+        Parent.OutputTex3D = NativeCenterTex;
+        Parent.WideOutputTex3D = ColorBufferTex;
+    }
 
     glEnable(GL_BLEND);
     glBlendEquationSeparate(GL_FUNC_ADD, GL_MAX);
@@ -698,6 +708,8 @@ GLRenderer3D::~GLRenderer3D()
     glDeleteFramebuffers(1, &MainFramebuffer);
     glDeleteFramebuffers(1, &MainMSAAFramebuffer);
     glDeleteTextures(1, &ColorBufferTex);
+    glDeleteTextures(1, &NativeCenterTex);
+    glDeleteFramebuffers(1, &NativeCenterFB);
     glDeleteTextures(1, &DepthBufferTex);
     glDeleteTextures(1, &AttrBufferTex);
     glDeleteTextures(1, &MSAAColorBufferTex);
@@ -706,6 +718,7 @@ GLRenderer3D::~GLRenderer3D()
 
     glDeleteVertexArrays(1, &VertexArrayID);
     glDeleteBuffers(1, &VertexBufferID);
+    glDeleteBuffers(1, &IndexBufferID);
     glDeleteVertexArrays(1, &ClearVertexArrayID);
     glDeleteBuffers(1, &ClearVertexBufferID);
     glDeleteTextures(2, ClearBitmapTex);
@@ -713,6 +726,11 @@ GLRenderer3D::~GLRenderer3D()
     delete[] ClearBitmap[1];
 
     glDeleteBuffers(1, &ShaderConfigUBO);
+
+    glDeleteProgram(ClearShaderPlain);
+    glDeleteProgram(ClearShaderBitmap);
+    glDeleteProgram(FinalPassEdgeShader);
+    glDeleteProgram(FinalPassFogShader);
 
     for (int i = 0; i < 2; i++)
     {
@@ -800,11 +818,20 @@ void GLRenderer3D::SetRenderSettings(int scale, bool betterpolygons, bool readab
     }
     CurShaderID = -1;
 
-    ScreenW = 256 * scale;
-    ScreenH = 192 * scale;
+    ScreenW = WideMelon::Width() * scale;
+    ScreenH = WideMelon::ViewHeight * scale;
 
     glBindTexture(GL_TEXTURE_2D, ColorBufferTex);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, ScreenW, ScreenH, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+
+    if (WideMelon::Enabled())
+    {
+        glBindTexture(GL_TEXTURE_2D, NativeCenterTex);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 256 * scale, 192 * scale, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+        glBindFramebuffer(GL_FRAMEBUFFER, NativeCenterFB);
+        glFramebufferTexture(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, NativeCenterTex, 0);
+        glDrawBuffer(GL_COLOR_ATTACHMENT0);
+    }
 
     glBindTexture(GL_TEXTURE_2D, DepthBufferTex);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH24_STENCIL8, ScreenW, ScreenH, 0, GL_DEPTH_STENCIL, GL_UNSIGNED_INT_24_8, NULL);
@@ -947,6 +974,18 @@ u32* GLRenderer3D::SetupVertex(const Polygon* poly, int vid, const Vertex* vtx, 
         }
     }*/
 
+    if (WideMelon::Enabled())
+        x = (static_cast<uint64_t>(vtx->HiresPosition[0]) * ScaleFactor * WideMelon::Width()) / (16 * 256);
+    if (WideMelon::Vertical())
+    {
+        // Keep native fixed-point raster positions; projecting down and then
+        // stretching them back loses precision and shifts flat 2D artwork.
+        const s64 nativeY = s64(vtx->NativeSourcePosition[1]) + (WideMelon::Height() - 192) * 8;
+        y = vtx->NativeSourceValid && nativeY >= 0 && nativeY <= WideMelon::Height() * 16
+            ? (nativeY * ScaleFactor) >> 4
+            : (static_cast<uint64_t>(vtx->HiresPosition[1]) * ScaleFactor * WideMelon::Height()) / (16 * 192);
+    }
+    x = WideTransitionX(TransitionPlan, poly, vtx, x, ScreenW);
     *vptr++ = x | (y << 16);
     *vptr++ = z | (w << 16);
 
@@ -976,6 +1015,23 @@ u32* GLRenderer3D::SetupVertex(const Polygon* poly, int vid, const Vertex* vtx, 
 
 void GLRenderer3D::BuildPolygons(GLRenderer3D::RendererPolygon* polygons, int npolys, int captureinfo[16])
 {
+    const TextureReconstructionPlan emptyReconstruction;
+    const TextureReconstructionPlan* reconstructionPlan = &emptyReconstruction;
+    std::vector<GLuint> reconstructedTextures;
+    if (TextureScaling.ReconstructCompatible3D && TextureScaleFactor > 1 && TexEnable)
+    {
+        std::vector<Polygon*> inputs;
+        for (int i = 0; i < npolys; i++) inputs.push_back(polygons[i].PolyData);
+        reconstructionPlan = &Texcache.GetTextureReconstructionPlan(inputs,
+            TextureScaling.ReconstructCompatible3DEdgeContext, TextureScaling.ReconstructCompatible3DFractionalAlpha);
+        Texcache.BeginTextureReconstruction();
+        for (const auto& group : reconstructionPlan->Groups)
+        {
+            auto* texture = Texcache.GetReconstructedTexture(group);
+            reconstructedTextures.push_back(texture ? texture->Handle : 0);
+        }
+    }
+    const auto& reconstruction = *reconstructionPlan;
     u32* vptr = &VertexBuffer[0];
     u32 vidx = 0;
 
@@ -990,6 +1046,8 @@ void GLRenderer3D::BuildPolygons(GLRenderer3D::RendererPolygon* polygons, int np
     u32 curtexheight = 0;
     TextureSamplingBounds curSamplingBounds;
     bool curBinaryAlphaTexture = false;
+    bool currentNativeTexture = false;
+    int currentReconstruction = -1;
     std::vector<TextureFrameEdgeExtendCandidate> edgeExtendCandidates;
     TextureFrameEdgeExtendCandidateMap edgeExtendCandidateMap;
     if (TextureScaling.EdgeExtendUnusedMargins && TextureScaleFactor > 1)
@@ -1007,6 +1065,15 @@ void GLRenderer3D::BuildPolygons(GLRenderer3D::RendererPolygon* polygons, int np
     {
         RendererPolygon* rp = &polygons[i];
         Polygon* poly = rp->PolyData;
+        int groupIndex = reconstruction.Membership.empty() ? -1 : reconstruction.Membership[i];
+        if (groupIndex >= 0 && !reconstructedTextures[groupIndex]) groupIndex = -1;
+        Polygon reconstructedPolygon;
+        std::array<Vertex,4> reconstructedVertices;
+        if (groupIndex >= 0)
+        {
+            RemapTextureReconstructionPolygon(*poly, reconstruction.Groups[groupIndex], reconstructedPolygon, reconstructedVertices);
+            poly = &reconstructedPolygon;
+        }
 
         rp->IndicesOffset = iidx;
         rp->NumIndices = 0;
@@ -1016,9 +1083,11 @@ void GLRenderer3D::BuildPolygons(GLRenderer3D::RendererPolygon* polygons, int np
         u32 polyattr = poly->Attr;
         u32 texparam = poly->TexParam & ~0xC00F0000;
         u32 texpal = poly->TexPalette;
+        const bool nativeTexture = groupIndex < 0 && TexEnable && TextureScaleFactor > 1 &&
+            TextureFilter.Smart2DFiltering && IsStretchedTexture2DStrip(*poly);
         TextureSamplingBounds samplingBounds;
         const u32 textypeForBounds = (texparam >> 26) & 0x7;
-        if (TexEnable && textypeForBounds)
+        if (TexEnable && textypeForBounds && groupIndex < 0 && !nativeTexture)
         {
             const u32 texWidth = TextureWidth(texparam);
             const u32 texHeight = TextureHeight(texparam);
@@ -1039,10 +1108,18 @@ void GLRenderer3D::BuildPolygons(GLRenderer3D::RendererPolygon* polygons, int np
         if (poly->FacingView) vtxattr |= (1<<8);
         if (poly->WBuffer)    vtxattr |= (1<<9);
 
-        if ((texparam != curtexparam) || (texpal != curtexpal) || (samplingBounds != curSamplingBounds))
+        if ((texparam != curtexparam) || (texpal != curtexpal) || (samplingBounds != curSamplingBounds) || groupIndex != currentReconstruction || nativeTexture != currentNativeTexture)
         {
             u32 textype = (texparam >> 26) & 0x7;
-            if (TexEnable && (textype != 0))
+            if (groupIndex >= 0)
+            {
+                curtexid = reconstructedTextures[groupIndex];
+                curtexlayer = 0xFFFF0000;
+                curtexwidth = reconstruction.Groups[groupIndex].Width;
+                curtexheight = reconstruction.Groups[groupIndex].Height;
+                curBinaryAlphaTexture = !reconstruction.Groups[groupIndex].HasFractionalAlpha();
+            }
+            else if (TexEnable && (textype != 0))
             {
                 // figure out which texture this polygon is going to use
 
@@ -1093,7 +1170,7 @@ void GLRenderer3D::BuildPolygons(GLRenderer3D::RendererPolygon* polygons, int np
                     auto edgeExtendPhaseStart = std::chrono::steady_clock::now();
                     bool textureCacheHit = false;
                     Texcache.GetTexture(texparam, texpal, curtexid, curtexlayer, halp, &curBinaryAlphaTexture,
-                                        samplingBounds.Valid ? &samplingBounds : nullptr, &textureCacheHit);
+                                        samplingBounds.Valid ? &samplingBounds : nullptr, &textureCacheHit, nullptr, nativeTexture);
                     if (edgeExtendTextureLookup)
                     {
                         const u64 elapsedUS = ElapsedUS(edgeExtendPhaseStart);
@@ -1129,6 +1206,8 @@ void GLRenderer3D::BuildPolygons(GLRenderer3D::RendererPolygon* polygons, int np
             curtexparam = texparam;
             curtexpal = texpal;
             curSamplingBounds = samplingBounds;
+            currentReconstruction = groupIndex;
+            currentNativeTexture = nativeTexture;
         }
 
         rp->TexID = curtexid;
@@ -1138,7 +1217,7 @@ void GLRenderer3D::BuildPolygons(GLRenderer3D::RendererPolygon* polygons, int np
             TextureBoundsRemapCoordinates(samplingBounds) ? samplingBounds : TextureSamplingBounds{};
         TextureSpriteUVInsetBounds spriteUVInsetBounds;
         const bool canClassifySpriteTexture =
-            TexEnable && textypeForBounds &&
+            groupIndex < 0 && TexEnable && textypeForBounds &&
             !TextureBoundsRemapCoordinates(samplingBounds) &&
             curtexid != static_cast<GLuint>(-1) && curtexid != static_cast<GLuint>(-2);
         const bool spriteTexture =
@@ -1151,7 +1230,7 @@ void GLRenderer3D::BuildPolygons(GLRenderer3D::RendererPolygon* polygons, int np
             IsLargeTranslucentTextureDraw(poly);
         const bool forceNearestTexture =
             canClassifySpriteTexture &&
-            ((TextureFilter.Smart2DFiltering && spriteTexture) ||
+            ((TextureFilter.Smart2DFiltering && spriteTexture) || nativeTexture ||
              translucentTextureGuard);
         rp->DisableMSAA = canClassifySpriteTexture && translucentTextureGuard;
         if (!TextureFilter.SpriteUVInset)
@@ -1254,7 +1333,13 @@ void GLRenderer3D::BuildPolygons(GLRenderer3D::RendererPolygon* polygons, int np
                     Vertex* vtx = poly->Vertices[j];
 
                     cX += vtx->HiresPosition[0];
-                    cY += vtx->HiresPosition[1];
+                    if (WideMelon::Vertical())
+                    {
+                        const s64 nativeY = s64(vtx->NativeSourcePosition[1]) + (WideMelon::Height() - 192) * 8;
+                        cY += vtx->NativeSourceValid && nativeY >= 0 && nativeY <= WideMelon::Height() * 16
+                            ? nativeY : (u64(vtx->HiresPosition[1]) * WideMelon::Height()) / 192;
+                    }
+                    else cY += vtx->HiresPosition[1];
 
                     float fw = (float)poly->FinalW[j] * poly->NumVertices;
                     cW += 1.0f / fw;
@@ -1285,7 +1370,7 @@ void GLRenderer3D::BuildPolygons(GLRenderer3D::RendererPolygon* polygons, int np
                 cS *= cW;
                 cT *= cW;
 
-                cX = (cX * ScaleFactor) >> 4;
+                cX = (static_cast<uint64_t>(cX) * ScaleFactor * WideMelon::Width()) / (16 * 256);
                 cY = (cY * ScaleFactor) >> 4;
 
                 u32 w = (u32)cW;
@@ -1995,6 +2080,9 @@ void GLRenderer3D::AppendRenderFrameTimingCSVHeader(std::string& header, const c
     addPhase("buffer_upload");
     addPhase("scene_render");
     addPhase("msaa_resolve_only");
+    addCounter("reconstruction_hits_total");
+    addCounter("reconstruction_builds_total");
+    addCounter("reconstruction_texels_total");
 }
 
 void GLRenderer3D::AppendRenderFrameTimingCSVRow(std::string& row) const
@@ -2057,6 +2145,10 @@ void GLRenderer3D::AppendRenderFrameTimingCSVRow(std::string& row) const
     addPhase(RenderFrameTiming.BufferUpload);
     addPhase(RenderFrameTiming.SceneRender);
     addPhase(RenderFrameTiming.MSAAResolveOnly);
+    addCounter(Texcache.GetReconstructionHits());
+    addCounter(Texcache.GetReconstructionBuilds());
+    if (!row.empty()) row += ",";
+    row += std::to_string(Texcache.GetReconstructionBuiltTexels());
 }
 
 void GLRenderer3D::RenderFrame()
@@ -2073,6 +2165,10 @@ void GLRenderer3D::RenderFrame()
         LastRenderFrameSkipped = true;
         return;
     }
+
+    Texcache.BeginRenderFrame();
+    TransitionPlan = BuildWideTransitionPlan(GPU3D.RenderPolygonRAM.data(), GPU3D.RenderNumPolygons,
+        WideMelon::Width() > 256 && WideMelon::ExtendWindows);
 
     // figure out which chunks of texture memory contain display captures
     int captureinfo[16];
@@ -2303,6 +2399,21 @@ void GLRenderer3D::RenderFrame()
     }
 
     Texcache.FinishDebugFrameTextureCapture();
+    if (WideMelon::Enabled())
+    {
+        // All existing 2D, Hybrid and DS capture paths consume the native
+        // center. The wider texture is presentation-only outside this point.
+        const int left = (ScreenW - 256 * ScaleFactor) / 2;
+        glDisable(GL_SCISSOR_TEST);
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, MainFramebuffer);
+        glReadBuffer(GL_COLOR_ATTACHMENT0);
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, NativeCenterFB);
+        glDrawBuffer(GL_COLOR_ATTACHMENT0);
+        const int top = (ScreenH - 192 * ScaleFactor) / 2;
+        glBlitFramebuffer(left, top, left + 256 * ScaleFactor, top + 192 * ScaleFactor,
+                          0, 0, 256 * ScaleFactor, 192 * ScaleFactor, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    }
+
 }
 
 bool GLRenderer3D::GetTextureScalingDebugStats(TextureScalingDebugStats& stats, std::string* status)

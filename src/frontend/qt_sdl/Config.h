@@ -131,6 +131,7 @@ private:
 
 
 bool Load();
+void ConstrainVideoSettings(Table& cfg, bool computeShaders);
 void Save();
 
 Table GetLocalTable(int instance);

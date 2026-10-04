@@ -31,6 +31,12 @@ namespace melonDS::OpenGL
 void LoadShaderCache();
 void SaveShaderCache();
 
+// OpenGL normally has only a small finite set of sticky error flags, but a
+// proxy/runtime can keep returning an error after its context is lost during
+// window teardown. Never use an unbounded glGetError drain in a render path.
+// Returns false if the error state did not quiesce within the finite GL set.
+bool ClearErrors();
+
 struct AttributeTarget
 {
     const char* Name;

@@ -25,6 +25,11 @@
 namespace Ui { class VideoSettingsDialog; }
 class VideoSettingsDialog;
 class EmuInstance;
+class QComboBox;
+class QCheckBox;
+class QGroupBox;
+class QGridLayout;
+class QTabWidget;
 
 class VideoSettingsDialog : public QDialog
 {
@@ -87,10 +92,13 @@ private slots:
     void on_cb3DTextureScalingNativeMipFloor_stateChanged(int state);
     void on_cb3DTextureScalingSourceMips_stateChanged(int state);
     void on_cb3DTextureScalingEdgeExtendUnusedMargins_stateChanged(int state);
+    void on_cbReconstructCompatible3D_stateChanged(int state);
+    void on_cbReconstructCompatible3DEdgeContext_stateChanged(int state);
+    void on_cbReconstructCompatible3DFractionalAlpha_stateChanged(int state);
     void on_cb3DTextureScalingLegacyAlphaHandling_stateChanged(int state);
     void on_cb3DTextureScalingQualityAlphaHandling_stateChanged(int state);
     void on_cb3DTextureScalingAlphaXBRZ_stateChanged(int state);
-    void on_cb3DTextureScalingSpline36Alpha_stateChanged(int state);
+    void setTextureAlpha(int value);
     void on_cbWholeScene2DScale_stateChanged(int state);
     void on_cbWholeScene2DScaleSourceBoundaryGuard_stateChanged(int state);
     void on_cbxWholeScene2DScaleMode_currentIndexChanged(int idx);
@@ -112,6 +120,12 @@ private slots:
     void on_cbWholeScene2DScaleHybridNativeEffectGuard_stateChanged(int state);
     void on_cbWholeScene2DScaleHybridForeground2DBase_stateChanged(int state);
     void on_cbWholeScene2DScaleHybridCleanLegacyCandidate_stateChanged(int state);
+    void on_cbWholeScene2DScaleHybridStrictAffineHighRes_stateChanged(int state);
+    void on_cbWholeScene2DScaleHybridStrictAffineSourceEnhancement_stateChanged(int state);
+    void on_cbWholeScene2DScaleHybridStrictAffineConnectedSources_stateChanged(int state);
+    void on_cbWholeScene2DScaleHybridStrictAffineOpaqueAssemblies_stateChanged(int state);
+    void on_cbWholeScene2DScaleHybridStrictAffineTopTextBG_stateChanged(int state);
+    void on_cbWholeScene2DScaleHybridStrictAffineMaskedOBJMLAA_stateChanged(int state);
     void on_cbxWholeScene2DScaleFinalUpscale3DFilter_currentIndexChanged(int idx);
     void on_cbxComputeHiResCoords_stateChanged(int state);
     void on_cbGLMSAA_stateChanged(int state);
@@ -119,11 +133,37 @@ private slots:
 
     void on_cbSoftwareThreaded_stateChanged(int state);
 private:
+    bool computeShadersAvailable = true;
+    void configureComputeOptions();
+    QComboBox* widescreenCombo = nullptr;
+    QComboBox* widescreenDisplayCombo = nullptr;
+    QCheckBox* widescreenExtendWindows = nullptr;
+    QCheckBox* widescreenExpandNarrowBorders = nullptr;
     void setVsyncControlEnable(bool hasOGL);
     void setEnabled();
     void applyTexture2DAtlasProtection(bool enabled);
     void syncTexture2DAtlasProtectionCheckbox();
     void applyRecommendedDefaults();
+    void setupEnhancementSections();
+    void setupTabbedLayout(QGroupBox* widescreenGroup);
+    void updateTabVisibility(bool advanced);
+    QTabWidget* settingsTabs = nullptr;
+    QWidget* compatibilityPage = nullptr;
+    QWidget* experimentsPage = nullptr;
+    QGroupBox* advancedTextureGroup = nullptr;
+    QGroupBox* presentationGroup = nullptr;
+    QGridLayout* artifactOptionsLayout = nullptr;
+    bool oldScreenFilter = false, oldScreenSharpen = false, oldScreenGhosting = false;
+    int oldScreenSharpenStrength = 0, oldScreenGhostingMode = 0;
+
+    QGroupBox* affineGroup;
+    QGroupBox* affineAssemblyGroup;
+    QGroupBox* affineEdgeGroup;
+    QGroupBox* compatibilityGroup;
+    QGroupBox* experimentsGroup;
+    QGridLayout* affineBasicLayout;
+    QGridLayout* affineAssemblyLayout;
+    QGridLayout* compatibilityLayout;
 
     Ui::VideoSettingsDialog* ui;
     EmuInstance* emuInstance;
@@ -163,10 +203,12 @@ private:
         int NativeMipFloor;
         int SourceMips;
         int EdgeExtendUnusedMargins;
+        int ReconstructCompatible3D;
+        int ReconstructCompatible3DEdgeContext;
+        int ReconstructCompatible3DFractionalAlpha;
         int LegacyAlphaHandling;
         int QualityAlphaHandling;
-        int AlphaXBRZ;
-        int Spline36Alpha;
+        int Alpha;
     } oldTextureScaling;
 
     struct WholeScene2DSnapshot
@@ -193,11 +235,24 @@ private:
         int HybridNativeEffectGuard;
         int HybridForeground2DBase;
         int HybridCleanLegacyCandidate;
+        int HybridStrictAffineHighRes;
+        int HybridStrictAffineSourceEnhancement;
+        int HybridStrictAffineConnectedSources;
+        int HybridStrictAffineOpaqueAssemblies;
+        int HybridStrictAffineTopTextBG;
+        int HybridStrictAffineMaskedOBJMLAA;
     } oldWholeScene2D;
 
+    int oldAffineAlpha = 1, oldAffineSampling = 0;
+    bool oldNNEDI3PremultipliedRGB = false;
+    QCheckBox* nnedi3PremultipliedRGB = nullptr;
+    QComboBox* textureAlphaCombo = nullptr;
+    QWidget* textureAlphaRow = nullptr;
+    QComboBox* affineAlphaCombo = nullptr;
+    QComboBox* affineSamplingCombo = nullptr;
+    QGroupBox* affineReconstructionGroup = nullptr;
     int oldHiresCoordinates;
     int oldGLMSAA;
 };
 
 #endif // VIDEOSETTINGSDIALOG_H
-

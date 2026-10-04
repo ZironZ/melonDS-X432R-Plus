@@ -1,20 +1,5 @@
-/*
-    Copyright 2026 ZironZ
-
-    This file is part of melonDS.
-
-    melonDS is free software: you can redistribute it and/or modify it under
-    the terms of the GNU General Public License as published by the Free
-    Software Foundation, either version 3 of the License, or (at your option)
-    any later version.
-
-    melonDS is distributed in the hope that it will be useful, but WITHOUT ANY
-    WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
-    FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
-
-    You should have received a copy of the GNU General Public License along
-    with melonDS. If not, see http://www.gnu.org/licenses/.
-*/
+// Copyright 2026 ZironZ
+// SPDX-License-Identifier: GPL-3.0-or-later
 
 #pragma once
 
@@ -57,6 +42,8 @@ enum class WholeSceneRenderPath
     SourceACaptureReplacement,
     CaptureEpochOverlay,
     PhysicalFinalPostprocessInput,
+    NativeExactFloor,
+    StrictAffineHighRes,
 };
 
 enum class WholeSceneCurrentPathReason
@@ -72,17 +59,16 @@ enum class WholeSceneCurrentPathReason
 
 enum class WholeScenePathDecisionReason : u8
 {
-    None,
-    CaptureBackedProducerDuringHybridGuard,
-    HybridPresentationGuard,
-    CaptureBackedBeforeGeneralFallbacks,
-    ChunkedUnsafeOverlay,
-    PhysicalFinalPostprocessNativeInput,
-    SplitLegacyFallback,
-    CaptureBackedAfterGeneralFallbacks,
-    FragmentationOrUnsafeFrameCurrentFallback,
-    WholeSceneScale,
-    ScalePathUnavailable,
+    None = 0,
+    CaptureBackedProducerDuringHybridGuard = 1,
+    HybridPresentationGuard = 2,
+    CaptureBackedBeforeGeneralFallbacks = 3,
+    PhysicalFinalPostprocessNativeInput = 5,
+    SplitLegacyFallback = 6,
+    CaptureBackedAfterGeneralFallbacks = 7,
+    FragmentationOrUnsafeFrameCurrentFallback = 8,
+    WholeSceneScale = 9,
+    ScalePathUnavailable = 10,
 };
 
 enum class WholeSceneScaleDecisionReason : u8
@@ -95,7 +81,447 @@ enum class WholeSceneScaleDecisionReason : u8
     OverlayOperator,
     FinalNativeUpscale,
     LegacyNativeUpscale,
+    StrictAffineHighRes,
 };
+
+enum class StrictAffineHighResBlockReason : u8
+{
+    None = 0,
+    FeatureDisabled,
+    NotConservativeHybrid,
+    ScalePathUnavailable,
+    ScaleFactorOne,
+    IncompleteRange,
+    DisplayModeNotComposited,
+    SnapshotIncoherent,
+    CandidateTargetUnavailable,
+    HighResolutionGeometryNotRequired,
+    NotExactlyOneVisibleLayer,
+    VisibleLayerNotTiledAffineBG,
+    UnsupportedActiveChannel,
+    NotExactlyOneAffineBG,
+    UnsupportedCompanionLayer,
+    UnsupportedAlphaBlendConfiguration,
+};
+
+enum class StrictAffineDebugProductClass : u8
+{
+    None = 0,
+    ProductionEligible,
+    DualExtendedAffineWithOBJ,
+};
+
+enum class StrictAffineSourceEnhancementDecision : u8
+{
+    Disabled = 0,
+    StrictAffinePathNotSelected,
+    AlgorithmUnsupported,
+    Spline36Inline,
+    CuNNyCachedAffineSources,
+    NNEDI3CachedAffineSources,
+    XBRZCachedAffineSources,
+    ArtCNNCachedAffineSources,
+    Spline36CachedAffineSources,
+    NativeCachedAffineSources,
+};
+
+enum StrictAffineUnderlayRejectReason : u32
+{
+    StrictAffineUnderlayRejectNone = 0,
+    StrictAffineUnderlayRejectInvalidRange = 1u << 0,
+    StrictAffineUnderlayRejectLowerBG = 1u << 1,
+    StrictAffineUnderlayRejectLowerOBJ = 1u << 2,
+    StrictAffineUnderlayRejectBackdropVaries = 1u << 3,
+    StrictAffineUnderlayRejectTarget1Mismatch = 1u << 4,
+    StrictAffineUnderlayRejectTarget2Mismatch = 1u << 5,
+};
+
+enum StrictAffineOperandExcludedOverlayRejectReason : u32
+{
+    StrictAffineOperandExcludedOverlayRejectNone = 0,
+    StrictAffineOperandExcludedOverlayRejectNoPlan = 1u << 0,
+    StrictAffineOperandExcludedOverlayRejectNoDirect3D = 1u << 1,
+    StrictAffineOperandExcludedOverlayRejectAffineBG = 1u << 2,
+    StrictAffineOperandExcludedOverlayRejectRange = 1u << 3,
+    StrictAffineOperandExcludedOverlayRejectWindow = 1u << 4,
+    StrictAffineOperandExcludedOverlayRejectEffect = 1u << 5,
+    StrictAffineOperandExcludedOverlayRejectOrdering = 1u << 6,
+    StrictAffineOperandExcludedOverlayRejectSpecialOBJ = 1u << 7,
+    StrictAffineOperandExcludedOverlayRejectNoAffineOperand = 1u << 8,
+    StrictAffineOperandExcludedOverlayRejectRender = 1u << 9,
+};
+
+enum StrictAffineResolvedOBJRejectReason : u32
+{
+    StrictAffineResolvedOBJRejectNone = 0,
+    StrictAffineResolvedOBJRejectRange = 1u << 0,
+    StrictAffineResolvedOBJRejectUnsupportedSprite = 1u << 1,
+    StrictAffineResolvedOBJRejectNoOrdinaryOBJ = 1u << 2,
+    StrictAffineResolvedOBJRejectScale = 1u << 3,
+    StrictAffineResolvedOBJRejectStorage = 1u << 4,
+    StrictAffineResolvedOBJRejectRGBScale = 1u << 5,
+    StrictAffineResolvedOBJRejectAlphaScale = 1u << 6,
+};
+
+struct StrictAffineSourceEnhancementInputs
+{
+    bool Enabled = false;
+    bool StrictAffinePathSelected = false;
+    bool InlineSpline36Available = false;
+    bool CachedArtCNNAvailable = false;
+    bool CachedCuNNyAvailable = false;
+    bool CachedNNEDI3Available = false;
+    bool CachedXBRZAvailable = false;
+};
+
+StrictAffineSourceEnhancementDecision ChooseStrictAffineSourceEnhancement(
+    const StrictAffineSourceEnhancementInputs& inputs);
+
+constexpr bool IsStrictAffineCachedSource(StrictAffineSourceEnhancementDecision decision)
+{
+    return decision == StrictAffineSourceEnhancementDecision::ArtCNNCachedAffineSources ||
+           decision == StrictAffineSourceEnhancementDecision::CuNNyCachedAffineSources ||
+           decision == StrictAffineSourceEnhancementDecision::NNEDI3CachedAffineSources ||
+           decision == StrictAffineSourceEnhancementDecision::XBRZCachedAffineSources ||
+           decision == StrictAffineSourceEnhancementDecision::Spline36CachedAffineSources ||
+           decision == StrictAffineSourceEnhancementDecision::NativeCachedAffineSources;
+}
+
+constexpr int StrictAffineCachedSourceScale(
+    StrictAffineSourceEnhancementDecision decision, int outputScale)
+{
+    return IsStrictAffineCachedSource(decision) ? (outputScale >= 4 ? 4 : 2) : 1;
+}
+
+enum class AffineOBJPresentationTopClass : u8
+{
+    Unsupported = 0,
+    Backdrop,
+    BG,
+    OBJ,
+};
+
+struct AffineOBJPresentationPriorityInputs
+{
+    u8 CandidatePriority = 0;
+    u8 CandidateOAMIndex = 0;
+    AffineOBJPresentationTopClass TopClass =
+        AffineOBJPresentationTopClass::Unsupported;
+    u8 TopPriority = 0;
+    u8 TopOAMIndex = 0;
+    bool TopIsSameAffineCandidate = false;
+};
+
+// Pure mirror of the bounded presentation shader rule. OBJ wins over BG at
+// equal numeric priority; OBJ/OBJ ties are resolved by lower OAM index, while
+// an identical affine native winner is the candidate rather than an occluder.
+constexpr bool DoesAffineOBJPresentationCandidateWin(
+    const AffineOBJPresentationPriorityInputs& inputs)
+{
+    switch (inputs.TopClass)
+    {
+    case AffineOBJPresentationTopClass::Backdrop:
+        return true;
+    case AffineOBJPresentationTopClass::BG:
+        return inputs.CandidatePriority <= inputs.TopPriority;
+    case AffineOBJPresentationTopClass::OBJ:
+        if (inputs.TopIsSameAffineCandidate)
+            return true;
+        return (static_cast<u16>(inputs.CandidatePriority) * 128u +
+                inputs.CandidateOAMIndex) <
+               (static_cast<u16>(inputs.TopPriority) * 128u +
+                inputs.TopOAMIndex);
+    default:
+        return false;
+    }
+}
+
+struct StrictAffineHighResEligibilityInputs
+{
+    bool FeatureEnabled = false;
+    bool ConservativeHybridMode = false;
+    bool ScalePathAvailable = false;
+    int OutputScale = 1;
+    int YStart = 0;
+    int YEnd = 0;
+    bool DisplayModeComposited = false;
+    bool SnapshotCoherent = false;
+    bool CandidateTargetAvailable = false;
+    bool HighResolutionGeometryRequired = true;
+    u32 VisibleLayerMask = 0;
+    u32 TiledAffineBGMask = 0;
+    u32 ExtendedTiledAffineBGMask = 0;
+    u32 TextTiledBGMask = 0;
+    u32 Direct3DLayerMask = 0;
+    u32 AlphaBlendTarget1Mask = 0;
+    u32 AlphaBlendTarget2Mask = 0;
+    u32 ColorEffectMode = 0;
+    u32 ColorEffectFactor = 0;
+    bool HasOrdinaryOBJ = false;
+    bool HasSemiTransparentOrdinaryOBJ = false;
+    bool HasSemiTransparentAffineOBJ = false;
+    bool HasBitmapOrdinaryOBJ = false;
+    bool HasBitmapAffineOBJ = false;
+    bool HasUnsupportedSemiTransparentOBJ = false;
+    bool AlphaBlendOrdinaryOBJPrioritySafe = false;
+    u64 RequiredChannels = 0;
+};
+
+enum class DeferredScanlineStrictAffineBlockReason : u8
+{
+    None = 0,
+    FeatureDisabled,
+    NotConservativeHybrid,
+    ScaleFactorOne,
+    CandidateTargetUnavailable,
+    NativeFrameIncomplete,
+    NativeRowIdentityInvalid,
+    NativeRowMissing,
+    NativeRowSourceMismatch,
+    LiveSourceMismatch,
+    RouteOrPresentationMismatch,
+    UnsupportedRowState,
+    UnsupportedOrdinaryOBJPresentation,
+    HighResolutionGeometryNotRequired,
+};
+
+struct DeferredScanlineStrictAffineInputs
+{
+    static constexpr u32 MaxHistoricalSourceEpochs = 3;
+
+    bool FeatureEnabled = false;
+    bool ConservativeHybridMode = false;
+    int OutputScale = 1;
+    bool CandidateTargetAvailable = false;
+    bool NativeFrameComplete = false;
+    bool NativeRowIdentityValid = false;
+    bool RouteAndPresentationUniform = false;
+    bool AllRowsSupported = false;
+    bool OrdinaryOBJPresentationRequired = false;
+    bool OrdinaryOBJPresentationSupported = false;
+    bool HighResolutionGeometryRequired = false;
+    u64 LiveSourceGeneration = 0;
+    u64 LiveRowSourceGeneration[192] = {};
+    bool HistoricalSourceAvailable = false;
+    int HistoricalSourceYEnd = 0;
+    u64 HistoricalSourceGeneration = 0;
+    u64 HistoricalRowSourceGeneration[192] = {};
+    u32 HistoricalSourceEpochCount = 0;
+    bool HistoricalSourceEpochAvailable[MaxHistoricalSourceEpochs] = {};
+    int HistoricalSourceEpochYStart[MaxHistoricalSourceEpochs] = {};
+    int HistoricalSourceEpochYEnd[MaxHistoricalSourceEpochs] = {};
+    u64 HistoricalSourceEpochGeneration[MaxHistoricalSourceEpochs] = {};
+    u64 HistoricalSourceEpochRowGeneration[MaxHistoricalSourceEpochs][192] = {};
+    bool RowValid[192] = {};
+    u64 RowSourceGeneration[192] = {};
+};
+
+struct DeferredScanlineStrictAffineAssessment
+{
+    bool Eligible = false;
+    DeferredScanlineStrictAffineBlockReason BlockReason =
+        DeferredScanlineStrictAffineBlockReason::FeatureDisabled;
+    u64 SourceGeneration = 0;
+    bool HistoricalSourceUsed = false;
+    int HistoricalSourceYEnd = 0;
+    u64 HistoricalSourceGeneration = 0;
+    u32 HistoricalSourceEpochCount = 0;
+};
+
+DeferredScanlineStrictAffineAssessment
+AssessDeferredScanlineStrictAffine(
+    const DeferredScanlineStrictAffineInputs& inputs);
+
+// Direct-color bitmap OBJ is the one currently admitted alpha-blend material
+// whose semantic operator consumes the real high-resolution target-2 winner.
+// Companion text-BG reconstruction is therefore an input to that exact
+// material equation rather than the unsupported fractional third operand
+// presented by general mode-1 EVA/EVB blending.
+constexpr bool HasStrictAffineResolvedBitmapOBJMaterial(
+    const StrictAffineHighResEligibilityInputs& inputs)
+{
+    return inputs.ColorEffectMode == 1 &&
+           inputs.HasBitmapAffineOBJ &&
+           !inputs.HasSemiTransparentOrdinaryOBJ &&
+           !inputs.HasSemiTransparentAffineOBJ &&
+           !inputs.HasUnsupportedSemiTransparentOBJ &&
+           inputs.AlphaBlendTarget2Mask != 0;
+}
+
+// Enhanced text-BG RGB can remain an ordinary semantic operand when the
+// strict compositor already has a complete, bounded EVA/EVB equation. The
+// reconstructed alpha is deliberately not part of this proof: native BG
+// ownership selects target 1, then the existing compositor blends that
+// reconstructed color against the real affine-BG/backdrop target 2.
+constexpr bool HasStrictAffineResolvedTextBGAlphaBlend(
+    const StrictAffineHighResEligibilityInputs& inputs)
+{
+    constexpr u32 backdrop = 1u << 5;
+    const u32 visibleText =
+        inputs.VisibleLayerMask & inputs.TextTiledBGMask & 0xFu;
+    const u32 visibleAffine = inputs.VisibleLayerMask &
+        (inputs.TiledAffineBGMask | inputs.ExtendedTiledAffineBGMask) & 0xFu;
+    const u32 target1 = inputs.AlphaBlendTarget1Mask;
+    const u32 target2 = inputs.AlphaBlendTarget2Mask;
+
+    return inputs.ColorEffectMode == 1 &&
+           target1 != 0 && target2 != 0 &&
+           (target1 & visibleText) != 0 &&
+           (target1 & ~visibleText) == 0 &&
+           (target2 & (visibleAffine | backdrop)) != 0 &&
+           (target2 & ~(visibleAffine | backdrop)) == 0 &&
+           !inputs.HasSemiTransparentOrdinaryOBJ &&
+           !inputs.HasSemiTransparentAffineOBJ &&
+           !inputs.HasBitmapOrdinaryOBJ &&
+           !inputs.HasBitmapAffineOBJ &&
+           !inputs.HasUnsupportedSemiTransparentOBJ &&
+           (!inputs.HasOrdinaryOBJ ||
+            inputs.AlphaBlendOrdinaryOBJPrioritySafe);
+}
+
+// BLDCNT may retain alpha-blend mode while there is no possible target-1
+// participant. Normal OBJ do not implicitly become target 1; only mode-1 and
+// bitmap-material OBJ do. In that state the blend equation is inert and does
+// not prevent source-RGB reconstruction of an ordinary text BG.
+constexpr bool HasStrictAffineInertAlphaBlend(
+    const StrictAffineHighResEligibilityInputs& inputs)
+{
+    return inputs.ColorEffectMode == 1 &&
+           inputs.AlphaBlendTarget1Mask == 0 &&
+           !inputs.HasSemiTransparentOrdinaryOBJ &&
+           !inputs.HasSemiTransparentAffineOBJ &&
+           !inputs.HasBitmapOrdinaryOBJ &&
+           !inputs.HasBitmapAffineOBJ &&
+           !inputs.HasUnsupportedSemiTransparentOBJ;
+}
+
+// Once the bounded semantic blend is complete, bilinear native-source
+// coverage may interpolate between that completed target-1 result and the
+// actual exposed target-2 winner. This is presentation coverage, not a change
+// to DS blend coefficients or layer ownership.
+constexpr u32 ChooseStrictAffineResolvedTextBGBilinearCoverageMask(
+    u32 enhancedTextBGMask,
+    u32 alphaBlendTarget1Mask,
+    bool sourceEnhanced,
+    bool resolvedTextBGAlphaBlend)
+{
+    if (!sourceEnhanced || !resolvedTextBGAlphaBlend)
+    {
+        return 0;
+    }
+
+    return enhancedTextBGMask & alphaBlendTarget1Mask & 0xFu;
+}
+
+constexpr u32 ChooseStrictAffineConstantBackdropCompositeMask(
+    u32 constantBackdropProofBGMask,
+    bool bilinearPresentationEnabled,
+    u32 blendEffect,
+    u32 alphaBlendTarget1Mask,
+    u32 alphaBlendTarget2Mask,
+    u32 colorEffectFactor,
+    bool resolvedTextBGAlphaBlend)
+{
+    const bool brightnessEffect =
+        (blendEffect == 2 || blendEffect == 3) && colorEffectFactor > 0;
+    const bool ordinaryGateOpen =
+        (alphaBlendTarget1Mask == 0 || brightnessEffect) &&
+        (alphaBlendTarget2Mask == 0 || alphaBlendTarget2Mask == 0x3Fu);
+
+    // In the bounded text-BG equation the affine BG and backdrop have equal
+    // Target-2 membership (part of the supplied proof). Folding their smooth
+    // boundary first is therefore distributive with the later EVA/EVB blend.
+    const bool boundedAlphaBlendGateOpen =
+        blendEffect == 1 && resolvedTextBGAlphaBlend;
+    return bilinearPresentationEnabled &&
+           (ordinaryGateOpen || boundedAlphaBlendGateOpen)
+        ? (constantBackdropProofBGMask & 0xFu)
+        : 0u;
+}
+
+struct StrictAffineGeometryDemandInputs
+{
+    u32 VisibleAffineBGMask = 0;
+    u32 IdentityEquivalentAffineBGMask = 0;
+    u32 PreviousTransformedAffineBGMask = 0;
+    u32 SettledIdentityAffineBGMask = 0;
+    bool HasAffineOBJ = false;
+};
+
+struct StrictAffineGeometryDemandResult
+{
+    u32 TransformedAffineBGMask = 0;
+    bool HighResolutionGeometryRequired = false;
+};
+
+// A transformed BG remains strict until the renderer has observed a stable
+// run of exact-identity frames. A momentary identity crossing therefore cannot
+// switch paths in the middle of a real affine animation.
+constexpr StrictAffineGeometryDemandResult UpdateStrictAffineGeometryDemand(
+    const StrictAffineGeometryDemandInputs& inputs)
+{
+    const u32 visible = inputs.VisibleAffineBGMask & 0xFu;
+    const u32 identityEquivalent =
+        inputs.IdentityEquivalentAffineBGMask & visible;
+    const u32 transformed =
+        (inputs.PreviousTransformedAffineBGMask & visible &
+         ~inputs.SettledIdentityAffineBGMask) |
+        (visible & ~identityEquivalent);
+    return {
+        transformed,
+        inputs.HasAffineOBJ || transformed != 0,
+    };
+}
+
+// The DISPCNT enable bit alone does not create an OBJ-window mask. Treat the
+// channel as active only while OBJ rendering is enabled and a mode-2 sprite is
+// actually present in the renderer's current OAM inputs.
+constexpr bool HasStrictAffineActiveOBJWindow(
+    bool objWindowEnabled,
+    bool objLayerEnabled,
+    bool objWindowParticipant)
+{
+    return objWindowEnabled && objLayerEnabled && objWindowParticipant;
+}
+
+constexpr u32 ChooseStrictAffineCompanionTextBGMask(
+    u32 layerEnable,
+    u32 ordinaryTextBGMask,
+    bool enhancementEnabled,
+    u32 blendEffect,
+    bool resolvedBitmapOBJMaterial,
+    bool resolvedTextBGAlphaBlend,
+    bool inertAlphaBlend)
+{
+    // Fractional text-BG presentation under general EVA/EVB blending still
+    // lacks the required third-operand ordering contract. Source-RGB-only
+    // reconstruction is safe for the bounded text-BG equation proven above.
+    // Bitmap OBJ is also already resolved semantically
+    // against target 2, so leaving that target native would make its admitted
+    // high-resolution operand internally mixed-resolution.
+    if (!enhancementEnabled ||
+        (blendEffect == 1 && !resolvedBitmapOBJMaterial &&
+         !resolvedTextBGAlphaBlend && !inertAlphaBlend))
+        return 0;
+
+    return layerEnable & ordinaryTextBGMask & 0xFu;
+}
+
+StrictAffineHighResBlockReason ChooseStrictAffineHighResBlockReason(
+    const StrictAffineHighResEligibilityInputs& inputs);
+
+StrictAffineDebugProductClass ChooseStrictAffineDebugProductClass(
+    const StrictAffineHighResEligibilityInputs& inputs);
+
+bool CanProduceStrictAffineDebugProducts(
+    const StrictAffineHighResEligibilityInputs& inputs);
+
+inline bool CanUseStrictAffineHighResCandidate(
+    const StrictAffineHighResEligibilityInputs& inputs)
+{
+    return ChooseStrictAffineHighResBlockReason(inputs) ==
+           StrictAffineHighResBlockReason::None;
+}
 
 enum class HybridSourceDecisionReason : u8
 {
@@ -111,32 +537,6 @@ enum class WholeSceneOverlayEndpointFinalMode
     None,
     MetadataResolve,
     ExactCompositor,
-};
-
-enum class SourceACaptureReplacementMode
-{
-    None,
-    FullProduct,
-    CurrentOverlay,
-    FullProductAfterOverlayFailed,
-};
-
-enum class SourceAProductChoiceReason
-{
-    None,
-    UsedFullProductKeyMatch,
-    UsedFullProductNoOverlayVisible,
-    UsedBackgroundUnderlayCurrentOverlay,
-    RejectedFullProductKeyMismatch,
-    RejectedCurrentOverlayKeyMismatch,
-    RejectedMissingBackgroundProduct,
-    RejectedMissingFullProduct,
-    ReusedPreviousRouteProduct,
-    FallbackNormalHybrid,
-    FallbackFinalImage,
-    UsedFullProductRouteBridge,
-    DeferredLiveScenePromotion,
-    UsedExactRouteProductSameEvent,
 };
 
 inline bool WholeSceneRenderPathUsesFullFrameFinalizer(WholeSceneRenderPath path)
@@ -205,6 +605,10 @@ inline const char* WholeSceneRenderPathName(WholeSceneRenderPath path)
         return "capture-epoch background plus current overlay";
     case WholeSceneRenderPath::PhysicalFinalPostprocessInput:
         return "physical final postprocess input";
+    case WholeSceneRenderPath::NativeExactFloor:
+        return "native-exact nearest floor";
+    case WholeSceneRenderPath::StrictAffineHighRes:
+        return "strict high-resolution affine BG";
     case WholeSceneRenderPath::None:
     default:
         return "none";
@@ -221,23 +625,6 @@ inline const char* WholeSceneOverlayEndpointFinalModeName(
     case WholeSceneOverlayEndpointFinalMode::ExactCompositor:
         return "exact compositor";
     case WholeSceneOverlayEndpointFinalMode::None:
-    default:
-        return "none";
-    }
-}
-
-inline const char* SourceACaptureReplacementModeName(
-    SourceACaptureReplacementMode mode)
-{
-    switch (mode)
-    {
-    case SourceACaptureReplacementMode::FullProduct:
-        return "full captured product";
-    case SourceACaptureReplacementMode::CurrentOverlay:
-        return "captured 3D background plus current overlay";
-    case SourceACaptureReplacementMode::FullProductAfterOverlayFailed:
-        return "full captured product after current overlay unavailable/failed";
-    case SourceACaptureReplacementMode::None:
     default:
         return "none";
     }
@@ -270,14 +657,45 @@ struct VisibleOBJCaptureDebug
     u32 RejectReason = 0;
 };
 
+enum class WholeSceneNativeProductRowIdentityInvalidReason : u8
+{
+    None,
+    DescriptorScopeMismatch,
+    OverlapIdentityMismatch,
+};
+
+enum WholeSceneNativeProductEpochInvalidReason : u32
+{
+    WholeSceneNativeProductEpochInvalidNone = 0,
+    WholeSceneNativeProductEpochInvalidEligibility = 1u << 0,
+    WholeSceneNativeProductEpochInvalidPath = 1u << 1,
+    WholeSceneNativeProductEpochInvalidMidFrameState = 1u << 2,
+};
+
+struct WholeSceneNativeProductFinalizerInputs
+{
+    bool FinalizerPathSeen = false;
+    bool EpochValid = false;
+    u32 EpochInvalidReason = WholeSceneNativeProductEpochInvalidNone;
+    bool RowIdentityValid = false;
+    u32 IdentityRows = 0;
+    u64 FrameIdentity = 0;
+    bool FrameComplete = false;
+};
+
+// Admission and finalization must agree on which state transitions can
+// retain native rows for a later full-frame reconstruction.
+bool CanDeferWholeSceneNativeProductEpoch(bool epochValid, u32 invalidReason);
+
+bool CanFinalizeWholeSceneRowOwnedNativeProduct(
+    const WholeSceneNativeProductFinalizerInputs& inputs);
+
 struct WholeSceneRenderTrace
 {
     WholeSceneRenderPath Path = WholeSceneRenderPath::None;
     WholeSceneCurrentPathReason CurrentReason = WholeSceneCurrentPathReason::None;
     WholeSceneNative3DSource Native3DSource = WholeSceneNative3DSource::None;
     WholeSceneOverlayEndpointFinalMode OverlayEndpointFinalMode = WholeSceneOverlayEndpointFinalMode::None;
-    SourceACaptureReplacementMode SourceACaptureMode = SourceACaptureReplacementMode::None;
-    SourceAProductChoiceReason SourceAProductChoice = SourceAProductChoiceReason::None;
     WholeSceneCaptureAuthority CaptureAuthority = WholeSceneCaptureAuthority::None;
     WholeSceneCaptureBackedPlanRole CaptureRole = WholeSceneCaptureBackedPlanRole::None;
     WholeSceneCaptureRequestKind CaptureRequestKind = WholeSceneCaptureRequestKind::None;
@@ -351,22 +769,13 @@ struct WholeSceneRenderTrace
     u32 SourceAChosenProductRenderAction = 0;
     u32 SourceAChosenProductPresentationClass = 0;
     bool CaptureProductUseAccepted = false;
-    bool CaptureProductUsePresentationCompatible = false;
-    bool CaptureProductPresentationHashMatch = false;
-    u32 CaptureProductStoredEffectOwner = 0;
-    u32 CaptureProductStoredEffectState = 0;
-    u32 CaptureProductConsumeEffectOwner = 0;
-    u32 CaptureProductConsumeEffectState = 0;
-    u32 CaptureProductEffectAction = 0;
-    bool CaptureProductEffectPhaseIncompatible = false;
-    u32 CaptureProductFinalPassEffectOwner = 0;
-    bool CaptureProductApplyEffectOnBlit = false;
+    bool CaptureProductRowScopeCompatible = false;
+    int CaptureProductValidYStart = 0;
+    int CaptureProductValidYEnd = 0;
     bool OutputPresentationMasterBrightnessApplied = false;
     u32 OutputPresentationEffectOwner = 0;
     u32 OutputPresentationEffectState = 0;
     int OutputPresentationTex = 0;
-    bool SourceAFullProductKeyMatch = false;
-    bool SourceAPreferExactRouteProduct = false;
     int SourceAFullProductCaptureBank = -1;
     int SourceAFullProductTex = 0;
     bool SourceAFullProductEventValid = false;
@@ -396,6 +805,66 @@ struct WholeSceneRenderTrace
     bool HighRes3D = false;
     bool Linear3D = false;
     bool Resolve3D = false;
+    bool DeferredScanlineStrictAffineEvaluated = false;
+    bool DeferredScanlineStrictAffineEligible = false;
+    DeferredScanlineStrictAffineBlockReason
+        DeferredScanlineStrictAffineReason =
+            DeferredScanlineStrictAffineBlockReason::FeatureDisabled;
+    bool DeferredStrictAffineHistoricalSourceAttempted = false;
+    bool DeferredStrictAffineHistoricalSourceValid = false;
+    bool DeferredStrictAffineHistoricalSourceUsed = false;
+    int DeferredStrictAffineHistoricalSourceYEnd = 0;
+    u32 DeferredStrictAffineHistoricalNativeBGMask = 0;
+    u32 DeferredStrictAffineHistoricalEnhancedBGMask = 0;
+    u32 DeferredStrictAffineRowSourceEpochCount = 0;
+    int DeferredStrictAffineFirstSourceTransitionY = -1;
+    u64 DeferredStrictAffineFirstRowSourceGeneration = 0;
+    u64 DeferredStrictAffineLiveSourceGeneration = 0;
+    StrictAffineDebugProductClass StrictAffineDebugClass =
+        StrictAffineDebugProductClass::None;
+    StrictAffineSourceEnhancementDecision StrictAffineSourceEnhancement =
+        StrictAffineSourceEnhancementDecision::Disabled;
+    u32 StrictAffineEnhancedOBJActiveSlots = 0;
+    u32 StrictAffineEnhancedOBJCacheHits = 0;
+    u32 StrictAffineEnhancedOBJCacheMisses = 0;
+    u32 StrictAffineEnhancedOBJNeuralDispatches = 0;
+    u32 StrictAffineEnhancedOBJFallbacks = 0;
+    bool StrictAffineOrdinaryOBJNativeStack = false;
+    bool StrictAffineResolvedOBJRequested = false;
+    bool StrictAffineResolvedOBJOrdinaryProductReady = false;
+    bool StrictAffineResolvedOBJOrdinaryProductReused = false;
+    bool StrictAffineResolvedOBJMergeExecuted = false;
+    u32 StrictAffineResolvedOBJRejectionMask = 0;
+    bool StrictAffineOBJOperandPlanRequested = false;
+    bool StrictAffineOBJOperandPlanNoAffineExtension = false;
+    bool StrictAffineOBJOperandPlanSpecialIsolationReady = false;
+    bool StrictAffineOBJOperandPlanCleanBG3DBase = false;
+    u32 StrictAffineOBJOperandPlanRejectionMask = 0;
+    u32 StrictAffineOBJOperandPlanOperandCount = 0;
+    u32 StrictAffineOBJOperandPlanPresentationProductCount = 0;
+    u64 StrictAffineOBJOperandPlanHash = 0;
+    bool StrictAffineOperandExcludedOverlayRequested = false;
+    u32 StrictAffineOperandExcludedOverlayRejectionMask = 0;
+    u64 StrictAffineOperandExcludedOverlayOAMHash = 0;
+    u32 StrictAffineEnhancedBGActiveLayers = 0;
+    u32 StrictAffineEnhancedBGCacheHits = 0;
+    u32 StrictAffineEnhancedBGCacheMisses = 0;
+    u32 StrictAffineEnhancedBGNeuralDispatches = 0;
+    u32 StrictAffineEnhancedBGFallbacks = 0;
+    u32 StrictAffineUnderlayCandidateBGMask = 0;
+    u32 StrictAffineConstantBackdropProofBGMask = 0;
+    u32 StrictAffineConstantBackdropCompositeBGMask = 0;
+    u32 StrictAffineBG2UnderlayRejectReasons = 0;
+    u32 StrictAffineBG3UnderlayRejectReasons = 0;
+    u32 StrictAffineBG2UnderlayBackdropColor = 0;
+    u32 StrictAffineBG3UnderlayBackdropColor = 0;
+    bool StrictAffineDeferredTextBGAARequested = false;
+    bool StrictAffineDeferredTextBGAAExecuted = false;
+    bool StrictAffineDeferredOrdinaryOBJCandidateRequested = false;
+    bool StrictAffineDeferredOrdinaryOBJCandidateProductReady = false;
+    bool StrictAffineDeferredOrdinaryOBJCandidateEvaluated = false;
+    bool StrictAffineCandidateValid = false;
+    bool StrictAffineNativeReferenceValid = false;
     bool NativeExactFinalValid = false;
     bool PhysicalFinalNativeInputValid = false;
     bool Native3DResolveValid = false;
@@ -407,6 +876,12 @@ struct WholeSceneRenderTrace
     u32 FullFrameFinalizerPasses = 0;
     u32 NativeProductValidRows = 0;
     bool NativeProductsFrameComplete = false;
+    bool NativeProductRowIdentityValid = true;
+    WholeSceneNativeProductRowIdentityInvalidReason
+        NativeProductRowIdentityInvalidReason =
+            WholeSceneNativeProductRowIdentityInvalidReason::None;
+    u32 NativeProductIdentityRows = 0;
+    u64 NativeProductFrameIdentity = 0;
     bool NativeProductEpochValid = true;
     u32 NativeProductEpochInvalidReason = 0;
     WholeSceneScaleEligibility NativeProductFrameEligibility = WholeSceneScaleEligibility::ScreenUnavailable;
@@ -430,20 +905,17 @@ struct WholeScenePathDecision
     WholeSceneRenderPath Path = WholeSceneRenderPath::None;
     WholeSceneCurrentPathReason CurrentReason = WholeSceneCurrentPathReason::None;
     WholeSceneCaptureBackedPlan CapturePlan;
-    bool ConservativeHybrid = false;
     bool HybridFragmentationFallback = false;
 };
 
 struct WholeScenePathDecisionInputs
 {
     WholeSceneCaptureBackedPlan CapturePlan;
-    bool ChunkedUnsafeOverlayAvailable = false;
     bool CurrentFallbackAvailable = false;
     bool PhysicalFinalPostprocessNativeInputAvailable = false;
     bool HybridPresentationGuardActive = false;
     bool SplitLegacyFallbackAvailable = false;
     bool CanUseScalePath = false;
-    bool ConservativeHybridMode = false;
 };
 
 WholeScenePathDecision ChooseWholeScenePathDecision(
@@ -527,7 +999,7 @@ struct CaptureBackedBrightnessReleaseInputs
     u32 CrossingFullWholeSceneCaptureMask = 0;
 };
 
-inline bool ShouldHoldFullWhiteForCaptureBackedBrightnessRelease(
+inline bool ShouldPlanPhysicalBrightnessForCaptureBackedRelease(
     const CaptureBackedBrightnessReleaseInputs& inputs)
 {
     if (!inputs.WholeSceneScaleRequested ||

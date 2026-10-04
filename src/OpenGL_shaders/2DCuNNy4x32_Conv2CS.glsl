@@ -56,6 +56,8 @@ uniform vec4 conv8_mul;
 
 uniform vec2 LUMA_size;
 uniform vec2 MAIN_size;
+// Native pixel coordinates, independent of packed feature-plane dimensions.
+uniform ivec2 uWorkOrigin;
 uniform vec2 LUMA_pt;
 uniform vec2 MAIN_pt;
 uniform vec2 in_pt;
@@ -94,7 +96,7 @@ vec4 conv8_gather(vec2 pos, int component) { switch (component) { case 1: return
 shared V4 G[8][10][10];
 void main() {
 	ivec2 xy = ivec2(gl_LocalInvocationID.xy);
-	ivec2 pos = ivec2(gl_WorkGroupID.xy) * ivec2(8, 8) + xy;
+	ivec2 pos = uWorkOrigin + ivec2(gl_WorkGroupID.xy) * ivec2(8, 8) + xy;
 	bool inside = pos.x < int(MAIN_size.x) && pos.y < int(MAIN_size.y);
 	ivec2 opos = pos * ivec2(4, 2);
 	ivec2 sz = ivec2(MAIN_size) - ivec2(1);

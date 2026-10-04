@@ -17,7 +17,7 @@
 #   .\lift-policy-rows.ps1 -Csv <csv> -From 100 -To 400 -Name DQVLogo -Engine A -OutFile block.cpp
 #
 # Column -> input mapping (per engine prefix a_/b_):
-#   PolicyAccepted          <- capture_repr_effect_action != 5 (Fallback = policy rejected)
+#   PolicyAccepted          <- true (only accepted rows remain liftable)
 #   HasTexture              <- source_a_chosen_product_tex != 0
 #   RequestKind             <- capture_policy_request_kind
 #   ProductKind             <- source_a_chosen_product_kind
@@ -26,30 +26,18 @@
 #   PresentationClass       <- source_a_chosen_product_class
 #   ProductPresentationHash <- source_a_request_capture_presentation_hash
 #   RequestPresentationHash <- source_a_request_current_presentation_hash
-#   HasStoredEffectState    <- capture_repr_stored_effect_state != 0
-#       (a stored-but-inactive state also reads 0; that ambiguity is
-#        decision-equivalent, the guard cannot fire either way)
-#   Stored/ConsumeEffectActive <- packed (mode<<8)|factor from
-#       capture_repr_stored_effect_state / capture_repr_consume_effect_state
 # Expected outputs:
 #   Accepted                 <- capture_repr_product_use_accepted
-#   EffectPhaseIncompatible  <- capture_repr_effect_phase_incompatible
-#   RequiresRePresentation   <- only when capture_repr_effect_action makes it
-#       unambiguous (4=NeedsRePresentation -> true; 1/2 -> false; 3 masked)
 #
-# Known trace limitation: effect-application columns can under-report effects
-# applied after the capture-policy decision. For example, an EVY brightness
-# effect applied by the final blit is not represented by
-# capture_repr_effect_action. This script asserts only decision fields, which
-# are recorded directly from the policy result, so the limitation does not
-# affect lifted rows.
+# The obsolete effect-action trace once supplied an indirect PolicyAccepted
+# bit. Rejected rows cannot reconstruct that input after its removal and are
+# skipped; write negative policy cases directly from their typed inputs.
 param(
     [Parameter(Mandatory = $true)] [string]$Csv,
     [Parameter(Mandatory = $true)] [int]$From,
     [Parameter(Mandatory = $true)] [int]$To,
     [Parameter(Mandatory = $true)] [string]$Name,
     [ValidateSet('A', 'B', 'Both')] [string]$Engine = 'Both',
-    [switch]$IncludeFallback,
     [switch]$NoDedupe,
     [string]$OutFile
 )
@@ -63,24 +51,14 @@ $productKindNames = @('None', 'RouteProduct', 'RouteEventProduct', 'RouteStatePr
 $proofKindNames = @('None', 'ExactCaptureEvent', 'RouteStateIdentity', 'ActiveBackgroundEpoch', 'HandoffRouteKey', 'DirectFinalPresentationMatch', 'CurrentOverlayEligibility', 'Source3DSceneIdentity')
 $renderActionNames = @('None', 'BlitExactProduct', 'CompositeCurrentOverlay', 'RenderHandoffHybrid', 'RenderNormalHybridFallback')
 $presentationClassNames = @('None', 'RawContent', 'AlreadyPresented', 'Fallback', 'Unknown')
-$effectActionNames = @('None', 'DisplayAsIs', 'ApplyOnBlit', 'CompositeCurrentOverlay', 'NeedsRePresentation', 'Fallback', 'Reject')
-
 function EnumLiteral([string]$type, [long]$value, [string[]]$names) {
     if ($value -ge 0 -and $value -lt $names.Count) { return "${type}::$($names[$value])" }
     return "static_cast<${type}>($value)"
 }
 
-function PackedEffectActive([long]$packed) {
-    $mode = ($packed -shr 8) -band 0x3
-    $factor = $packed -band 0xFF
-    return ($mode -eq 1 -or $mode -eq 2) -and $factor -gt 0
-}
-
 $neededColumns = @(
     'capture_policy_request_kind', 'capture_policy_proof_kind',
-    'capture_repr_effect_action', 'capture_repr_product_use_accepted',
-    'capture_repr_effect_phase_incompatible',
-    'capture_repr_stored_effect_state', 'capture_repr_consume_effect_state',
+    'capture_repr_product_use_accepted',
     'source_a_chosen_product_tex', 'source_a_chosen_product_kind',
     'source_a_chosen_product_render_action', 'source_a_chosen_product_class',
     'source_a_request_capture_presentation_hash',
@@ -115,19 +93,14 @@ try {
         foreach ($prefix in $engines) {
             $get = { param($col) [long]$cells[$indexOf["${prefix}_${col}"]] }
 
-            $effectAction = & $get 'capture_repr_effect_action'
-            if ($effectAction -eq 0) { continue }
-            if ($effectAction -eq 5 -and -not $IncludeFallback) { continue }
-
-            $stored = & $get 'capture_repr_stored_effect_state'
-            $consume = & $get 'capture_repr_consume_effect_state'
+            $accepted = (& $get 'capture_repr_product_use_accepted') -ne 0
+            if (-not $accepted) { continue }
 
             $vectors.Add([pscustomobject]@{
                 Frame = $f
                 EnginePrefix = $prefix
                 Path = & $get 'path'
-                EffectAction = $effectAction
-                PolicyAccepted = $effectAction -ne 5
+                PolicyAccepted = $true
                 HasTexture = (& $get 'source_a_chosen_product_tex') -ne 0
                 RequestKind = & $get 'capture_policy_request_kind'
                 ProductKind = & $get 'source_a_chosen_product_kind'
@@ -136,11 +109,7 @@ try {
                 PresentationClass = & $get 'source_a_chosen_product_class'
                 ProductHash = & $get 'source_a_request_capture_presentation_hash'
                 RequestHash = & $get 'source_a_request_current_presentation_hash'
-                HasStoredEffectState = $stored -ne 0
-                StoredEffectActive = PackedEffectActive $stored
-                ConsumeEffectActive = PackedEffectActive $consume
                 ExpectedAccepted = (& $get 'capture_repr_product_use_accepted') -ne 0
-                ExpectedPhaseIncompatible = (& $get 'capture_repr_effect_phase_incompatible') -ne 0
             })
         }
     }
@@ -148,7 +117,7 @@ try {
 finally { $reader.Close() }
 
 if ($vectors.Count -eq 0) {
-    Write-Warning "No usable decision rows in frame range $From-$To (effect_action was 0/Fallback everywhere)."
+    Write-Warning "No accepted product-use rows in frame range $From-$To. Rejected rows no longer retain enough CSV policy input to lift safely."
     return
 }
 
@@ -157,10 +126,9 @@ if ($vectors.Count -eq 0) {
 # like Hotel Dusk alternate two vectors on the per-frame A/B cadence, which a
 # consecutive-run dedupe would never collapse. Emitted in first-seen order;
 # the comment keeps the contributing frames.
-$inputKeys = 'EnginePrefix', 'Path', 'EffectAction', 'PolicyAccepted', 'HasTexture', 'RequestKind',
+$inputKeys = 'EnginePrefix', 'Path', 'PolicyAccepted', 'HasTexture', 'RequestKind',
              'ProductKind', 'ProofKind', 'RenderAction', 'PresentationClass', 'ProductHash',
-             'RequestHash', 'HasStoredEffectState', 'StoredEffectActive', 'ConsumeEffectActive',
-             'ExpectedAccepted', 'ExpectedPhaseIncompatible'
+             'RequestHash', 'ExpectedAccepted'
 $groups = New-Object System.Collections.Generic.List[object]
 $groupByKey = @{}
 foreach ($v in $vectors) {
@@ -192,9 +160,8 @@ foreach ($g in $groups) {
     $v = $g.Vector
     $frameLabel = if ($g.Count -eq 1) { "frame $($g.Frames[0])" }
                   else { "frames $($g.Frames -join ',')..$($g.LastFrame) ($($g.Count) rows)" }
-    $actionName = if ($v.EffectAction -lt $effectActionNames.Count) { $effectActionNames[$v.EffectAction] } else { $v.EffectAction }
     [void]$sb.AppendLine("    {")
-    [void]$sb.AppendLine("        // $frameLabel, engine $($v.EnginePrefix.ToUpper()): path=$($v.Path), effect_action=$actionName")
+    [void]$sb.AppendLine("        // $frameLabel, engine $($v.EnginePrefix.ToUpper()): path=$($v.Path)")
     [void]$sb.AppendLine("        WholeSceneCaptureProductUseInputs inputs = {};")
     [void]$sb.AppendLine("        inputs.PolicyAccepted = $($bool[$v.PolicyAccepted]);")
     [void]$sb.AppendLine("        inputs.HasTexture = $($bool[$v.HasTexture]);")
@@ -205,22 +172,10 @@ foreach ($g in $groups) {
     [void]$sb.AppendLine("        inputs.PresentationClass = $(EnumLiteral 'WholeSceneCaptureProductPresentationClass' $v.PresentationClass $presentationClassNames);")
     [void]$sb.AppendLine(("        inputs.ProductPresentationHash = 0x{0:X}u;" -f $v.ProductHash))
     [void]$sb.AppendLine(("        inputs.RequestPresentationHash = 0x{0:X}u;" -f $v.RequestHash))
-    [void]$sb.AppendLine("        inputs.HasStoredEffectState = $($bool[$v.HasStoredEffectState]);")
-    [void]$sb.AppendLine("        inputs.StoredEffectActive = $($bool[$v.StoredEffectActive]);")
-    [void]$sb.AppendLine("        inputs.ConsumeEffectActive = $($bool[$v.ConsumeEffectActive]);")
     [void]$sb.AppendLine("")
     [void]$sb.AppendLine("        const WholeSceneCaptureProductUseDecision decision =")
     [void]$sb.AppendLine("            CanUseWholeSceneCaptureProduct(inputs);")
     [void]$sb.AppendLine("        CHECK_EQ(decision.Accepted, $($bool[$v.ExpectedAccepted]));")
-    [void]$sb.AppendLine("        CHECK_EQ(decision.EffectPhaseIncompatible, $($bool[$v.ExpectedPhaseIncompatible]));")
-    # The adapter's effect-action ladder checks applyEffectOnBlit BEFORE
-    # RequiresRePresentation, so ApplyOnBlit (2) and CompositeCurrentOverlay
-    # (3) mask the re-presentation flag; only DisplayAsIs (1) proves it false
-    # and NeedsRePresentation (4) proves it true.
-    switch ($g.Vector.EffectAction) {
-        1 { [void]$sb.AppendLine("        CHECK_EQ(decision.RequiresRePresentation, false);") }
-        4 { [void]$sb.AppendLine("        CHECK_EQ(decision.RequiresRePresentation, true);") }
-    }
     [void]$sb.AppendLine("    }")
 }
 [void]$sb.AppendLine('}')

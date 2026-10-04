@@ -70,6 +70,7 @@ public:
         msg_InitGL,
         msg_DeInitGL,
         msg_BorrowGL,
+        msg_BorrowGLAfterFrame,
 
         msg_BootROM,
         msg_BootFirmware,
@@ -136,6 +137,11 @@ public:
     void deinitContext(int win);
     void borrowGL();
     void returnGL();
+    // UI thread, with GL already borrowed and no UI context current. Queue the
+    // next borrow BEFORE releasing this one. Its acknowledgement follows a real
+    // completed frame (not a shader-compilation iteration); no frame can overwrite
+    // the captured products before returnGL(). A paused emulator stays paused.
+    void borrowNextFrameGL();
     void updateVideoSettings() { videoSettingsDirty = true; }
     void updateVideoRenderer() { videoSettingsDirty = true; lastVideoRenderer = -1; }
     bool startWholeSceneTimingLog(const QString& filename, QString& errorstr);
@@ -167,11 +173,12 @@ signals:
     void syncVolumeLevel();
 
 private:
-    void handleMessages();
+    void handleMessages(bool frameReady);
 
     void updateRenderer();
     void compileShaders();
     void appendWholeSceneTimingLog(melonDS::u32 nlines,
+                                   melonDS::u32 keyMask,
                                    melonDS::u64 runFrameUS,
                                    melonDS::u64 drawScreenUS,
                                    melonDS::u64 presentPreSwapUS,
@@ -202,6 +209,8 @@ private:
 
     int msgResult = 0;
     QString msgError;
+
+    bool glBorrowed = false; // protected by glBorrowMutex
 
     QMutex msgMutex;
     QSemaphore msgSemaphore;

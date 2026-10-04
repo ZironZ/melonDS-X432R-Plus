@@ -50,8 +50,9 @@
 uniform sampler2D Source;
 uniform sampler2D InfoTex;
 uniform vec2 uOutputSize;
+uniform bool uBilinearAlpha;
 
-in vec2 fTexcoord;
+smooth in vec2 fTexcoord;
 out vec4 oColor;
 
 const int BLEND_NONE = 0;
@@ -181,5 +182,19 @@ void main()
         res = mix(res, blendPix, GetLeftRatio(pos, origin, direction, scale));
     }
 
+    if (uBilinearAlpha)
+    {
+        // Preserve xBRZ's RGBA edge classification; replace only output alpha.
+        ivec2 size = textureSize(Source, 0);
+        vec2 p = gl_FragCoord.xy * vec2(size) / uOutputSize - vec2(0.5);
+        ivec2 b = ivec2(floor(p));
+        vec2 f = fract(p);
+        ivec2 hi = size - ivec2(1);
+        float a00 = texelFetch(Source, clamp(b, ivec2(0), hi), 0).a;
+        float a10 = texelFetch(Source, clamp(b + ivec2(1, 0), ivec2(0), hi), 0).a;
+        float a01 = texelFetch(Source, clamp(b + ivec2(0, 1), ivec2(0), hi), 0).a;
+        float a11 = texelFetch(Source, clamp(b + ivec2(1, 1), ivec2(0), hi), 0).a;
+        res.a = clamp(mix(mix(a00, a10, f.x), mix(a01, a11, f.x), f.y), 0.0, 1.0);
+    }
     oColor = res;
 }

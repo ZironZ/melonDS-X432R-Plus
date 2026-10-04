@@ -49,7 +49,7 @@
 
 uniform sampler2D Source;
 
-in vec2 fTexcoord;
+smooth in vec2 fTexcoord;
 out vec4 oColor;
 
 const int BLEND_NONE = 0;

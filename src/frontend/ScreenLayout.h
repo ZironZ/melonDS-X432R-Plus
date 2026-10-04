@@ -64,7 +64,9 @@ public:
     // * screenGap: size of the gap between the two screens in pixels
     // * integerScale: force screens to be scaled up at integer scaling factors
     // * screenSwap: whether to swap the position of both screens
-    // * topAspect/botAspect: ratio by which to scale the top and bottom screen respectively
+    // * topAspect/botAspect: horizontal scale of each display
+    // * topHeight/botHeight: vertical scale, before rotation
+    // * preserveHybridAspect: retain those ratios for the hybrid layout too
     void Setup(int screenWidth, int screenHeight,
                ScreenLayoutType screenLayout,
                ScreenRotation rotation,
@@ -72,7 +74,9 @@ public:
                int screenGap,
                bool integerScale,
                bool swapScreens,
-               float topAspect, float botAspect);
+               float topAspect, float botAspect,
+               bool preserveHybridAspect = false,
+               float topHeight = 1.f, float botHeight = 1.f);
 
     // get a 2x3 transform matrix for each screen and whether it's a top or bottom screen
     // note: the transform assumes an origin point at the top left of the display,
@@ -86,7 +90,9 @@ public:
 
     // de-transform the provided host display coordinates to get coordinates
     // on the bottom screen
-    bool GetTouchCoords(int& x, int& y, bool clamp);
+    // Source dimensions include optional extra scenery; only the native
+    // 256x192 center is touchable. Transform before rounding and clamping.
+    bool GetTouchCoords(int& x, int& y, bool clamp, int sourceWidth = 256, int sourceHeight = 192);
 
 private:
     float TopScreenMtx[6];

@@ -1,20 +1,5 @@
-/*
-    Copyright 2026 ZironZ
-
-    This file is part of melonDS.
-
-    melonDS is free software: you can redistribute it and/or modify it under
-    the terms of the GNU General Public License as published by the Free
-    Software Foundation, either version 3 of the License, or (at your option)
-    any later version.
-
-    melonDS is distributed in the hope that it will be useful, but WITHOUT ANY
-    WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
-    FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
-
-    You should have received a copy of the GNU General Public License along
-    with melonDS. If not, see http://www.gnu.org/licenses/.
-*/
+// Copyright 2026 ZironZ
+// SPDX-License-Identifier: GPL-3.0-or-later
 
 // Table tests for WholeSceneCapturePolicy. Each block encodes a behavior that
 // was established from recorded evidence in a specific game; the referenced
@@ -96,22 +81,13 @@ SourceAExactRouteProductPreferenceInputs MakeExactRouteProductPreferenceInputs()
     return inputs;
 }
 
+bool ShouldPreferSourceAExactRouteProductForDirectBottom(
+    const SourceAExactRouteProductPreferenceInputs& inputs)
+{
+    return ChooseSourceAExactProductPreference({}, inputs) ==
+           SourceACaptureSelectionPreference::ExactRouteProduct;
 }
 
-// Master brightness packing: mode=(v>>14)&3 (1=up, 2=down), factor=v&31.
-// 32783 = darken/15 is the Hotel Dusk fade value from the recorded CSVs.
-POLICY_TEST(MasterBrightnessActiveDecoding)
-{
-    CHECK(IsMasterBrightnessEffectActive(32783));
-    CHECK(IsMasterBrightnessEffectActive(MakeBrightness(2, 15)));
-    CHECK(IsMasterBrightnessEffectActive(MakeBrightness(1, 5)));
-    CHECK(IsMasterBrightnessEffectActive(MakeBrightness(2, 16)));
-
-    // 0 = off/released — the release is what exposed the Hotel Dusk bright pop.
-    CHECK(!IsMasterBrightnessEffectActive(0));
-    CHECK(!IsMasterBrightnessEffectActive(MakeBrightness(1, 0)));
-    CHECK(!IsMasterBrightnessEffectActive(MakeBrightness(2, 0)));
-    CHECK(!IsMasterBrightnessEffectActive(MakeBrightness(3, 10)));
 }
 
 // Hotel Dusk fade-out, B halves: BLDCNT mode 3 (brightness decrease) with all
@@ -148,66 +124,20 @@ POLICY_TEST(ConsumerBrightnessColorEffectGate)
              MakeBrightness(2, 8));
 }
 
-// Hotel Dusk rolling-frame008695 (timing 8650-8652): the game hides a scene
-// change under darken/15, then releases the register to 0. A raw route product
-// stored during the fade must be rejected when the consumer's effect has been
-// released — otherwise the pre-fade bright content displays as-is for ~2
-// frames.
-POLICY_TEST(StoredEffectActiveConsumeInactiveRejects)
+// Raw products are pre-presentation content. Current capture-event, route and
+// source-3D provenance select the product before this admission policy runs;
+// no retained effect-history input exists here.
+POLICY_TEST(RawContentAdmissionUsesPreselectedContentProvenance)
 {
     WholeSceneCaptureProductUseInputs inputs = MakeRawContentUseInputs();
-    inputs.HasStoredEffectState = true;
-    inputs.StoredEffectActive = true;
-    inputs.ConsumeEffectActive = false;
+    CHECK(CanUseWholeSceneCaptureProduct(inputs).Accepted);
 
-    const WholeSceneCaptureProductUseDecision decision =
-        CanUseWholeSceneCaptureProduct(inputs);
-    CHECK(!decision.Accepted);
-    CHECK(decision.EffectPhaseIncompatible);
-}
-
-// The DQ V Square Enix logo coupling (b414aa59): stored brightness is always
-// recorded at store time, and the rejection above exempts ExactCaptureEvent
-// proof — that product represents the exact event being consumed, not just a
-// similar route state. Reverting either half without the other re-breaks DQ V.
-POLICY_TEST(ExactCaptureEventProofExemptFromStoredEffectGuard)
-{
-    WholeSceneCaptureProductUseInputs inputs = MakeRawContentUseInputs();
     inputs.ProductKind = WholeSceneCaptureProductKind::RouteEventProduct;
     inputs.ProofKind = WholeSceneCaptureProofKind::ExactCaptureEvent;
-    inputs.HasStoredEffectState = true;
-    inputs.StoredEffectActive = true;
-    inputs.ConsumeEffectActive = false;
-
-    const WholeSceneCaptureProductUseDecision decision =
-        CanUseWholeSceneCaptureProduct(inputs);
-    CHECK(decision.Accepted);
-    CHECK(!decision.EffectPhaseIncompatible);
-}
-
-POLICY_TEST(StoredEffectGuardOnlyFiresOnRelease)
-{
-    // Stored inactive: nothing to leak.
-    WholeSceneCaptureProductUseInputs inputs = MakeRawContentUseInputs();
-    inputs.HasStoredEffectState = true;
-    inputs.StoredEffectActive = false;
-    inputs.ConsumeEffectActive = false;
-    CHECK(CanUseWholeSceneCaptureProduct(inputs).Accepted);
-
-    // Both active: mid-fade reuse is allowed (rejecting here would demote
-    // entire fades to fallback and recreate the alternation flicker).
-    inputs.StoredEffectActive = true;
-    inputs.ConsumeEffectActive = true;
-    CHECK(CanUseWholeSceneCaptureProduct(inputs).Accepted);
-
-    // No stored metadata at all: legacy products stay usable.
-    inputs = MakeRawContentUseInputs();
-    inputs.HasStoredEffectState = false;
-    inputs.StoredEffectActive = true;
     CHECK(CanUseWholeSceneCaptureProduct(inputs).Accepted);
 }
 
-POLICY_TEST(RawContentPresentationMismatchRequestsRePresentation)
+POLICY_TEST(RawContentPresentationIsOwnedDownstream)
 {
     WholeSceneCaptureProductUseInputs inputs = MakeRawContentUseInputs();
     inputs.ProductPresentationHash = 0x1111;
@@ -216,10 +146,9 @@ POLICY_TEST(RawContentPresentationMismatchRequestsRePresentation)
     const WholeSceneCaptureProductUseDecision decision =
         CanUseWholeSceneCaptureProduct(inputs);
     CHECK(decision.Accepted);
-    CHECK(!decision.PresentationCompatible);
-    CHECK(decision.RequiresRePresentation);
+    CHECK(decision.PresentationCompatible);
 
-    // A zero hash on either side means "no proof either way", not a mismatch.
+    // A zero hash on either side is equally irrelevant to raw content.
     inputs.ProductPresentationHash = 0;
     CHECK(CanUseWholeSceneCaptureProduct(inputs).PresentationCompatible);
     inputs.ProductPresentationHash = 0x1111;
@@ -273,68 +202,121 @@ POLICY_TEST(ProductUseGateConditions)
     CHECK(!CanUseWholeSceneCaptureProduct(inputs).Accepted);
 }
 
-// The Source-A resolution ordering. The documented rejected idea from the
-// Hotel Dusk bright-pop investigation: treating NeedsRePresentation +
-// no-overlay as rejection would demote entire fades to fallback (the
-// presentation hash includes master brightness, which ramps every other frame
-// during any fade) and recreate the exact/reconstructed alternation flicker.
-// The route product must win when no overlay is available.
+POLICY_TEST(CaptureProductUseRequiresCoherentRowScope)
+{
+    WholeSceneCaptureProductUseInputs inputs = MakeRawContentUseInputs();
+    inputs.RequestYStart = 48;
+    inputs.RequestYEnd = 96;
+    CHECK(CanUseWholeSceneCaptureProduct(inputs).Accepted);
+    CHECK(CanUseWholeSceneCaptureProduct(inputs).RowScopeCompatible);
+
+    inputs.ProductYStart = 64;
+    CHECK(!CanUseWholeSceneCaptureProduct(inputs).Accepted);
+    CHECK(!CanUseWholeSceneCaptureProduct(inputs).RowScopeCompatible);
+
+    inputs = MakeRawContentUseInputs();
+    inputs.RenderAction =
+        WholeSceneCaptureRenderAction::CompositeCurrentOverlay;
+    inputs.RequestYStart = 48;
+    inputs.RequestYEnd = 96;
+    CHECK(!CanUseWholeSceneCaptureProduct(inputs).Accepted);
+    CHECK(!CanUseWholeSceneCaptureProduct(inputs).RowScopeCompatible);
+
+    inputs.RequestYStart = 0;
+    inputs.RequestYEnd = 192;
+    CHECK(CanUseWholeSceneCaptureProduct(inputs).Accepted);
+    CHECK(CanUseWholeSceneCaptureProduct(inputs).RowScopeCompatible);
+}
+
+// The Source-A resolution ordering. A route/current composition-hash mismatch
+// can select a current-overlay rebuild when that representation is available.
+// Treating a mismatch plus no-overlay as rejection would demote entire fades
+// to fallback because the identity hash also contains changing presentation
+// registers; the route product must win when no reconstruction is available.
 POLICY_TEST(SourceAResolutionOrdering)
 {
     SourceACaptureResolutionInputs inputs = {};
 
     // DQ V Square Enix logo: exact full product preference wins outright.
-    inputs.PreferExactFullProduct = true;
-    inputs.PreferExactRouteProduct = true;
+    inputs.Preference = SourceACaptureSelectionPreference::ExactFullProduct;
     inputs.HasFullProduct = true;
     inputs.HasRouteProduct = true;
     inputs.CanUseCurrentOverlay = true;
-    CHECK_EQ(ChooseSourceACaptureResolutionKind(inputs),
+    inputs.FullProductPresentationProof =
+        SourceAFullProductPresentationProof::ExactFullEquivalentDirectFinal;
+    const SourceACaptureSelectionDecision exactFullDecision =
+        ChooseSourceACaptureSelectionDecision(inputs);
+    CHECK_EQ(exactFullDecision.Primary,
              SourceACaptureResolutionKind::FullProduct);
+    CHECK_EQ(exactFullDecision.PrimaryReason,
+             SourceACaptureSelectionReason::ExactFullProductPreference);
+    CHECK_EQ(exactFullDecision.FullProductPresentationProof,
+             SourceAFullProductPresentationProof::
+                 ExactFullEquivalentDirectFinal);
 
     // Lufia title/menu: strict same-event proof makes the exact route product
     // authoritative over a reconstruction that would otherwise alternate.
     inputs = {};
     inputs.HasRouteProduct = true;
-    inputs.RouteProductNeedsRePresentation = true;
+    inputs.RouteProductCompositionMismatch = true;
     inputs.CanUseCurrentOverlay = true;
-    inputs.PreferExactRouteProduct = true;
-    CHECK_EQ(ChooseSourceACaptureResolutionKind(inputs),
+    inputs.Preference = SourceACaptureSelectionPreference::ExactRouteProduct;
+    const SourceACaptureSelectionDecision exactRouteDecision =
+        ChooseSourceACaptureSelectionDecision(inputs);
+    CHECK_EQ(exactRouteDecision.Primary,
              SourceACaptureResolutionKind::RouteProduct);
+    CHECK_EQ(exactRouteDecision.PrimaryReason,
+             SourceACaptureSelectionReason::ExactRouteProductPreference);
 
-    // Re-presentation needed and the overlay path is available: rebuild.
+    // Composition differs and the overlay path is available: rebuild.
     inputs = {};
     inputs.HasRouteProduct = true;
-    inputs.RouteProductNeedsRePresentation = true;
+    inputs.RouteProductCompositionMismatch = true;
     inputs.CanUseCurrentOverlay = true;
-    CHECK_EQ(ChooseSourceACaptureResolutionKind(inputs),
+    const SourceACaptureSelectionDecision overlayDecision =
+        ChooseSourceACaptureSelectionDecision(inputs);
+    CHECK_EQ(overlayDecision.Primary,
              SourceACaptureResolutionKind::BackgroundOverlay);
+    CHECK_EQ(overlayDecision.PrimaryReason,
+             SourceACaptureSelectionReason::RouteProductCompositionRebuild);
+    CHECK_EQ(overlayDecision.AfterOverlayFailure,
+             SourceACaptureResolutionKind::RouteProduct);
+    CHECK_EQ(overlayDecision.AfterOverlayFailureReason,
+             SourceACaptureSelectionReason::RouteProductAvailable);
 
-    // Re-presentation needed but no overlay: the route product still displays.
+    // Composition differs but no overlay exists: the route product still displays.
     // NOT RejectedFallback — see the note above.
     inputs.CanUseCurrentOverlay = false;
-    CHECK_EQ(ChooseSourceACaptureResolutionKind(inputs),
+    CHECK_EQ(ChooseSourceACaptureSelectionDecision(inputs).Primary,
              SourceACaptureResolutionKind::RouteProduct);
 
     // AllowCurrentOverlay=false must behave like overlay-unavailable.
     inputs.CanUseCurrentOverlay = true;
     inputs.AllowCurrentOverlay = false;
-    CHECK_EQ(ChooseSourceACaptureResolutionKind(inputs),
+    CHECK_EQ(ChooseSourceACaptureSelectionDecision(inputs).Primary,
              SourceACaptureResolutionKind::RouteProduct);
 
     // No route product: overlay, then full product, then rejection.
     inputs = {};
     inputs.CanUseCurrentOverlay = true;
-    CHECK_EQ(ChooseSourceACaptureResolutionKind(inputs),
+    const SourceACaptureSelectionDecision overlayOnlyDecision =
+        ChooseSourceACaptureSelectionDecision(inputs);
+    CHECK_EQ(overlayOnlyDecision.Primary,
              SourceACaptureResolutionKind::BackgroundOverlay);
+    CHECK_EQ(overlayOnlyDecision.PrimaryReason,
+             SourceACaptureSelectionReason::CurrentOverlayAvailable);
+    CHECK_EQ(overlayOnlyDecision.AfterOverlayFailure,
+             SourceACaptureResolutionKind::RejectedFallback);
+    CHECK_EQ(overlayOnlyDecision.AfterOverlayFailureReason,
+             SourceACaptureSelectionReason::NoUsableProduct);
 
     inputs = {};
     inputs.HasFullProduct = true;
-    CHECK_EQ(ChooseSourceACaptureResolutionKind(inputs),
+    CHECK_EQ(ChooseSourceACaptureSelectionDecision(inputs).Primary,
              SourceACaptureResolutionKind::FullProduct);
 
     inputs = {};
-    CHECK_EQ(ChooseSourceACaptureResolutionKind(inputs),
+    CHECK_EQ(ChooseSourceACaptureSelectionDecision(inputs).Primary,
              SourceACaptureResolutionKind::RejectedFallback);
 }
 
@@ -422,6 +404,34 @@ POLICY_TEST(ExactRouteProductSameEventPreference)
     inputs = MakeExactRouteProductPreferenceInputs();
     inputs.FullProductEventSourceOBJVisible = true;
     CHECK(!ShouldPreferSourceAExactRouteProductForDirectBottom(inputs));
+}
+
+POLICY_TEST(ExactProductPreferenceOrdering)
+{
+    SourceAExactFullProductPreferenceInputs fullInputs = {};
+    fullInputs.DirectFinalBottomConsumer = true;
+    fullInputs.SubEngineCapturedSourceAOnly = true;
+    fullInputs.HasFullProduct = true;
+    fullInputs.FullProductEventValid = true;
+    fullInputs.FullProductKeyMatch = true;
+    fullInputs.FullProductEventRouteMatches = true;
+    fullInputs.FullProductEventFullEquivalent = true;
+    fullInputs.FullProductEventCleanEngineA2DOutput = true;
+    fullInputs.FullProductEventAccepted = true;
+    const SourceAExactRouteProductPreferenceInputs routeInputs =
+        MakeExactRouteProductPreferenceInputs();
+
+    CHECK_EQ(ChooseSourceAExactProductPreference(fullInputs, routeInputs),
+             SourceACaptureSelectionPreference::ExactFullProduct);
+
+    fullInputs.FullProductKeyMatch = false;
+    fullInputs.FullProductEventRouteMatches = false;
+    CHECK_EQ(ChooseSourceAExactProductPreference(fullInputs, routeInputs),
+             SourceACaptureSelectionPreference::ExactRouteProduct);
+
+    fullInputs.FullProductEventSourceOBJVisible = true;
+    CHECK_EQ(ChooseSourceAExactProductPreference(fullInputs, routeInputs),
+             SourceACaptureSelectionPreference::ExactFullProduct);
 }
 
 // Kingdom Hearts post-battle screen swap: a direct-final product recorded for
@@ -648,6 +658,57 @@ POLICY_TEST(HandoffBackgroundOverlayGate)
     CHECK(!ShouldUseHandoffRouteBackgroundOverlay(inputs));
 }
 
+POLICY_TEST(HandoffLivePresentationRequiresCapturedPhaseEvidence)
+{
+    HandoffStableLiveCandidateInputs candidate = {};
+    candidate.Direct3DOnlyLiveBackground = true;
+    candidate.HasProvenRouteProduct = true;
+    candidate.HasNoBGUpload = true;
+    candidate.NativeProductEpochValid = true;
+
+    // Mario Kart can publish exact route products for Engine B's display
+    // capture cadence while Engine A remains a wholly live Hybrid scene. A
+    // product alone must not turn that live route into an A7 handoff.
+    CHECK(!IsHandoffStableLiveCandidate(candidate));
+
+    HandoffPresentationEligibilityInputs presentation = {};
+    presentation.Phase = CaptureBackedHandoffPhase::Live3D;
+    CHECK(!ShouldUseHandoffPresentation(presentation));
+
+    // Hotel Dusk also has a causal bootstrap case: the accepted event and
+    // proven product are for the current physical route on this same frame.
+    candidate.CurrentCaptureEventMatchesRoute = true;
+    presentation.CurrentCaptureEventMatchesRoute = true;
+    CHECK(!IsHandoffStableLiveCandidate(candidate));
+    CHECK(!ShouldUseHandoffPresentation(presentation));
+
+    // Exact identity is not enough if LastHighResDisplayCaptureEvent is an
+    // old accepted event. Only a current/previous-frame publication can
+    // bootstrap the live route without a captured phase.
+    candidate.CurrentCaptureEventFresh = true;
+    CHECK(IsHandoffStableLiveCandidate(candidate));
+    presentation.CurrentCaptureEventFresh = true;
+    CHECK(ShouldUseHandoffPresentation(presentation));
+    candidate.CurrentCaptureEventMatchesRoute = false;
+    candidate.CurrentCaptureEventFresh = false;
+    presentation.CurrentCaptureEventMatchesRoute = false;
+    presentation.CurrentCaptureEventFresh = false;
+
+    // Hotel Dusk's live half remains eligible after the same physical route
+    // has genuinely exhibited its captured-bitmap half.
+    candidate.RouteHasCapturedPhase = true;
+    CHECK(IsHandoffStableLiveCandidate(candidate));
+    presentation.RouteHasCapturedPhase = true;
+    CHECK(ShouldUseHandoffPresentation(presentation));
+
+    // The first visible full-display capture is still allowed to establish
+    // the route evidence used by later live frames.
+    presentation = {};
+    presentation.Phase = CaptureBackedHandoffPhase::CapturedBitmap;
+    presentation.HasOnlyFullDisplaySourceACapture = true;
+    CHECK(ShouldUseHandoffPresentation(presentation));
+}
+
 POLICY_TEST(HandoffEpochVisibleBankMatchIsStrict)
 {
     HandoffVisibleEpochMatchInputs inputs = {};
@@ -833,32 +894,8 @@ POLICY_TEST(MainVRAMDisplayEpochReplacementRejectReasons)
     CHECK_EQ(MainVRAMDisplayEpochReplacementRejectReason(inputs), 6);
 }
 
-// Presentation class assignment: capture-family products are stored raw;
-// FullCaptureProduct is the one AlreadyPresented family (its pixels went
-// through the source presentation); a fallback render action poisons any kind.
-POLICY_TEST(PresentationClassForProductKind)
+POLICY_TEST(StorableCapturePresentationClasses)
 {
-    CHECK_EQ(CaptureProductPresentationClassForProduct(
-                 WholeSceneCaptureProductKind::RouteProduct,
-                 WholeSceneCaptureRenderAction::BlitExactProduct),
-             WholeSceneCaptureProductPresentationClass::RawContent);
-    CHECK_EQ(CaptureProductPresentationClassForProduct(
-                 WholeSceneCaptureProductKind::RouteEventProduct,
-                 WholeSceneCaptureRenderAction::BlitExactProduct),
-             WholeSceneCaptureProductPresentationClass::RawContent);
-    CHECK_EQ(CaptureProductPresentationClassForProduct(
-                 WholeSceneCaptureProductKind::FullCaptureProduct,
-                 WholeSceneCaptureRenderAction::BlitExactProduct),
-             WholeSceneCaptureProductPresentationClass::AlreadyPresented);
-    CHECK_EQ(CaptureProductPresentationClassForProduct(
-                 WholeSceneCaptureProductKind::RouteProduct,
-                 WholeSceneCaptureRenderAction::RenderNormalHybridFallback),
-             WholeSceneCaptureProductPresentationClass::Fallback);
-    CHECK_EQ(CaptureProductPresentationClassForProduct(
-                 WholeSceneCaptureProductKind::None,
-                 WholeSceneCaptureRenderAction::BlitExactProduct),
-             WholeSceneCaptureProductPresentationClass::None);
-
     CHECK(IsStorableCaptureBackedRouteProductClass(
         WholeSceneCaptureProductPresentationClass::RawContent));
     CHECK(IsStorableCaptureBackedRouteProductClass(
@@ -867,6 +904,39 @@ POLICY_TEST(PresentationClassForProductKind)
         WholeSceneCaptureProductPresentationClass::Fallback));
     CHECK(!IsStorableCaptureBackedRouteProductClass(
         WholeSceneCaptureProductPresentationClass::Unknown));
+}
+
+// Policy results carry their presentation contract explicitly.  The GL
+// adapter must not have to rediscover it from the selected product family.
+POLICY_TEST(CapturePolicyResultCarriesPresentationClass)
+{
+    const WholeSceneCapturePolicyResult route =
+        MakeRouteProductCapturePolicyResult(
+            CaptureBackedRouteProductLookupSource::ExactEventProduct,
+            WholeSceneCaptureAuthority::SourceABackgroundCurrentOverlay);
+    CHECK_EQ(route.PresentationClass,
+             WholeSceneCaptureProductPresentationClass::RawContent);
+
+    const WholeSceneCapturePolicyResult background =
+        MakeBackgroundCapturePolicyResult(
+            SourceABackgroundSource::ActiveCaptureEpochTex,
+            WholeSceneCaptureRenderAction::CompositeCurrentOverlay,
+            WholeSceneCaptureAuthority::SourceABackgroundCurrentOverlay);
+    CHECK_EQ(background.PresentationClass,
+             WholeSceneCaptureProductPresentationClass::RawContent);
+
+    const WholeSceneCapturePolicyResult full =
+        MakeFullProductCapturePolicyResult(
+            WholeSceneCaptureAuthority::SourceAFullProduct,
+            WholeSceneCaptureProofKind::ExactCaptureEvent);
+    CHECK_EQ(full.PresentationClass,
+             WholeSceneCaptureProductPresentationClass::AlreadyPresented);
+
+    const WholeSceneCapturePolicyResult rejected =
+        MakeRejectedCapturePolicyResult(
+            WholeSceneCaptureRenderAction::RenderNormalHybridFallback);
+    CHECK_EQ(rejected.PresentationClass,
+             WholeSceneCaptureProductPresentationClass::Fallback);
 }
 
 // Route lookup source -> product/proof mapping. Path-8 exact-event reuse is
@@ -910,14 +980,12 @@ POLICY_TEST(CaptureBackedPlanInvariants)
     CHECK_EQ(handoff.Kind, WholeSceneCaptureBackedPlanKind::CaptureBackedHandoff);
     CHECK_EQ(handoff.Stage, WholeSceneCaptureBackedPlanStage::BeforeGeneralFallbacks);
     CHECK_EQ(handoff.Role, WholeSceneCaptureBackedPlanRole::RouteHandoff);
-    CHECK_EQ(handoff.ProofKind, WholeSceneCaptureProofKind::HandoffRouteKey);
     CHECK(!handoff.CanRunDuringHybridPresentationGuard);
 
     const WholeSceneCaptureBackedPlan replacement = MakeWholeSceneSourceACaptureReplacementPlan();
     CHECK_EQ(replacement.Kind, WholeSceneCaptureBackedPlanKind::SourceACaptureReplacement);
     CHECK_EQ(replacement.Stage, WholeSceneCaptureBackedPlanStage::AfterGeneralFallbacks);
     CHECK_EQ(replacement.Role, WholeSceneCaptureBackedPlanRole::RouteConsumer);
-    CHECK_EQ(replacement.ProofKind, WholeSceneCaptureProofKind::ExactCaptureEvent);
     CHECK(!replacement.CanRunDuringHybridPresentationGuard);
 
     const WholeSceneCaptureBackedPlan overlay = MakeWholeSceneCaptureEpochOverlayPlan(3);
@@ -926,4 +994,33 @@ POLICY_TEST(CaptureBackedPlanInvariants)
     CHECK_EQ(overlay.Role, WholeSceneCaptureBackedPlanRole::RouteProducer);
     CHECK_EQ(overlay.CaptureEpochOverlayRouteSlot, 3);
     CHECK(overlay.CanRunDuringHybridPresentationGuard);
+}
+
+POLICY_TEST(SourceAFullProductPresentationProof)
+{
+    SourceAFullProductPresentationProofInputs inputs = {};
+    inputs.DirectFinalBottomConsumer = true;
+    inputs.SubEngineCapturedSourceAOnly = true;
+    inputs.HasFullProduct = true;
+    inputs.FullProductEventValid = true;
+    inputs.FullProductEventFullEquivalent = true;
+    inputs.FullProductEventCleanEngineA2DOutput = true;
+    inputs.FullProductEventAccepted = true;
+    CHECK_EQ(ProveSourceAFullProductPresentation(inputs),
+             SourceAFullProductPresentationProof::
+                 ExactFullEquivalentDirectFinal);
+
+    inputs.DirectFinalBottomConsumer = false;
+    CHECK_EQ(ProveSourceAFullProductPresentation(inputs),
+             SourceAFullProductPresentationProof::None);
+
+    inputs.DirectFinalDisplayConsumer = true;
+    inputs.SubEngineCapturedOBJOnly = true;
+    CHECK_EQ(ProveSourceAFullProductPresentation(inputs),
+             SourceAFullProductPresentationProof::
+                 ExactFullEquivalentDirectFinal);
+
+    inputs.FullProductEventAccepted = false;
+    CHECK_EQ(ProveSourceAFullProductPresentation(inputs),
+             SourceAFullProductPresentationProof::None);
 }

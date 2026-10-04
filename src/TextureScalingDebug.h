@@ -1,20 +1,5 @@
-/*
-    Copyright 2026 ZironZ
-
-    This file is part of melonDS.
-
-    melonDS is free software: you can redistribute it and/or modify it under
-    the terms of the GNU General Public License as published by the Free
-    Software Foundation, either version 3 of the License, or (at your option)
-    any later version.
-
-    melonDS is distributed in the hope that it will be useful, but WITHOUT ANY
-    WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
-    FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
-
-    You should have received a copy of the GNU General Public License along
-    with melonDS. If not, see http://www.gnu.org/licenses/.
-*/
+// Copyright 2026 ZironZ
+// SPDX-License-Identifier: GPL-3.0-or-later
 
 #ifndef TEXTURESCALINGDEBUG_H
 #define TEXTURESCALINGDEBUG_H
@@ -57,8 +42,7 @@ struct TextureScalingDebugStats
     bool DeferredScalingEnabled = false;
     bool LegacyAlphaHandling = false;
     bool QualityAlphaHandling = false;
-    bool AlphaXBRZ = false;
-    bool Spline36Alpha = false;
+    int AlphaAlgorithmIndex = 0;
     bool ReadableTextureCache = false;
     int AlgorithmIndex = 0;
     u32 ScaleFactor = 1;
@@ -74,6 +58,10 @@ struct TextureScalingDebugStats
     u64 SecondaryCacheMaxApproxBytes = 0;
     u64 FramesObserved = 0;
     u64 LastMissSequence = 0;
+    u32 ReconstructionEntries = 0;
+    u32 ReconstructionHits = 0;
+    u32 ReconstructionBuilds = 0;
+    u64 ReconstructionBuiltTexels = 0;
     TextureScalingDebugFrameStats LastFrame;
     TextureScalingDebugFrameStats Totals;
 };

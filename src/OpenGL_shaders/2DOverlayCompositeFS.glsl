@@ -46,6 +46,12 @@ struct sScanline
     ivec4 WinPos;
     bvec4 BGMosaicEnable;
     ivec4 MosaicSize;
+    ivec4 BGPrio;
+    bool EnableOBJ;
+    bool Enable3D;
+    int BlendCnt;
+    int BlendEffect;
+    ivec3 BlendCoef;
 };
 
 layout(std140) uniform ubScanlineConfig
@@ -56,6 +62,12 @@ layout(std140) uniform ubScanlineConfig
 smooth in vec2 fTexcoord;
 
 out vec4 oColor;
+
+ivec4 gRowBGPrio;
+bool gRowEnable3D;
+int gRowBlendCnt;
+int gRowBlendEffect;
+ivec3 gRowBlendCoef;
 
 struct StackEffectInfo
 {
@@ -144,9 +156,9 @@ StackEffectInfo ResolveStackEffectInfo(int specialType,
     info.effect = 0;
     info.eva = 0;
     info.evb = 0;
-    info.evy = uBlendCoef[2];
+    info.evy = gRowBlendCoef[2];
 
-    if ((specialType != 0) && ((uBlendCnt & (sourceMask2 << 8)) != 0))
+    if ((specialType != 0) && ((gRowBlendCnt & (sourceMask2 << 8)) != 0))
     {
         if (specialType == 1)
         {
@@ -157,8 +169,8 @@ StackEffectInfo ResolveStackEffectInfo(int specialType,
         else if (specialType == 2)
         {
             info.effect = 1;
-            info.eva = uBlendCoef[0];
-            info.evb = uBlendCoef[1];
+            info.eva = gRowBlendCoef[0];
+            info.evb = gRowBlendCoef[1];
         }
         else
         {
@@ -167,15 +179,15 @@ StackEffectInfo ResolveStackEffectInfo(int specialType,
             info.evb = 16 - info.eva;
         }
     }
-    else if (((uBlendCnt & sourceMask1) != 0) && blendAllowed)
+    else if (((gRowBlendCnt & sourceMask1) != 0) && blendAllowed)
     {
-        info.effect = uBlendEffect;
+        info.effect = gRowBlendEffect;
         if (info.effect == 1)
         {
-            if ((uBlendCnt & (sourceMask2 << 8)) != 0)
+            if ((gRowBlendCnt & (sourceMask2 << 8)) != 0)
             {
-                info.eva = uBlendCoef[0];
-                info.evb = uBlendCoef[1];
+                info.eva = gRowBlendCoef[0];
+                info.evb = gRowBlendCoef[1];
             }
             else
             {
@@ -268,68 +280,68 @@ bool Direct3DForegroundEffectCanUseHybrid(StackEffectInfo effect)
 bool NativeAlphaBlendExcludesDirect3D()
 {
     const int direct3DMask = (1 << 0);
-    return uBlendEffect == 1 &&
-           (uBlendCnt & direct3DMask) == 0 &&
-           (uBlendCnt & (direct3DMask << 8)) == 0;
+    return gRowBlendEffect == 1 &&
+           (gRowBlendCnt & direct3DMask) == 0 &&
+           (gRowBlendCnt & (direct3DMask << 8)) == 0;
 }
 
 bool AlphaBlendHasNoTarget1()
 {
-    return uBlendEffect == 1 &&
-           (uBlendCnt & 0x3F) == 0;
+    return gRowBlendEffect == 1 &&
+           (gRowBlendCnt & 0x3F) == 0;
 }
 
 bool Direct3DTarget1AlphaBlendZeroed()
 {
     const int direct3DMask = (1 << 0);
     const int twoDLayerMask = (1 << 1) | (1 << 2) | (1 << 3) | (1 << 4);
-    return uBlendEffect == 1 &&
-           (uBlendCnt & direct3DMask) == direct3DMask &&
-           (uBlendCnt & (direct3DMask << 8)) == 0 &&
-           (uBlendCnt & (twoDLayerMask << 8)) != 0 &&
-           uBlendCoef[0] == 0 &&
-           uBlendCoef[1] == 16;
+    return gRowBlendEffect == 1 &&
+           (gRowBlendCnt & direct3DMask) == direct3DMask &&
+           (gRowBlendCnt & (direct3DMask << 8)) == 0 &&
+           (gRowBlendCnt & (twoDLayerMask << 8)) != 0 &&
+           gRowBlendCoef[0] == 0 &&
+           gRowBlendCoef[1] == 16;
 }
 
 bool Direct3DTarget1AlphaBlendContributes()
 {
     const int direct3DMask = (1 << 0);
     const int nonDirect3DMask = 0x3F ^ direct3DMask;
-    return uBlendEffect == 1 &&
-           (uBlendCnt & direct3DMask) == direct3DMask &&
-           (uBlendCnt & (nonDirect3DMask << 8)) != 0 &&
-           uBlendCoef[0] > 0 &&
-           uBlendCoef[1] > 0;
+    return gRowBlendEffect == 1 &&
+           (gRowBlendCnt & direct3DMask) == direct3DMask &&
+           (gRowBlendCnt & (nonDirect3DMask << 8)) != 0 &&
+           gRowBlendCoef[0] > 0 &&
+           gRowBlendCoef[1] > 0;
 }
 
 bool Direct3DTarget1AlphaBlendZeroCoefficient()
 {
     const int direct3DMask = (1 << 0);
     const int nonDirect3DMask = 0x3F ^ direct3DMask;
-    return uBlendEffect == 1 &&
-           (uBlendCnt & direct3DMask) == direct3DMask &&
-           (uBlendCnt & (nonDirect3DMask << 8)) != 0 &&
-           uBlendCoef[0] == 0 &&
-           uBlendCoef[1] == 0;
+    return gRowBlendEffect == 1 &&
+           (gRowBlendCnt & direct3DMask) == direct3DMask &&
+           (gRowBlendCnt & (nonDirect3DMask << 8)) != 0 &&
+           gRowBlendCoef[0] == 0 &&
+           gRowBlendCoef[1] == 0;
 }
 
 bool Direct3DTarget1AlphaBlendConfigured()
 {
     const int direct3DMask = (1 << 0);
-    return uBlendEffect == 1 &&
-           (uBlendCnt & direct3DMask) == direct3DMask;
+    return gRowBlendEffect == 1 &&
+           (gRowBlendCnt & direct3DMask) == direct3DMask;
 }
 
 bool Direct3DTarget2AlphaBlendContributes()
 {
     const int direct3DMask = (1 << 0);
     const int nonDirect3DMask = 0x3F ^ direct3DMask;
-    return uBlendEffect == 1 &&
-           (uBlendCnt & direct3DMask) == 0 &&
-           (uBlendCnt & nonDirect3DMask) != 0 &&
-           (uBlendCnt & (direct3DMask << 8)) == (direct3DMask << 8) &&
-           uBlendCoef[0] > 0 &&
-           uBlendCoef[1] > 0;
+    return gRowBlendEffect == 1 &&
+           (gRowBlendCnt & direct3DMask) == 0 &&
+           (gRowBlendCnt & nonDirect3DMask) != 0 &&
+           (gRowBlendCnt & (direct3DMask << 8)) == (direct3DMask << 8) &&
+           gRowBlendCoef[0] > 0 &&
+           gRowBlendCoef[1] > 0;
 }
 
 bool NativeCellHas2DOnlyAlphaBlendEffect(ivec2 nativeCoord)
@@ -377,9 +389,9 @@ int HybridNativeSelectionRole(ivec2 nativeCoord)
     bool blendAllowed = (packedFlags & 0x2) != 0;
     int nativeEffect = (packedFlags >> 2) & 0x7;
 
-    int direct3DPrio = uBGPrio[0];
+    int direct3DPrio = gRowBGPrio[0];
     const int direct3DMask = (1 << 0);
-    if (!uEnable3D || !bg0Allowed || direct3DPrio < 0)
+    if (!gRowEnable3D || !bg0Allowed || direct3DPrio < 0)
         return 0;
 
     bool direct3DTop = IsInFront(direct3DPrio, direct3DMask, sourcePrio1, sourceMask1);
@@ -415,7 +427,7 @@ int HybridSelectionRole(ivec2 coord)
 
 bool NativeCellIsSafeWindowExcludedDirect3D(ivec2 nativeCoord)
 {
-    if (!uEnable3D || uBGPrio[0] < 0)
+    if (!gRowEnable3D || gRowBGPrio[0] < 0)
         return false;
 
     vec4 meta = texelFetch(NativeMetaTex, nativeCoord, 0);
@@ -438,9 +450,9 @@ int HybridNativeFallbackReason(ivec2 nativeCoord)
     bool blendAllowed = (packedFlags & 0x2) != 0;
     int nativeEffect = (packedFlags >> 2) & 0x7;
 
-    int direct3DPrio = uBGPrio[0];
+    int direct3DPrio = gRowBGPrio[0];
     const int direct3DMask = (1 << 0);
-    if (!uEnable3D || direct3DPrio < 0)
+    if (!gRowEnable3D || direct3DPrio < 0)
         return 1;
     if (!bg0Allowed)
         return nativeEffect == 0 ? 6 : 3;
@@ -622,9 +634,9 @@ bool NativeCellHasForegroundDirect3DEffect(ivec2 nativeCoord, int expectedEffect
     bool bg0Allowed = (packedFlags & 0x1) != 0;
     bool blendAllowed = (packedFlags & 0x2) != 0;
 
-    int direct3DPrio = uBGPrio[0];
+    int direct3DPrio = gRowBGPrio[0];
     const int direct3DMask = (1 << 0);
-    if (!uEnable3D || !bg0Allowed || direct3DPrio < 0)
+    if (!gRowEnable3D || !bg0Allowed || direct3DPrio < 0)
         return false;
 
     bool direct3DTop = IsInFront(direct3DPrio, direct3DMask, sourcePrio1, sourceMask1);
@@ -736,6 +748,12 @@ void main()
 {
     ivec2 size = textureSize(OverlayBlackTex, 0);
     ivec2 coord = clamp(ivec2(floor(fTexcoord * vec2(size))), ivec2(0), size - ivec2(1));
+    int line = clamp((coord.y * 192) / max(size.y, 1), 0, 191);
+    gRowBGPrio = uScanline[line].BGPrio;
+    gRowEnable3D = uScanline[line].Enable3D;
+    gRowBlendCnt = uScanline[line].BlendCnt;
+    gRowBlendEffect = uScanline[line].BlendEffect;
+    gRowBlendCoef = uScanline[line].BlendCoef;
 
     vec3 overlayBlack = clamp(texelFetch(OverlayBlackTex, coord, 0).rgb, 0.0, 1.0);
     vec3 overlayWhite = clamp(texelFetch(OverlayWhiteTex, coord, 0).rgb, 0.0, 1.0);

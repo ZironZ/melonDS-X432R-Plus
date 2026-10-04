@@ -1,24 +1,10 @@
-/*
-    Copyright 2026 ZironZ
-
-    This file is part of melonDS.
-
-    melonDS is free software: you can redistribute it and/or modify it under
-    the terms of the GNU General Public License as published by the Free
-    Software Foundation, either version 3 of the License, or (at your option)
-    any later version.
-
-    melonDS is distributed in the hope that it will be useful, but WITHOUT ANY
-    WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
-    FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
-
-    You should have received a copy of the GNU General Public License along
-    with melonDS. If not, see http://www.gnu.org/licenses/.
-*/
+// Copyright 2026 ZironZ
+// SPDX-License-Identifier: GPL-3.0-or-later
 
 #ifndef WHOLESCENE2DDEBUGDIALOG_H
 #define WHOLESCENE2DDEBUGDIALOG_H
 
+#include "WholeScene2DDebugExport.h"
 #include <QDialog>
 #include <QImage>
 #include <QString>
@@ -33,6 +19,7 @@ class QPushButton;
 class QTimer;
 class MainWindow;
 class EmuThread;
+namespace melonDS { class Renderer; }
 
 class WholeScene2DDebugDialog : public QDialog
 {
@@ -88,22 +75,12 @@ private slots:
     void updateDebugPoison();
 
 private:
-    struct CapturedView
-    {
-        int Index = 0;
-        int Screen = -1;
-        int ViewValue = 0;
-        QString ScreenName;
-        QString Category;
-        QString Label;
-        QString FileStem;
-        QString Status;
-        QImage Image;
-        int Width = 0;
-        int Height = 0;
-        bool Available = false;
-    };
+    using CapturedView = WholeSceneDebugExport::CapturedView;
 
+    static bool dumpFrame(MainWindow* parent, const QString& timingCsvPath,
+                          qulonglong timingFrame, bool includeViews,
+                          QString* exportPath, QString* errorText);
+    static std::vector<CapturedView> captureViews(melonDS::Renderer& renderer, MainWindow* window);
     void updatePreviewPixmap();
     void setStatusText(const QString& text);
     void setDetailsText(const QString& text);

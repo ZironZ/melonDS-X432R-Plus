@@ -988,9 +988,12 @@ void TexcacheOpenGLLoader::RenderFullscreenPass(GLuint shader, GLuint outputTex,
     glDrawArrays(GL_TRIANGLES, 0, 6);
 }
 
-void TexcacheOpenGLLoader::RenderSpline36(GLuint sourceTex, GLuint targetTex, int width, int height, float sourceShiftX, float sourceShiftY)
+void TexcacheOpenGLLoader::RenderSpline36(GLuint sourceTex, GLuint targetTex, int width, int height, float sourceShiftX, float sourceShiftY,
+                                         bool boundedAlpha, bool bilinearAlpha)
 {
     glUseProgram(Spline36Shader);
+    SetUniform1iIfPresent(Spline36Shader, "uBoundedCoverageAlpha", boundedAlpha);
+    SetUniform1iIfPresent(Spline36Shader, "uBilinearAlpha", bilinearAlpha);
     GLint sourceShiftLoc = glGetUniformLocation(Spline36Shader, "uSourceShift");
     if (sourceShiftLoc >= 0)
         glUniform2f(sourceShiftLoc, sourceShiftX, sourceShiftY);
@@ -998,9 +1001,12 @@ void TexcacheOpenGLLoader::RenderSpline36(GLuint sourceTex, GLuint targetTex, in
     RenderFullscreenPass(Spline36Shader, targetTex, width, height, sourceTex, 0);
 }
 
-void TexcacheOpenGLLoader::RenderXBRZ(GLuint sourceTex, GLuint targetTex, int width, int height, u32 scaleFactor)
+void TexcacheOpenGLLoader::RenderXBRZ(GLuint sourceTex, GLuint targetTex, int width, int height, u32 scaleFactor,
+                                     bool bilinearAlpha)
 {
     RenderFullscreenPass(XBRZPreprocessShader, XBRZInfoTex, width, height, sourceTex, 0);
+    glUseProgram(XBRZFreescaleShader);
+    SetUniform1iIfPresent(XBRZFreescaleShader, "uBilinearAlpha", bilinearAlpha);
     RenderFullscreenPass(XBRZFreescaleShader, targetTex, width * (int)scaleFactor, height * (int)scaleFactor, sourceTex, XBRZInfoTex);
 }
 
@@ -1071,7 +1077,8 @@ void TexcacheOpenGLLoader::RenderArtCNNComputePass(GLuint shader, GLuint targetT
 }
 
 void TexcacheOpenGLLoader::RenderNNEDI3ComputePass(GLuint shader, GLuint sourceTex, GLuint targetTex,
-                                                   int sourceWidth, int sourceHeight)
+                                                   int sourceWidth, int sourceHeight, const TextureScaleRegion& region,
+                                                   bool predictAlpha, bool alphaOnly)
 {
     glDisable(GL_DEPTH_TEST);
     glDisable(GL_STENCIL_TEST);
@@ -1082,12 +1089,18 @@ void TexcacheOpenGLLoader::RenderNNEDI3ComputePass(GLuint shader, GLuint sourceT
 
     glUseProgram(shader);
     SetUniform2iIfPresent(shader, "uSrcSize", sourceWidth, sourceHeight);
+    SetUniform1iIfPresent(shader, "uPredictAlpha", predictAlpha);
+    SetUniform1iIfPresent(shader, "uAlphaOnly", alphaOnly);
+    SetUniform1iIfPresent(shader, "uBoundedCoverageAlpha", predictAlpha);
+    SetUniform1iIfPresent(shader, "uPremultiplyInput", false);
+    const auto dispatch = region.Dispatch(sourceWidth, sourceHeight);
+    SetUniform2iIfPresent(shader, "uWorkOrigin", dispatch.X, dispatch.Y);
 
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, sourceTex);
 
     glBindImageTexture(0, targetTex, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA16F);
-    glDispatchCompute((GLuint)((sourceWidth + 7) / 8), (GLuint)((sourceHeight + 7) / 8), 1);
+    glDispatchCompute(dispatch.GroupsX, dispatch.GroupsY, 1);
     glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT |
                     GL_TEXTURE_FETCH_BARRIER_BIT |
                     GL_FRAMEBUFFER_BARRIER_BIT);
@@ -1095,9 +1108,30 @@ void TexcacheOpenGLLoader::RenderNNEDI3ComputePass(GLuint shader, GLuint sourceT
     glActiveTexture(GL_TEXTURE0);
 }
 
+bool TexcacheOpenGLLoader::RenderNNEDI3AtScale(GLuint source, GLuint target, int width, int height, int scale,
+                                             const TextureScaleRegion& region, bool predictAlpha, bool alphaOnly)
+{
+    if (!EnsureNNEDI3ComputePrograms()) return false;
+    RenderNNEDI3ComputePass(NNEDI3VerticalComputeShader, source, NNEDI3VerticalTex,
+                            width, height, region, predictAlpha, alphaOnly);
+    RenderNNEDI3ComputePass(NNEDI3HorizontalComputeShader, NNEDI3VerticalTex, ArtCNNLuma2xTex,
+                            width, height * 2, region, predictAlpha, alphaOnly);
+    if (scale >= 4)
+    {
+        RenderNNEDI3ComputePass(NNEDI3VerticalComputeShader, ArtCNNLuma2xTex, NNEDI3Vertical4xTex,
+                                width * 2, height * 2, region, predictAlpha, alphaOnly);
+        RenderNNEDI3ComputePass(NNEDI3HorizontalComputeShader, NNEDI3Vertical4xTex, NNEDI3Luma4xTex,
+                                width * 2, height * 4, region, predictAlpha, alphaOnly);
+        RenderSpline36(NNEDI3Luma4xTex, target, width * scale, height * scale, -1.5f, -1.5f, predictAlpha);
+    }
+    else
+        RenderSpline36(ArtCNNLuma2xTex, target, width * scale, height * scale, -0.5f, -0.5f, predictAlpha);
+    return true;
+}
+
 void TexcacheOpenGLLoader::RenderCuNNyComputePass(GLuint shader, GLuint sourceTex, GLuint baseTex, GLuint targetTex,
                                                   int sourceWidth, int sourceHeight,
-                                                  int nativeWidth, int nativeHeight)
+                                                  int nativeWidth, int nativeHeight, const TextureScaleRegion& region)
 {
     glDisable(GL_DEPTH_TEST);
     glDisable(GL_STENCIL_TEST);
@@ -1107,6 +1141,8 @@ void TexcacheOpenGLLoader::RenderCuNNyComputePass(GLuint shader, GLuint sourceTe
     glDisable(GL_SCISSOR_TEST);
 
     glUseProgram(shader);
+    const auto dispatch = region.Dispatch(nativeWidth, nativeHeight);
+    SetUniform2iIfPresent(shader, "uWorkOrigin", dispatch.X, dispatch.Y);
     SetUniform2fIfPresent(shader, "LUMA_size", (GLfloat)nativeWidth, (GLfloat)nativeHeight);
     SetUniform2fIfPresent(shader, "MAIN_size", (GLfloat)nativeWidth, (GLfloat)nativeHeight);
     SetUniform2fIfPresent(shader, "LUMA_pt", 1.0f / (GLfloat)nativeWidth, 1.0f / (GLfloat)nativeHeight);
@@ -1126,7 +1162,7 @@ void TexcacheOpenGLLoader::RenderCuNNyComputePass(GLuint shader, GLuint sourceTe
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
 
     glBindImageTexture(0, targetTex, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA16F);
-    glDispatchCompute((GLuint)((nativeWidth + 7) / 8), (GLuint)((nativeHeight + 7) / 8), 1);
+    glDispatchCompute(dispatch.GroupsX, dispatch.GroupsY, 1);
     glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT |
                     GL_TEXTURE_FETCH_BARRIER_BIT |
                     GL_FRAMEBUFFER_BARRIER_BIT);
@@ -1138,7 +1174,7 @@ void TexcacheOpenGLLoader::RenderCuNNyComputePass(GLuint shader, GLuint sourceTe
 }
 
 bool TexcacheOpenGLLoader::RenderCuNNy2x(int modelIndex, GLuint sourceBaseTex, GLuint targetTex,
-                                         int width, int height)
+                                         int width, int height, const TextureScaleRegion& region)
 {
     if (modelIndex < 0 || modelIndex >= RendererSettings::GLCuNNyModelCount)
         return false;
@@ -1150,7 +1186,7 @@ bool TexcacheOpenGLLoader::RenderCuNNy2x(int modelIndex, GLuint sourceBaseTex, G
         return false;
 
     RenderCuNNyComputePass(CuNNyInShaders[modelIndex], sourceBaseTex, sourceBaseTex,
-                           CuNNyWorkTex[0], width, height, width, height);
+                           CuNNyWorkTex[0], width, height, width, height, region);
 
     GLuint currentTex = CuNNyWorkTex[0];
     int currentIndex = 0;
@@ -1165,7 +1201,7 @@ bool TexcacheOpenGLLoader::RenderCuNNy2x(int modelIndex, GLuint sourceBaseTex, G
 
         RenderCuNNyComputePass(CuNNyConvShaders[modelIndex][pass], currentTex, sourceBaseTex,
                                CuNNyWorkTex[targetIndex], currentWidth, currentHeight,
-                               width, height);
+                               width, height, region);
         currentTex = CuNNyWorkTex[targetIndex];
         currentIndex = targetIndex;
         currentWidth = targetWidth;
@@ -1173,7 +1209,7 @@ bool TexcacheOpenGLLoader::RenderCuNNy2x(int modelIndex, GLuint sourceBaseTex, G
     }
 
     RenderCuNNyComputePass(CuNNyOutShaders[modelIndex], currentTex, sourceBaseTex,
-                           targetTex, currentWidth, currentHeight, width, height);
+                           targetTex, currentWidth, currentHeight, width, height, region);
     return true;
 }
 
@@ -1206,10 +1242,22 @@ void TexcacheOpenGLLoader::RenderAlphaAwareMipLevel(GLuint sourceTex, GLuint tar
     glDrawArrays(GL_TRIANGLES, 0, 6);
 }
 
-bool TexcacheOpenGLLoader::ProcessTextureGPUScaleToTexture(u32 width, u32 height, u32 scaleFactor, const u32* sourceRGBA, GLuint& outputTexture)
+bool TexcacheOpenGLLoader::ProcessTextureGPUScaleToTexture(u32 width, u32 height, u32 scaleFactor, const u32* sourceRGBA, GLuint& outputTexture,
+                                                          const TextureSamplingBounds* edgeBounds, bool* restrictedScale)
 {
-    if (scaleFactor <= 1)
+    if (restrictedScale)
+        *restrictedScale = false;
+    if (scaleFactor <= 1 || width == 0 || height == 0)
         return false;
+
+    // The prepared source remains full-sized. Only these local neural
+    // pipelines have a bounded dependency footprint established here.
+    // Bounds are part of the owning cache key; a wider request builds a
+    // different variant synchronously, using the normal invalidation rules.
+    const bool canRestrict = !FilterableSampling && !SourceMipScaling &&
+        (ScaleAlgorithm == RendererSettings::GLScaleAlgorithm::NNEDI3 ||
+         ScaleAlgorithm == RendererSettings::GLScaleAlgorithm::CuNNy4x32);
+    const auto region = MakeTextureScaleRegion(width, height, canRestrict ? edgeBounds : nullptr);
 
     GLint prevDrawFramebuffer = 0;
     GLint prevReadFramebuffer = 0;
@@ -1331,200 +1379,99 @@ bool TexcacheOpenGLLoader::ProcessTextureGPUScaleToTexture(u32 width, u32 height
     glBindTexture(GL_TEXTURE_2D, ArtCNNSourceTex);
     glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, width, height, GL_RGBA, GL_UNSIGNED_BYTE, sourceRGBA);
 
+    using TA = RendererSettings::TextureAlpha;
+    const bool nnediRGB = RendererSettings::IsGLNNEDI3Algorithm(ScaleAlgorithm);
+    const bool combinedNNEDI = nnediRGB && Alpha == TA::NNEDI3;
+    // Spline36/xBRZ can also finish Bilinear alpha while writing RGB, avoiding
+    // an intermediate scaled RGBA8 texture and a separate replacement pass.
+    const bool rgbSuppliesAlpha = combinedNNEDI ||
+        (ScaleAlgorithm == RendererSettings::GLScaleAlgorithm::XBRZ && (Alpha == TA::XBRZ || Alpha == TA::Bilinear)) ||
+        (ScaleAlgorithm == RendererSettings::GLScaleAlgorithm::Spline36 && (Alpha == TA::Spline36 || Alpha == TA::Bilinear));
+    const GLuint colorTarget = rgbSuppliesAlpha ? ArtCNNOutputTex : ArtCNNOutputWorkTex;
+
     if (ScaleAlgorithm == RendererSettings::GLScaleAlgorithm::Spline36)
-    {
-        const bool replaceAlpha = AlphaXBRZ || !Spline36Alpha;
-        GLuint finalTarget = replaceAlpha ? ArtCNNOutputWorkTex : ArtCNNOutputTex;
-        RenderSpline36(ArtCNNSourceTex, finalTarget,
-                             width * scaleFactor, height * scaleFactor, 0.0f, 0.0f);
-        if (AlphaXBRZ)
-        {
-            RenderXBRZ(ArtCNNSourceTex, ArtCNNAlphaXBRZOutputTex, width, height, scaleFactor);
-            RenderAlphaReplace(ArtCNNOutputWorkTex, ArtCNNAlphaXBRZOutputTex, ArtCNNOutputTex,
-                               width * scaleFactor, height * scaleFactor);
-        }
-        else if (!Spline36Alpha)
-            RenderMidpointAlphaReplace(ArtCNNOutputWorkTex, ArtCNNSourceTex, ArtCNNOutputTex,
-                                       width * scaleFactor, height * scaleFactor);
-    }
+        RenderSpline36(ArtCNNSourceTex, colorTarget, width * scaleFactor, height * scaleFactor,
+                       0.0f, 0.0f, false, Alpha == TA::Bilinear);
     else if (ScaleAlgorithm == RendererSettings::GLScaleAlgorithm::XBRZ)
+        RenderXBRZ(ArtCNNSourceTex, colorTarget, width, height, scaleFactor, Alpha == TA::Bilinear);
+    else if (nnediRGB)
     {
-        RenderXBRZ(ArtCNNSourceTex, ArtCNNOutputTex, width, height, scaleFactor);
+        // Predict RGB and bounded alpha together when both use NNEDI3.
+        // Other alpha choices do not pay for unused neural alpha prediction.
+        if (!RenderNNEDI3AtScale(ArtCNNSourceTex, colorTarget, width, height, scaleFactor,
+                                 region, combinedNNEDI, false))
+        {
+            restoreState();
+            return false;
+        }
     }
     else
     {
-        const bool useAlphaXBRZ =
-            AlphaXBRZ &&
-            (RendererSettings::IsGLNNEDI3Algorithm(ScaleAlgorithm) ||
-             RendererSettings::IsGLArtCNNAlgorithm(ScaleAlgorithm) ||
-             RendererSettings::IsGLCuNNyAlgorithm(ScaleAlgorithm));
-        bool finalAlphaXBRZRendered = false;
-        auto renderFinalAlphaXBRZ = [&]() -> GLuint
+        RenderFullscreenPass(RGBAToYUVAShader, ArtCNNYUVTex, width, height, ArtCNNSourceTex, 0);
+        RenderSpline36(ArtCNNYUVTex, ArtCNNYUVA2xTex, width * 2, height * 2);
+        const GLuint rgba2xTarget = scaleFactor == 2 ? colorTarget : ArtCNNRGBA2xTex;
+        GLuint sourceLuma = ArtCNNLuma2xTex;
+        bool directRGB = false;
+        if (RendererSettings::IsGLCuNNyAlgorithm(ScaleAlgorithm))
         {
-            if (!finalAlphaXBRZRendered)
-            {
-                RenderXBRZ(ArtCNNSourceTex, ArtCNNAlphaXBRZOutputTex, width, height, scaleFactor);
-                finalAlphaXBRZRendered = true;
-            }
-            return ArtCNNAlphaXBRZOutputTex;
-        };
-        bool finalAlphaSpline36Rendered = false;
-        auto renderFinalAlphaSpline36 = [&]() -> GLuint
-        {
-            if (!finalAlphaSpline36Rendered)
-            {
-                RenderSpline36(ArtCNNSourceTex, ArtCNNAlphaXBRZOutputTex,
-                                     width * scaleFactor, height * scaleFactor, 0.0f, 0.0f);
-                finalAlphaSpline36Rendered = true;
-            }
-            return ArtCNNAlphaXBRZOutputTex;
-        };
-        auto renderYUVAToRGBA = [&](GLuint target, int targetWidth, int targetHeight,
-                                    GLuint sourceYUVA, GLuint sourceLuma, GLuint alphaSource)
-        {
-            glUseProgram(ArtCNNYUVAToRGBA2xShader);
-            GLint useAlphaSourceLoc = glGetUniformLocation(ArtCNNYUVAToRGBA2xShader, "uUseAlphaSource");
-            if (useAlphaSourceLoc >= 0)
-                glUniform1i(useAlphaSourceLoc, alphaSource != 0 ? 1 : 0);
-            RenderFullscreenPass(ArtCNNYUVAToRGBA2xShader, target, targetWidth, targetHeight,
-                             sourceYUVA, sourceLuma, alphaSource);
-        };
-        const bool useMidpointAlpha = !Spline36Alpha;
-        auto finalAlphaTarget = [&](bool alphaXBRZ, bool spline36Alpha) -> GLuint
-        {
-            return (alphaXBRZ || useMidpointAlpha || spline36Alpha) ? ArtCNNOutputWorkTex : ArtCNNOutputTex;
-        };
-        auto renderFinalAlpha = [&](GLuint colorTex, bool alphaXBRZ, bool spline36Alpha)
-        {
-            if (alphaXBRZ)
-            {
-                RenderAlphaReplace(colorTex, renderFinalAlphaXBRZ(), ArtCNNOutputTex,
-                                   width * scaleFactor, height * scaleFactor);
-            }
-            else if (useMidpointAlpha)
-                RenderMidpointAlphaReplace(colorTex, ArtCNNSourceTex, ArtCNNOutputTex,
-                                           width * scaleFactor, height * scaleFactor);
-            else if (spline36Alpha)
-            {
-                RenderAlphaReplace(colorTex, renderFinalAlphaSpline36(), ArtCNNOutputTex,
-                                   width * scaleFactor, height * scaleFactor);
-            }
-        };
-
-        if (RendererSettings::IsGLNNEDI3Algorithm(ScaleAlgorithm))
-        {
-            if (!EnsureNNEDI3ComputePrograms())
-            {
-                restoreState();
-                return false;
-            }
-
-            RenderNNEDI3ComputePass(NNEDI3VerticalComputeShader, ArtCNNSourceTex,
-                                    NNEDI3VerticalTex, width, height);
-            RenderNNEDI3ComputePass(NNEDI3HorizontalComputeShader, NNEDI3VerticalTex,
-                                    ArtCNNLuma2xTex, width, height * 2);
-
-            if (scaleFactor >= 4)
-            {
-                RenderNNEDI3ComputePass(NNEDI3VerticalComputeShader, ArtCNNLuma2xTex,
-                                        NNEDI3Vertical4xTex, width * 2, height * 2);
-                RenderNNEDI3ComputePass(NNEDI3HorizontalComputeShader, NNEDI3Vertical4xTex,
-                                        NNEDI3Luma4xTex, width * 2, height * 4);
-
-                GLuint finalTarget = finalAlphaTarget(useAlphaXBRZ, Spline36Alpha);
-                RenderSpline36(NNEDI3Luma4xTex, finalTarget,
-                                     width * scaleFactor, height * scaleFactor, -1.5f, -1.5f);
-                renderFinalAlpha(finalTarget, useAlphaXBRZ, Spline36Alpha);
-            }
-            else
-            {
-                GLuint finalTarget = finalAlphaTarget(useAlphaXBRZ, Spline36Alpha);
-                RenderSpline36(ArtCNNLuma2xTex, finalTarget,
-                                     width * scaleFactor, height * scaleFactor, -0.5f, -0.5f);
-                renderFinalAlpha(finalTarget, useAlphaXBRZ, Spline36Alpha);
-            }
-        }
-        else if (RendererSettings::IsGLCuNNyAlgorithm(ScaleAlgorithm))
-        {
-            RenderFullscreenPass(RGBAToYUVAShader, ArtCNNYUVTex, width, height, ArtCNNSourceTex, 0);
-
-            if (!EnsureCuNNyPrograms())
-            {
-                restoreState();
-                return false;
-            }
-
-            const int cunnyModelIndex = CuNNyModelIndex();
-            const CuNNyModelInfo& cunnyModel = kCuNNyModels[cunnyModelIndex];
-
-            RenderSpline36(ArtCNNYUVTex, ArtCNNYUVA2xTex, width * 2, height * 2, 0.0f, 0.0f);
-            GLuint cunnySource = cunnyModel.RGB ? ArtCNNSourceTex : ArtCNNYUVTex;
-            if (!RenderCuNNy2x(cunnyModelIndex, cunnySource, ArtCNNLuma2xTex, width, height))
-            {
-                restoreState();
-                return false;
-            }
-
-            GLuint rgba2xTarget = (scaleFactor == 2) ? finalAlphaTarget(useAlphaXBRZ, false) : ArtCNNRGBA2xTex;
-            if (cunnyModel.RGB)
-            {
-                RenderAlphaReplace(ArtCNNLuma2xTex, ArtCNNYUVA2xTex,
-                                   rgba2xTarget, width * 2, height * 2);
-            }
-            else
-            {
-                renderYUVAToRGBA(rgba2xTarget, width * 2, height * 2,
-                                 ArtCNNYUVA2xTex, ArtCNNLuma2xTex, 0);
-            }
-
-            if (scaleFactor > 2)
-            {
-                GLuint finalTarget = finalAlphaTarget(useAlphaXBRZ, false);
-                RenderSpline36(ArtCNNRGBA2xTex, finalTarget,
-                                     width * scaleFactor, height * scaleFactor, 0.0f, 0.0f);
-                renderFinalAlpha(finalTarget, useAlphaXBRZ, false);
-            }
-            else
-                renderFinalAlpha(rgba2xTarget, useAlphaXBRZ, false);
+            if (!EnsureCuNNyPrograms()) { restoreState(); return false; }
+            const int model = CuNNyModelIndex();
+            directRGB = kCuNNyModels[model].RGB;
+            if (!RenderCuNNy2x(model, directRGB ? ArtCNNSourceTex : ArtCNNYUVTex,
+                               ArtCNNLuma2xTex, width, height, region))
+            { restoreState(); return false; }
         }
         else
         {
-            RenderFullscreenPass(RGBAToYUVAShader, ArtCNNYUVTex, width, height, ArtCNNSourceTex, 0);
+            const int model = ArtCNNModelIndex();
+            if (!EnsureArtCNNComputePrograms()) { restoreState(); return false; }
+            RenderArtCNNComputePass(ArtCNNConvShaders[model][0], ArtCNNConv0Tex, 0, width, height);
+            RenderArtCNNComputePass(ArtCNNConvShaders[model][1], ArtCNNConvWorkTex[0], 1, width, height);
+            RenderArtCNNComputePass(ArtCNNConvShaders[model][2], ArtCNNConvWorkTex[1], 2, width, height);
+            RenderArtCNNComputePass(ArtCNNConvShaders[model][3], ArtCNNConvWorkTex[0], 3, width, height);
+            RenderArtCNNComputePass(ArtCNNConvShaders[model][4], ArtCNNConvWorkTex[1], 4, width, height);
+            RenderArtCNNComputePass(ArtCNNConvShaders[model][5], ArtCNNConvWorkTex[0], 5, width, height);
+            RenderArtCNNComputePass(ArtCNNConvShaders[model][6], ArtCNNPackedTex, 6, width, height);
+            RenderArtCNNComputePass(ArtCNNDepthToSpaceShaders[model], ArtCNNLuma2xTex, 7, width, height);
+        }
+        if (directRGB)
+            RenderAlphaReplace(sourceLuma, ArtCNNYUVA2xTex, rgba2xTarget, width * 2, height * 2);
+        else
+        {
+            glUseProgram(ArtCNNYUVAToRGBA2xShader);
+            SetUniform1iIfPresent(ArtCNNYUVAToRGBA2xShader, "uUseAlphaSource", 0);
+            RenderFullscreenPass(ArtCNNYUVAToRGBA2xShader, rgba2xTarget, width * 2, height * 2,
+                                 ArtCNNYUVA2xTex, sourceLuma, 0);
+        }
+        if (scaleFactor > 2)
+            RenderSpline36(ArtCNNRGBA2xTex, colorTarget, width * scaleFactor, height * scaleFactor);
+    }
 
-            const int modelIndex = ArtCNNModelIndex();
-            if (!EnsureArtCNNComputePrograms())
-            {
-                restoreState();
-                return false;
-            }
-
-            RenderSpline36(ArtCNNYUVTex, ArtCNNYUVA2xTex, width * 2, height * 2, 0.0f, 0.0f);
-            RenderArtCNNComputePass(ArtCNNConvShaders[modelIndex][0], ArtCNNConv0Tex, 0, width, height);
-            RenderArtCNNComputePass(ArtCNNConvShaders[modelIndex][1], ArtCNNConvWorkTex[0], 1, width, height);
-            RenderArtCNNComputePass(ArtCNNConvShaders[modelIndex][2], ArtCNNConvWorkTex[1], 2, width, height);
-            RenderArtCNNComputePass(ArtCNNConvShaders[modelIndex][3], ArtCNNConvWorkTex[0], 3, width, height);
-            RenderArtCNNComputePass(ArtCNNConvShaders[modelIndex][4], ArtCNNConvWorkTex[1], 4, width, height);
-            RenderArtCNNComputePass(ArtCNNConvShaders[modelIndex][5], ArtCNNConvWorkTex[0], 5, width, height);
-            RenderArtCNNComputePass(ArtCNNConvShaders[modelIndex][6], ArtCNNPackedTex, 6, width, height);
-            RenderArtCNNComputePass(ArtCNNDepthToSpaceShaders[modelIndex], ArtCNNLuma2xTex, 7, width, height);
-
-            GLuint rgba2xTarget = (scaleFactor == 2) ? finalAlphaTarget(useAlphaXBRZ, false) : ArtCNNRGBA2xTex;
-            renderYUVAToRGBA(rgba2xTarget, width * 2, height * 2,
-                             ArtCNNYUVA2xTex, ArtCNNLuma2xTex, 0);
-
-            if (scaleFactor > 2)
-            {
-                GLuint finalTarget = finalAlphaTarget(useAlphaXBRZ, false);
-                RenderSpline36(ArtCNNRGBA2xTex, finalTarget,
-                                     width * scaleFactor, height * scaleFactor, 0.0f, 0.0f);
-                renderFinalAlpha(finalTarget, useAlphaXBRZ, false);
-            }
-            else
-                renderFinalAlpha(rgba2xTarget, useAlphaXBRZ, false);
+    // One alpha selection for every RGB algorithm. RGB padding and the final
+    // cache's cutout/material-alpha conversion remain separate policies.
+    if (!rgbSuppliesAlpha)
+    {
+        if (Alpha == TA::Bilinear)
+            RenderMidpointAlphaReplace(colorTarget, ArtCNNSourceTex, ArtCNNOutputTex,
+                                       width * scaleFactor, height * scaleFactor);
+        else
+        {
+            const GLuint alphaTarget = ArtCNNAlphaXBRZOutputTex;
+            if (Alpha == TA::XBRZ)
+                RenderXBRZ(ArtCNNSourceTex, alphaTarget, width, height, scaleFactor);
+            else if (Alpha == TA::Spline36)
+                RenderSpline36(ArtCNNSourceTex, alphaTarget, width * scaleFactor, height * scaleFactor);
+            else if (!RenderNNEDI3AtScale(ArtCNNSourceTex, alphaTarget, width, height, scaleFactor,
+                                          region, true, true))
+            { restoreState(); return false; }
+            RenderAlphaReplace(colorTarget, alphaTarget, ArtCNNOutputTex,
+                               width * scaleFactor, height * scaleFactor);
         }
     }
 
     outputTexture = ArtCNNOutputTex;
+    if (restrictedScale)
+        *restrictedScale = region.Restricted();
     restoreState();
     return true;
 }
@@ -1705,14 +1652,23 @@ bool TexcacheOpenGLLoader::ProcessTextureGPUScaleToCacheLayer(u32 width, u32 hei
                                                               std::vector<u32>* outputPreviewRGBA,
                                                               bool alphaAwareMipChain,
                                                               bool allowFilterableBinaryAlphaDefaultMips,
-                                                              bool preserveTransparentRGB)
+                                                              bool preserveTransparentRGB,
+                                                              const TextureSamplingBounds* edgeBounds,
+                                                              bool* restrictedScale)
 {
+    if (restrictedScale)
+        *restrictedScale = false;
     if (FilterableSampling && FilterableMipAlphaHandling && binaryAlpha &&
         !alphaAwareMipChain && !allowFilterableBinaryAlphaDefaultMips)
         return false;
 
     GLuint outputTexture = 0;
-    if (!ProcessTextureGPUScaleToTexture(width, height, scaleFactor, sourceRGBA, outputTexture))
+    // Full-sheet exports and all mip/filter consumers require a complete
+    // result, including margins outside the variant's drawing bounds.
+    const bool fullSheet = outputPreviewRGBA || alphaAwareMipChain ||
+        FilterableSampling || SourceMipScaling || outputFmt != outputFmt_RGB6A5;
+    if (!ProcessTextureGPUScaleToTexture(width, height, scaleFactor, sourceRGBA, outputTexture,
+                                         fullSheet ? nullptr : edgeBounds, restrictedScale))
         return false;
 
     GLint prevDrawFramebuffer = 0;

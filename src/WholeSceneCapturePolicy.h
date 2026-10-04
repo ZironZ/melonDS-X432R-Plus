@@ -1,20 +1,5 @@
-/*
-    Copyright 2026 ZironZ
-
-    This file is part of melonDS.
-
-    melonDS is free software: you can redistribute it and/or modify it under
-    the terms of the GNU General Public License as published by the Free
-    Software Foundation, either version 3 of the License, or (at your option)
-    any later version.
-
-    melonDS is distributed in the hope that it will be useful, but WITHOUT ANY
-    WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
-    FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
-
-    You should have received a copy of the GNU General Public License along
-    with melonDS. If not, see http://www.gnu.org/licenses/.
-*/
+// Copyright 2026 ZironZ
+// SPDX-License-Identifier: GPL-3.0-or-later
 
 #pragma once
 
@@ -86,17 +71,6 @@ enum class WholeSceneCaptureEffectOwner : u8
     // brightness suppression proof can never match it: the color effect and
     // master brightness are independent stages and both must apply.
     CurrentEngineColorEffect = 6,
-};
-
-enum class WholeSceneCaptureEffectAction : u8
-{
-    None = 0,
-    DisplayAsIs = 1,
-    ApplyOnBlit = 2,
-    CompositeCurrentOverlay = 3,
-    NeedsRePresentation = 4,
-    Fallback = 5,
-    Reject = 6,
 };
 
 enum class WholeSceneCaptureProofKind : u8
@@ -184,6 +158,31 @@ enum class SourceACaptureResolutionKind : u8
     FullProduct,
 };
 
+enum class SourceACaptureSelectionReason : u8
+{
+    None,
+    ExactFullProductPreference,
+    ExactRouteProductPreference,
+    RouteProductCompositionRebuild,
+    RouteProductAvailable,
+    CurrentOverlayAvailable,
+    FullProductAvailable,
+    NoUsableProduct,
+};
+
+enum class SourceACaptureSelectionPreference : u8
+{
+    None,
+    ExactFullProduct,
+    ExactRouteProduct,
+};
+
+enum class SourceAFullProductPresentationProof : u8
+{
+    None,
+    ExactFullEquivalentDirectFinal,
+};
+
 enum class WholeSceneCaptureBackedPlanKind : u8
 {
     None,
@@ -202,12 +201,43 @@ enum class WholeSceneCaptureBackedPlanStage : u8
 struct SourceACaptureResolutionInputs
 {
     bool HasRouteProduct = false;
-    bool RouteProductNeedsRePresentation = false;
+    bool RouteProductCompositionMismatch = false;
     bool CanUseCurrentOverlay = false;
     bool HasFullProduct = false;
-    bool PreferExactFullProduct = false;
-    bool PreferExactRouteProduct = false;
+    SourceACaptureSelectionPreference Preference =
+        SourceACaptureSelectionPreference::None;
+    SourceAFullProductPresentationProof FullProductPresentationProof =
+        SourceAFullProductPresentationProof::None;
     bool AllowCurrentOverlay = true;
+};
+
+struct SourceACaptureSelectionDecision
+{
+    SourceACaptureResolutionKind Primary =
+        SourceACaptureResolutionKind::RejectedFallback;
+    SourceACaptureSelectionReason PrimaryReason =
+        SourceACaptureSelectionReason::None;
+    SourceACaptureResolutionKind AfterOverlayFailure =
+        SourceACaptureResolutionKind::RejectedFallback;
+    SourceACaptureSelectionReason AfterOverlayFailureReason =
+        SourceACaptureSelectionReason::None;
+    SourceAFullProductPresentationProof FullProductPresentationProof =
+        SourceAFullProductPresentationProof::None;
+};
+
+struct SourceAFullProductPresentationProofInputs
+{
+    bool DirectFinalBottomConsumer = false;
+    bool DirectFinalDisplayConsumer = false;
+    bool SubEngineCapturedOBJOnly = false;
+    bool MainEngineCapturedBGOnly = false;
+    bool FullProductEventRouteMatches = false;
+    bool SubEngineCapturedSourceAOnly = false;
+    bool HasFullProduct = false;
+    bool FullProductEventValid = false;
+    bool FullProductEventFullEquivalent = false;
+    bool FullProductEventCleanEngineA2DOutput = false;
+    bool FullProductEventAccepted = false;
 };
 
 struct SourceAExactRouteProductPreferenceInputs
@@ -305,20 +335,18 @@ struct WholeSceneCaptureProductUseInputs
         WholeSceneCaptureProductPresentationClass::None;
     u32 ProductPresentationHash = 0;
     u32 RequestPresentationHash = 0;
-    bool HasStoredEffectState = false;
-    bool StoredEffectActive = false;
-    bool ConsumeEffectActive = false;
+    int RequestYStart = 0;
+    int RequestYEnd = 192;
+    int ProductYStart = 0;
+    int ProductYEnd = 192;
 };
 
 struct WholeSceneCaptureProductUseDecision
 {
     bool Accepted = false;
     bool PresentationCompatible = false;
-    bool RequiresRePresentation = false;
-    bool EffectPhaseIncompatible = false;
+    bool RowScopeCompatible = false;
 };
-
-bool IsMasterBrightnessEffectActive(u16 masterBrightness);
 
 // Packed master-brightness-style state (mode<<14 | factor) for the consuming
 // engine's frame-global BLDCNT brightness color effect, or 0 when BLDCNT does
@@ -446,6 +474,26 @@ struct HandoffRouteBackgroundOverlayInputs
     bool CapturedBitmapUpdatedThisFrame = false;
 };
 
+struct HandoffStableLiveCandidateInputs
+{
+    bool Direct3DOnlyLiveBackground = false;
+    bool HasProvenRouteProduct = false;
+    bool RouteHasCapturedPhase = false;
+    bool CurrentCaptureEventMatchesRoute = false;
+    bool CurrentCaptureEventFresh = false;
+    bool HasNoBGUpload = false;
+    bool NativeProductEpochValid = false;
+};
+
+struct HandoffPresentationEligibilityInputs
+{
+    CaptureBackedHandoffPhase Phase = CaptureBackedHandoffPhase::None;
+    bool RouteHasCapturedPhase = false;
+    bool CurrentCaptureEventMatchesRoute = false;
+    bool CurrentCaptureEventFresh = false;
+    bool HasOnlyFullDisplaySourceACapture = false;
+};
+
 struct CaptureBackedHandoffRouteKey
 {
     u8 Engine = 0;
@@ -498,15 +546,6 @@ bool CaptureBackedRouteProductIdentityMatchesEvent(
     u64 source3DSerial,
     u32 source3DSceneHash);
 
-WholeSceneCaptureProductPresentationClass CaptureProductPresentationClassForProduct(
-    WholeSceneCaptureProductKind product,
-    WholeSceneCaptureRenderAction action);
-
-bool ShouldApplySourceAReplacementPresentationEffect(
-    WholeSceneCaptureProductPresentationClass productClass,
-    WholeSceneCaptureRequestKind requestKind,
-    bool sourceEngineIsSub);
-
 bool ShouldApplyHandoffPresentationEffect(
     WholeSceneCaptureProductPresentationClass productClass,
     WholeSceneCaptureRequestKind requestKind);
@@ -531,13 +570,10 @@ struct CaptureBackedRouteProductState
     bool Valid = false;
     CaptureBackedRouteProductIdentity Identity;
     u64 CapturedEventSerial = 0;
+    u32 CapturedEventFrameSerial = 0;
     u32 StableFrames = 0;
     WholeSceneCaptureProductPresentationClass PresentationClass =
         WholeSceneCaptureProductPresentationClass::RawContent;
-    // Meaningful only when HasStoredEffectState is true. Raw route products
-    // are stored before final master brightness and should not claim this.
-    u16 StoredMasterBrightness = 0;
-    bool HasStoredEffectState = false;
 };
 
 struct CaptureBackedRouteEventProductState
@@ -545,17 +581,17 @@ struct CaptureBackedRouteEventProductState
     bool Valid = false;
     CaptureBackedRouteProductIdentity Identity;
     u64 CapturedEventSerial = 0;
+    u32 CapturedEventFrameSerial = 0;
     u32 StableFrames = 0;
     WholeSceneCaptureProductPresentationClass PresentationClass =
         WholeSceneCaptureProductPresentationClass::RawContent;
-    u16 StoredMasterBrightness = 0;
-    bool HasStoredEffectState = false;
 };
 
 struct CaptureBackedRoutePendingEventState
 {
     bool Valid = false;
     u64 CaptureEventSerial = 0;
+    u32 CaptureEventFrameSerial = 0;
     u64 Source3DSerial = 0;
     u32 Source3DSceneHash = 0;
     u32 CaptureBank = 0xFFFFFFFFu;
@@ -632,14 +668,15 @@ WholeSceneCaptureProductKind CaptureProductKindForBackgroundSource(
 WholeSceneCaptureProofKind CaptureProofKindForBackgroundSource(
     SourceABackgroundSource source);
 
-SourceACaptureResolutionKind ChooseSourceACaptureResolutionKind(
+SourceACaptureSelectionDecision ChooseSourceACaptureSelectionDecision(
     const SourceACaptureResolutionInputs& inputs);
 
-bool ShouldPreferSourceAExactRouteProductForDirectBottom(
-    const SourceAExactRouteProductPreferenceInputs& inputs);
+SourceAFullProductPresentationProof ProveSourceAFullProductPresentation(
+    const SourceAFullProductPresentationProofInputs& inputs);
 
-bool ShouldPreferSourceAExactFullProductForDirectBottom(
-    const SourceAExactFullProductPreferenceInputs& inputs);
+SourceACaptureSelectionPreference ChooseSourceAExactProductPreference(
+    const SourceAExactFullProductPreferenceInputs& fullProductInputs,
+    const SourceAExactRouteProductPreferenceInputs& routeProductInputs);
 
 bool DoesDirectFinalRouteMatch(
     const DirectFinalRouteMatchInputs& inputs);
@@ -677,6 +714,17 @@ bool IsHandoffRoutePresentationStable(
 bool ShouldUseHandoffRouteBackgroundOverlay(
     const HandoffRouteBackgroundOverlayInputs& inputs);
 
+// A route product proves that capture infrastructure produced content; it
+// does not prove that the current physical route alternates through a captured
+// presentation. Stable live frames may maintain a known handoff only after
+// that route has actually exhibited its captured phase or when the current
+// accepted capture event and its proven product target that same route.
+bool IsHandoffStableLiveCandidate(
+    const HandoffStableLiveCandidateInputs& inputs);
+
+bool ShouldUseHandoffPresentation(
+    const HandoffPresentationEligibilityInputs& inputs);
+
 struct WholeSceneCaptureRequest
 {
     WholeSceneCaptureBackedPlanRole Role = WholeSceneCaptureBackedPlanRole::None;
@@ -704,17 +752,46 @@ struct WholeSceneCaptureProductRef
     u32 CurrentPresentationHash = 0;
 };
 
+// Pre-execution authority carried with a representation candidate. Content
+// identity and presentation/effect completeness are intentionally separate:
+// capture causality can be proven while downstream effect ownership remains
+// debt, and neither proof is inferred from post-execution texture observation.
+struct WholeSceneCaptureRepresentationEvidence
+{
+    bool Available = false;
+    bool ContentProven = false;
+    bool PresentationProven = false;
+    WholeSceneCaptureProductRef ProductRef;
+    WholeSceneCaptureProofKind ProofKind = WholeSceneCaptureProofKind::None;
+    WholeSceneCaptureProofKind AuthorizationProofKind =
+        WholeSceneCaptureProofKind::None;
+    u64 AuthorizationEpochSerial = 0;
+    u32 AuthorizationCaptureBank = 0xFFFFFFFFu;
+    u32 AuthorizationPresentationHash = 0;
+    u64 Source3DSerial = 0;
+    u32 Source3DSceneHash = 0;
+    u32 SourceKind = 0;
+    u32 ProductMask = 0;
+    WholeSceneCaptureEffectOwner OutputEffectOwner =
+        WholeSceneCaptureEffectOwner::None;
+    u32 OutputEffectState = 0;
+    bool OutputPreMaster = false;
+    bool CaptureInputProven = false;
+    u32 CaptureCnt = 0;
+    bool CaptureConsumesSelectedPresentation = false;
+    bool CaptureUsesSourceB = false;
+    bool CanPublishRouteProduct = false;
+};
+
 struct WholeSceneCaptureBackedPlan
 {
     WholeSceneCaptureBackedPlanKind Kind = WholeSceneCaptureBackedPlanKind::None;
     WholeSceneCaptureBackedPlanStage Stage = WholeSceneCaptureBackedPlanStage::None;
     WholeSceneCaptureBackedPlanRole Role = WholeSceneCaptureBackedPlanRole::None;
     WholeSceneCaptureRequestKind RequestKind = WholeSceneCaptureRequestKind::None;
-    WholeSceneCaptureProductKind ProductKind = WholeSceneCaptureProductKind::None;
-    WholeSceneCaptureProofKind ProofKind = WholeSceneCaptureProofKind::None;
-    WholeSceneCaptureRenderAction RenderAction = WholeSceneCaptureRenderAction::None;
     int CaptureEpochOverlayRouteSlot = -1;
     bool CanRunDuringHybridPresentationGuard = false;
+    WholeSceneCaptureRepresentationEvidence Evidence;
 };
 
 WholeSceneCaptureBackedPlan MakeWholeSceneCaptureBackedHandoffPlan();
@@ -732,6 +809,8 @@ struct WholeSceneCapturePolicyResult
     WholeSceneCaptureAuthority Authority = WholeSceneCaptureAuthority::None;
     WholeSceneCaptureProofKind ProofKind = WholeSceneCaptureProofKind::None;
     WholeSceneCaptureRenderAction RenderAction = WholeSceneCaptureRenderAction::None;
+    WholeSceneCaptureProductPresentationClass PresentationClass =
+        WholeSceneCaptureProductPresentationClass::None;
 };
 
 struct SourceACaptureResolution
@@ -832,6 +911,7 @@ WholeSceneCapturePolicyResult MakeWholeSceneCapturePolicyResult(
     WholeSceneCaptureProductKind product,
     WholeSceneCaptureProofKind proof,
     WholeSceneCaptureRenderAction action,
+    WholeSceneCaptureProductPresentationClass presentationClass,
     WholeSceneCaptureAuthority authority = WholeSceneCaptureAuthority::None,
     SourceABackgroundSource backgroundSource = SourceABackgroundSource::None,
     bool accepted = true);

@@ -46,26 +46,80 @@ void main()
 )";
 
 const char* kScreenFS = R"(#version 140
+uniform float uContentWidth;
+uniform float uContentHeight;
 
 uniform sampler2DArray ScreenTex;
+uniform sampler2DArray LCDGhostingHistoryTex;
 uniform float uSharpenAmount;
+uniform int uLCDGhostingMode;
+uniform ivec4 uLCDGhostingHistorySlots;
 
 smooth in vec3 fTexcoord;
 
 out vec4 oColor;
 
+bool SameColor(vec3 a, vec3 b)
+{
+    return all(equal(a, b));
+}
+
+vec3 GetScreenColor(vec3 texcoord)
+{
+    vec3 current = texture(ScreenTex, texcoord).rgb;
+    if (uLCDGhostingMode == 0)
+        return current;
+
+    float screen = texcoord.z;
+    vec3 previous1 = texture(LCDGhostingHistoryTex,
+                             vec3(texcoord.xy, float(uLCDGhostingHistorySlots.x * 2) + screen)).rgb;
+    vec3 previous2 = texture(LCDGhostingHistoryTex,
+                             vec3(texcoord.xy, float(uLCDGhostingHistorySlots.y * 2) + screen)).rgb;
+    vec3 previous3 = texture(LCDGhostingHistoryTex,
+                             vec3(texcoord.xy, float(uLCDGhostingHistorySlots.z * 2) + screen)).rgb;
+
+    if (uLCDGhostingMode == 1)
+    {
+        bool alternating =
+            (SameColor(current, previous2) || SameColor(previous1, previous3)) &&
+            !SameColor(current, previous1) &&
+            !SameColor(current, previous3) &&
+            !SameColor(previous1, previous2);
+
+        return alternating ? (current + previous1) * 0.5 : current;
+    }
+
+    vec3 previous4 = texture(LCDGhostingHistoryTex,
+                             vec3(texcoord.xy, float(uLCDGhostingHistorySlots.w * 2) + screen)).rgb;
+    // Four historical samples are enough for this approximation because r^5
+    // contributes less than half a percent.
+    const float response = 0.333;
+    vec3 color = current;
+    float responseFactor = response;
+    color += (previous1 - color) * responseFactor;
+    responseFactor *= response;
+    color += (previous2 - color) * responseFactor;
+    responseFactor *= response;
+    color += (previous3 - color) * responseFactor;
+    responseFactor *= response;
+    color += (previous4 - color) * responseFactor;
+    return color;
+}
+
 void main()
 {
-    vec4 pixel = texture(ScreenTex, fTexcoord);
-    vec3 color = pixel.rgb;
+    vec3 coord = fTexcoord;
+    coord.x = (coord.x - 0.5) * uContentWidth + 0.5;
+    coord.y = (coord.y - 0.5) * uContentHeight + 0.5;
+    vec3 color = GetScreenColor(coord);
 
     if (uSharpenAmount > 0.0)
     {
         vec2 texel = 1.0 / vec2(textureSize(ScreenTex, 0).xy);
-        vec3 left = texture(ScreenTex, fTexcoord + vec3(-texel.x, 0.0, 0.0)).rgb;
-        vec3 right = texture(ScreenTex, fTexcoord + vec3(texel.x, 0.0, 0.0)).rgb;
-        vec3 up = texture(ScreenTex, fTexcoord + vec3(0.0, -texel.y, 0.0)).rgb;
-        vec3 down = texture(ScreenTex, fTexcoord + vec3(0.0, texel.y, 0.0)).rgb;
+        vec3 left = GetScreenColor(coord + vec3(-texel.x, 0.0, 0.0));
+        vec3 right = GetScreenColor(coord + vec3(texel.x, 0.0, 0.0));
+        vec3 up = GetScreenColor(coord + vec3(0.0, -texel.y, 0.0));
+        vec3 down = GetScreenColor(coord + vec3(0.0, texel.y, 0.0));
 
         vec3 edge = color * 4.0 - left - right - up - down;
         color = clamp(color + edge * uSharpenAmount, 0.0, 1.0);

@@ -1,13 +1,28 @@
 name: BSD
 
 on:
+  workflow_dispatch:
   push:
     branches:
       - master
+      - main
+      - x432r-plus
       - ci/*
+      - release/*
+    tags:
+      - 'v*'
   pull_request:
     branches:
       - master
+      - main
+      - x432r-plus
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   MELONDS_GIT_BRANCH: ${{ github.ref }}
@@ -16,7 +31,9 @@ env:
 
 jobs:
   build:
+    timeout-minutes: 90
     strategy:
+      fail-fast: false
       matrix:
         os: [freebsd, netbsd, openbsd]
         # The emulated aarch64 VMs are quite slow, so disable aarch64
@@ -78,12 +95,12 @@ jobs:
         # workspace is only synced before and after the setup VM step.
         with: >
           {
-            "arch": ${{ matrix.arch }},
+            "arch": "${{ matrix.arch }}",
             "envs": "MELONDS_GIT_BRANCH MELONDS_GIT_HASH
                      MELONDS_BUILD_PROVIDER",
-            "prepare": ${{ toJSON(matrix.prepare_vm) }},
+            "prepare": ${{ toJSON(matrix.prepare_vm || '') }},
             "sync": "nfs",
-            "usesh": "true",
+            "usesh": "true"
           }
 
     - name: Install dependencies
@@ -91,16 +108,52 @@ jobs:
 
     - name: Configure
       run: >
-        cmake -S $GITHUB_WORKSPACE -B /tmp/build -G Ninja
-        -DMELONDS_EMBED_BUILD_INFO=ON
+        cmake -S "$GITHUB_WORKSPACE" -B /tmp/build -G Ninja
+        -DCMAKE_BUILD_TYPE=Release -DMELONDS_EMBED_BUILD_INFO=ON
+        -DBUILD_POLICY_TESTS=ON -DBUILD_DEBUG_EXPORT_TESTS=OFF
+        -DBUILD_RENDERER_SHADER_TESTS=OFF
 
     - name: Build
       run: |
         cmake --build /tmp/build
-        cp -RP /tmp/build $GITHUB_WORKSPACE/
+    - name: Test policies
+      run: ctest --test-dir /tmp/build --output-on-failure --no-tests=error --timeout 300 --output-junit test-results.xml
 
+    - name: Collect build and test output
+      if: always()
+      run: |
+        if [ -d /tmp/build ]; then
+          cp -RP /tmp/build "$GITHUB_WORKSPACE/"
+        fi
+
+    - name: Upload test reports
+      if: always()
+      uses: actions/upload-artifact@v7
+      with:
+        name: test-results-${{ matrix.os }}-${{ matrix.arch }}
+        path: |
+          build/test-results.xml
+          build/Testing/Temporary/*.log
+        retention-days: 14
+
+    - name: Package executable
+      run: |
+        cp README.md LICENSE build/
+        cd build
+        cmake -E tar cf ../melonDS-${{ matrix.os }}-${{ matrix.arch }}.zip --format=zip melonDS README.md LICENSE
+        cd ..
+        cmake -E sha256sum melonDS-${{ matrix.os }}-${{ matrix.arch }}.zip > SHA256SUMS-${{ matrix.os }}-${{ matrix.arch }}.txt
     - name: Upload binary
       uses: actions/upload-artifact@v7
       with:
         name: melonDS-${{ matrix.os }}-${{ matrix.arch }}
-        path: build/melonDS
+        path: melonDS-${{ matrix.os }}-${{ matrix.arch }}.zip
+        archive: false
+        if-no-files-found: error
+        retention-days: 14
+    - uses: actions/upload-artifact@v7
+      with:
+        path: SHA256SUMS-${{ matrix.os }}-${{ matrix.arch }}.txt
+        archive: false
+        if-no-files-found: error
+        retention-days: 14

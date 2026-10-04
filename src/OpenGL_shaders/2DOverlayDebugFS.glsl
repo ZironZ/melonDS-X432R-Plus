@@ -20,6 +20,12 @@ struct sScanline
     ivec4 WinPos;
     bvec4 BGMosaicEnable;
     ivec4 MosaicSize;
+    ivec4 BGPrio;
+    bool EnableOBJ;
+    bool Enable3D;
+    int BlendCnt;
+    int BlendEffect;
+    ivec3 BlendCoef;
 };
 
 layout(std140) uniform ubScanlineConfig

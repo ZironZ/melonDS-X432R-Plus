@@ -20,10 +20,13 @@
 #include <QComboBox>
 #include <QDialogButtonBox>
 #include <QGridLayout>
+#include <QGroupBox>
 #include <QLabel>
 #include <QLayout>
 #include <QPushButton>
 #include <QSignalBlocker>
+#include <QStandardItemModel>
+#include <QVBoxLayout>
 #include <QWhatsThis>
 #include <QtGlobal>
 
@@ -32,16 +35,17 @@
 #include "Config.h"
 #include "GPU.h"
 #include "RendererSettings.h"
+#include "WideMelon.h"
 #include "main.h"
 
 #include "VideoSettingsDialog.h"
 #include "ui_VideoSettingsDialog.h"
 
 
-inline bool VideoSettingsDialog::UsesGL()
+bool VideoSettingsDialog::UsesGL()
 {
     auto& cfg = emuInstance->getGlobalConfig();
-    return cfg.GetBool("Screen.UseGL") || (cfg.GetInt("3D.Renderer") != renderer3D_Software);
+    return WideMelon::Enabled() || cfg.GetBool("Screen.UseGL") || (cfg.GetInt("3D.Renderer") != renderer3D_Software);
 }
 
 VideoSettingsDialog* VideoSettingsDialog::currentDlg = nullptr;
@@ -259,10 +263,123 @@ void CopyWhatsThis(QWidget* target, const QWidget* source)
 }
 }
 
+void VideoSettingsDialog::setupEnhancementSections()
+{
+    // Reuse the existing controls and connections so layout changes do not
+    // translate, reset, or combine renderer settings.
+    auto makeSection = [this](const QString& title, const char* name, int row)
+    {
+        auto* group = new QGroupBox(title, ui->groupBox_3);
+        group->setObjectName(QString::fromLatin1(name));
+        ui->gridLayout_4->addWidget(group, row, 0);
+        return group;
+    };
+    auto moveLayout = [](QLayout* from, QLayout* layout, QGridLayout* to, int row)
+    {
+        from->removeItem(layout);
+        layout->setParent(nullptr);
+        to->addLayout(layout, row, 0);
+    };
+
+    affineGroup = new QGroupBox(tr("Sprite and background enhancements"), ui->groupBoxWholeScene2DScaling);
+    affineGroup->setObjectName("groupAffine");
+    ui->gridLayoutWholeScene2DScaling->addWidget(affineGroup, 6, 0, 1, 3);
+    auto* affineLayout = new QVBoxLayout(affineGroup);
+    affineBasicLayout = new QGridLayout;
+    affineLayout->addLayout(affineBasicLayout);
+
+    affineReconstructionGroup = new QGroupBox(tr("Sprite edges and sampling"), affineGroup);
+    auto* reconstructionLayout = new QGridLayout(affineReconstructionGroup);
+    affineAlphaCombo = new QComboBox(affineReconstructionGroup);
+    affineAlphaCombo->setObjectName("cbxAffineAlphaReconstruction");
+    affineAlphaCombo->addItem(tr("Automatic"), 5);
+    affineAlphaCombo->addItem(tr("Original pixel edges"), 0);
+    affineAlphaCombo->addItem(tr("Bilinear"), 1);
+    affineAlphaCombo->addItem(tr("Spline36"), 2);
+    affineAlphaCombo->addItem(tr("NNEDI3"), 3);
+    affineAlphaCombo->addItem(tr("xBRZ"), 4);
+    affineAlphaCombo->setWhatsThis(tr("Choose how transparency and outlines are reconstructed for supported sprites and backgrounds. Automatic follows the upscaling algorithm: Spline36 and xBRZ use matching transparency reconstruction; neural upscalers use NNEDI3. Select another option to keep a fixed algorithm. Original pixel edges retains the original transparency outline. The game's drawing order and blending effects are preserved."));
+    affineSamplingCombo = new QComboBox(affineReconstructionGroup);
+    affineSamplingCombo->setObjectName("cbxAffineSampling");
+    affineSamplingCombo->addItem(tr("Standard sampling"), 0);
+    affineSamplingCombo->addItem(tr("2x sprite supersampling"), 1);
+    affineSamplingCombo->setWhatsThis(tr("Standard sampling evaluates reconstructed artwork at the selected output resolution. 2x sprite supersampling takes extra samples to smooth some sprite edges. It costs more and may make little difference in some scenes. Neither choice changes the transparency algorithm or which sprite pieces are combined."));
+    affineAlphaCombo->setAccessibleName(tr("Transparency reconstruction"));
+    affineSamplingCombo->setAccessibleName(tr("Sampling"));
+    auto* alphaLabel = new QLabel(tr("Transparency reconstruction:"));
+    alphaLabel->setBuddy(affineAlphaCombo);
+    reconstructionLayout->addWidget(alphaLabel, 0, 0);
+    reconstructionLayout->addWidget(affineAlphaCombo, 0, 1);
+    auto* samplingLabel = new QLabel(tr("Sampling:"));
+    samplingLabel->setBuddy(affineSamplingCombo);
+    reconstructionLayout->addWidget(samplingLabel, 1, 0);
+    reconstructionLayout->addWidget(affineSamplingCombo, 1, 1);
+    nnedi3PremultipliedRGB = new QCheckBox(tr("Premultiplied color (NNEDI3, experimental)"), affineReconstructionGroup);
+    nnedi3PremultipliedRGB->setObjectName("cbNNEDI3PremultipliedRGB");
+    nnedi3PremultipliedRGB->setWhatsThis(tr("Reconstruct color with transparency included in the color values. This changes sprite and background edge colors and may introduce artifacts. Requires NNEDI3 for both color and transparency reconstruction, with sprite and background artwork upscaling enabled. Applies immediately; turn off to compare. Does not affect whole-screen postprocessing or 3D texture upscaling."));
+    reconstructionLayout->addWidget(nnedi3PremultipliedRGB, 2, 0, 1, 2);
+    connect(nnedi3PremultipliedRGB, &QCheckBox::toggled, this, [this](bool enabled) {
+        emuInstance->getGlobalConfig().SetBool("3D.GL.HybridNNEDI3PremultipliedRGB", enabled);
+        emit updateVideoSettings(false);
+    });
+    affineLayout->addWidget(affineReconstructionGroup);
+    auto changeReconstruction = [this]()
+    {
+        auto& cfg = emuInstance->getGlobalConfig();
+        cfg.SetInt("3D.GL.HybridAffineAlpha", affineAlphaCombo->currentData().toInt());
+        cfg.SetInt("3D.GL.HybridAffineSampling", affineSamplingCombo->currentData().toInt());
+        emit updateVideoSettings(false);
+        setEnabled();
+    };
+    connect(affineAlphaCombo, qOverload<int>(&QComboBox::currentIndexChanged), this,
+        [changeReconstruction](int) { changeReconstruction(); });
+    connect(affineSamplingCombo, qOverload<int>(&QComboBox::currentIndexChanged), this,
+        [changeReconstruction](int) { changeReconstruction(); });
+    affineAssemblyGroup = new QGroupBox(tr("Sprite piece assembly"), affineGroup);
+    affineAssemblyLayout = new QGridLayout(affineAssemblyGroup);
+    affineLayout->addWidget(affineAssemblyGroup);
+    affineEdgeGroup = new QGroupBox(tr("Final edge smoothing"), affineGroup);
+    auto* edgeLayout = new QVBoxLayout(affineEdgeGroup);
+    edgeLayout->addWidget(ui->cbWholeScene2DScaleHybridStrictAffineMaskedOBJMLAA);
+    affineLayout->addWidget(affineEdgeGroup);
+
+    compatibilityGroup = new QGroupBox(tr("Rendering compatibility"), ui->groupBoxWholeScene2DScaling);
+    compatibilityGroup->setObjectName("groupCompatibility");
+    ui->gridLayoutWholeScene2DScaling->addWidget(compatibilityGroup, 7, 0, 1, 3);
+    auto* compatibilityContents = new QGridLayout(compatibilityGroup);
+    compatibilityLayout = new QGridLayout;
+    compatibilityContents->addLayout(compatibilityLayout, 2, 0);
+    moveLayout(ui->gridLayoutWholeScene2DScaling,
+               ui->horizontalLayoutWholeScene2DScaleFinalUpscale3DFilter, compatibilityContents, 1);
+
+    experimentsGroup = makeSection(QString(), "groupRendererExperiments", 13);
+    auto* experimentsLayout = new QGridLayout(experimentsGroup);
+    ui->gridLayout_4->removeWidget(ui->cbReadable3DTextureCache);
+    experimentsLayout->addWidget(ui->cbReadable3DTextureCache, 1, 0);
+    moveLayout(ui->gridLayoutWholeScene2DScaling,
+               ui->gridLayoutWholeScene2DScaleOptions, experimentsLayout, 2);
+
+    ui->groupBoxTextureEnhancements->setTitle(tr("Texture enhancements"));
+    ui->groupBoxTextureFiltering->setTitle(QString());
+    ui->groupBoxTextureFiltering->setFlat(true);
+    ui->groupBoxTextureFiltering->setStyleSheet("QGroupBox#groupBoxTextureFiltering { border: none; margin-top: 0px; }");
+    ui->groupBoxTextureScaling->setTitle(QString());
+    ui->groupBoxTextureScaling->setFlat(true);
+    ui->groupBoxTextureScaling->setStyleSheet("QGroupBox#groupBoxTextureScaling { border: none; margin-top: 0px; }");
+    ui->cb3DTextureScaling->setText(tr("Upscale textures"));
+    ui->groupBoxWholeScene2DScaling->setTitle(tr("Screen upscaling"));
+    ui->cbWholeScene2DScale->setText(tr("Enable screen upscaling"));
+    ui->lblWholeScene2DScaleMode->setText(tr("Method:"));
+    ui->lblWholeScene2DScaleFragmentationFallback->setText(tr("Slowdown fallback:"));
+    ui->lblWholeScene2DScaleAlgorithm->setText(tr("Upscaling algorithm:"));
+    ui->lbl3DTextureScalingAlgorithm->setText(tr("Upscaling algorithm:"));
+}
+
 void VideoSettingsDialog::setEnabled()
 {
     auto& cfg = emuInstance->getGlobalConfig();
     int renderer = cfg.GetInt("3D.Renderer");
+    if (WideMelon::Enabled() && renderer == renderer3D_Software) renderer = renderer3D_OpenGL;
 
     bool softwareRenderer = renderer == renderer3D_Software;
     bool advancedSettings = UsesGL() && ui->cbAdvancedVideoSettings->isChecked();
@@ -286,12 +403,6 @@ void VideoSettingsDialog::setEnabled()
     bool alphaAwareFiltering = anisotropicFiltering && ui->cb3DTextureFilterMipmapAlphaHandling->isChecked();
     bool textureScalingVisible = UsesGL() && ui->cb3DTextureScaling->isChecked();
     auto textureScalingAlgorithm = melonDS::RendererSettings::GetGLScaleAlgorithm(ReadScaleAlgorithmCombo(ui->cbx3DTextureScalingAlgorithm));
-    bool alphaXBRZTextureAlgorithm =
-        textureScalingAlgorithm == melonDS::RendererSettings::GLScaleAlgorithm::Spline36 ||
-        melonDS::RendererSettings::IsGLArtCNNAlgorithm(textureScalingAlgorithm) ||
-        melonDS::RendererSettings::IsGLNNEDI3Algorithm(textureScalingAlgorithm) ||
-        melonDS::RendererSettings::IsGLCuNNyAlgorithm(textureScalingAlgorithm);
-    bool spline36AlphaTextureAlgorithm = alphaXBRZTextureAlgorithm;
     bool spriteUVInsetApplicable = UsesGL() && (anisotropicFiltering || textureScalingVisible);
     bool smart2DFilteringApplicable = UsesGL() && (anisotropicFiltering || textureScalingVisible);
     bool edgeExtendApplicable = UsesGL() && textureScalingVisible;
@@ -316,8 +427,9 @@ void VideoSettingsDialog::setEnabled()
         wholeSceneAlgorithm == melonDS::RendererSettings::GLScaleAlgorithm::XBRZ;
     bool gpuTextureAlgorithm = UsesGL() && ui->cb3DTextureScaling->isChecked();
 
-    ui->btnRecommendedDefaults->setEnabled(!softwareRenderer);
-    ui->cbAdvancedVideoSettings->setEnabled(!softwareRenderer);
+    ui->btnRecommendedDefaults->setEnabled(!softwareRenderer ||
+        (!computeShadersAvailable && ui->rb3DOpenGL->isEnabled()));
+    ui->cbAdvancedVideoSettings->setEnabled(true);
     ui->cbGLDisplay->setEnabled(softwareRenderer);
     ui->cbSoftwareThreaded->setEnabled(softwareRenderer);
     ui->cbxGLResolution->setEnabled(!softwareRenderer);
@@ -326,9 +438,8 @@ void VideoSettingsDialog::setEnabled()
     ui->cbReadable3DTextureCache->setEnabled(renderer == renderer3D_OpenGL);
     ui->cbx3DTextureAnisotropy->setEnabled(UsesGL());
     ui->lbl3DTextureAnisotropy->setEnabled(UsesGL());
-    ui->cb3DTexture2DAtlasProtection->setVisible(
-        UsesGL() && !advancedSettings && (anisotropicFiltering || textureScalingVisible));
-    ui->cb3DTexture2DAtlasProtection->setEnabled(UsesGL());
+    ui->cb3DTexture2DAtlasProtection->setVisible(true);
+    ui->cb3DTexture2DAtlasProtection->setEnabled(smart2DFilteringApplicable);
     ui->cbxComputeHiResCoords->setVisible(true);
     SetLayoutVisible(ui->horizontalLayout3DTextureFilterMipDepth, advancedSettings && anisotropicFiltering);
     ui->cb3DTextureFilterBinaryAlphaHandling->setVisible(advancedSettings && anisotropicFiltering);
@@ -353,17 +464,24 @@ void VideoSettingsDialog::setEnabled()
         renderer == renderer3D_OpenGLCompute && highRes3D);
     ui->cb3DTextureScaling->setEnabled(UsesGL());
     SetLayoutVisible(ui->horizontalLayout3DTextureScalingAlgorithm, UsesGL() && ui->cb3DTextureScaling->isChecked());
+    ui->cb3DTextureScalingFrequentChangePolicy->setVisible(textureScalingVisible);
+    ui->cb3DTextureScalingDeferred->setVisible(textureScalingVisible);
     SetCompactGridOptions(ui->gridLayout3DTextureScalingOptions, {
-        {ui->cb3DTextureScalingAlphaXBRZ, textureScalingVisible && alphaXBRZTextureAlgorithm},
-        {ui->cb3DTextureScalingFrequentChangePolicy, textureScalingVisible},
-        {ui->cb3DTextureScalingDeferred, textureScalingVisible},
         {ui->cb3DTextureScalingLegacyAlphaHandling, advancedSettings && textureScalingVisible},
         {ui->cb3DTextureScalingQualityAlphaHandling, advancedSettings && textureScalingVisible},
-        {ui->cb3DTextureScalingSpline36Alpha, advancedSettings && textureScalingVisible && spline36AlphaTextureAlgorithm},
         {ui->cb3DTextureScalingNativeMipFloor, advancedSettings && textureScalingVisible && anisotropicFiltering},
         {ui->cb3DTextureScalingSourceMips, advancedSettings && textureScalingVisible && anisotropicFiltering},
-        {ui->cb3DTextureScalingEdgeExtendUnusedMargins, advancedSettings && edgeExtendApplicable},
-    }, 3);
+        {ui->cb3DHighPrecisionTextureCoordinates, advancedSettings && renderer == renderer3D_OpenGLCompute},
+        {ui->cb3DTextureFilterSpriteUVInset, spriteUVInsetVisible},
+    }, 1);
+    if (artifactOptionsLayout)
+        SetCompactGridOptions(artifactOptionsLayout, {
+            {ui->cb3DTexture2DAtlasProtection, true},
+            {ui->cb3DTextureScalingAlphaXBRZ, !advancedSettings},
+            {ui->cb3DTextureFilterSmart2D, advancedSettings},
+            {ui->cb3DTextureScalingEdgeExtendUnusedMargins, advancedSettings},
+            {ui->reconstruction3DOptions, advancedSettings},
+        }, 1);
     ui->cbx3DTextureScalingAlgorithm->setEnabled(UsesGL() && ui->cb3DTextureScaling->isChecked());
     ui->lbl3DTextureScalingAlgorithm->setEnabled(UsesGL() && ui->cb3DTextureScaling->isChecked());
     ui->cb3DTextureScalingFrequentChangePolicy->setEnabled(UsesGL() && ui->cb3DTextureScaling->isChecked());
@@ -373,27 +491,39 @@ void VideoSettingsDialog::setEnabled()
     ui->cb3DTextureScalingSourceMips->setEnabled(
         UsesGL() && ui->cb3DTextureScaling->isChecked() && anisotropicFiltering);
     ui->cb3DTextureScalingEdgeExtendUnusedMargins->setEnabled(edgeExtendApplicable);
+    ui->cbReconstructCompatible3D->setEnabled(UsesGL() && ui->cb3DTextureScaling->isChecked());
+    ui->cbReconstructCompatible3DEdgeContext->setEnabled(ui->cbReconstructCompatible3D->isEnabled() && ui->cbReconstructCompatible3D->isChecked());
+    ui->cbReconstructCompatible3DFractionalAlpha->setEnabled(ui->cbReconstructCompatible3D->isEnabled() && ui->cbReconstructCompatible3D->isChecked());
     ui->cb3DTextureScalingLegacyAlphaHandling->setEnabled(UsesGL() && ui->cb3DTextureScaling->isChecked() && gpuTextureAlgorithm);
     ui->cb3DTextureScalingQualityAlphaHandling->setEnabled(UsesGL() && ui->cb3DTextureScaling->isChecked() &&
                                                            gpuTextureAlgorithm && !ui->cb3DTextureScalingLegacyAlphaHandling->isChecked());
-    ui->cb3DTextureScalingAlphaXBRZ->setEnabled(
-        UsesGL() && ui->cb3DTextureScaling->isChecked() && alphaXBRZTextureAlgorithm);
-    ui->cb3DTextureScalingSpline36Alpha->setEnabled(
-        UsesGL() && ui->cb3DTextureScaling->isChecked() && spline36AlphaTextureAlgorithm);
+    ui->cb3DTextureScalingAlphaXBRZ->setEnabled(textureScalingVisible);
+    if (textureAlphaRow) textureAlphaRow->setVisible(advancedSettings && textureScalingVisible);
+    if (textureAlphaCombo) textureAlphaCombo->setEnabled(textureScalingVisible);
     ui->cbWholeScene2DScale->setEnabled(UsesGL());
     SetLayoutVisible(ui->horizontalLayoutWholeScene2DScaleMode, wholeSceneEnabled);
     SetLayoutVisible(ui->horizontalLayoutWholeScene2DScaleAlgorithm, wholeSceneEnabled);
-    SetLayoutVisible(ui->horizontalLayoutWholeScene2DScaleFragmentationFallback, wholeSceneEnabled);
-    SetCompactGridOptions(ui->gridLayoutWholeScene2DScaleOptions, {
+    SetLayoutVisible(ui->horizontalLayoutWholeScene2DScaleFragmentationFallback, advancedSettings && wholeSceneEnabled);
+    SetCompactGridOptions(affineBasicLayout, {
+        {ui->cbWholeScene2DScaleHybridStrictAffineHighRes, wholeSceneHybridMode},
+        {ui->cbWholeScene2DScaleHybridStrictAffineSourceEnhancement, advancedSettings && wholeSceneEnabled && wholeSceneHybridMode},
+    }, 1);
+    SetCompactGridOptions(affineAssemblyLayout, {
+        {ui->cbWholeScene2DScaleHybridStrictAffineConnectedSources, advancedSettings && wholeSceneEnabled && wholeSceneHybridMode},
+        {ui->cbWholeScene2DScaleHybridStrictAffineOpaqueAssemblies, advancedSettings && wholeSceneEnabled && wholeSceneHybridMode},
+    }, 1);
+    SetCompactGridOptions(compatibilityLayout, {
         {ui->cbWholeScene2DScaleExactFinalFallback, advancedSettings && wholeSceneEnabled && wholeSceneLegacyMode},
         {ui->cbWholeScene2DScaleForegroundOverlay, advancedSettings && wholeSceneEnabled && wholeSceneLegacyMode},
         {ui->cbWholeScene2DScaleCaptureBacked, advancedSettings && wholeSceneEnabled},
         {ui->cbWholeScene2DScaleSourceBoundaryGuard, advancedSettings && wholeSceneEnabled && wholeSceneLegacyMode &&
                                                        wholeSceneSupportsSourceBoundaryGuard},
-        {ui->cbWholeScene2DScaleDebugTint, advancedSettings && wholeSceneEnabled},
         {ui->cbWholeScene2DScaleNoWrapFilterTaps, advancedSettings && wholeSceneEnabled && wholeSceneHighResMode &&
                                                  wholeSceneAlgorithm == melonDS::RendererSettings::GLScaleAlgorithm::Spline36},
-        {ui->cbWholeScene2DScaleFinalUpscaleRender3DNative, showFinalUpscaleRender3DNative},
+    }, 1);
+    ui->cbWholeScene2DScaleFinalUpscaleRender3DNative->setVisible(showFinalUpscaleRender3DNative);
+    SetCompactGridOptions(ui->gridLayoutWholeScene2DScaleOptions, {
+        {ui->cbWholeScene2DScaleDebugTint, advancedSettings && wholeSceneEnabled},
         {ui->cbWholeScene2DScaleFinalUpscale3DCoverageAware, advancedSettings && wholeSceneFinal3DResolve},
         {ui->cbWholeScene2DScaleFinalUpscale3DRepresentativeSemantics, advancedSettings && wholeSceneFinal3DResolve},
         {ui->cbWholeScene2DScaleFinalUpscale3DSplitSemantics, advancedSettings && wholeSceneFinal3DResolve},
@@ -404,7 +534,15 @@ void VideoSettingsDialog::setEnabled()
         {ui->cbWholeScene2DScaleHybridNativeEffectGuard, advancedSettings && wholeSceneEnabled && wholeSceneHybridMode},
         {ui->cbWholeScene2DScaleHybridForeground2DBase, advancedSettings && wholeSceneEnabled && wholeSceneHybridMode},
         {ui->cbWholeScene2DScaleHybridCleanLegacyCandidate, advancedSettings && wholeSceneEnabled && wholeSceneHybridMode},
-    }, 3);
+        {ui->cbWholeScene2DScaleHybridStrictAffineTopTextBG, advancedSettings && wholeSceneEnabled && wholeSceneHybridMode},
+    }, 1);
+    affineGroup->setVisible(UsesGL() && wholeSceneHybridMode);
+    affineGroup->setEnabled(wholeSceneEnabled);
+    affineAssemblyGroup->setVisible(advancedSettings);
+    affineReconstructionGroup->setVisible(advancedSettings);
+    affineEdgeGroup->setVisible(advancedSettings);
+    compatibilityGroup->setVisible(wholeSceneEnabled && (advancedSettings || wholeSceneFinalMode));
+    experimentsGroup->setVisible(advancedSettings);
     SetLayoutVisible(ui->horizontalLayoutWholeScene2DScaleFinalUpscale3DFilter, advancedSettings && wholeSceneFinal3DResolve);
     ui->cbxWholeScene2DScaleMode->setEnabled(wholeSceneEnabled);
     ui->lblWholeScene2DScaleMode->setEnabled(wholeSceneEnabled);
@@ -432,12 +570,38 @@ void VideoSettingsDialog::setEnabled()
     ui->cbWholeScene2DScaleHybridNativeEffectGuard->setEnabled(wholeSceneEnabled && wholeSceneHybridMode);
     ui->cbWholeScene2DScaleHybridForeground2DBase->setEnabled(wholeSceneEnabled && wholeSceneHybridMode);
     ui->cbWholeScene2DScaleHybridCleanLegacyCandidate->setEnabled(wholeSceneEnabled && wholeSceneHybridMode);
+    ui->cbWholeScene2DScaleHybridStrictAffineHighRes->setEnabled(wholeSceneEnabled && wholeSceneHybridMode);
+    ui->cbWholeScene2DScaleHybridStrictAffineSourceEnhancement->setEnabled(
+        wholeSceneEnabled && wholeSceneHybridMode &&
+        ui->cbWholeScene2DScaleHybridStrictAffineHighRes->isChecked());
+    const bool reconstructionEnabled = wholeSceneEnabled && wholeSceneHybridMode &&
+        ui->cbWholeScene2DScaleHybridStrictAffineHighRes->isChecked();
+    affineReconstructionGroup->setEnabled(reconstructionEnabled);
+    const auto effectiveAlpha = melonDS::RendererSettings::ResolveAffineAlphaReconstruction(
+        melonDS::RendererSettings::GetAffineAlphaReconstruction(cfg.GetInt("3D.GL.HybridAffineAlpha")),
+        wholeSceneAlgorithm);
+    const auto automaticAlpha = melonDS::RendererSettings::ResolveAffineAlphaReconstruction(
+        melonDS::RendererSettings::AffineAlphaReconstruction::Automatic, wholeSceneAlgorithm);
+    affineAlphaCombo->setItemText(affineAlphaCombo->findData(5), tr("Automatic (%1)").arg(
+        affineAlphaCombo->itemText(affineAlphaCombo->findData(static_cast<int>(automaticAlpha)))));
+    nnedi3PremultipliedRGB->setEnabled(reconstructionEnabled &&
+        ui->cbWholeScene2DScaleHybridStrictAffineSourceEnhancement->isChecked() &&
+        melonDS::RendererSettings::IsGLNNEDI3Algorithm(wholeSceneAlgorithm) &&
+        effectiveAlpha ==
+            melonDS::RendererSettings::AffineAlphaReconstruction::NNEDI3);
+    ui->cbWholeScene2DScaleHybridStrictAffineConnectedSources->setEnabled(reconstructionEnabled);
+    ui->cbWholeScene2DScaleHybridStrictAffineOpaqueAssemblies->setEnabled(reconstructionEnabled);
+    ui->cbWholeScene2DScaleHybridStrictAffineTopTextBG->setEnabled(reconstructionEnabled &&
+        ui->cbWholeScene2DScaleHybridStrictAffineSourceEnhancement->isChecked());
+    ui->cbWholeScene2DScaleHybridStrictAffineMaskedOBJMLAA->setEnabled(
+        wholeSceneEnabled && wholeSceneHybridMode &&
+        ui->cbWholeScene2DScaleHybridStrictAffineHighRes->isChecked());
     ui->lblWholeScene2DScaleFinalUpscale3DFilter->setEnabled(wholeSceneFinal3DResolve);
     ui->cbxWholeScene2DScaleFinalUpscale3DFilter->setEnabled(wholeSceneFinal3DResolve);
     ui->cbxComputeHiResCoords->setEnabled(renderer == renderer3D_OpenGLCompute);
     ui->cbGLMSAA->setEnabled(UsesGL());
 
-    ui->scrollAreaWidgetContentsOpenGLRenderer->setMinimumHeight(ui->groupBox_3->sizeHint().height());
+    updateTabVisibility(ui->cbAdvancedVideoSettings->isChecked());
 }
 
 void VideoSettingsDialog::applyTexture2DAtlasProtection(bool enabled)
@@ -447,6 +611,9 @@ void VideoSettingsDialog::applyTexture2DAtlasProtection(bool enabled)
     cfg.SetBool("3D.GL.TextureFilterTranslucentGuard", enabled);
     cfg.SetBool("3D.GL.TextureFilterSpriteUVInset", enabled);
     cfg.SetBool("3D.GL.TextureScalingEdgeExtendUnusedMargins", enabled);
+    cfg.SetBool("3D.GL.ReconstructCompatible3D", enabled);
+    cfg.SetBool("3D.GL.ReconstructCompatible3DEdgeContext", enabled);
+    cfg.SetBool("3D.GL.ReconstructCompatible3DFractionalAlpha", enabled);
 
     {
         QSignalBlocker blocker(ui->cb3DTextureFilterSmart2D);
@@ -464,6 +631,13 @@ void VideoSettingsDialog::applyTexture2DAtlasProtection(bool enabled)
         QSignalBlocker blocker(ui->cb3DTextureScalingEdgeExtendUnusedMargins);
         ui->cb3DTextureScalingEdgeExtendUnusedMargins->setChecked(enabled);
     }
+    for (auto* checkbox : {ui->cbReconstructCompatible3D,
+                           ui->cbReconstructCompatible3DEdgeContext,
+                           ui->cbReconstructCompatible3DFractionalAlpha})
+    {
+        QSignalBlocker blocker(checkbox);
+        checkbox->setChecked(enabled);
+    }
     {
         QSignalBlocker blocker(ui->cb3DTexture2DAtlasProtection);
         ui->cb3DTexture2DAtlasProtection->setChecked(enabled);
@@ -476,10 +650,13 @@ void VideoSettingsDialog::syncTexture2DAtlasProtectionCheckbox()
         static_cast<int>(ui->cb3DTextureFilterSmart2D->isChecked()) +
         static_cast<int>(ui->cb3DTextureFilterTranslucentGuard->isChecked()) +
         static_cast<int>(ui->cb3DTextureFilterSpriteUVInset->isChecked()) +
-        static_cast<int>(ui->cb3DTextureScalingEdgeExtendUnusedMargins->isChecked());
+        static_cast<int>(ui->cb3DTextureScalingEdgeExtendUnusedMargins->isChecked()) +
+        static_cast<int>(ui->cbReconstructCompatible3D->isChecked()) +
+        static_cast<int>(ui->cbReconstructCompatible3DEdgeContext->isChecked()) +
+        static_cast<int>(ui->cbReconstructCompatible3DFractionalAlpha->isChecked());
     const Qt::CheckState state =
         enabledCount == 0 ? Qt::Unchecked :
-        enabledCount == 4 ? Qt::Checked :
+        enabledCount == 7 ? Qt::Checked :
         Qt::PartiallyChecked;
 
     QSignalBlocker blocker(ui->cb3DTexture2DAtlasProtection);
@@ -489,6 +666,7 @@ void VideoSettingsDialog::syncTexture2DAtlasProtectionCheckbox()
 VideoSettingsDialog::VideoSettingsDialog(QWidget* parent) : QDialog(parent), ui(new Ui::VideoSettingsDialog)
 {
     ui->setupUi(this);
+    setupEnhancementSections();
     setAttribute(Qt::WA_DeleteOnClose);
     ui->cb3DTexture2DAtlasProtection->setTristate(true);
 
@@ -510,7 +688,93 @@ VideoSettingsDialog::VideoSettingsDialog(QWidget* parent) : QDialog(parent), ui(
 
     emuInstance = ((MainWindow*)parent)->getEmuInstance();
     auto& cfg = emuInstance->getGlobalConfig();
+    computeShadersAvailable = static_cast<MainWindow*>(parent)->supportsComputeShaders();
+    // Normalize before taking Cancel snapshots, so neither the dialog nor its
+    // Cancel action can restore options that this context cannot execute.
+    Config::ConstrainVideoSettings(cfg, computeShadersAvailable);
+    auto* wideGroup = new QGroupBox(tr("Widescreen"), this);
+    auto* wideLayout = new QVBoxLayout(wideGroup);
+    widescreenCombo = new QComboBox(wideGroup);
+    widescreenCombo->addItem(tr("Off (native 4:3)"), 256);
+    widescreenCombo->addItem(tr("16:10"), 308);
+    widescreenCombo->addItem(tr("16:9"), 342);
+    widescreenCombo->addItem(tr("21:9"), 448);
+    widescreenCombo->addItem(tr("32:9"), 682);
+    widescreenCombo->addItem(tr("3:4 (rotated games)"), -342);
+    widescreenCombo->addItem(tr("9:16 (rotated games)"), -456);
+    const int wideHeight = WideMelon::ValidateHeight(cfg.GetInt("3D.GL.WidescreenHeight"));
+    widescreenCombo->setCurrentIndex(std::max(0, widescreenCombo->findData(wideHeight > 192 ? -wideHeight : cfg.GetInt("3D.GL.WidescreenWidth"))));
+    widescreenCombo->setWhatsThis(tr("Reveals additional 3D scenery at the sides in compatible games. "
+        "Works with Classic OpenGL or Compute and keeps 2D content centered on the selected displays. "
+        "Some games hide off-screen objects or use effects that cannot extend beyond the original screen. "
+        "The 3:4 and 9:16 options extend the scene vertically for rotated games. After a 90-degree screen rotation, these appear as 4:3 and 16:9. "
+        "Set screen rotation separately. Reset or reopen the game to apply changes. Off restores normal renderer selection."));
+    wideLayout->addWidget(widescreenCombo);
+    auto* displayRow = new QHBoxLayout;
+    auto* displayLabel = new QLabel(tr("Display:"), wideGroup);
+    widescreenDisplayCombo = new QComboBox(wideGroup);
+    widescreenDisplayCombo->addItem(tr("Top"), WideMelon::Top);
+    widescreenDisplayCombo->addItem(tr("Bottom"), WideMelon::Bottom);
+    widescreenDisplayCombo->addItem(tr("Both"), WideMelon::Both);
+    widescreenDisplayCombo->setCurrentIndex(WideMelon::ValidateDisplayTarget(cfg.GetInt("3D.GL.WidescreenDisplay")));
+    widescreenDisplayCombo->setWhatsThis(tr("Choose which physical display can show the extra 3D scenery. "
+        "Both is useful for games that move 3D between displays; it does not duplicate the scene. "
+        "Some images copied by the game and other 2D artwork still keep their original size. "
+        "On a wide bottom display, touch controls stay in the original center area. Reset or reopen the game to apply changes."));
+    displayLabel->setBuddy(widescreenDisplayCombo);
+    displayLabel->setWhatsThis(widescreenDisplayCombo->whatsThis());
+    displayRow->addWidget(displayLabel);
+    displayRow->addWidget(widescreenDisplayCombo, 1);
+    wideLayout->addLayout(displayRow);
+    widescreenExtendWindows = new QCheckBox(tr("Extend screen masks and transitions"), wideGroup);
+    widescreenExtendWindows->setChecked(cfg.GetBool("3D.GL.WidescreenExtendWindows"));
+    widescreenExtendWindows->setWhatsThis(tr("Extend supported screen masks, the areas a game hides, and solid transition effects into the extra screen area. "
+        "Uses the same rules across games, but cannot extend every effect. "
+        "Disable this if borders or transitions look wrong. Without it, masked scenes may have black margins. "
+        "Reset or reopen the game to apply changes."));
+    wideLayout->addWidget(widescreenExtendWindows);
+    widescreenExpandNarrowBorders = new QCheckBox(tr("Expand scenes behind narrow borders"), wideGroup);
+    widescreenExpandNarrowBorders->setChecked(cfg.GetBool("3D.GL.WidescreenExpandNarrowBorders"));
+    widescreenExpandNarrowBorders->setWhatsThis(tr("Try this when a 3D scene stays inside black side borders with widescreen enabled. "
+        "Reveals scenery behind some thin borders without stretching logos or other 2D artwork. "
+        "May reveal unintended scenery or effects outside the original picture. "
+        "Turn it off if borders or transitions look wrong. Requires Extend screen masks and transitions, "
+        "and works with regular and rotated-game aspect ratios. Reset or reopen the game to apply changes."));
+    wideLayout->addWidget(widescreenExpandNarrowBorders);
+    auto updateNarrowBorders = [this] {
+        widescreenExpandNarrowBorders->setEnabled(widescreenCombo->currentData().toInt() != 256 &&
+            widescreenExtendWindows->isChecked());
+    };
+    updateNarrowBorders();
+    connect(widescreenExtendWindows, &QCheckBox::toggled, this, updateNarrowBorders);
+    connect(widescreenCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this, updateNarrowBorders);
+    widescreenExtendWindows->setEnabled(widescreenCombo->currentData().toInt() != 256);
+    widescreenDisplayCombo->setEnabled(widescreenCombo->currentData().toInt() != 256);
+    connect(widescreenCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int) {
+        widescreenDisplayCombo->setEnabled(widescreenCombo->currentData().toInt() != 256);
+        widescreenExtendWindows->setEnabled(widescreenCombo->currentData().toInt() != 256);
+    });
+    auto* wideRestartHelp = new QLabel(tr("Reset or reopen the game to apply changes. Supports Classic OpenGL and Compute."), wideGroup);
+    wideRestartHelp->setWordWrap(true);
+    wideRestartHelp->setToolTip(tr("With multiple emulator instances open, close the other instances before resetting to apply widescreen changes."));
+    wideRestartHelp->setWhatsThis(wideRestartHelp->toolTip());
+    wideLayout->addWidget(wideRestartHelp);
+    // Enhancement setup already occupies the diagnostics rows. Append this
+    // independent section so expanding diagnostics cannot overlap it.
+    ui->gridLayout_4->addWidget(wideGroup, ui->gridLayout_4->rowCount(), 0);
     oldAdvancedVideoSettings = cfg.GetBool("3D.GL.AdvancedVideoSettings");
+    oldAffineAlpha = cfg.GetInt("3D.GL.HybridAffineAlpha");
+    oldAffineSampling = cfg.GetInt("3D.GL.HybridAffineSampling");
+    oldNNEDI3PremultipliedRGB = cfg.GetBool("3D.GL.HybridNNEDI3PremultipliedRGB");
+    {
+        QSignalBlocker blocker(nnedi3PremultipliedRGB);
+        nnedi3PremultipliedRGB->setChecked(oldNNEDI3PremultipliedRGB);
+    }
+    {
+        QSignalBlocker a(affineAlphaCombo), b(affineSamplingCombo);
+        affineAlphaCombo->setCurrentIndex(affineAlphaCombo->findData(oldAffineAlpha));
+        affineSamplingCombo->setCurrentIndex(affineSamplingCombo->findData(oldAffineSampling));
+    }
     {
         QSignalBlocker blocker(ui->cbAdvancedVideoSettings);
         ui->cbAdvancedVideoSettings->setChecked(oldAdvancedVideoSettings != 0);
@@ -570,15 +834,12 @@ VideoSettingsDialog::VideoSettingsDialog(QWidget* parent) : QDialog(parent), ui(
     oldTextureScaling.NativeMipFloor = cfg.GetBool("3D.GL.TextureScalingNativeMipFloor");
     oldTextureScaling.SourceMips = cfg.GetBool("3D.GL.TextureScalingSourceMips");
     oldTextureScaling.EdgeExtendUnusedMargins = cfg.GetBool("3D.GL.TextureScalingEdgeExtendUnusedMargins");
+    oldTextureScaling.ReconstructCompatible3D = cfg.GetBool("3D.GL.ReconstructCompatible3D");
+    oldTextureScaling.ReconstructCompatible3DEdgeContext = cfg.GetBool("3D.GL.ReconstructCompatible3DEdgeContext");
+    oldTextureScaling.ReconstructCompatible3DFractionalAlpha = cfg.GetBool("3D.GL.ReconstructCompatible3DFractionalAlpha");
     oldTextureScaling.LegacyAlphaHandling = cfg.GetBool("3D.GL.TextureScalingLegacyAlphaHandling");
     oldTextureScaling.QualityAlphaHandling = cfg.GetBool("3D.GL.TextureScalingQualityAlphaHandling");
-    oldTextureScaling.AlphaXBRZ = cfg.GetBool("3D.GL.TextureScalingAlphaXBRZ");
-    oldTextureScaling.Spline36Alpha = cfg.GetBool("3D.GL.TextureScalingSpline36Alpha");
-    if (oldTextureScaling.AlphaXBRZ && oldTextureScaling.Spline36Alpha)
-    {
-        oldTextureScaling.Spline36Alpha = false;
-        cfg.SetBool("3D.GL.TextureScalingSpline36Alpha", false);
-    }
+    oldTextureScaling.Alpha = cfg.GetInt("3D.GL.TextureScalingAlpha");
     oldWholeScene2D.Enabled = cfg.GetBool("3D.GL.WholeScene2DScale");
     oldWholeScene2D.SourceBoundaryGuard = cfg.GetBool("3D.GL.WholeScene2DScaleSourceBoundaryGuard");
     oldWholeScene2D.Mode = melonDS::RendererSettings::GetWholeScene2DScaleModeIndex(
@@ -604,6 +865,12 @@ VideoSettingsDialog::VideoSettingsDialog(QWidget* parent) : QDialog(parent), ui(
     oldWholeScene2D.HybridNativeEffectGuard = cfg.GetBool("3D.GL.WholeScene2DScaleHybridNativeEffectGuard");
     oldWholeScene2D.HybridForeground2DBase = cfg.GetBool("3D.GL.WholeScene2DScaleHybridForeground2DBase");
     oldWholeScene2D.HybridCleanLegacyCandidate = cfg.GetBool("3D.GL.WholeScene2DScaleHybridCleanLegacyCandidate");
+    oldWholeScene2D.HybridStrictAffineHighRes = cfg.GetBool("3D.GL.WholeScene2DScaleHybridStrictAffineHighRes");
+    oldWholeScene2D.HybridStrictAffineSourceEnhancement = cfg.GetBool("3D.GL.WholeScene2DScaleHybridStrictAffineSourceEnhancement");
+    oldWholeScene2D.HybridStrictAffineConnectedSources = cfg.GetBool("3D.GL.WholeScene2DScaleHybridStrictAffineConnectedSources");
+    oldWholeScene2D.HybridStrictAffineOpaqueAssemblies = cfg.GetBool("3D.GL.WholeScene2DScaleHybridStrictAffineOpaqueAssemblies");
+    oldWholeScene2D.HybridStrictAffineTopTextBG = cfg.GetBool("3D.GL.WholeScene2DScaleHybridStrictAffineTopTextBG");
+    oldWholeScene2D.HybridStrictAffineMaskedOBJMLAA = cfg.GetBool("3D.GL.WholeScene2DScaleHybridStrictAffineMaskedOBJMLAA");
     oldHiresCoordinates = cfg.GetBool("3D.GL.HiresCoordinates");
     oldGLMSAA = cfg.GetBool("3D.GL.MSAA");
 
@@ -616,15 +883,19 @@ VideoSettingsDialog::VideoSettingsDialog(QWidget* parent) : QDialog(parent), ui(
 #else
     connect(grp3DRenderer, SIGNAL(idClicked(int)), this, SLOT(onChange3DRenderer(int)));
 #endif
-    grp3DRenderer->button(oldRenderer)->setChecked(true);
+    grp3DRenderer->button(WideMelon::Enabled() && oldRenderer == renderer3D_Software
+        ? renderer3D_OpenGL : oldRenderer)->setChecked(true);
+    if (WideMelon::Enabled())
+    {
+        ui->rb3DSoftware->setEnabled(false);
+        ui->rb3DSoftware->setWhatsThis(tr("Widescreen requires Classic OpenGL or Compute. Turn widescreen off and reset or reopen the game to use Software."));
+    }
 
 #ifndef OGLRENDERER_ENABLED
     ui->rb3DOpenGL->setEnabled(false);
 #endif
 
-#ifdef __APPLE__
-    ui->rb3DCompute->setEnabled(false);
-#endif
+    ui->rb3DCompute->setEnabled(computeShadersAvailable);
 
     ui->cbGLDisplay->setChecked(oldGLDisplay != 0);
 
@@ -660,10 +931,15 @@ VideoSettingsDialog::VideoSettingsDialog(QWidget* parent) : QDialog(parent), ui(
     ui->cb3DTextureScalingNativeMipFloor->setChecked(oldTextureScaling.NativeMipFloor != 0);
     ui->cb3DTextureScalingSourceMips->setChecked(oldTextureScaling.SourceMips != 0);
     ui->cb3DTextureScalingEdgeExtendUnusedMargins->setChecked(oldTextureScaling.EdgeExtendUnusedMargins != 0);
+    ui->cbReconstructCompatible3D->setChecked(oldTextureScaling.ReconstructCompatible3D != 0);
+    ui->cbReconstructCompatible3DEdgeContext->setChecked(oldTextureScaling.ReconstructCompatible3DEdgeContext != 0);
+    ui->cbReconstructCompatible3DFractionalAlpha->setChecked(oldTextureScaling.ReconstructCompatible3DFractionalAlpha != 0);
     ui->cb3DTextureScalingLegacyAlphaHandling->setChecked(oldTextureScaling.LegacyAlphaHandling != 0);
     ui->cb3DTextureScalingQualityAlphaHandling->setChecked(oldTextureScaling.QualityAlphaHandling != 0);
-    ui->cb3DTextureScalingAlphaXBRZ->setChecked(oldTextureScaling.AlphaXBRZ != 0);
-    ui->cb3DTextureScalingSpline36Alpha->setChecked(oldTextureScaling.Spline36Alpha != 0);
+    {
+        QSignalBlocker blocker(ui->cb3DTextureScalingAlphaXBRZ);
+        ui->cb3DTextureScalingAlphaXBRZ->setChecked(oldTextureScaling.Alpha == 3);
+    }
     syncTexture2DAtlasProtectionCheckbox();
     ui->cbWholeScene2DScale->setChecked(oldWholeScene2D.Enabled != 0);
     ui->cbWholeScene2DScaleSourceBoundaryGuard->setChecked(oldWholeScene2D.SourceBoundaryGuard != 0);
@@ -686,6 +962,20 @@ VideoSettingsDialog::VideoSettingsDialog(QWidget* parent) : QDialog(parent), ui(
     ui->cbWholeScene2DScaleHybridNativeEffectGuard->setChecked(oldWholeScene2D.HybridNativeEffectGuard != 0);
     ui->cbWholeScene2DScaleHybridForeground2DBase->setChecked(oldWholeScene2D.HybridForeground2DBase != 0);
     ui->cbWholeScene2DScaleHybridCleanLegacyCandidate->setChecked(oldWholeScene2D.HybridCleanLegacyCandidate != 0);
+    {
+        QSignalBlocker blocker(ui->cbWholeScene2DScaleHybridStrictAffineHighRes);
+        ui->cbWholeScene2DScaleHybridStrictAffineHighRes->setChecked(oldWholeScene2D.HybridStrictAffineHighRes != 0);
+    }
+    ui->cbWholeScene2DScaleHybridStrictAffineSourceEnhancement->setChecked(
+        oldWholeScene2D.HybridStrictAffineSourceEnhancement != 0);
+    ui->cbWholeScene2DScaleHybridStrictAffineConnectedSources->setChecked(
+        oldWholeScene2D.HybridStrictAffineConnectedSources != 0);
+    ui->cbWholeScene2DScaleHybridStrictAffineOpaqueAssemblies->setChecked(
+        oldWholeScene2D.HybridStrictAffineOpaqueAssemblies != 0);
+    ui->cbWholeScene2DScaleHybridStrictAffineTopTextBG->setChecked(
+        oldWholeScene2D.HybridStrictAffineTopTextBG != 0);
+    ui->cbWholeScene2DScaleHybridStrictAffineMaskedOBJMLAA->setChecked(
+        oldWholeScene2D.HybridStrictAffineMaskedOBJMLAA != 0);
     SetFinalUpscale3DFilterCombo(ui->cbxWholeScene2DScaleFinalUpscale3DFilter, oldWholeScene2D.FinalUpscale3DFilter);
     ui->cbxComputeHiResCoords->setChecked(oldHiresCoordinates != 0);
     ui->cbGLMSAA->setChecked(oldGLMSAA != 0);
@@ -694,8 +984,33 @@ VideoSettingsDialog::VideoSettingsDialog(QWidget* parent) : QDialog(parent), ui(
         ui->sbVSyncInterval->setEnabled(false);
     setVsyncControlEnable(UsesGL());
 
+    setupTabbedLayout(wideGroup);
+    configureComputeOptions();
     setEnabled();
-    resize(1066, 835);
+}
+
+void VideoSettingsDialog::configureComputeOptions()
+{
+    if (computeShadersAvailable) return;
+    const QString help = tr("Requires compute shader support, which is unavailable here. Use Spline36 or xBRZ for color, and a non-neural transparency option.");
+    auto disable = [&help](QComboBox* combo, int index)
+    {
+        auto* model = qobject_cast<QStandardItemModel*>(combo->model());
+        if (!model || index < 0) return;
+        model->item(index)->setEnabled(false);
+        combo->setItemText(index, tr("%1 (requires compute shaders)").arg(combo->itemText(index)));
+        combo->setItemData(index, help, Qt::ToolTipRole);
+        combo->setItemData(index, help, Qt::WhatsThisRole);
+    };
+    for (auto* combo : {ui->cbx3DTextureScalingAlgorithm, ui->cbxWholeScene2DScaleAlgorithm})
+        for (int i = 0; i < combo->count(); ++i)
+            if (melonDS::RendererSettings::ScaleAlgorithmRequiresCompute(
+                    melonDS::RendererSettings::GetGLScaleAlgorithm(combo->itemData(i).toInt())))
+                disable(combo, i);
+    disable(textureAlphaCombo, textureAlphaCombo->findData(
+        static_cast<int>(melonDS::RendererSettings::TextureAlpha::NNEDI3)));
+    disable(affineAlphaCombo, affineAlphaCombo->findData(
+        static_cast<int>(melonDS::RendererSettings::AffineAlphaReconstruction::NNEDI3)));
 }
 
 VideoSettingsDialog::~VideoSettingsDialog()
@@ -705,6 +1020,12 @@ VideoSettingsDialog::~VideoSettingsDialog()
 
 void VideoSettingsDialog::on_VideoSettingsDialog_accepted()
 {
+    const int wideChoice = widescreenCombo->currentData().toInt();
+    emuInstance->getGlobalConfig().SetInt("3D.GL.WidescreenWidth", wideChoice < 0 ? 256 : wideChoice);
+    emuInstance->getGlobalConfig().SetInt("3D.GL.WidescreenHeight", wideChoice < 0 ? -wideChoice : 192);
+    emuInstance->getGlobalConfig().SetInt("3D.GL.WidescreenDisplay", widescreenDisplayCombo->currentData().toInt());
+    emuInstance->getGlobalConfig().SetBool("3D.GL.WidescreenExtendWindows", widescreenExtendWindows->isChecked());
+    emuInstance->getGlobalConfig().SetBool("3D.GL.WidescreenExpandNarrowBorders", widescreenExpandNarrowBorders->isChecked());
     Config::Save();
 
     closeDlg();
@@ -712,6 +1033,14 @@ void VideoSettingsDialog::on_VideoSettingsDialog_accepted()
 
 void VideoSettingsDialog::on_VideoSettingsDialog_rejected()
 {
+    auto* window = static_cast<MainWindow*>(parentWidget());
+    auto& windowCfg = window->getWindowConfig();
+    windowCfg.SetBool("ScreenFilter", oldScreenFilter);
+    windowCfg.SetBool("ScreenSharpen", oldScreenSharpen);
+    windowCfg.SetInt("ScreenSharpenStrength", oldScreenSharpenStrength);
+    windowCfg.SetBool("ScreenLCDGhosting", oldScreenGhosting);
+    windowCfg.SetInt("ScreenLCDGhostingMode", oldScreenGhostingMode);
+    window->refreshScreenPresentationSettings();
     if (!((MainWindow*)parent())->getEmuInstance())
     {
         closeDlg();
@@ -747,10 +1076,12 @@ void VideoSettingsDialog::on_VideoSettingsDialog_rejected()
     cfg.SetBool("3D.GL.TextureScalingNativeMipFloor", oldTextureScaling.NativeMipFloor);
     cfg.SetBool("3D.GL.TextureScalingSourceMips", oldTextureScaling.SourceMips);
     cfg.SetBool("3D.GL.TextureScalingEdgeExtendUnusedMargins", oldTextureScaling.EdgeExtendUnusedMargins);
+    cfg.SetBool("3D.GL.ReconstructCompatible3D", oldTextureScaling.ReconstructCompatible3D);
+    cfg.SetBool("3D.GL.ReconstructCompatible3DEdgeContext", oldTextureScaling.ReconstructCompatible3DEdgeContext);
+    cfg.SetBool("3D.GL.ReconstructCompatible3DFractionalAlpha", oldTextureScaling.ReconstructCompatible3DFractionalAlpha);
     cfg.SetBool("3D.GL.TextureScalingLegacyAlphaHandling", oldTextureScaling.LegacyAlphaHandling);
     cfg.SetBool("3D.GL.TextureScalingQualityAlphaHandling", oldTextureScaling.QualityAlphaHandling);
-    cfg.SetBool("3D.GL.TextureScalingAlphaXBRZ", oldTextureScaling.AlphaXBRZ);
-    cfg.SetBool("3D.GL.TextureScalingSpline36Alpha", oldTextureScaling.Spline36Alpha);
+    cfg.SetInt("3D.GL.TextureScalingAlpha", oldTextureScaling.Alpha);
     cfg.SetBool("3D.GL.WholeScene2DScale", oldWholeScene2D.Enabled);
     cfg.SetBool("3D.GL.WholeScene2DScaleSourceBoundaryGuard", oldWholeScene2D.SourceBoundaryGuard);
     cfg.SetInt("3D.GL.WholeScene2DScaleMode", oldWholeScene2D.Mode);
@@ -773,6 +1104,15 @@ void VideoSettingsDialog::on_VideoSettingsDialog_rejected()
     cfg.SetBool("3D.GL.WholeScene2DScaleHybridNativeEffectGuard", oldWholeScene2D.HybridNativeEffectGuard);
     cfg.SetBool("3D.GL.WholeScene2DScaleHybridForeground2DBase", oldWholeScene2D.HybridForeground2DBase);
     cfg.SetBool("3D.GL.WholeScene2DScaleHybridCleanLegacyCandidate", oldWholeScene2D.HybridCleanLegacyCandidate);
+    cfg.SetBool("3D.GL.WholeScene2DScaleHybridStrictAffineHighRes", oldWholeScene2D.HybridStrictAffineHighRes);
+    cfg.SetInt("3D.GL.HybridAffineAlpha", oldAffineAlpha);
+    cfg.SetInt("3D.GL.HybridAffineSampling", oldAffineSampling);
+    cfg.SetBool("3D.GL.HybridNNEDI3PremultipliedRGB", oldNNEDI3PremultipliedRGB);
+    cfg.SetBool("3D.GL.WholeScene2DScaleHybridStrictAffineSourceEnhancement", oldWholeScene2D.HybridStrictAffineSourceEnhancement);
+    cfg.SetBool("3D.GL.WholeScene2DScaleHybridStrictAffineConnectedSources", oldWholeScene2D.HybridStrictAffineConnectedSources);
+    cfg.SetBool("3D.GL.WholeScene2DScaleHybridStrictAffineOpaqueAssemblies", oldWholeScene2D.HybridStrictAffineOpaqueAssemblies);
+    cfg.SetBool("3D.GL.WholeScene2DScaleHybridStrictAffineTopTextBG", oldWholeScene2D.HybridStrictAffineTopTextBG);
+    cfg.SetBool("3D.GL.WholeScene2DScaleHybridStrictAffineMaskedOBJMLAA", oldWholeScene2D.HybridStrictAffineMaskedOBJMLAA);
     cfg.SetBool("3D.GL.HiresCoordinates", oldHiresCoordinates);
     cfg.SetBool("3D.GL.MSAA", oldGLMSAA);
 
@@ -789,21 +1129,16 @@ void VideoSettingsDialog::setVsyncControlEnable(bool hasOGL)
 
 void VideoSettingsDialog::applyRecommendedDefaults()
 {
-    const bool textureFiltering = ReadAnisotropyCombo(ui->cbx3DTextureAnisotropy) > 1;
-    const bool textureScaling = ui->cb3DTextureScaling->isChecked();
-    const bool wholeScene2DScaling = ui->cbWholeScene2DScale->isChecked();
-
+    if (!computeShadersAvailable && ui->rb3DOpenGL->isEnabled() && !ui->rb3DOpenGL->isChecked())
+        ui->rb3DOpenGL->click();
     auto& cfg = emuInstance->getGlobalConfig();
-    const int renderer = cfg.GetInt("3D.Renderer");
-    const bool classicRenderer = renderer == renderer3D_OpenGL;
     cfg.SetInt("3D.GL.ScaleFactor", 4);
     cfg.SetBool("3D.GL.BetterPolygons", true);
     cfg.SetBool("3D.GL.ReadableTextureCache", false);
     cfg.SetBool("3D.GL.HiresCoordinates", true);
     cfg.SetBool("3D.GL.MSAA", false);
 
-    if (textureFiltering)
-        cfg.SetInt("3D.GL.TextureAnisotropy", 16);
+    cfg.SetInt("3D.GL.TextureAnisotropy", 4);
     cfg.SetInt("3D.GL.TextureFilterMipDepth",
                melonDS::RendererSettings::GetTextureFilterMipDepthIndex(TextureFilterMipDepth::Min32));
     cfg.SetBool("3D.GL.TextureFilterBinaryAlphaHandling", true);
@@ -811,17 +1146,18 @@ void VideoSettingsDialog::applyRecommendedDefaults()
     cfg.SetBool("3D.GL.TextureFilterMipmapPremultipliedAlphaHandling", false);
     cfg.SetBool("3D.GL.TextureFilterMipmapSubrectHandling", false);
 
-    cfg.SetBool("3D.GL.TextureScaling", textureScaling);
+    cfg.SetBool("3D.GL.TextureScaling", false);
     cfg.SetBool("3D.GL.TextureScalingLegacyAlphaHandling", false);
     cfg.SetBool("3D.GL.TextureScalingQualityAlphaHandling", false);
-    cfg.SetBool("3D.GL.TextureScalingAlphaXBRZ", false);
-    cfg.SetBool("3D.GL.TextureScalingSpline36Alpha", false);
+    cfg.SetInt("3D.GL.TextureScalingAlpha", 0);
     cfg.SetBool("3D.GL.TextureScalingFrequentChangePolicy", true);
     cfg.SetBool("3D.GL.TextureScalingDeferred", false);
     cfg.SetBool("3D.GL.TextureScalingNativeMipFloor", false);
     cfg.SetBool("3D.GL.TextureScalingSourceMips", false);
 
-    cfg.SetBool("3D.GL.WholeScene2DScale", wholeScene2DScaling);
+    cfg.SetBool("3D.GL.WholeScene2DScale", true);
+    const int screenAlgorithm = melonDS::RendererSettings::GetGLScaleAlgorithmIndex(GLScaleAlgorithm::Spline36);
+    WriteScaleAlgorithmConfig(cfg, "3D.GL.WholeScene2DScaleAlgorithm", screenAlgorithm, true);
     cfg.SetBool("3D.GL.WholeScene2DScaleSourceBoundaryGuard", false);
     cfg.SetInt("3D.GL.WholeScene2DScaleMode",
                melonDS::RendererSettings::GetWholeScene2DScaleModeIndex(
@@ -848,6 +1184,16 @@ void VideoSettingsDialog::applyRecommendedDefaults()
     cfg.SetBool("3D.GL.WholeScene2DScaleHybridNativeEffectGuard", false);
     cfg.SetBool("3D.GL.WholeScene2DScaleHybridForeground2DBase", true);
     cfg.SetBool("3D.GL.WholeScene2DScaleHybridCleanLegacyCandidate", true);
+    cfg.SetBool("3D.GL.WholeScene2DScaleHybridStrictAffineHighRes", true);
+    cfg.SetBool("3D.GL.WholeScene2DScaleHybridStrictAffineSourceEnhancement", true);
+    cfg.SetBool("3D.GL.WholeScene2DScaleHybridStrictAffineConnectedSources", true);
+    cfg.SetBool("3D.GL.WholeScene2DScaleHybridStrictAffineOpaqueAssemblies", true);
+    cfg.SetBool("3D.GL.WholeScene2DScaleHybridStrictAffineTopTextBG", true);
+    cfg.SetBool("3D.GL.WholeScene2DScaleHybridStrictAffineMaskedOBJMLAA", false);
+    cfg.SetInt("3D.GL.HybridAffineAlpha", 5);
+    cfg.SetInt("3D.GL.HybridAffineSampling", 0);
+    cfg.SetBool("3D.GL.HybridNNEDI3PremultipliedRGB", false);
+    nnedi3PremultipliedRGB->setChecked(false);
 
     auto setChecked = [](auto* widget, bool checked)
     {
@@ -860,16 +1206,17 @@ void VideoSettingsDialog::applyRecommendedDefaults()
         combo->setCurrentIndex(index);
     };
 
+    setComboIndex(affineAlphaCombo, affineAlphaCombo->findData(5));
+    setComboIndex(affineSamplingCombo, affineSamplingCombo->findData(0));
     setComboIndex(ui->cbxGLResolution, 3);
     setChecked(ui->cbBetterPolygons, true);
     setChecked(ui->cbReadable3DTextureCache, false);
     setChecked(ui->cbxComputeHiResCoords, true);
     setChecked(ui->cbGLMSAA, false);
 
-    if (textureFiltering)
     {
         QSignalBlocker blocker(ui->cbx3DTextureAnisotropy);
-        SetAnisotropyCombo(ui->cbx3DTextureAnisotropy, 16);
+        SetAnisotropyCombo(ui->cbx3DTextureAnisotropy, 4);
     }
     {
         QSignalBlocker blocker(ui->cbx3DTextureFilterMipDepth);
@@ -882,17 +1229,21 @@ void VideoSettingsDialog::applyRecommendedDefaults()
     setChecked(ui->cb3DTextureFilterMipmapTopologyHandling, false);
     setChecked(ui->cb3DTextureFilterMipmapSubrectHandling, false);
 
-    setChecked(ui->cb3DTextureScaling, textureScaling);
+    applyTexture2DAtlasProtection(false);
+    setChecked(ui->cb3DTextureScaling, false);
     setChecked(ui->cb3DTextureScalingLegacyAlphaHandling, false);
     setChecked(ui->cb3DTextureScalingQualityAlphaHandling, false);
-    setChecked(ui->cb3DTextureScalingAlphaXBRZ, false);
-    setChecked(ui->cb3DTextureScalingSpline36Alpha, false);
+    setTextureAlpha(0);
     setChecked(ui->cb3DTextureScalingFrequentChangePolicy, true);
     setChecked(ui->cb3DTextureScalingDeferred, false);
     setChecked(ui->cb3DTextureScalingNativeMipFloor, false);
     setChecked(ui->cb3DTextureScalingSourceMips, false);
 
-    setChecked(ui->cbWholeScene2DScale, wholeScene2DScaling);
+    setChecked(ui->cbWholeScene2DScale, true);
+    {
+        QSignalBlocker blocker(ui->cbxWholeScene2DScaleAlgorithm);
+        SetScaleAlgorithmCombo(ui->cbxWholeScene2DScaleAlgorithm, screenAlgorithm);
+    }
     setChecked(ui->cbWholeScene2DScaleSourceBoundaryGuard, false);
     {
         QSignalBlocker blocker(ui->cbxWholeScene2DScaleMode);
@@ -931,6 +1282,20 @@ void VideoSettingsDialog::applyRecommendedDefaults()
     setChecked(ui->cbWholeScene2DScaleHybridNativeEffectGuard, false);
     setChecked(ui->cbWholeScene2DScaleHybridForeground2DBase, true);
     setChecked(ui->cbWholeScene2DScaleHybridCleanLegacyCandidate, true);
+    setChecked(ui->cbWholeScene2DScaleHybridStrictAffineHighRes, true);
+    setChecked(ui->cbWholeScene2DScaleHybridStrictAffineSourceEnhancement, true);
+    setChecked(ui->cbWholeScene2DScaleHybridStrictAffineConnectedSources, true);
+    setChecked(ui->cbWholeScene2DScaleHybridStrictAffineOpaqueAssemblies, true);
+    setChecked(ui->cbWholeScene2DScaleHybridStrictAffineTopTextBG, true);
+    setChecked(ui->cbWholeScene2DScaleHybridStrictAffineMaskedOBJMLAA, false);
+
+    // Widescreen options are saved on OK. Let the signal update the dependent
+    // narrow-border control, without changing its selected value.
+    widescreenExtendWindows->setChecked(true);
+
+    auto* window = static_cast<MainWindow*>(parentWidget());
+    window->getWindowConfig().SetBool("ScreenFilter", true);
+    window->refreshScreenPresentationSettings();
 
     setVsyncControlEnable(UsesGL());
     setEnabled();
@@ -939,6 +1304,7 @@ void VideoSettingsDialog::applyRecommendedDefaults()
 
 void VideoSettingsDialog::onChange3DRenderer(int renderer)
 {
+    if (WideMelon::Enabled() && renderer == renderer3D_Software) return;
     bool old_gl = UsesGL();
 
     auto& cfg = emuInstance->getGlobalConfig();
@@ -1150,34 +1516,24 @@ void VideoSettingsDialog::on_cb3DTextureScalingQualityAlphaHandling_stateChanged
     emit updateVideoSettings(false);
 }
 
-void VideoSettingsDialog::on_cb3DTextureScalingAlphaXBRZ_stateChanged(int state)
+void VideoSettingsDialog::setTextureAlpha(int value)
 {
+    value = static_cast<int>(melonDS::RendererSettings::GetTextureAlpha(value));
     auto& cfg = emuInstance->getGlobalConfig();
-    const bool enabled = state != 0;
-    cfg.SetBool("3D.GL.TextureScalingAlphaXBRZ", enabled);
-    if (enabled && ui->cb3DTextureScalingSpline36Alpha->isChecked())
+    cfg.SetInt("3D.GL.TextureScalingAlpha", value);
+    QSignalBlocker checkBlock(ui->cb3DTextureScalingAlphaXBRZ);
+    ui->cb3DTextureScalingAlphaXBRZ->setChecked(value == 3);
+    if (textureAlphaCombo)
     {
-        QSignalBlocker blocker(ui->cb3DTextureScalingSpline36Alpha);
-        ui->cb3DTextureScalingSpline36Alpha->setChecked(false);
-        cfg.SetBool("3D.GL.TextureScalingSpline36Alpha", false);
+        QSignalBlocker comboBlock(textureAlphaCombo);
+        textureAlphaCombo->setCurrentIndex(textureAlphaCombo->findData(value));
     }
-
     emit updateVideoSettings(false);
 }
 
-void VideoSettingsDialog::on_cb3DTextureScalingSpline36Alpha_stateChanged(int state)
+void VideoSettingsDialog::on_cb3DTextureScalingAlphaXBRZ_stateChanged(int state)
 {
-    auto& cfg = emuInstance->getGlobalConfig();
-    const bool enabled = state != 0;
-    cfg.SetBool("3D.GL.TextureScalingSpline36Alpha", enabled);
-    if (enabled && ui->cb3DTextureScalingAlphaXBRZ->isChecked())
-    {
-        QSignalBlocker blocker(ui->cb3DTextureScalingAlphaXBRZ);
-        ui->cb3DTextureScalingAlphaXBRZ->setChecked(false);
-        cfg.SetBool("3D.GL.TextureScalingAlphaXBRZ", false);
-    }
-
-    emit updateVideoSettings(false);
+    setTextureAlpha(state != 0 ? 3 : 0);
 }
 
 void VideoSettingsDialog::on_cb3DTextureScalingDeferred_stateChanged(int state)
@@ -1210,6 +1566,28 @@ void VideoSettingsDialog::on_cb3DTextureScalingEdgeExtendUnusedMargins_stateChan
     cfg.SetBool("3D.GL.TextureScalingEdgeExtendUnusedMargins", (state != 0));
     syncTexture2DAtlasProtectionCheckbox();
 
+    emit updateVideoSettings(false);
+}
+
+void VideoSettingsDialog::on_cbReconstructCompatible3D_stateChanged(int state)
+{
+    emuInstance->getGlobalConfig().SetBool("3D.GL.ReconstructCompatible3D", state != 0);
+    syncTexture2DAtlasProtectionCheckbox();
+    setEnabled();
+    emit updateVideoSettings(false);
+}
+
+void VideoSettingsDialog::on_cbReconstructCompatible3DEdgeContext_stateChanged(int state)
+{
+    emuInstance->getGlobalConfig().SetBool("3D.GL.ReconstructCompatible3DEdgeContext", state != 0);
+    syncTexture2DAtlasProtectionCheckbox();
+    emit updateVideoSettings(false);
+}
+
+void VideoSettingsDialog::on_cbReconstructCompatible3DFractionalAlpha_stateChanged(int state)
+{
+    emuInstance->getGlobalConfig().SetBool("3D.GL.ReconstructCompatible3DFractionalAlpha", state != 0);
+    syncTexture2DAtlasProtectionCheckbox();
     emit updateVideoSettings(false);
 }
 
@@ -1399,6 +1777,61 @@ void VideoSettingsDialog::on_cbWholeScene2DScaleHybridCleanLegacyCandidate_state
 {
     auto& cfg = emuInstance->getGlobalConfig();
     cfg.SetBool("3D.GL.WholeScene2DScaleHybridCleanLegacyCandidate", (state != 0));
+
+    emit updateVideoSettings(false);
+}
+
+void VideoSettingsDialog::on_cbWholeScene2DScaleHybridStrictAffineHighRes_stateChanged(int state)
+{
+    auto& cfg = emuInstance->getGlobalConfig();
+    cfg.SetBool("3D.GL.WholeScene2DScaleHybridStrictAffineHighRes", (state != 0));
+    if (state != 0)
+    {
+        cfg.SetBool("3D.GL.WholeScene2DScaleHybridStrictAffineSourceEnhancement", true);
+        QSignalBlocker blocker(ui->cbWholeScene2DScaleHybridStrictAffineSourceEnhancement);
+        ui->cbWholeScene2DScaleHybridStrictAffineSourceEnhancement->setChecked(true);
+    }
+
+    setEnabled();
+    emit updateVideoSettings(false);
+}
+
+void VideoSettingsDialog::on_cbWholeScene2DScaleHybridStrictAffineSourceEnhancement_stateChanged(int state)
+{
+    auto& cfg = emuInstance->getGlobalConfig();
+    cfg.SetBool("3D.GL.WholeScene2DScaleHybridStrictAffineSourceEnhancement", (state != 0));
+
+    setEnabled();
+    emit updateVideoSettings(false);
+}
+
+void VideoSettingsDialog::on_cbWholeScene2DScaleHybridStrictAffineConnectedSources_stateChanged(int state)
+{
+    auto& cfg = emuInstance->getGlobalConfig();
+    cfg.SetBool("3D.GL.WholeScene2DScaleHybridStrictAffineConnectedSources", state != 0);
+    emit updateVideoSettings(false);
+}
+
+void VideoSettingsDialog::on_cbWholeScene2DScaleHybridStrictAffineOpaqueAssemblies_stateChanged(int state)
+{
+    auto& cfg = emuInstance->getGlobalConfig();
+    cfg.SetBool("3D.GL.WholeScene2DScaleHybridStrictAffineOpaqueAssemblies", state != 0);
+    emit updateVideoSettings(false);
+}
+
+void VideoSettingsDialog::on_cbWholeScene2DScaleHybridStrictAffineTopTextBG_stateChanged(int state)
+{
+    auto& cfg = emuInstance->getGlobalConfig();
+    cfg.SetBool("3D.GL.WholeScene2DScaleHybridStrictAffineTopTextBG", (state != 0));
+
+    setEnabled();
+    emit updateVideoSettings(false);
+}
+
+void VideoSettingsDialog::on_cbWholeScene2DScaleHybridStrictAffineMaskedOBJMLAA_stateChanged(int state)
+{
+    auto& cfg = emuInstance->getGlobalConfig();
+    cfg.SetBool("3D.GL.WholeScene2DScaleHybridStrictAffineMaskedOBJMLAA", (state != 0));
 
     emit updateVideoSettings(false);
 }

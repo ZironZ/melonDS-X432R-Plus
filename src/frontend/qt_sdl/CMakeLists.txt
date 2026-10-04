@@ -6,6 +6,7 @@ set(SOURCES_QT_SDL
     main.cpp
     main_shaders.h
     Screen.cpp
+    ScreenCapture.cpp
     Window.cpp
     EmuInstance.cpp
     EmuInstanceAudio.cpp
@@ -22,6 +23,8 @@ set(SOURCES_QT_SDL
     InputConfig/MapButton.h
     InputConfig/resources/ds.qrc
     VideoSettingsDialog.cpp
+    VideoSettingsLayout.cpp
+    WholeScene2DDebugExport.cpp
     WholeScene2DDebugDialog.cpp
     TextureScalingDebugDialog.cpp
     CameraSettingsDialog.cpp
@@ -62,6 +65,8 @@ set(SOURCES_QT_SDL
 
     RendererTest.h
     RendererTest.cpp
+    RendererTestAssertions.h
+    RendererTestAssertions.cpp
 
     LANDialog.cpp
     NetplayDialog.cpp
@@ -206,7 +211,7 @@ if (WIN32)
         target_compile_definitions(melonDS PRIVATE WIN32_PORTABLE)
     endif()
 
-    string(REPLACE . , MELON_RC_VERSION ${melonDS_VERSION})
+    string(REPLACE . , MELON_RC_VERSION "${MELONDS_FORK_VERSION}.0")
     configure_file("${CMAKE_SOURCE_DIR}/res/melon.rc.in" "${CMAKE_BINARY_DIR}/res/melon.rc")
     target_sources(melonDS PUBLIC "${CMAKE_BINARY_DIR}/res/melon.rc")
     target_include_directories(melonDS PRIVATE "${CMAKE_BINARY_DIR}/res")
@@ -284,4 +289,80 @@ if (ENABLE_OGLRENDERER)
     target_compile_definitions(melonDS PUBLIC OGLRENDERER_ENABLED)
     target_compile_definitions(melonDS PUBLIC MELONDS_GL_HEADER=${MELONDS_GL_HEADER})
     target_compile_definitions(core PUBLIC MELONDS_GL_HEADER=${MELONDS_GL_HEADER})
+endif()
+
+option(BUILD_DEBUG_EXPORT_TESTS "Build debug export writer tests" OFF)
+option(BUILD_RENDERER_SHADER_TESTS "Build OpenGL 4.3 coverage shader tests (requires GPU context)" OFF)
+if (BUILD_RENDERER_SHADER_TESTS)
+    if (ENABLE_OGLRENDERER)
+        target_sources(melonDS PRIVATE "${CMAKE_SOURCE_DIR}/test/renderer/GLRendererLifetimeTests.cpp")
+        target_compile_definitions(melonDS PRIVATE BUILD_GL_LIFETIME_TESTS)
+        add_test(NAME gl-renderer-lifetime-tests COMMAND melonDS --test-gl-lifetime)
+    endif()
+    add_executable(widescreen-capture-tests
+        "${CMAKE_SOURCE_DIR}/test/renderer/WidescreenCaptureTests.cpp" ../glad/glad.c)
+    target_include_directories(widescreen-capture-tests PRIVATE
+        "${CMAKE_SOURCE_DIR}/src" "${CMAKE_SOURCE_DIR}/src/frontend")
+    target_link_libraries(widescreen-capture-tests PRIVATE ${QT_LINK_LIBS})
+    add_test(NAME widescreen-capture-tests COMMAND widescreen-capture-tests)
+    add_executable(screen-capture-tests
+        "${CMAKE_SOURCE_DIR}/test/renderer/ScreenCaptureTests.cpp"
+        ScreenCapture.cpp ../glad/glad.c)
+    target_include_directories(screen-capture-tests PRIVATE
+        "${CMAKE_SOURCE_DIR}/src" "${CMAKE_SOURCE_DIR}/src/frontend" "${CMAKE_CURRENT_SOURCE_DIR}")
+    target_link_libraries(screen-capture-tests PRIVATE ${QT_LINK_LIBS})
+    add_test(NAME screen-capture-tests COMMAND screen-capture-tests)
+    add_executable(compute-dispatch-tests "${CMAKE_SOURCE_DIR}/test/renderer/ComputeDispatchTests.cpp")
+    target_link_libraries(compute-dispatch-tests PRIVATE ${QT_LINK_LIBS})
+    add_test(NAME compute-dispatch-tests COMMAND compute-dispatch-tests)
+    add_test(NAME compute-dispatch-negative-control COMMAND compute-dispatch-tests --broken-index)
+    set_tests_properties(compute-dispatch-negative-control PROPERTIES WILL_FAIL TRUE)
+    add_executable(compute-widescreen-tests "${CMAKE_SOURCE_DIR}/test/renderer/ComputeWidescreenTests.cpp")
+    target_link_libraries(compute-widescreen-tests PRIVATE ${QT_LINK_LIBS})
+    add_test(NAME compute-widescreen-tests COMMAND compute-widescreen-tests)
+    add_test(NAME compute-wide-center-negative-control COMMAND compute-widescreen-tests --broken-center)
+    add_test(NAME compute-wide-padding-negative-control COMMAND compute-widescreen-tests --broken-padding)
+    set_tests_properties(compute-wide-center-negative-control compute-wide-padding-negative-control PROPERTIES WILL_FAIL TRUE)
+    add_executable(nnedi3-coverage-tests
+        "${CMAKE_SOURCE_DIR}/test/renderer/NNEDI3CoverageTests.cpp"
+        "${CMAKE_SOURCE_DIR}/test/renderer/NNEDI3CompositionDiagnostic.cpp"
+        "${CMAKE_SOURCE_DIR}/test/renderer/TextureScaleRegionTests.cpp"
+        "${CMAKE_SOURCE_DIR}/test/renderer/ScalerAlphaFusionTests.cpp")
+    target_link_libraries(nnedi3-coverage-tests PRIVATE ${QT_LINK_LIBS})
+    target_compile_definitions(nnedi3-coverage-tests PRIVATE SHADER_SOURCE_DIR="${CMAKE_SOURCE_DIR}/src/OpenGL_shaders")
+    enable_testing()
+    add_test(NAME nnedi3-coverage-tests COMMAND nnedi3-coverage-tests)
+    add_test(NAME texture-scale-region-tests COMMAND nnedi3-coverage-tests --test-edge-regions)
+    add_test(NAME scaler-alpha-fusion-tests COMMAND nnedi3-coverage-tests --test-scaler-alpha-fusion)
+    add_test(NAME texture-scale-region-negative-control COMMAND nnedi3-coverage-tests --test-edge-regions --corrupt-edge-origin)
+    set_tests_properties(texture-scale-region-negative-control PROPERTIES WILL_FAIL TRUE)
+    add_test(NAME nnedi3-coverage-negative-control COMMAND nnedi3-coverage-tests --unbounded)
+    set_tests_properties(nnedi3-coverage-negative-control PROPERTIES WILL_FAIL TRUE)
+    add_executable(opaque-obj-assembly-tests
+        "${CMAKE_SOURCE_DIR}/test/renderer/OpaqueOBJAssemblyTests.cpp"
+        "${CMAKE_SOURCE_DIR}/test/renderer/ResolvedOBJMergeTests.cpp"
+        "${CMAKE_SOURCE_DIR}/test/renderer/EnhancedBGSamplingTests.cpp")
+    target_link_libraries(opaque-obj-assembly-tests PRIVATE ${QT_LINK_LIBS})
+    target_compile_definitions(opaque-obj-assembly-tests PRIVATE SHADER_SOURCE_DIR="${CMAKE_SOURCE_DIR}/src/OpenGL_shaders")
+    add_test(NAME opaque-obj-assembly-tests COMMAND opaque-obj-assembly-tests)
+    add_test(NAME enhanced-bg-domain-negative-control COMMAND opaque-obj-assembly-tests --broken-bg-domain)
+    add_test(NAME enhanced-bg-wrap-negative-control COMMAND opaque-obj-assembly-tests --broken-bg-wrap)
+    set_tests_properties(enhanced-bg-domain-negative-control enhanced-bg-wrap-negative-control PROPERTIES WILL_FAIL TRUE)
+    add_test(NAME resolved-obj-boundary-negative-control COMMAND opaque-obj-assembly-tests --legacy-obj-boundary)
+    set_tests_properties(resolved-obj-boundary-negative-control PROPERTIES WILL_FAIL TRUE)
+    add_test(NAME resolved-obj-special-boundary-negative-control COMMAND opaque-obj-assembly-tests --opaque-only-obj-boundary)
+    set_tests_properties(resolved-obj-special-boundary-negative-control PROPERTIES WILL_FAIL TRUE)
+    add_test(NAME opaque-obj-assembly-spline-rgb-negative-control COMMAND opaque-obj-assembly-tests --clipped-spline-rgb)
+    set_tests_properties(opaque-obj-assembly-spline-rgb-negative-control PROPERTIES WILL_FAIL TRUE)
+endif()
+
+if (BUILD_DEBUG_EXPORT_TESTS)
+    add_executable(debug-export-tests
+        "${CMAKE_SOURCE_DIR}/test/debug-export/DebugExportTests.cpp"
+        WholeScene2DDebugExport.cpp)
+    target_include_directories(debug-export-tests PRIVATE "${CMAKE_SOURCE_DIR}/src" "${CMAKE_CURRENT_SOURCE_DIR}")
+    target_link_libraries(debug-export-tests PRIVATE ${QT_LINK_LIBS})
+    enable_testing()
+    add_test(NAME debug-export-tests COMMAND debug-export-tests)
+    add_test(NAME debug-export-shutdown COMMAND debug-export-tests --shutdown-test)
 endif()

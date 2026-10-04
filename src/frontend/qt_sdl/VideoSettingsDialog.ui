@@ -136,7 +136,7 @@
       <item row="3" column="0">
        <widget class="QCheckBox" name="cbBetterPolygons">
         <property name="whatsThis">
-         <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;Enabling this may help reduce distortion on quads and more complex polygons, but may also reduce performance.&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
+         <string>&lt;p&gt;Reduce distortion on quads and other complex polygons by changing how they are split for rendering. Classic OpenGL only. May reduce performance.&lt;/p&gt;</string>
         </property>
         <property name="text">
          <string>Improved polygon splitting</string>
@@ -152,14 +152,14 @@
          </size>
         </property>
         <property name="whatsThis">
-         <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;Sets the resolution scale used by the OpenGL renderer. Normally this controls the resolution at which 3D graphics are rendered. When whole-scene 2D scaling is enabled, it also controls the whole-scene 2D upscale factor. If Render 3D at native resolution is enabled, 3D remains at native DS resolution while the whole screen is still scaled by this amount.&lt;/p&gt;&lt;p&gt;Higher scales can improve image quality, but require more GPU performance and may expose rendering glitches.&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
+         <string>&lt;p&gt;Higher values make 3D graphics sharper and set the output scale for screen upscaling. They use more GPU power and may expose rendering glitches. This does not change the window size. With Render 3D at native resolution enabled, 3D stays at its original resolution while the completed screen can still be upscaled.&lt;/p&gt;</string>
         </property>
        </widget>
       </item>
       <item row="4" column="0">
        <widget class="QCheckBox" name="cbReadable3DTextureCache">
         <property name="whatsThis">
-         <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;Classic OpenGL only. Decodes cached 3D textures as readable RGBA8 data to make texture array slices easier to inspect in tools like RenderDoc. This is intended for debugging, not accuracy.&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
+         <string>&lt;p&gt;Store cached 3D textures as readable color data for inspection in tools such as RenderDoc. Classic OpenGL only. This is a debugging option, not an accuracy or image-quality improvement.&lt;/p&gt;</string>
         </property>
         <property name="text">
          <string>Use readable 3D texture cache (debug)</string>
@@ -169,7 +169,7 @@
       <item row="5" column="0">
        <widget class="QCheckBox" name="cbxComputeHiResCoords">
         <property name="whatsThis">
-         <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;Compute shader only. Uses sub-pixel vertex screen coordinates when 3D is rendered above native resolution, so upscaled polygon edges follow the game's original vertex math instead of snapping to the native DS pixel grid. This gives smoother, more stable polygon edges and less vertex wobble. Disable it to reproduce DS-style vertex snapping at high resolutions.&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
+         <string>&lt;p&gt;Use subpixel positions for polygon edges when rendering above native resolution. This can make edges smoother and reduce vertex wobble. Compute only. Disable to restore the original DS-style snapping. This is separate from texture-coordinate precision.&lt;/p&gt;</string>
         </property>
         <property name="text">
          <string>Use high resolution coordinates</string>
@@ -179,10 +179,10 @@
       <item row="6" column="0">
        <widget class="QCheckBox" name="cbGLMSAA">
         <property name="whatsThis">
-         <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;Enables 3D anti-aliasing in the OpenGL renderers. Classic OpenGL uses multisample rendering and resolves to the selected resolution scale. Compute shader uses its anti-aliased final pass, including when 3D is rendered at native resolution for whole-scene 2D scaling. MSAA can cause stray lines just outside some object edges.&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
+         <string>&lt;p&gt;Smooth jagged 3D polygon edges.&lt;/p&gt;&lt;p&gt;Classic OpenGL: enable multisample anti-aliasing.&lt;/p&gt;&lt;p&gt;Compute: force DS-style anti-aliasing on, even when the game disables it. When unchecked, follow the game's own anti-aliasing setting. If the game already enables it, this option makes no additional difference.&lt;/p&gt;&lt;p&gt;Can cause stray lines just outside some object edges.&lt;/p&gt;</string>
         </property>
         <property name="text">
-         <string>3D MSAA</string>
+         <string>3D anti-aliasing</string>
         </property>
        </widget>
       </item>
@@ -213,7 +213,7 @@
            <item>
             <widget class="QComboBox" name="cbx3DTextureAnisotropy">
              <property name="whatsThis">
-              <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;Anisotropic filtering for cached 3D textures in the OpenGL renderers. Intended to reduce shimmer on slanted 3D textured surfaces. This may expose alpha-edge artifacts on some textures and can cause brief pauses when new textures need filterable mipmaps.&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
+              <string>&lt;p&gt;Keep distant or angled textures clearer and reduce shimmer. Higher levels may cost performance. Some textures can develop edge artifacts, and preparing new textures may briefly cause stutter.&lt;/p&gt;</string>
              </property>
              <item>
               <property name="text">
@@ -249,7 +249,7 @@
            <item>
             <widget class="QLabel" name="lbl3DTextureFilterMipDepth">
              <property name="text">
-              <string>Mipmap depth:</string>
+              <string>Smallest mipmap size:</string>
              </property>
              <property name="buddy">
               <cstring>cbx3DTextureFilterMipDepth</cstring>
@@ -259,11 +259,11 @@
            <item>
             <widget class="QComboBox" name="cbx3DTextureFilterMipDepth">
              <property name="whatsThis">
-              <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;Limits how far filterable cached 3D textures generate mipmaps for anisotropic filtering. Full chain generates all levels down to 1x1. The minimum-size options stop before a mip level would become smaller than the selected threshold, which can reduce atlas bleed and control distant texture blur.&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
+              <string>&lt;p&gt;Choose the smallest mipmap, a reduced texture used for distant surfaces. Stopping at a larger size can reduce color bleeding between pieces of artwork and distant blur, but can increase shimmer. Down to 1x1 builds the full mipmap chain.&lt;/p&gt;</string>
              </property>
              <item>
               <property name="text">
-               <string>Full chain</string>
+               <string>Down to 1x1</string>
               </property>
              </item>
              <item>
@@ -288,60 +288,60 @@
          <item row="2" column="0">
           <widget class="QCheckBox" name="cb3DTextureFilterBinaryAlphaHandling">
            <property name="whatsThis">
-            <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;Snaps filtered binary-alpha cached 3D textures back to hard cutout coverage during anisotropic sampling. Intended to preserve nearest-sampled cutout behavior on props such as signs, fences, foliage, and small objects, while avoiding the heavier custom mip path. Low overhead and intended as the conservative general fix for binary-alpha texture filtering.&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
+            <string>&lt;p&gt;Keep hard transparent/opaque edges when filtering cutout textures such as signs, fences, and foliage. This has low overhead, but can make outlines look less smooth.&lt;/p&gt;</string>
            </property>
            <property name="text">
-           <string>Binary alpha cutout handling</string>
+           <string>Keep cutout edges opaque</string>
            </property>
          </widget>
          </item>
          <item row="2" column="1">
           <widget class="QCheckBox" name="cb3DTextureFilterMipmapAlphaHandling">
            <property name="whatsThis">
-            <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;Alpha-aware mip handling for anisotropic filtering. Pads transparent-edge RGB on binary-alpha cached 3D textures before generating filterable mipmaps. Intended to reduce halo and garbage bleed on cutout props like signs, fences, and small objects. Uses the same fast/full padding style selected by the 3D texture-scaling alpha handling options when available.&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
+            <string>&lt;p&gt;Reduce color halos around cutout textures when filtering them at a distance. Pads colors around transparent edges before creating mipmaps, the smaller texture versions used for distant surfaces. Preparing new textures can cost extra time.&lt;/p&gt;</string>
            </property>
            <property name="text">
-            <string>Alpha-aware filtered mipmaps</string>
+            <string>Reduce transparent-edge halos in mipmaps</string>
            </property>
          </widget>
          </item>
          <item row="2" column="2">
           <widget class="QCheckBox" name="cb3DTextureFilterMipmapTopologyHandling">
            <property name="whatsThis">
-            <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;Experimental topology-aware alpha mip handling. Uses alpha-island topology to decide whether a binary-alpha texture should use the heavier alpha-aware filtered mip path at all. Simple cutout props keep the heavier mip path. Fragmented or atlas-like textures fall back to normal filtered mips plus hard alpha cutout handling to avoid recoloring unrelated sprite regions.&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
+            <string>&lt;p&gt;Use simpler filtered mipmaps for fragmented texture sheets, while keeping transparent-edge padding for simple cutout textures. This can reduce colors bleeding between unrelated pieces of artwork, but some cutout edges may look worse. Requires transparent-edge halo reduction for mipmaps.&lt;/p&gt;</string>
            </property>
            <property name="text">
-            <string>Topology-aware alpha mip handling</string>
+            <string>Avoid alpha-aware mipmaps on fragmented textures</string>
            </property>
          </widget>
          </item>
          <item row="3" column="0">
           <widget class="QCheckBox" name="cb3DTextureFilterMipmapSubrectHandling">
            <property name="whatsThis">
-            <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;Experimental cropped draw-rect alpha mip handling. For simple clamp-only sprite rectangles, uploads a cropped texture variant and generates alpha-aware mips in crop space so atlas neighbors do not tint filtered mipmaps. Other draws fall back to the normal alpha mip path.&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
+            <string>&lt;p&gt;For supported rectangular sprites, build smaller filtered textures from just the region being drawn. This can prevent neighboring artwork from bleeding into sprite edges. Other draws use the normal mipmap path. Requires transparent-edge halo reduction for mipmaps.&lt;/p&gt;</string>
            </property>
            <property name="text">
-            <string>Cropped draw-rect alpha mips</string>
+            <string>Isolate sprite regions for mipmaps</string>
            </property>
          </widget>
          </item>
          <item row="4" column="0">
           <widget class="QCheckBox" name="cb3DTextureFilterSmart2D">
            <property name="whatsThis">
-            <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;Experimental smart 2D texture filtering. Detects simple clamp-only 2D sprite rectangles drawn through the 3D renderer, then forces nearest texture sampling for those draws so anisotropic filtering does not pull neighboring atlas pixels into sprite edges. Leave it off unless a game shows filtering lines or halos around 3D-textured UI or sprites.&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
+            <string>&lt;p&gt;Keep original sampling for supported 2D artwork drawn using 3D textures. This can reduce lines and halos around sprites and stop enlarged fill pieces from becoming patchy. Other artwork remains enhanced. Included in Reduce 2D texture artifacts; disable this component if it removes smoothing you prefer.&lt;/p&gt;</string>
            </property>
            <property name="text">
-            <string>Smart 2D texture filtering</string>
+            <string>Protect 2D artwork from filtering</string>
            </property>
           </widget>
          </item>
          <item row="4" column="1">
           <widget class="QCheckBox" name="cb3DTextureFilterTranslucentGuard">
            <property name="whatsThis">
-            <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;Experimental translucent texture filtering guard. For large translucent 3D polygons using A5I3 alpha-indexed textures, forces nearest texture sampling when anisotropic filtering is active. This can hide filtering seams on full-screen or effect-like translucent draws, but can make those effects look less filtered.&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
+            <string>&lt;p&gt;Use original, unfiltered texture sampling for some large translucent effects when anisotropic filtering is enabled. This can hide seams but can make those effects look more pixelated. Included in Reduce 2D texture artifacts.&lt;/p&gt;</string>
            </property>
            <property name="text">
-            <string>Translucent texture filtering guard</string>
+            <string>Use original sampling for large translucent effects</string>
            </property>
           </widget>
          </item>
@@ -357,8 +357,8 @@
          <item>
           <widget class="QCheckBox" name="cb3DTextureScaling">
            <property name="whatsThis">
-            <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;3D texture-cache upscaling. Scales cached 3D textures by the current resolution scale before they are sampled. This may produce severe UV or edge artifacts.&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
-           </property>
+              <string>Enlarge game textures using the selected algorithm. This can improve close-up textures, but may add stutter or edge artifacts.</string>
+             </property>
            <property name="text">
             <string>3D texture scaling</string>
            </property>
@@ -382,36 +382,36 @@
            <item>
            <widget class="QComboBox" name="cbx3DTextureScalingAlgorithm">
             <property name="whatsThis">
-               <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;Selects the algorithm used for 3D texture-cache scaling.&lt;/p&gt;&lt;ul&gt;&lt;li&gt;&lt;b&gt;Spline36 (GPU):&lt;/b&gt; Shared GPU Spline36 color path with direct GPU repack into the texture cache; alpha uses center-aligned linear scaling unless Spline36 Alpha or Cleaner transparent edges is enabled.&lt;/li&gt;&lt;li&gt;&lt;b&gt;xBRZ (GPU):&lt;/b&gt; Two-pass GPU xBRZ freescale path with direct GPU repack.&lt;/li&gt;&lt;li&gt;&lt;b&gt;ArtCNN Luma (GPU compute):&lt;/b&gt; Plain C4F16 ArtCNN luma model on decoded 3D textures, with chroma scaled by GPU Spline36 and alpha using center-aligned linear scaling unless Spline36 Alpha or Cleaner transparent edges is enabled.&lt;/li&gt;&lt;li&gt;&lt;b&gt;ArtCNN DN Luma (GPU compute):&lt;/b&gt; Denoising C4F16 DN luma model.&lt;/li&gt;&lt;li&gt;&lt;b&gt;NNEDI3 nns16 8x4 RGB (GPU compute):&lt;/b&gt; NNEDI3 RGB compute path on decoded 3D texture color. At 2x it runs one vertical+horizontal stage; at 4x and above it chains a second 2x stage to 4x, then uses a Spline36 finish to the requested scale. Alpha uses center-aligned linear scaling unless Spline36 Alpha or Cleaner transparent edges is enabled.&lt;/li&gt;&lt;li&gt;&lt;b&gt;CuNNy 4x32 NVL RGB (GPU compute):&lt;/b&gt; Four-layer NVL RGB model, with alpha using center-aligned linear scaling unless Spline36 Alpha or Cleaner transparent edges is enabled, and a Spline36 finish above 2x.&lt;/li&gt;&lt;/ul&gt;&lt;/body&gt;&lt;/html&gt;</string>
+              <string>&lt;p&gt;Chooses how to enlarge the colors in game textures. Try different algorithms to find one that suits the game.&lt;/p&gt;&lt;p&gt;Transparent edges are controlled separately by Transparency scaling in Advanced settings. Cleaner transparent edges selects xBRZ alpha.&lt;/p&gt;</string>
              </property>
              <item>
               <property name="text">
-               <string>Spline36 (GPU)</string>
+               <string>Spline36</string>
               </property>
              </item>
              <item>
               <property name="text">
-               <string>xBRZ (GPU)</string>
+               <string>xBRZ</string>
               </property>
              </item>
              <item>
               <property name="text">
-               <string>ArtCNN Luma (GPU compute)</string>
+               <string>ArtCNN</string>
               </property>
              </item>
              <item>
               <property name="text">
-               <string>ArtCNN DN Luma (GPU compute)</string>
+               <string>ArtCNN DN</string>
               </property>
              </item>
              <item>
               <property name="text">
-               <string>NNEDI3 nns16 8x4 RGB (GPU compute)</string>
+               <string>NNEDI3</string>
               </property>
              </item>
              <item>
               <property name="text">
-               <string>CuNNy 4x32 NVL RGB (GPU compute)</string>
+               <string>CuNNy</string>
               </property>
              </item>
             </widget>
@@ -420,96 +420,141 @@
          </item>
          <item>
           <layout class="QGridLayout" name="gridLayout3DTextureScalingOptions">
+           <item row="4" column="0" colspan="3">
+            <widget class="QWidget" name="reconstruction3DOptions">
+             <layout class="QVBoxLayout" name="reconstruction3DOptionsLayout">
+              <property name="leftMargin">
+               <number>0</number>
+              </property>
+              <property name="topMargin">
+               <number>0</number>
+              </property>
+              <property name="rightMargin">
+               <number>0</number>
+              </property>
+              <property name="bottomMargin">
+               <number>0</number>
+              </property>
+              <item>
+               <widget class="QCheckBox" name="cbReconstructCompatible3D">
+                <property name="text">
+                 <string>Upscale compatible texture pieces together</string>
+                </property>
+                <property name="whatsThis">
+                 <string>&lt;p&gt;Treat compatible adjacent pieces drawn using 3D textures as shared artwork when upscaling. This can reduce seams between pieces. Pieces with incompatible placement, textures, depth, or effects remain separate. Uses the selected texture color and transparency scaling and can add processing and memory costs.&lt;/p&gt;</string>
+                </property>
+               </widget>
+              </item>
+              <item>
+               <layout class="QVBoxLayout" name="reconstruction3DChildrenLayout">
+                <property name="leftMargin">
+                 <number>20</number>
+                </property>
+                <item>
+                 <widget class="QCheckBox" name="cbReconstructCompatible3DEdgeContext">
+                  <property name="text">
+                   <string>Use neighboring artwork at joined edges</string>
+                  </property>
+                  <property name="whatsThis">
+                   <string>&lt;p&gt;Use neighboring artwork to improve continuity at joined texture edges when there is one clear matching neighbor. Ambiguous overlaps remain unchanged. Requires compatible texture-piece upscaling and adds reconstruction work.&lt;/p&gt;</string>
+                  </property>
+                 </widget>
+                </item>
+                <item>
+                 <widget class="QCheckBox" name="cbReconstructCompatible3DFractionalAlpha">
+                  <property name="text">
+                   <string>Include semi-transparent pieces</string>
+                  </property>
+                  <property name="whatsThis">
+                   <string>&lt;p&gt;Also join compatible pieces containing partly transparent artwork, such as split characters. Keeps their partial transparency and original drawing order. Requires compatible texture-piece upscaling and adds processing and memory costs.&lt;/p&gt;</string>
+                  </property>
+                 </widget>
+                </item>
+               </layout>
+              </item>
+             </layout>
+            </widget>
+           </item>
            <property name="leftMargin">
             <number>20</number>
            </property>
            <item row="0" column="0">
             <widget class="QCheckBox" name="cb3DTextureScalingLegacyAlphaHandling">
              <property name="whatsThis">
-              <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;Uses the older GPU 3D texture-scaling alpha-edge handling without transparent-edge color padding. This overrides Quality alpha handling and is intended for A/B comparison.&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
+              <string>&lt;p&gt;Skip color padding around transparent texture edges before upscaling. Use this to compare how padding affects edge colors; disabling padding can restore halos or stray colors. Overrides More thorough transparent-edge padding. This is separate from the transparency-scaling algorithm and is not limited to Classic OpenGL.&lt;/p&gt;</string>
              </property>
              <property name="text">
-              <string>Classic GPU alpha handling</string>
+              <string>Disable transparent-edge color padding</string>
              </property>
             </widget>
            </item>
            <item row="0" column="1">
             <widget class="QCheckBox" name="cb3DTextureScalingQualityAlphaHandling">
              <property name="whatsThis">
-              <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;Uses full transparent-edge color padding for binary-alpha 3D textures before GPU texture scaling. This can reduce edge artifacts, but may hitch more on scene-entry texture misses. When unchecked, a faster bounded padding pass is used instead.&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
+              <string>&lt;p&gt;Use more thorough color padding around fully transparent areas of cutout textures before upscaling. This can reduce edge artifacts, but may cause more stutter when new textures appear. When off, a faster limited padding pass is used. Has no effect while transparent-edge color padding is disabled.&lt;/p&gt;</string>
              </property>
              <property name="text">
-              <string>Quality alpha handling</string>
+              <string>More thorough transparent-edge padding</string>
              </property>
             </widget>
            </item>
            <item row="0" column="2">
             <widget class="QCheckBox" name="cb3DTextureScalingAlphaXBRZ">
              <property name="whatsThis">
-              <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;Uses xBRZ for texture transparency on supported GPU scalers while texture colors stay on the selected scaler. This can make cutout edges cleaner and less blocky. Enabling this disables Spline36 Alpha.&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
+              <string>&lt;p&gt;Try this if cutout edges look blocky or uneven after texture upscaling. Selects xBRZ in the advanced Transparency scaling menu while keeping the selected color algorithm. Turning it off selects Bilinear transparency scaling.&lt;/p&gt;</string>
              </property>
              <property name="text">
               <string>Cleaner transparent edges</string>
              </property>
             </widget>
            </item>
-           <item row="0" column="3">
-            <widget class="QCheckBox" name="cb3DTextureScalingSpline36Alpha">
-             <property name="whatsThis">
-              <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;Uses Spline36 for texture alpha on GPU texture scalers. When unchecked, texture alpha uses conservative center-aligned linear scaling to avoid ringing and tiny holes in alpha-tested textures. Enabling this disables Cleaner transparent edges.&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
-             </property>
-             <property name="text">
-              <string>Spline36 Alpha</string>
-             </property>
-            </widget>
-           </item>
            <item row="1" column="0">
             <widget class="QCheckBox" name="cb3DTextureScalingFrequentChangePolicy">
              <property name="whatsThis">
-              <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;Detects 3D texture slots that are being overwritten repeatedly. When enabled, the renderer can temporarily use cheap nearest-neighbor expansion instead of the selected texture-scaling algorithm and reuse archived scaled copies when the same contents cycle back. This can reduce hitches in palette-fade, animation, and movie-like scenes, but may leave rapidly changing textures pixelated while they are unstable.&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
+              <string>&lt;p&gt;Use simpler scaling for rapidly changing textures and reuse matching enhanced images when possible. This can reduce stutter during animations and effects, but those textures may look more pixelated. The game's texture updates are not delayed.&lt;/p&gt;</string>
              </property>
              <property name="text">
-              <string>Frequent-change protection</string>
+              <string>Limit upscaling of changing textures</string>
              </property>
             </widget>
            </item>
            <item row="1" column="1">
             <widget class="QCheckBox" name="cb3DTextureScalingDeferred">
              <property name="whatsThis">
-              <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;Defers the first upscale for palette-driven 3D textures. New palette variants are uploaded unscaled first, then upgraded to the selected scaler later after they have been reused and stayed stable long enough. Intended to reduce first-hit hitches in battle flashes and similar effects.&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
+              <string>&lt;p&gt;Show eligible new textures at their original detail first, then upscale them after they have been reused and remained stable. This can reduce pauses when textures change, but you may notice them become sharper a moment later. Applies to supported palette-based textures; it does not delay every texture or the game's updates.&lt;/p&gt;</string>
              </property>
              <property name="text">
-              <string>Deferred scaling</string>
+              <string>Defer texture upscaling</string>
              </property>
             </widget>
            </item>
            <item row="1" column="2">
             <widget class="QCheckBox" name="cb3DTextureScalingNativeMipFloor">
              <property name="whatsThis">
-              <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;Limits filterable mipmap generation for scaled 3D textures so the chain does not continue below the original native texture scale. Power-of-two texture scales produce a DeSmuME-style ladder such as 8x, 4x, 2x, 1x. Non-power-of-two scales stop at the last standard mip level still above native scale.&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
+              <string>&lt;p&gt;Stop generating smaller filtered versions once a scaled texture reaches its original size. This can retain distant detail but may increase shimmer. Power-of-two scales can end at the original size; other scales stop at the last mipmap still above it.&lt;/p&gt;</string>
              </property>
              <property name="text">
-              <string>Stop mips at native size</string>
+              <string>Stop mipmaps at original texture size</string>
              </property>
             </widget>
            </item>
            <item row="2" column="0">
             <widget class="QCheckBox" name="cb3DTextureScalingSourceMips">
              <property name="whatsThis">
-              <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;For power-of-two 3D texture scaling factors, builds lower filterable mip levels from the original texture source instead of downsampling the top scaled texture. For example, 4x uses the selected scaler again for the 2x mip and uploads the original texture as the 1x mip. This can improve color/detail consistency, but may add extra scaler work on texture-cache misses.&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
+              <string>&lt;p&gt;Build smaller filtered texture versions by upscaling the original artwork again instead of shrinking the largest enhanced version. This can improve consistency of color and detail, but adds work when new textures appear. Applies to power-of-two texture scales.&lt;/p&gt;</string>
              </property>
              <property name="text">
-              <string>Source-scaled mip levels</string>
+              <string>Build mipmaps from original artwork</string>
              </property>
             </widget>
            </item>
            <item row="2" column="1">
             <widget class="QCheckBox" name="cb3DTextureScalingEdgeExtendUnusedMargins">
              <property name="whatsThis">
-              <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;For clamped 3D texture draws, detects the frame-wide used texture rectangle and edge-extends unused margins before scaling. This can prevent unused atlas or VRAM garbage from influencing scalers, but should stay disabled unless a game needs it.&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
+              <string>&lt;p&gt;Extend edge colors into unused areas of supported clamped textures before upscaling. This can stop unrelated or unused pixels from creating lines around the artwork, but adds processing and cannot remove every seam. Included in Reduce 2D texture artifacts.&lt;/p&gt;</string>
              </property>
              <property name="text">
-              <string>Edge-extend unused margins before scaling</string>
+              <string>Pad unused texture edges before upscaling</string>
              </property>
             </widget>
            </item>
@@ -523,7 +568,7 @@
           <item>
            <widget class="QCheckBox" name="cb3DHighPrecisionTextureCoordinates">
             <property name="whatsThis">
-             <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;Uses additional texture-coordinate interpolation precision in the compute renderer whenever 3D is rendered above native resolution. This keeps texture edges and perspective detail aligned with the high-resolution sample grid, whether or not 3D texture scaling is enabled.&lt;/p&gt;&lt;p&gt;At 1x, the original DS-oriented interpolation remains unchanged. This affects UV interpolation only; depth, vertex color, and polygon coverage retain their existing precision.&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
+             <string>&lt;p&gt;Keep texture details better aligned with high-resolution 3D by using more precise texture coordinates. Compute only, above native resolution; texture upscaling does not need to be enabled. This affects texture placement, not polygon-edge snapping.&lt;/p&gt;</string>
             </property>
             <property name="text">
              <string>High-precision texture coordinates</string>
@@ -533,10 +578,10 @@
           <item>
            <widget class="QCheckBox" name="cb3DTextureFilterSpriteUVInset">
             <property name="whatsThis">
-             <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;Experimental sprite edge UV inset. For simple clamp-only sprite rectangles, slightly clips texture coordinates before sampling so filtering or scaled textures are less likely to pull neighboring atlas pixels into the sprite edge. This can crop exact texture edges, so leave it off unless a game shows atlas-edge lines or garbage around 3D-textured sprites.&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
+             <string>&lt;p&gt;Sample slightly inside the texture edges of supported rectangular sprites to reduce lines or stray colors from neighboring artwork. This can trim edge pixels. Included in Reduce 2D texture artifacts; disable it if sprite edges appear cropped.&lt;/p&gt;</string>
             </property>
             <property name="text">
-             <string>Sprite edge UV inset</string>
+             <string>Inset sprite texture edges</string>
             </property>
            </widget>
           </item>
@@ -558,7 +603,7 @@
         <item>
          <widget class="QCheckBox" name="cb3DTexture2DAtlasProtection">
           <property name="whatsThis">
-           <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;Try this if UI, sprites, or 2D backgrounds show thin lines, halos, or stray pixels after enabling texture filtering or texture scaling.&lt;/p&gt;&lt;p&gt;This can help games that draw 2D art as 3D textures, but it will not fix every game and can slightly change texture edges. Advanced settings show the individual fixes controlled by this option. A partially checked box means only some of those individual fixes are enabled.&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
+           <string>&lt;p&gt;Try this if sprites, menus, or backgrounds develop lines, halos, or stray pixels after texture filtering or upscaling. Combines several fixes for 2D artwork drawn using 3D textures, including joining compatible pieces before upscaling to reduce seams. May cost performance or change texture edges, and will not fix every game. Advanced settings exposes the individual fixes. A partially checked box means only some are enabled.&lt;/p&gt;</string>
           </property>
           <property name="text">
            <string>Reduce 2D texture artifacts</string>
@@ -577,10 +622,10 @@
          <item row="0" column="0" colspan="3">
           <widget class="QCheckBox" name="cbWholeScene2DScale">
            <property name="whatsThis">
-            <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;Scales 2D screens and mixed 2D/3D presentation using the selected whole-scene mode. Intended to improve backgrounds, sprites, UI, and 2D-heavy scenes. Some games use complex blending, capture, or mid-frame effects, so this can fall back to native presentation or cause brief slowdowns in difficult scenes.&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
+            <string>&lt;p&gt;Improve text, sprites, backgrounds, and menus using the selected method and upscaling algorithm. Complex effects may remain at their original detail, and more demanding algorithms can reduce performance.&lt;/p&gt;</string>
            </property>
            <property name="text">
-           <string>Whole-scene 2D scaling</string>
+           <string>Enable screen upscaling</string>
            </property>
           </widget>
          </item>
@@ -602,7 +647,7 @@
            <item>
             <widget class="QComboBox" name="cbxWholeScene2DScaleMode">
              <property name="whatsThis">
-              <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;Selects the whole-scene 2D scaling compositor.&lt;/p&gt;&lt;ul&gt;&lt;li&gt;&lt;b&gt;Hybrid Upscale:&lt;/b&gt; Main mode. Chooses high-resolution 3D where it is clean, uses overlay assist for safe 2D-over-3D regions, and falls back to true native presentation where reconstruction is risky.&lt;/li&gt;&lt;li&gt;&lt;b&gt;Postprocessing Upscale:&lt;/b&gt; Resolves the native final image first, then scales the whole screen. Usually safest, but 3D detail is native-resolution before scaling (downsampled from high-resolution 3D unless Render 3D at native resolution is enabled).&lt;/li&gt;&lt;li&gt;&lt;b&gt;Presentation Overlay Upscale:&lt;/b&gt; Advanced comparison mode that reconstructs a scaled 2D overlay over direct 3D.&lt;/li&gt;&lt;li&gt;&lt;b&gt;High-resolution Compositor:&lt;/b&gt; Advanced comparison/debug mode that tries to composite 2D layers directly at high resolution.&lt;/li&gt;&lt;li&gt;&lt;b&gt;Native Stack Upscale:&lt;/b&gt; Scales the native top/second compositor stack before resolving it, useful for comparison and simple scenes.&lt;/li&gt;&lt;/ul&gt;&lt;/body&gt;&lt;/html&gt;</string>
+              <string>&lt;p&gt;Choose how 2D artwork and 3D graphics are combined and upscaled. Hybrid preserves sharp 3D where possible. Postprocessing upscales the completed screen and can help when Hybrid has visual problems, but 3D usually looks softer.&lt;/p&gt;</string>
              </property>
              <item>
               <property name="text">
@@ -651,36 +696,36 @@
            <item>
            <widget class="QComboBox" name="cbxWholeScene2DScaleAlgorithm">
             <property name="whatsThis">
-               <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;Selects the algorithm used for whole-scene 2D scaling.&lt;/p&gt;&lt;ul&gt;&lt;li&gt;&lt;b&gt;Spline36 (GPU):&lt;/b&gt; Regular whole-scene color scaler.&lt;/li&gt;&lt;li&gt;&lt;b&gt;xBRZ (GPU):&lt;/b&gt; Two-pass xBRZ freescale shader path for whole-scene 2D colors, while keeping metadata and coverage on the regular resolve path.&lt;/li&gt;&lt;li&gt;&lt;b&gt;ArtCNN Luma (GPU compute):&lt;/b&gt; Plain C4F16 ArtCNN luma path for whole-scene 2D colors, with remaining color channels scaled by GPU Spline36 and a Spline36 finish at higher resolution scales.&lt;/li&gt;&lt;li&gt;&lt;b&gt;ArtCNN DN Luma (GPU compute):&lt;/b&gt; Denoising C4F16 DN luma path.&lt;/li&gt;&lt;li&gt;&lt;b&gt;NNEDI3 nns16 8x4 RGB (GPU compute):&lt;/b&gt; NNEDI3 RGB compute path for whole-scene 2D color. At 2x it runs one vertical+horizontal stage; at 4x and above it chains a second 2x stage to 4x, then uses a Spline36 finish to the requested scale. Alpha is carried/interpolated, not NNEDI3-predicted.&lt;/li&gt;&lt;li&gt;&lt;b&gt;CuNNy 4x32 NVL RGB (GPU compute):&lt;/b&gt; Four-layer NVL RGB model, with alpha scaled by GPU Spline36 and a Spline36 finish above 2x.&lt;/li&gt;&lt;/ul&gt;&lt;/body&gt;&lt;/html&gt;</string>
+               <string>&lt;p&gt;Choose how to enlarge the colors in the screen image and supported sprite and background artwork. Try different algorithms to find one that suits the game. With Improve rotation and scaling enabled, sprite and background transparency follows Automatic or the Transparency reconstruction override in Advanced settings.&lt;/p&gt;</string>
              </property>
              <item>
               <property name="text">
-               <string>Spline36 (GPU)</string>
+               <string>Spline36</string>
               </property>
              </item>
              <item>
               <property name="text">
-               <string>xBRZ (GPU)</string>
+               <string>xBRZ</string>
               </property>
              </item>
              <item>
               <property name="text">
-               <string>ArtCNN Luma (GPU compute)</string>
+               <string>ArtCNN</string>
               </property>
              </item>
              <item>
               <property name="text">
-               <string>ArtCNN DN Luma (GPU compute)</string>
+               <string>ArtCNN DN</string>
               </property>
              </item>
              <item>
               <property name="text">
-               <string>NNEDI3 nns16 8x4 RGB (GPU compute)</string>
+               <string>NNEDI3</string>
               </property>
              </item>
              <item>
               <property name="text">
-               <string>CuNNy 4x32 NVL RGB (GPU compute)</string>
+               <string>CuNNy</string>
               </property>
              </item>
             </widget>
@@ -705,7 +750,7 @@
            <item>
             <widget class="QComboBox" name="cbxWholeScene2DScaleFinalUpscale3DFilter">
              <property name="whatsThis">
-              <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;Selects how high-resolution 3D is resolved to native resolution for whole-scene scaling. This resolve is shared by the Postprocessing, Presentation Overlay, and Hybrid Upscale modes.&lt;/p&gt;&lt;ul&gt;&lt;li&gt;&lt;b&gt;Area / Box:&lt;/b&gt; Averages the full source region. Stable baseline and recommended default.&lt;/li&gt;&lt;li&gt;&lt;b&gt;Linear:&lt;/b&gt; Uses the older OpenGL linear sampling path. Useful for comparison against older behavior.&lt;/li&gt;&lt;li&gt;&lt;b&gt;Tent:&lt;/b&gt; Slightly softer weighted resolve that can smooth some edges but may blur more than Area / Box.&lt;/li&gt;&lt;/ul&gt;&lt;/body&gt;&lt;/html&gt;</string>
+              <string>&lt;p&gt;Choose how high-resolution 3D is reduced to the original screen resolution before screen upscaling. Applies to Postprocessing, Presentation Overlay, and Hybrid when 3D is rendered above native resolution. Area / Box averages the source pixels and is recommended. Linear uses linear sampling. Tent uses a softer weighted average that may smooth edges but blur details.&lt;/p&gt;</string>
              </property>
              <item>
               <property name="text">
@@ -744,21 +789,21 @@
            <item>
             <widget class="QComboBox" name="cbxWholeScene2DScaleFragmentationFallback">
              <property name="whatsThis">
-              <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;Selects how whole-scene 2D scaling reacts when a game changes display settings mid-frame and the screen has to be scaled in many horizontal strips. FMV playback and some effects do this, and scaling every strip can be slow.&lt;/p&gt;&lt;ul&gt;&lt;li&gt;&lt;b&gt;Auto: no scaling for bitmap/FMV:&lt;/b&gt; Disables whole-scene 2D scaling for fragmented full-screen bitmap, capture-style, or OBJ-only presentation, such as FMV-like frames.&lt;/li&gt;&lt;li&gt;&lt;b&gt;Postprocessing fallback only:&lt;/b&gt; Keeps whole-scene 2D scaling, but falls back to Postprocessing Upscale when Hybrid is too expensive.&lt;/li&gt;&lt;li&gt;&lt;b&gt;No scaling for severe frames:&lt;/b&gt; Also renders extremely fragmented frames without whole-scene scaling, since even Postprocessing Upscale may stutter on them.&lt;/li&gt;&lt;li&gt;&lt;b&gt;Off:&lt;/b&gt; Keeps the selected mode even if fragmented frames drop performance.&lt;/li&gt;&lt;/ul&gt;&lt;/body&gt;&lt;/html&gt;</string>
+              <string>&lt;p&gt;Choose how to reduce slowdown when mid-frame display changes make screen upscaling expensive. Skip upscaling for video-like frames uses the original rendering for heavily split bitmap, captured-image, or sprite-only screens. Use Postprocessing keeps upscaling but switches complex Hybrid frames to Postprocessing. Skip upscaling for very complex frames can also bypass upscaling when Postprocessing would still be too slow. Off keeps the selected method. These fallbacks can change image quality during affected frames.&lt;/p&gt;</string>
              </property>
              <item>
               <property name="text">
-               <string>Auto: no scaling for bitmap/FMV</string>
+               <string>Skip upscaling for video-like frames</string>
               </property>
              </item>
              <item>
               <property name="text">
-               <string>Postprocessing fallback only</string>
+               <string>Use Postprocessing</string>
               </property>
              </item>
              <item>
               <property name="text">
-               <string>No scaling for severe frames</string>
+               <string>Skip upscaling for very complex frames</string>
               </property>
              </item>
              <item>
@@ -773,42 +818,42 @@
          <item row="5" column="0" colspan="3">
           <layout class="QGridLayout" name="gridLayoutWholeScene2DScaleOptions">
            <property name="leftMargin">
-            <number>20</number>
+            <number>0</number>
            </property>
            <item row="0" column="0">
             <widget class="QCheckBox" name="cbWholeScene2DScaleExactFinalFallback">
              <property name="whatsThis">
-              <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;Experimental. Upscales an exact copy of the native final image in parallel and trusts it for pixels where the native compositor actually applied a blend effect. Intended to reduce fade/dialog recomposition artifacts, but may still cause seams or other scene-specific issues.&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
+              <string>&lt;p&gt;Experimental comparison option for Native Stack Upscale. Also upscale the completed original-resolution screen and use it where the game blends layers. This can reduce fade or dialogue artifacts, but may introduce seams in other scenes.&lt;/p&gt;</string>
              </property>
              <property name="text">
-              <string>Exact final fallback</string>
+              <string>Use completed-screen fallback for blending</string>
              </property>
             </widget>
            </item>
            <item row="0" column="1">
             <widget class="QCheckBox" name="cbWholeScene2DScaleForegroundOverlay">
              <property name="whatsThis">
-              <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;Experimental. Scales the resolved native 2D foreground as a premultiplied overlay over direct 3D. This is only used for conservative main-screen direct-3D scenes without capture-backed layers.&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
+              <string>&lt;p&gt;Experimental comparison option for Native Stack Upscale. Upscale the completed 2D foreground over live 3D in supported scenes. Not used with captured-image layers or other unsupported effects.&lt;/p&gt;</string>
              </property>
              <property name="text">
-              <string>Resolved 2D foreground overlay</string>
+              <string>Upscale the completed 2D foreground</string>
              </property>
             </widget>
            </item>
            <item row="0" column="2">
             <widget class="QCheckBox" name="cbWholeScene2DScaleCaptureBacked">
              <property name="whatsThis">
-              <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;Allows whole-scene 2D scaling for capture-backed UI overlays such as presentation text boxes. Full-screen copied final-output capture buffers and capture-backed OBJ sprites on the opposite physical screen still bypass whole-scene 2D scaling.&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
+              <string>&lt;p&gt;Allow supported images that the game copies internally from the DS display to use enhanced rendering. Helps some menus, overlays, and games that reuse 3D images between screens. Unsupported copies keep their original rendering. This controls in-game display copies, not screenshots or video recording.&lt;/p&gt;</string>
              </property>
              <property name="text">
-              <string>Allow capture-backed UI overlays</string>
+              <string>Enhance captured screen images</string>
              </property>
             </widget>
            </item>
            <item row="1" column="0">
             <widget class="QCheckBox" name="cbWholeScene2DScaleSourceBoundaryGuard">
              <property name="whatsThis">
-              <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;Blends scaled colors back toward native pixels near 2D source/class boundaries. Reduces cross-layer bleed, but can make text and thin UI details look less smooth.&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
+              <string>&lt;p&gt;Reduce colors bleeding between separate 2D layers by using more of the original pixels near their boundaries. This can make text and thin interface details look less smooth. Applies to Native Stack Upscale.&lt;/p&gt;</string>
              </property>
              <property name="text">
               <string>Protect source boundaries</string>
@@ -818,27 +863,27 @@
            <item row="1" column="1">
             <widget class="QCheckBox" name="cbWholeScene2DScaleDebugTint">
              <property name="whatsThis">
-              <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;Tints whole-scene output by resolved source class. In high-resolution compositor mode, this also distinguishes filtered BG/OBJ pixels from unfiltered BG/OBJ, capture, direct 3D, and backdrop pixels.&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
+              <string>&lt;p&gt;Replace normal colors with diagnostic colors identifying the layers and rendering paths used for the image. Use this to inspect how a scene is composed, not to improve image quality.&lt;/p&gt;</string>
              </property>
              <property name="text">
-              <string>Debug tint by source</string>
+              <string>Color-code rendering layers (debug)</string>
              </property>
             </widget>
            </item>
            <item row="2" column="0">
             <widget class="QCheckBox" name="cbWholeScene2DScaleNoWrapFilterTaps">
              <property name="whatsThis">
-              <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;Prevents high-resolution compositor Spline36 filter taps from wrapping around repeat-mode BG textures. This can reduce edge artifacts, but may remove some smoothing at wrapped BG boundaries.&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
+              <string>&lt;p&gt;Prevent Spline36 from blending pixels across the edges of repeating background textures. This can reduce edge artifacts, but may remove smoothing where the texture repeats. Applies to High-resolution Compositor.&lt;/p&gt;</string>
              </property>
              <property name="text">
-              <string>No wrapped Spline36 taps</string>
+              <string>Prevent filtering across repeating background edges</string>
              </property>
             </widget>
            </item>
            <item row="2" column="1">
             <widget class="QCheckBox" name="cbWholeScene2DScaleFinalUpscaleRender3DNative">
              <property name="whatsThis">
-              <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;Renders 3D at native DS resolution. In Postprocessing Upscale mode the native 3D is rescaled together with the 2D screen, avoiding high-resolution 3D/native 2D composition mismatch at the cost of 3D detail.&lt;/p&gt;&lt;p&gt;In Presentation Overlay and Hybrid Upscale modes, live 3D regions instead show unfiltered native-resolution 3D, so this is mainly useful for comparison there.&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
+              <string>&lt;p&gt;Render 3D at its original resolution. In Postprocessing, this can fix mismatched 2D and 3D edges at the cost of 3D detail. The completed screen is still upscaled. In Hybrid and Presentation Overlay, live 3D areas instead retain unfiltered original-resolution pixels, so this is mainly useful for comparison there.&lt;/p&gt;</string>
              </property>
              <property name="text">
               <string>Render 3D at native resolution</string>
@@ -848,101 +893,153 @@
            <item row="2" column="2">
             <widget class="QCheckBox" name="cbWholeScene2DScaleFinalUpscale3DCoverageAware">
              <property name="whatsThis">
-              <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;When high-resolution 3D is downsampled to native resolution for whole-scene scaling (Postprocessing, Presentation Overlay, or Hybrid Upscale), resolves RGB from alpha-covered 3D samples instead of averaging clear/background RGB into polygon edges. This can reduce green or clear-color outlines around 3D edges.&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
+              <string>&lt;p&gt;When reducing high-resolution 3D for screen upscaling, average colors from samples covered by polygons instead of mixing in the clear background color. This can reduce colored outlines around 3D edges. Applies to Postprocessing, Presentation Overlay, and Hybrid.&lt;/p&gt;</string>
              </property>
              <property name="text">
-              <string>Coverage-aware 3D resolve</string>
+              <string>Reduce color fringes when downsampling 3D</string>
              </property>
             </widget>
            </item>
            <item row="3" column="0">
             <widget class="QCheckBox" name="cbWholeScene2DScaleOverlayLegacyUnderlay">
              <property name="whatsThis">
-              <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;Presentation overlay upscale only. Uses the older raw Direct3D underlay endpoint, including Direct3D alpha, instead of matching the native compositor color endpoint. This can make some 3D edge outlines blend more like the older overlay behavior, but can reintroduce overlay reconstruction seams in scenes like Pokemon Diamond.&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
+              <string>&lt;p&gt;Use the raw 3D image and its transparency beneath overlays instead of matching the game's completed layer blending. This can change edge blending but may introduce seams around overlays. Applies to Hybrid and Presentation Overlay.&lt;/p&gt;</string>
              </property>
              <property name="text">
-              <string>Raw overlay underlay endpoint</string>
+              <string>Use raw 3D beneath overlays (comparison)</string>
              </property>
             </widget>
            </item>
            <item row="3" column="1">
             <widget class="QCheckBox" name="cbWholeScene2DScaleFinalUpscale3DRepresentativeSemantics">
              <property name="whatsThis">
-              <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;When high-resolution 3D is resolved to native resolution for the Postprocessing, Presentation Overlay, or Hybrid Upscale modes, uses a representative native-stage 3D sample for compositor alpha/presence instead of the visual resolve alpha. Disable this to compare against the older visual-resolve alpha behavior.&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
+              <string>&lt;p&gt;Use a representative original-resolution 3D sample to decide layer presence and transparency when combining 3D with 2D. Turn off to use the transparency from the downsampled visual image instead. A comparison option for Postprocessing, Presentation Overlay, and Hybrid.&lt;/p&gt;</string>
              </property>
              <property name="text">
-              <string>Representative 3D semantics</string>
+              <string>Use original-resolution 3D blending data</string>
              </property>
             </widget>
            </item>
            <item row="3" column="2">
             <widget class="QCheckBox" name="cbWholeScene2DScaleFinalUpscale3DSplitSemantics">
              <property name="whatsThis">
-              <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;Keeps high-resolution 3D visual coverage separate from native-stage material alpha/presence when resolved 3D is composited at native resolution. Disable this to compare against the single-alpha native compositor input.&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
+              <string>&lt;p&gt;Keep partial coverage at high-resolution polygon edges separate from the transparency of the polygon itself when combining 3D with 2D. Turn off to compare using one alpha value for both.&lt;/p&gt;</string>
              </property>
              <property name="text">
-              <string>Split 3D coverage/alpha</string>
+              <string>Separate 3D edge coverage from transparency</string>
              </property>
             </widget>
            </item>
            <item row="4" column="0">
             <widget class="QCheckBox" name="cbWholeScene2DScaleFinalUpscale3DSharpenSplitCoverage">
              <property name="whatsThis">
-              <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;Experimental. When split 3D coverage is enabled, biases visual coverage toward a harder native-like ownership transition instead of using raw high-resolution coverage as opacity. This can reduce 3D/background bleed but may reintroduce jaggier edges.&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
+              <string>&lt;p&gt;Make reconstructed 3D edge coverage more sharply defined. This can reduce blending with the background but may make edges more jagged. Requires Separate 3D edge coverage from transparency.&lt;/p&gt;</string>
              </property>
              <property name="text">
-              <string>Sharpen split 3D coverage</string>
+              <string>Sharpen reconstructed 3D edges</string>
              </property>
             </widget>
            </item>
            <item row="4" column="1">
             <widget class="QCheckBox" name="cbWholeScene2DScaleHybridWindowEdgeAssist">
              <property name="whatsThis">
-              <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;In conservative hybrid mode, lets presentation-overlay assist cover safe window-excluded 2D regions and adjacent visible operator edges. This can smooth Mario Kart-style panel corners, but may soften 3D near window boundaries.&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
+              <string>&lt;p&gt;In Hybrid mode, smooth supported corners and edges around areas hidden by the game using screen masks. This can also soften nearby 3D edges.&lt;/p&gt;</string>
              </property>
              <property name="text">
-              <string>Hybrid window-edge assist</string>
+              <string>Smooth edges around screen masks</string>
              </property>
             </widget>
            </item>
            <item row="4" column="2">
             <widget class="QCheckBox" name="cbWholeScene2DScaleHybridTarget2AlphaBlendAssist">
              <property name="whatsThis">
-              <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;In conservative hybrid mode, lets presentation-overlay assist handle native alpha-blend regions where Direct3D is the target2 underlay. This can preserve high-resolution 3D under translucent 2D overlays, but may affect games with more complex blend ownership.&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
+              <string>&lt;p&gt;In Hybrid mode, keep high-resolution 3D beneath supported translucent 2D overlays. May change the appearance of games with more complex layer blending.&lt;/p&gt;</string>
              </property>
              <property name="text">
-              <string>Hybrid target2 alpha assist</string>
+              <string>Preserve sharp 3D beneath translucent overlays</string>
              </property>
             </widget>
            </item>
            <item row="5" column="0">
             <widget class="QCheckBox" name="cbWholeScene2DScaleHybridForeground2DBase">
              <property name="whatsThis">
-              <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;In conservative hybrid mode, uses a high-resolution 2D-only base only for Direct3D-absent fallback pixels in a narrow halo beside safe foreground Direct3D. The rule is blocked near overlay assist, native effects, Direct3D effects, window/capture ambiguity, and unknown fallback. This can avoid native-resolution Direct3D residue around foreground 3D boundaries, but may affect nearby 2D/3D boundaries.&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
+              <string>&lt;p&gt;In Hybrid mode, use an enhanced 2D background in supported narrow areas beside foreground 3D. This can reduce low-resolution fringes but may change nearby 2D/3D boundaries. Complex effects, overlays, and ambiguous screen masks are excluded.&lt;/p&gt;</string>
              </property>
              <property name="text">
-              <string>Hybrid foreground boundary 2D base</string>
+              <string>Reduce low-resolution fringes around foreground 3D</string>
              </property>
             </widget>
            </item>
            <item row="5" column="1">
             <widget class="QCheckBox" name="cbWholeScene2DScaleHybridNativeEffectGuard">
              <property name="whatsThis">
-              <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;In conservative hybrid mode, keeps true native presentation near native 2D special-effect cells instead of replacing nearby foreground Direct3D with the high-resolution compositor. This can avoid splitting brightness/blend text effects, but may keep nearby 3D at native-presentation quality.&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
+              <string>&lt;p&gt;In Hybrid mode, keep the original rendering near some 2D brightness and blending effects to avoid splitting their appearance across layers. Nearby 3D may look less sharp.&lt;/p&gt;</string>
              </property>
              <property name="text">
-              <string>Hybrid native-effect guard</string>
+              <string>Preserve original rendering around 2D effects</string>
              </property>
             </widget>
            </item>
            <item row="5" column="2">
             <widget class="QCheckBox" name="cbWholeScene2DScaleHybridCleanLegacyCandidate">
              <property name="whatsThis">
-              <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;In hybrid mode, uses the Native Stack Upscale candidate for simple Direct3D plus 2D frames without capture, windows, or alpha blending. This can avoid hybrid overlay residue without adding an extra render pass.&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
+              <string>&lt;p&gt;In Hybrid mode, use Native Stack Upscale to combine simple 3D and 2D scenes without capture, screen masks, or alpha blending. This can avoid overlay artifacts without an extra rendering pass. Other scenes keep their normal Hybrid path.&lt;/p&gt;</string>
              </property>
              <property name="text">
-              <string>Hybrid clean native-stack candidate</string>
+              <string>Use simpler composition for basic scenes</string>
              </property>
+            </widget>
+           </item>
+           <item row="6" column="0">
+            <widget class="QCheckBox" name="cbWholeScene2DScaleHybridStrictAffineHighRes">
+             <property name="whatsThis">
+              <string>&lt;p&gt;Make supported sprites and backgrounds smoother when rotated or resized in Hybrid mode. This also upscales their artwork using the selected upscaling algorithm. Advanced settings lets you disable artwork upscaling separately.&lt;/p&gt;</string>
+             </property>
+             <property name="text">
+              <string>Improve rotation and scaling</string>
+             </property>
+            </widget>
+           </item>
+           <item row="6" column="1">
+            <widget class="QCheckBox" name="cbWholeScene2DScaleHybridStrictAffineSourceEnhancement">
+             <property name="whatsThis">
+              <string>&lt;p&gt;Upscale supported sprite and background artwork with the selected upscaling algorithm before rotating or resizing it. Turn this off to keep the original artwork while retaining smoother rotation and scaling. Transparency reconstruction is selected separately.&lt;/p&gt;</string>
+             </property>
+             <property name="text">
+              <string>Upscale sprite and background artwork</string>
+             </property>
+            </widget>
+           </item>
+            <item row="12" column="0" colspan="3">
+            <widget class="QCheckBox" name="cbWholeScene2DScaleHybridStrictAffineTopTextBG">
+             <property name="whatsThis">
+              <string>&lt;p&gt;Also upscale supported ordinary tile backgrounds in scenes with improved rotation and scaling. These layers can contain scenery, menus, or text; this does not specifically detect written text. Requires sprite and background artwork upscaling. Supported edges use the selected transparency reconstruction.&lt;/p&gt;</string>
+             </property>
+             <property name="text">
+              <string>Upscale additional tile backgrounds</string>
+             </property>
+           </widget>
+           </item>
+            <item row="16" column="0" colspan="3">
+             <widget class="QCheckBox" name="cbWholeScene2DScaleHybridStrictAffineConnectedSources">
+              <property name="text"><string>Join adjacent sprite pieces</string></property>
+              <property name="whatsThis"><string>&lt;p&gt;Upscale compatible adjoining sprite pieces together to reduce seams. Some layouts and effects cannot be combined, and animation can change which pieces qualify. Works with either sampling mode and any transparency-reconstruction algorithm.&lt;/p&gt;</string></property>
+             </widget>
+            </item>
+            <item row="18" column="0" colspan="3">
+             <widget class="QCheckBox" name="cbWholeScene2DScaleHybridStrictAffineOpaqueAssemblies">
+              <property name="text"><string>Combine overlapping sprite pieces</string></property>
+              <property name="whatsThis"><string>&lt;p&gt;Upscale compatible overlapping sprite pieces together to reduce seams. Pieces are combined only when drawing order and effects can be preserved; shadows and other separate blend effects retain their original behavior. Works with either sampling mode and any transparency-reconstruction algorithm. Adds processing and memory costs.&lt;/p&gt;</string></property>
+             </widget>
+            </item>
+            <item row="15" column="0" colspan="3">
+             <widget class="QCheckBox" name="cbWholeScene2DScaleHybridStrictAffineMaskedOBJMLAA">
+              <property name="whatsThis">
+               <string>&lt;p&gt;Smooth small staircase edges that remain after sprites and backgrounds are combined. Most noticeable on ordinary sprite and interface outlines that still follow the original pixel mask. Already reconstructed outlines usually keep their own smoothing. Adds rendering work and may make little visible difference. Does not repair incorrect transparency or blending.&lt;/p&gt;</string>
+              </property>
+              <property name="text">
+               <string>Smooth remaining sprite and background edges</string>
+              </property>
             </widget>
            </item>
           </layout>
@@ -1008,7 +1105,7 @@
       <item row="7" column="1">
        <widget class="QSpinBox" name="sbVSyncInterval">
         <property name="whatsThis">
-         <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;The interval at which to synchronize to the monitor's refresh rate. Set to 1 for a 60Hz monitor, 2 for 120Hz, ...&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
+         <string>&lt;p&gt;Choose how many monitor refreshes to wait between presented frames. For roughly 60 frames per second, use 1 on a 60 Hz monitor or 2 on a 120 Hz monitor. Other refresh rates may not divide evenly. Requires VSync.&lt;/p&gt;</string>
         </property>
         <property name="minimum">
          <number>1</number>
@@ -1021,7 +1118,7 @@
       <item row="5" column="0" colspan="2">
        <widget class="QCheckBox" name="cbGLDisplay">
         <property name="whatsThis">
-         <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;Use OpenGL to draw the DS screens to the main window. May result in better frame pacing. Mandatory when using the OpenGL 3D renderer.&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
+         <string>&lt;p&gt;Use OpenGL to display the DS screens in the window. This can improve frame pacing and is required by the OpenGL 3D renderers.&lt;/p&gt;</string>
         </property>
         <property name="text">
          <string>OpenGL display</string>
@@ -1047,7 +1144,7 @@
       <item row="6" column="0" colspan="2">
        <widget class="QCheckBox" name="cbVSync">
         <property name="whatsThis">
-         <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;When using OpenGL, synchronize the video output to your monitor's refresh rate.&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
+         <string>&lt;p&gt;Synchronize video output to the monitor's refresh cycle to reduce screen tearing. Requires OpenGL display.&lt;/p&gt;</string>
         </property>
         <property name="text">
          <string>VSync</string>
@@ -1063,7 +1160,7 @@
          </sizepolicy>
         </property>
         <property name="whatsThis">
-         <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;The interval at which to synchronize to the monitor's refresh rate. Set to 1 for a 60Hz monitor, 2 for 120Hz, ...&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
+         <string>&lt;p&gt;Choose how many monitor refreshes to wait between presented frames. For roughly 60 frames per second, use 1 on a 60 Hz monitor or 2 on a 120 Hz monitor. Other refresh rates may not divide evenly. Requires VSync.&lt;/p&gt;</string>
         </property>
         <property name="text">
          <string>VSync interval:</string>
@@ -1073,7 +1170,7 @@
       <item row="2" column="0" colspan="2">
        <widget class="QRadioButton" name="rb3DOpenGL">
         <property name="whatsThis">
-         <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;The OpenGL renderer may be faster than software and supports graphical enhancements, but is more prone to glitches.&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
+         <string>&lt;p&gt;Use the Classic OpenGL renderer for GPU-rendered 3D and graphical enhancements. Try it if Compute is unavailable or a game has rendering problems; some effects may look different.&lt;/p&gt;</string>
         </property>
         <property name="text">
          <string>OpenGL (Classic)</string>
@@ -1083,7 +1180,7 @@
       <item row="1" column="0" colspan="2">
        <widget class="QRadioButton" name="rb3DSoftware">
         <property name="whatsThis">
-         <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;The software renderer is more accurate and less prone to rendering glitches, but requires more CPU power.&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
+         <string>&lt;p&gt;Render original-resolution 3D on the CPU. Useful for checking whether a visual problem comes from an enhanced 3D renderer. OpenGL display and screen enhancements are separate settings. CPU usage may be higher.&lt;/p&gt;</string>
         </property>
         <property name="text">
          <string>Software</string>
@@ -1100,7 +1197,7 @@
       <item row="3" column="0">
        <widget class="QRadioButton" name="rb3DCompute">
         <property name="whatsThis">
-         <string>&lt;html&gt;&lt;head/&gt;&lt;body&gt;&lt;p&gt;The OpenGL compute shader renderer uses a compute-based 3D rendering path. It supports the graphical enhancement settings and is the main target for several newer renderer features, but may behave differently from the classic OpenGL renderer in some games.&lt;/p&gt;&lt;/body&gt;&lt;/html&gt;</string>
+         <string>&lt;p&gt;Suggested starting point where supported. Uses the GPU for 3D rendering and supports graphical enhancements. Requires OpenGL 4.3 and is unavailable on macOS. Try Classic if a game has rendering problems.&lt;/p&gt;</string>
         </property>
         <property name="text">
          <string>OpenGL (Compute shader)</string>
@@ -1135,7 +1232,6 @@
   <tabstop>cbx3DTextureScalingAlgorithm</tabstop>
   <tabstop>cb3DTextureScalingAlphaXBRZ</tabstop>
   <tabstop>cb3DTextureScalingFrequentChangePolicy</tabstop>
-  <tabstop>cb3DTextureScalingSpline36Alpha</tabstop>
   <tabstop>cb3DTextureScalingDeferred</tabstop>
   <tabstop>cb3DTextureScalingLegacyAlphaHandling</tabstop>
   <tabstop>cb3DTextureScalingQualityAlphaHandling</tabstop>
@@ -1164,6 +1260,12 @@
   <tabstop>cbWholeScene2DScaleHybridForeground2DBase</tabstop>
   <tabstop>cbWholeScene2DScaleHybridNativeEffectGuard</tabstop>
   <tabstop>cbWholeScene2DScaleHybridCleanLegacyCandidate</tabstop>
+  <tabstop>cbWholeScene2DScaleHybridStrictAffineHighRes</tabstop>
+  <tabstop>cbWholeScene2DScaleHybridStrictAffineSourceEnhancement</tabstop>
+   <tabstop>cbWholeScene2DScaleHybridStrictAffineConnectedSources</tabstop>
+   <tabstop>cbWholeScene2DScaleHybridStrictAffineOpaqueAssemblies</tabstop>
+   <tabstop>cbWholeScene2DScaleHybridStrictAffineTopTextBG</tabstop>
+   <tabstop>cbWholeScene2DScaleHybridStrictAffineMaskedOBJMLAA</tabstop>
   <tabstop>cbxWholeScene2DScaleFinalUpscale3DFilter</tabstop>
   <tabstop>cbxComputeHiResCoords</tabstop>
   <tabstop>cbGLMSAA</tabstop>

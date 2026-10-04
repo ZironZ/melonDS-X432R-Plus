@@ -72,6 +72,19 @@ std::vector<u64> NewShaders;
 constexpr u32 ShaderCacheMagic = 0x11CAC4E1;
 constexpr u32 ShaderCacheVersion = 1;
 
+bool ClearErrors()
+{
+    // GL defines fewer distinct error flags than this. If sixteen reads cannot
+    // reach GL_NO_ERROR, the context/runtime is no longer behaving like an
+    // ordinary live GL error queue (most notably during context teardown).
+    for (int i = 0; i < 16; i++)
+    {
+        if (glGetError() == GL_NO_ERROR)
+            return true;
+    }
+    return false;
+}
+
 void LoadShaderCache()
 {
     // for now the shader cache only contains only compute shaders
@@ -212,8 +225,6 @@ bool CompilerShader(GLuint& id, const std::string& source, const std::string& na
         Log(LogLevel::Debug, "shader source:\n--\n%s\n--\n", source.c_str());
         delete[] log;
 
-        glDeleteShader(id);
-
         return false;
     }
 
@@ -258,7 +269,11 @@ bool LinkProgram(GLuint& result, GLuint* ids, int numIds)
 
 bool CompileComputeProgram(GLuint& result, const std::string& source, const std::string& name)
 {
+    result = 0;
+    if (!glCreateProgram || !glDeleteProgram || !glCreateShader || !glDeleteShader)
+        return false;
     result = glCreateProgram();
+    if (!result) return false;
 
     /*u64 sourceHash = XXH64(source.data(), source.size(), 0);
     auto it = ShaderCache.find(sourceHash);
@@ -279,13 +294,11 @@ bool CompileComputeProgram(GLuint& result, const std::string& source, const std:
     }*/
     Log(LogLevel::Error, "Shader %s from cache was rejected\n", name.c_str());
 
-    GLuint shader;
+    GLuint shader = 0;
     bool linkingSucess = false;
 
-    if (!glCreateShader || !glDeleteShader)
-        goto error;
-
     shader = glCreateShader(GL_COMPUTE_SHADER);
+    if (!shader) goto error;
 
     if (!CompilerShader(shader, source, name, "compute"))
         goto error;
@@ -293,11 +306,12 @@ bool CompileComputeProgram(GLuint& result, const std::string& source, const std:
     linkingSucess = LinkProgram(result, &shader, 1);
 
 error:
-    glDeleteShader(shader);
+    if (shader) glDeleteShader(shader);
 
     if (!linkingSucess)
     {
         glDeleteProgram(result);
+        result = 0;
     }
     /*else
     {
@@ -321,6 +335,9 @@ bool CompileVertexFragmentProgram(GLuint& result,
     const std::initializer_list<AttributeTarget>& vertexInAttrs,
     const std::initializer_list<AttributeTarget>& fragmentOutAttrs)
 {
+    result = 0;
+    if (!glCreateProgram || !glDeleteProgram || !glCreateShader || !glDeleteShader)
+        return false;
     GLuint shaders[2] =
     {
         glCreateShader(GL_VERTEX_SHADER),
@@ -329,6 +346,9 @@ bool CompileVertexFragmentProgram(GLuint& result,
     result = glCreateProgram();
 
     bool linkingSucess = false;
+
+    if (!result || !shaders[0] || !shaders[1])
+        goto error;
 
     if (!CompilerShader(shaders[0], vs, name, "vertex"))
         goto error;
@@ -349,11 +369,14 @@ bool CompileVertexFragmentProgram(GLuint& result,
     linkingSucess = LinkProgram(result, shaders, 2);
 
 error:
-    glDeleteShader(shaders[1]);
-    glDeleteShader(shaders[0]);
+    if (shaders[1]) glDeleteShader(shaders[1]);
+    if (shaders[0]) glDeleteShader(shaders[0]);
 
     if (!linkingSucess)
-        glDeleteProgram(result);
+    {
+        if (result) glDeleteProgram(result);
+        result = 0;
+    }
 
     return linkingSucess;
 }

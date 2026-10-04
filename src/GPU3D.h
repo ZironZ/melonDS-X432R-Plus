@@ -47,17 +47,42 @@ struct Vertex
     // TODO maybe: hi-res color? (that survives clipping)
     s32 HiresPosition[2];
 
+    // Enhancement-only coordinates before the widescreen X projection.
+    // Rebuilt from submitted geometry, never part of the DS savestate format.
+    bool NativeSourceValid = false;
+    s32 NativeClipX = 0;
+    s32 NativeClipY = 0;
+    s32 NativeSourcePosition[2] = {};
+
     void DoSavestate(Savestate* file) noexcept;
 };
 
 struct Polygon
 {
+    // Enhancement-only source geometry. Never serialized as DS state.
+    struct UnclippedQuadSource
+    {
+        bool Valid;
+        s32 Position[4][2];
+        s16 UV[4][2];
+
+        static s64 ProjectAxis(s64 coordinate, s64 w, u32 size, u32 origin) noexcept
+        {
+            // Extend the positive viewport's floor quantization off-screen.
+            // Signed division alone truncates negative fractions toward zero,
+            // turning a grid-aligned -8 into -7.9375 in 4-bit fixed point.
+            const s64 numerator = (coordinate+w)*size*16;
+            const s64 denominator = w*2; // callers require positive W
+            return numerator/denominator - (numerator < 0 && numerator%denominator != 0) + s64(origin)*16;
+        }
+    } UnclippedSource;
     Vertex* Vertices[10];
     u32 NumVertices;
 
     s32 FinalZ[10];
     s32 FinalW[10];
     bool WBuffer;
+    bool WideOrthographic = false; // Enhancement metadata, not serialized.
 
     u32 Attr;
     u32 TexParam;

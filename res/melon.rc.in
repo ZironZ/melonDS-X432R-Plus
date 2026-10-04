@@ -15,14 +15,14 @@ FILETYPE VFT_APP
 		BLOCK "040904E4"
 		{
 			VALUE "CompanyName", "Melon Factory of Kuribo64"
-			VALUE "FileVersion", "${melonDS_VERSION}"
-			VALUE "FileDescription", "melonDS emulator"
+			VALUE "FileVersion", "${MELONDS_FORK_VERSION}"
+			VALUE "FileDescription", "melonDS X432R+ emulator"
 			VALUE "InternalName", "SDnolem"
 			VALUE "LegalCopyright", "2016-2025 melonDS team"
 			VALUE "LegalTrademarks", ""
 			VALUE "OriginalFilename", "melonDS.exe"
-			VALUE "ProductName", "melonDS"
-			VALUE "ProductVersion", "${melonDS_VERSION}"
+			VALUE "ProductName", "melonDS X432R+"
+			VALUE "ProductVersion", "${melonDS_VERSION}${MELONDS_VERSION_SUFFIX}"
 		}
 	}
   BLOCK "VarFileInfo"

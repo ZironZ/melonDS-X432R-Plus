@@ -88,13 +88,13 @@ private:
     GLuint ShaderSortWork {};
     GLuint ShaderFinalPass[8] {};
 
-    GLuint YSpanIndicesTextureMemory;
-    GLuint YSpanIndicesTexture;
-    GLuint YSpanSetupMemory;
-    GLuint XSpanSetupMemory;
-    GLuint BinResultMemory;
-    GLuint RenderPolygonMemory;
-    GLuint WorkDescMemory;
+    GLuint YSpanIndicesTextureMemory {};
+    GLuint YSpanIndicesTexture {};
+    GLuint YSpanSetupMemory {};
+    GLuint XSpanSetupMemory {};
+    GLuint BinResultMemory {};
+    GLuint RenderPolygonMemory {};
+    GLuint WorkDescMemory {};
 
     enum
     {
@@ -104,8 +104,8 @@ private:
         tilememoryLayer_Num,
     };
 
-    GLuint TileMemory[tilememoryLayer_Num];
-    GLuint FinalTileMemory;
+    GLuint TileMemory[tilememoryLayer_Num] {};
+    GLuint FinalTileMemory {};
 
     struct SpanSetupY
     {
@@ -191,6 +191,7 @@ private:
     static constexpr int UniformIdxTexIsCapture = 2;
     static constexpr int UniformIdxCaptureYOffset = 3;
     static constexpr int UniformIdxBinaryAlphaTexture = 4;
+    static constexpr int UniformIdxReconstructionTexelScale = 5;
 
     static constexpr int MaxFullscreenLayers = 16;
 
@@ -198,6 +199,7 @@ private:
     {
         u32 VariantWorkCount[MaxVariants*4];
         u32 SortedWorkOffset[MaxVariants];
+        u32 VariantWorkRealCount[MaxVariants];
 
         u32 SortWorkWorkCount[4];
     };
@@ -225,17 +227,19 @@ private:
 
         float ClearBitmapOffset[2];
     };
-    GLuint MetaUniformMemory;
+    GLuint MetaUniformMemory {};
 
-    GLuint Samplers[18];
+    GLuint Samplers[18] {};
 
-    GLuint ClearBitmapTex[2];
-    u32* ClearBitmap[2];
+    GLuint ClearBitmapTex[2] {};
+    u32* ClearBitmap[2] {};
     u8 ClearBitmapDirty;
 
     GLuint Framebuffer = 0;
+    GLuint NativeCenterTex = 0;
 
     int ScreenWidth, ScreenHeight;
+    int OutputWidth, OutputHeight;
     int TilesPerLine, TileLines;
     int ScaleFactor = -1;
     int MaxWorkTiles;

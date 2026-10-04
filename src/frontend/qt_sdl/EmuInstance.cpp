@@ -35,6 +35,7 @@
 #include "ArchiveUtil.h"
 #endif
 #include "EmuInstance.h"
+#include "WideMelon.h"
 #include "Config.h"
 #include "Platform.h"
 #include "Net.h"
@@ -374,8 +375,47 @@ void EmuInstance::emuStop(StopReason reason)
 
 bool EmuInstance::usesOpenGL()
 {
-    return globalCfg.GetBool("Screen.UseGL") ||
+    return WideMelon::Enabled() || (restartWidescreen && restartWidescreen->Enabled()) ||
+           globalCfg.GetBool("Screen.UseGL") ||
            (globalCfg.GetInt("3D.Renderer") != renderer3D_Software);
+}
+
+void EmuInstance::prepareConsoleRestart()
+{
+    emuThread->emuPause(false);
+    const auto requested = WideMelon::ResolveConfiguration(
+        globalCfg.GetInt("3D.GL.WidescreenWidth"),
+        globalCfg.GetInt("3D.GL.WidescreenDisplay"),
+        globalCfg.GetInt("3D.GL.WidescreenHeight"),
+        globalCfg.GetBool("3D.GL.WidescreenExtendWindows"),
+        globalCfg.GetBool("3D.GL.WidescreenExpandNarrowBorders"));
+    if (requested == WideMelon::CurrentConfiguration()) return;
+
+    // Dimensions are process-wide. Never invalidate another instance's live
+    // geometry or capture textures, or reset its game without being asked.
+    if (numEmuInstances() != 1)
+    {
+        osdAddMessage(0xFFC040, "Close other instances, then reset to apply widescreen changes");
+        return;
+    }
+
+    restartWidescreen = requested;
+    if (usesOpenGL() != mainWindow->hasOpenGL())
+        mainWindow->updateVideoSettings(true);
+    if (requested.Enabled() && !mainWindow->hasOpenGL())
+    {
+        restartWidescreen.reset();
+        osdAddMessage(0xFFC040, "Widescreen changes need an available OpenGL display");
+    }
+}
+
+void EmuInstance::finishConsoleRestart()
+{
+    restartWidescreen.reset();
+    if (usesOpenGL() != mainWindow->hasOpenGL())
+        mainWindow->updateVideoSettings(true);
+    doOnAllWindows([](MainWindow* window) { emit window->screenLayoutChange(); });
+    emuThread->emuUnpause(false);
 }
 
 void EmuInstance::initOpenGL(int win)
@@ -1336,13 +1376,22 @@ bool EmuInstance::updateConsole() noexcept
     }
 
     renderLock.lock();
-    if ((!nds) || (consoleType != nds->ConsoleType))
+    const bool wideChanged = restartWidescreen &&
+        *restartWidescreen != WideMelon::CurrentConfiguration();
+    if ((!nds) || (consoleType != nds->ConsoleType) || wideChanged)
     {
         if (nds)
         {
+            if (mainWindow->hasOpenGL()) makeCurrentGL();
             saveRTCData();
             delete nds;
+            nds = nullptr;
         }
+
+        // Dispose of the old renderer under its original dimensions. A new
+        // console also discards capture history and geometry from the old view.
+        if (wideChanged)
+            WideMelon::ApplyConfiguration(*restartWidescreen);
 
         if (consoleType == 1)
             nds = new DSi(std::move(dsiargs.value()), this);

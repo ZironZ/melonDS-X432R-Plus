@@ -1,20 +1,5 @@
-/*
-    Copyright 2026 ZironZ
-
-    This file is part of melonDS.
-
-    melonDS is free software: you can redistribute it and/or modify it under
-    the terms of the GNU General Public License as published by the Free
-    Software Foundation, either version 3 of the License, or (at your option)
-    any later version.
-
-    melonDS is distributed in the hope that it will be useful, but WITHOUT ANY
-    WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
-    FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
-
-    You should have received a copy of the GNU General Public License along
-    with melonDS. If not, see http://www.gnu.org/licenses/.
-*/
+// Copyright 2026 ZironZ
+// SPDX-License-Identifier: GPL-3.0-or-later
 
 #ifndef GPU3D_TEXCACHE_MIP_H
 #define GPU3D_TEXCACHE_MIP_H
@@ -22,6 +7,7 @@
 #include "GPU3D_TexcacheDecode.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <vector>
 
@@ -172,17 +158,17 @@ inline void TextureMipPackLevels(TexcacheMipChain& chain, int outputFmt)
         switch (outputFmt)
         {
         case outputFmt_RGB6A5:
-            ConvertRGBA8BufferToOutput<outputFmt_RGB6A5>(level.Width, level.Height,
+            ConvertRGBA8BufferToOutputLUT<outputFmt_RGB6A5>(level.Width, level.Height,
                                                          level.PreviewRGBA8.data(), level.Packed.data(),
                                                          false, level.RepackPolicy);
             break;
         case outputFmt_RGBA8:
-            ConvertRGBA8BufferToOutput<outputFmt_RGBA8>(level.Width, level.Height,
+            ConvertRGBA8BufferToOutputLUT<outputFmt_RGBA8>(level.Width, level.Height,
                                                         level.PreviewRGBA8.data(), level.Packed.data(), false,
                                                         level.RepackPolicy);
             break;
         case outputFmt_BGRA8:
-            ConvertRGBA8BufferToOutput<outputFmt_BGRA8>(level.Width, level.Height,
+            ConvertRGBA8BufferToOutputLUT<outputFmt_BGRA8>(level.Width, level.Height,
                                                         level.PreviewRGBA8.data(), level.Packed.data(), false,
                                                         level.RepackPolicy);
             break;
@@ -277,19 +263,20 @@ inline float TextureMipAlphaCoverage(const std::vector<u32>& level)
     return static_cast<float>(covered) / static_cast<float>(level.size());
 }
 
-inline float TextureMipScaledCoverage(const std::vector<u32>& level, float scale)
+inline float TextureMipScaledCoverage(const std::array<size_t, 256>& histogram,
+                                     size_t pixels, float scale)
 {
-    if (level.empty())
+    if (pixels == 0)
         return 0.0f;
 
     size_t covered = 0;
-    for (u32 color : level)
+    for (size_t a = 0; a < histogram.size(); a++)
     {
-        float alpha = std::min(255.0f, static_cast<float>((color >> 24) & 0xFF) * scale);
+        float alpha = std::min(255.0f, static_cast<float>(a) * scale);
         if (alpha >= 128.0f)
-            covered++;
+            covered += histogram[a];
     }
-    return static_cast<float>(covered) / static_cast<float>(level.size());
+    return static_cast<float>(covered) / static_cast<float>(pixels);
 }
 
 inline void TextureMipBuildAlphaIslands(u32 width, u32 height, const std::vector<u32>& level, std::vector<int>& labels)
@@ -458,7 +445,10 @@ inline void TextureMipBuildBinaryAlphaLevel(u32 srcWidth,
 {
     dstLevel.resize(static_cast<size_t>(dstWidth) * static_cast<size_t>(dstHeight));
     std::vector<float> avgAlpha(dstLevel.size());
-    std::vector<int> dominantLabels(dstLevel.size(), -1);
+    std::vector<int> dominantLabels;
+    if (useImprovedMipColors && dstLabels)
+        dominantLabels.resize(dstLevel.size(), -1);
+    std::array<size_t, 256> alphaHistogram = {};
     if (dstLabels)
         dstLabels->assign(dstLevel.size(), -1);
 
@@ -569,19 +559,7 @@ inline void TextureMipBuildBinaryAlphaLevel(u32 srcWidth,
             }
             else
             {
-                float accumWeight = 0.0f;
-                for (u32 oy = 0; oy < 2; oy++)
-                {
-                    u32 sy = std::min(srcHeight - 1, y * 2 + oy);
-                    for (u32 ox = 0; ox < 2; ox++)
-                    {
-                        u32 sx = std::min(srcWidth - 1, x * 2 + ox);
-                        u32 color = srcLevel[static_cast<size_t>(sy) * static_cast<size_t>(srcWidth) + static_cast<size_t>(sx)];
-                        float a = static_cast<float>((color >> 24) & 0xFF);
-                        if (a > 0.0f)
-                            accumWeight += a;
-                    }
-                }
+                const float accumWeight = accumAlpha;
                 if (accumWeight > 0.0f)
                 {
                     outR = accumR / accumWeight;
@@ -598,12 +576,14 @@ inline void TextureMipBuildBinaryAlphaLevel(u32 srcWidth,
 
             size_t dstIndex = static_cast<size_t>(y) * static_cast<size_t>(dstWidth) + static_cast<size_t>(x);
             avgAlpha[dstIndex] = std::clamp(accumAlpha / static_cast<float>(sampleCount), 0.0f, 255.0f);
-            dominantLabels[dstIndex] = dominantLabel;
+            if (!dominantLabels.empty())
+                dominantLabels[dstIndex] = dominantLabel;
             dstLevel[dstIndex] =
                 (static_cast<u32>(std::clamp(std::lround(avgAlpha[dstIndex]), 0l, 255l)) << 24) |
                 (static_cast<u32>(std::clamp(std::lround(outR), 0l, 255l)) & 0xFF) |
                 ((static_cast<u32>(std::clamp(std::lround(outG), 0l, 255l)) & 0xFF) << 8) |
                 ((static_cast<u32>(std::clamp(std::lround(outB), 0l, 255l)) & 0xFF) << 16);
+            alphaHistogram[dstLevel[dstIndex] >> 24]++;
         }
     }
 
@@ -613,7 +593,7 @@ inline void TextureMipBuildBinaryAlphaLevel(u32 srcWidth,
     for (int iter = 0; iter < 10; iter++)
     {
         float mid = (low + high) * 0.5f;
-        if (TextureMipScaledCoverage(dstLevel, mid) < targetCoverage)
+        if (TextureMipScaledCoverage(alphaHistogram, dstLevel.size(), mid) < targetCoverage)
             low = mid;
         else
             high = mid;

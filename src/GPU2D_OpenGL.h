@@ -22,16 +22,35 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <variant>
 #include <vector>
 #include "OpenGLSupport.h"
 #include "GPU2D.h"
+#include "GLBGVRAMUploadCache.h"
 #include "RendererDebug.h"
 #include "RendererSettings.h"
+#include "WholeSceneOutputPlan.h"
 #include "WholeSceneScalePolicy.h"
+#include "WholeSceneConnectedOBJPolicy.h"
 
 namespace melonDS
 {
 class GLRenderer;
+
+struct StrictAffineOrderedRecipeIntent
+{
+    bool Assessed = false;
+    bool OrdinaryBandEligible = false;
+    bool NoAffineExtensionEligible = false;
+    bool PlannedOrderedRequested = false;
+    bool AtomicRecipe = false;
+    bool PreservedBehindRecipe = false;
+    WholeSceneOBJBandClassification Classification;
+    WholeSceneOBJOperandPlan OperandPlan;
+    WholeSceneCompositorRecipe SemanticBaseRecipe;
+    WholeSceneCompositorRecipe OrderedRecipe;
+    WholeSceneOperandExcludedOverlayRecipe OverlayRecipe;
+};
 
 class GLRenderer2D : public Renderer2D
 {
@@ -71,15 +90,23 @@ public:
     void SetWholeSceneScaleHybridNativeEffectGuard(bool enable);
     void SetWholeSceneScaleHybridForeground2DBase(bool enable);
     void SetWholeSceneScaleHybridCleanLegacyCandidate(bool enable);
+    void SetWholeSceneScaleHybridStrictAffineHighRes(bool enable);
+    void SetWholeSceneScaleHybridStrictAffineSourceEnhancement(bool enable);
+    void SetWholeSceneScaleHybridStrictAffineOBJSubpixel2x(bool enable);
+    void SetWholeSceneScaleHybridStrictAffineConnectedSources(bool enable);
+    void SetWholeSceneScaleHybridStrictAffineTopTextBG(bool enable);
+    void SetWholeSceneScaleHybridStrictAffineMaskedOBJMLAA(bool enable);
     void SetWholeSceneDebugPoison(bool source3D, bool native3DResolve, bool native3DResolveAlpha);
     void SetWholeSceneDebugViewsActive(bool active);
     bool ReadWholeSceneDebugView(WholeScene2DDebugView view,
                                  int& width,
                                  int& height,
                                  std::vector<u32>& rgba,
-                                 std::string* status = nullptr) const;
+                                 std::string* status = nullptr,
+                                 WholeScene2DDebugReadContext* context = nullptr) const;
     void AppendWholeSceneTimingCSVHeader(std::string& header, const char* prefix) const;
     void AppendWholeSceneTimingCSVRow(std::string& row) const;
+    void CaptureAffineOBJDebugEvidence(WholeScene2DAffineOBJDebugEvidence& evidence) const;
     void ResetWholeSceneUpdateTiming();
 
     void DrawScanline(u32 line) override;
@@ -89,60 +116,103 @@ public:
 
 private:
     friend class GLRenderer;
+    friend struct GLRendererLifetimeTestAccess;
     GLRenderer& Parent;
 
     int ScaleFactor;
-    int ScreenW, ScreenH;
+    int ScreenW {}, ScreenH {};
 
-    GLuint LayerPreShader;
+    GLuint LayerPreShader {};
     GLint LayerPreCurBGULoc;
 
-    GLuint ScanlineConfigUBO;
-    GLuint SpriteScanlineConfigUBO;
+    GLuint ScanlineConfigUBO {};
+    GLuint SpriteScanlineConfigUBO {};
 
-    GLuint SpritePreShader;
-    GLuint SpritePreVtxBuffer;
-    GLuint SpritePreVtxArray;
-    u16* SpritePreVtxData;
+    GLuint SpritePreShader {};
+    GLuint SpritePreVtxBuffer {};
+    GLuint SpritePreVtxArray {};
+    u16 SpritePreVtxData[(3 * 6) * 128];
 
-    GLuint SpriteShader;
+    GLuint SpriteShader {};
     GLint SpriteRenderTransULoc;
     GLint SpriteFilterModeULoc;
-    GLuint SpriteVtxBuffer;
-    GLuint SpriteVtxArray;
-    u16* SpriteVtxData;
+    GLint SpriteAffineSourceEnhancementOnlyULoc;
+    GLint SpriteUseEnhancedSourceULoc;
+    GLint SpriteEnhancedSourceScaleULoc;
+    GLint SpriteLinearEnhancedSourceULoc;
+    GLint SpriteUseAssembledSourceULoc, SpriteAssembledSlotsULoc;
+    GLint SpriteXBRZPresentationOnlyULoc;
+    GLint SpriteAffineOBJPresentationCoverageModeULoc;
+    GLint SpriteOrderedPresentationBandULoc;
+    GLuint SpriteVtxBuffer {};
+    GLuint SpriteVtxArray {};
+    u16 SpriteVtxData[(5 * 6) * 256];
 
-    GLuint CompositorShader;
-    GLuint CompositorConfigUBO;
+    GLuint CompositorShader {};
+    GLuint CompositorConfigUBO {};
     GLint CompositorScaleULoc;
     GLint CompositorOBJNativeResolutionULoc;
     GLint CompositorLayerFilterModeULoc;
     GLint CompositorLayerFilterNoWrapULoc;
+    GLint CompositorAffineSourceEnhancementOnlyULoc;
+    GLint CompositorEnhancedBGMaskULoc;
     GLint CompositorDebugTintULoc;
     GLint CompositorSplit3DSemanticsULoc;
     GLint CompositorSharpenSplit3DCoverageULoc;
+    GLint CompositorUseEnhancedOBJPresentationCoverageULoc;
+    GLint CompositorUseXBRZPresentationContourULoc;
+    GLint CompositorPresentationContourPremultipliedULoc;
+    GLint CompositorBilinearAffineBGPresentationULoc;
+    GLint CompositorEnhancedBGCoverageMaskULoc;
+    GLint CompositorReconstructedBGCandidateMaskULoc;
+    GLint CompositorAffineConstantBackdropProofMaskULoc;
+    GLint CompositorDirect3DEndpointModeULoc;
+    GLint CompositorUseScanlineStateULoc;
+    GLint CompositorForceOBJDisabledULoc;
 
-    GLuint NativePrepassShader;
+    GLuint NativePrepassShader {};
     GLint NativePrepassScaleULoc;
     GLint NativePrepassDebugLayerULoc;
-    GLuint NativeUpscaleShader;
+    GLuint NativeUpscaleShader {};
     GLint NativeUpscaleScaleULoc;
     GLint NativeUpscaleLegacyFilterULoc;
-    GLuint NativeBoundaryGuardShader;
-    GLuint NativeResolveShader;
-    GLuint Native3DResolveShader;
+    GLuint NativeBoundaryGuardShader {};
+    GLuint NativeResolveShader {};
+    GLuint OrdinaryOBJBandPresentationShader {};
+    GLuint OrdinaryOBJSpecialCompositeShader {};
+    GLuint ResolvedOBJMergeShader {};
+    GLint ResolvedOBJMergeScaleULoc;
+    GLuint StrictAffineOrdinaryOBJCompositeShader {};
+    GLint StrictAffineOrdinaryOBJCompositeScaleULoc;
+    GLint StrictAffineOrdinaryOBJCompositeNativeStackBGMaskULoc;
+    GLint StrictAffineOrdinaryOBJCompositeDebugTintULoc;
+    GLint StrictAffineOrdinaryOBJCompositeBuildUnderlayULoc;
+    GLint StrictAffineOrdinaryOBJCompositeOrdinaryEquivalentMaskULoc;
+    GLuint StrictAffineMaskedOBJMaskShader {};
+    GLint StrictAffineMaskedOBJMaskScaleULoc;
+    GLint StrictAffineMaskedOBJMaskOwnerULoc;
+    GLuint StrictAffineMaskedOBJMLAAShader {};
+    GLint StrictAffineMaskedOBJMLAAScaleULoc;
+    GLint StrictAffineMaskedOBJMLAADebugCoverageULoc;
+    GLuint AffineOBJPresentationCompositeShader {};
+    GLint AffineOBJPresentationCompositeScaleULoc;
+    GLint AffineOBJPresentationCompositeSubpixelCoverageULoc;
+    GLint AffineOBJPresentationCompositePremultipliedSubpixelULoc;
+    GLuint Native3DResolveShader {};
     GLint Native3DResolveFilterModeULoc;
     GLint Native3DResolveCoverageAwareULoc;
     GLint Native3DResolveRepresentativeSemanticsULoc;
     GLint Native3DResolveSplitSemanticsULoc;
-    GLuint OverlayEndpointShader;
+    GLuint OverlayEndpointShader {};
     GLint OverlayEndpointWhiteULoc;
-    GLuint OverlayCompositeShader;
+    GLuint OverlayCompositeShader {};
     GLint OverlayCompositeScaleULoc;
     GLint OverlayCompositeDebugTintULoc;
     GLint OverlayCompositeLegacyUnderlayULoc;
     GLint OverlayCompositeDirect3DPresentationSpaceULoc;
-    GLuint OverlayHybridCompositeShader;
+    GLint OverlayCompositeStraightDirect3DColorULoc;
+    GLint OverlayCompositeExplicit3DOperatorULoc;
+    GLuint OverlayHybridCompositeShader {};
     GLint OverlayHybridCompositeScaleULoc;
     GLint OverlayHybridCompositeDebugTintULoc;
     GLint OverlayHybridCompositeLegacyUnderlayULoc;
@@ -155,10 +225,10 @@ private:
     GLint OverlayHybridCompositeLegacyCandidateULoc;
     GLint OverlayHybridCompositeForceOverlayAssistULoc;
     GLint OverlayHybridCompositeDebugModeULoc;
-    GLuint OverlayDebugShader;
+    GLuint OverlayDebugShader {};
     GLint OverlayDebugModeULoc;
     GLint OverlayDebugLegacyUnderlayULoc;
-    GLuint MasterBrightnessShader;
+    GLuint MasterBrightnessShader {};
     GLint MasterBrightnessModeULoc;
     GLint MasterBrightnessFactorULoc;
     GLint NativeResolveScaleULoc;
@@ -166,16 +236,24 @@ private:
     GLint NativeResolveUseForegroundOverlayULoc;
     GLint NativeResolveDebugTintULoc;
     GLint NativeResolveNativeExactOutputULoc;
-    GLuint RGBAToYUVAShader;
-    GLuint ArtCNNConvShaders[RendererSettings::GLArtCNNModelCount][7];
-    GLuint ArtCNNDepthToSpaceShaders[RendererSettings::GLArtCNNModelCount];
-    GLuint Spline36Shader;
-    GLuint ArtCNNYUVAToRGBA2xShader;
-    GLuint AlphaReplaceShader;
+    GLuint RGBAToYUVAShader {};
+    GLuint ArtCNNConvShaders[RendererSettings::GLArtCNNModelCount][7] {};
+    GLuint ArtCNNDepthToSpaceShaders[RendererSettings::GLArtCNNModelCount] {};
+    GLuint Spline36Shader {};
+    GLuint ArtCNNYUVAToRGBA2xShader {};
+    GLuint AlphaReplaceShader {};
+    GLuint ReconstructionAlphaShader = 0;
+    GLuint ReconstructionAlphaWorkTex[3] {};
+    int ReconstructionAlphaWidth = 0, ReconstructionAlphaHeight = 0, ReconstructionAlphaScale = 0;
+    GLuint MidpointAlphaShader {};
+    GLuint TransparentRGBPadShader {};
+    GLuint OpaqueOBJAssemblyShader = 0;
+    GLuint OpaqueOBJAssemblyTex = 0, OpaqueOBJAssemblyFB = 0;
+    int OpaqueOBJAssemblyWidth = 0, OpaqueOBJAssemblyHeight = 0;
     GLuint NNEDI3VerticalComputeShader {};
     GLuint NNEDI3HorizontalComputeShader {};
-    GLuint XBRZPreprocessShader;
-    GLuint XBRZFreescaleShader;
+    GLuint XBRZPreprocessShader {};
+    GLuint XBRZFreescaleShader {};
     GLRenderer2D* CuNNyShaderOwner;
     GLRenderer2D* ArtCNNShaderOwner;
     GLRenderer2D* NNEDI3ComputeShaderOwner;
@@ -198,82 +276,204 @@ private:
         {18, 19, 12, 16},   // large bitmap
     };
 
-    GLuint LayerConfigUBO;
-    GLuint SpriteConfigUBO;
+    GLuint LayerConfigUBO {};
+    GLuint SpriteConfigUBO {};
 
-    GLuint VRAMTex_BG;
-    GLuint VRAMTex_OBJ;
-    GLuint PalTex_BG;
-    GLuint PalTex_OBJ;
-    GLuint BlankColorTex;
+    GLuint VRAMTex_BG {};
+    GLuint VRAMTex_OBJ {};
+    GLuint PalTex_BG {};
+    GLuint PalTex_OBJ {};
+    GLuint BlankColorTex {};
 
-    GLuint MosaicTex;
+    GLuint MosaicTex {};
 
-    GLuint AllBGLayerFB[22];
-    GLuint AllBGLayerTex[22];
-    GLuint AllBGLayerMetaTex[22];
+    GLuint AllBGLayerFB[22] {};
+    GLuint AllBGLayerTex[22] {};
+    GLuint AllBGLayerMetaTex[22] {};
 
-    GLuint BGLayerFB[4];
-    GLuint BGLayerTex[4];
-    GLuint BGLayerMetaTex[4];
+    // Borrowed selections from AllBGLayer*, not separate allocations.
+    GLuint BGLayerFB[4] {};
+    GLuint BGLayerTex[4] {};
+    GLuint BGLayerMetaTex[4] {};
+    GLuint EnhancedBGLayerTex[4] {};
+    GLuint EnhancedBGLayerFB[4] {};
+    u32 EnhancedBGLayerWidth[4] {};
+    u32 EnhancedBGLayerHeight[4] {};
+    u64 BGLayerSourceGeneration[4] {1, 1, 1, 1};
+    u64 EnhancedBGLayerSourceGeneration[4] {};
+    u32 EnhancedBGLayerAlgorithm[4] {};
+    bool EnhancedBGLayerBackdropPrecomposed[4] {};
+    u32 EnhancedBGLayerBackdropColor[4] {};
+    GLuint DeferredStrictAffineHistoricalBGLayerTex
+        [DeferredScanlineStrictAffineInputs::MaxHistoricalSourceEpochs][4] {};
+    GLuint DeferredStrictAffineHistoricalBGLayerMetaTex
+        [DeferredScanlineStrictAffineInputs::MaxHistoricalSourceEpochs][4] {};
+    GLuint DeferredStrictAffineHistoricalBGLayerFB
+        [DeferredScanlineStrictAffineInputs::MaxHistoricalSourceEpochs][4] {};
+    u32 DeferredStrictAffineHistoricalBGLayerWidth
+        [DeferredScanlineStrictAffineInputs::MaxHistoricalSourceEpochs][4] {};
+    u32 DeferredStrictAffineHistoricalBGLayerHeight
+        [DeferredScanlineStrictAffineInputs::MaxHistoricalSourceEpochs][4] {};
+    GLuint DeferredStrictAffineHistoricalEnhancedBGLayerTex
+        [DeferredScanlineStrictAffineInputs::MaxHistoricalSourceEpochs][4] {};
+    GLuint DeferredStrictAffineHistoricalEnhancedBGLayerFB
+        [DeferredScanlineStrictAffineInputs::MaxHistoricalSourceEpochs][4] {};
+    u32 DeferredStrictAffineHistoricalEnhancedBGLayerWidth
+        [DeferredScanlineStrictAffineInputs::MaxHistoricalSourceEpochs][4] {};
+    u32 DeferredStrictAffineHistoricalEnhancedBGLayerHeight
+        [DeferredScanlineStrictAffineInputs::MaxHistoricalSourceEpochs][4] {};
+    GLuint EnhancedBGInputTex = 0;
+    GLuint EnhancedBGInputFB = 0;
+    GLuint EnhancedBGPreparedTex = 0;
+    GLuint EnhancedBGPreparedFB = 0;
+    GLuint EnhancedBGScaledTex = 0;
+    GLuint EnhancedBGScaledFB = 0;
+    u32 EnhancedBGScratchWidth = 0;
+    u32 EnhancedBGScratchHeight = 0;
+    u32 EnhancedBGScratchScale = 0;
 
-    GLuint SpriteFB;
-    GLuint SpriteTex;
+    GLuint SpriteFB {};
+    GLuint SpriteTex {};
+    GLuint EnhancedSpriteFB {};
+    GLuint EnhancedSpriteTex {};
+    GLuint EnhancedSpriteInputFB {};
+    GLuint EnhancedSpriteInputTex {};
+    GLuint EnhancedSpritePreparedFB {};
+    GLuint EnhancedSpritePreparedTex {};
+    GLuint EnhancedSpriteScaledRGBFB {};
+    GLuint EnhancedSpriteScaledRGBTex {};
+    GLuint EnhancedSpriteScaledRGBAFB {};
+    GLuint EnhancedSpriteScaledRGBATex {};
+    u32 EnhancedSpriteSourceScale = 2;
 
-    GLuint OBJLayerFB;
-    GLuint OBJLayerTex;
-    GLuint OBJDepthTex;
+    GLuint OBJLayerFB {};
+    GLuint OBJLayerTex {};
+    GLuint OBJDepthTex {};
 
-    GLuint OutputFB;
-    GLuint OutputTex;
+    GLuint OutputFB {};
+    GLuint OutputTex {};
+    GLuint StrictAffineCandidateFB {};
+    GLuint StrictAffineCandidateTex {};
+    GLuint StrictAffineMaskedOBJMaskFB {};
+    GLuint StrictAffineMaskedOBJMaskTex {};
+    GLuint StrictAffineSupersamplePresentationOBJLayerFB {};
+    GLuint StrictAffineSupersamplePresentationOBJLayerTex {};
+    GLuint StrictAffineSupersamplePresentationOBJDepthTex {};
+    u32 StrictAffineSupersampleWidth {};
+    u32 StrictAffineSupersampleHeight {};
+    GLuint StrictAffineOBJLayerFB {};
+    GLuint StrictAffineOBJLayerTex {};
+    GLuint StrictAffineOBJDepthTex {};
+    GLuint AffinePresentationOBJLayerFB {};
+    GLuint AffinePresentationOBJLayerTex {};
+    GLuint AffinePresentationOBJDepthTex {};
+    GLuint AffinePresentationUnderlayFB {};
+    GLuint AffinePresentationUnderlayTex {};
 
-    GLuint NativeOBJLayerFB;
-    GLuint NativeOBJLayerTex;
-    GLuint NativeOBJDepthTex;
+    GLuint NativeOBJLayerFB {};
+    GLuint NativeOBJLayerTex {};
+    GLuint NativeOBJDepthTex {};
+    GLuint NativeOperandExcludedOBJLayerFB {};
+    GLuint NativeOperandExcludedOBJLayerTex {};
+    GLuint NativeOperandExcludedOBJDepthTex {};
 
-    GLuint NativeOutputFB;
-    GLuint NativeOutputTex;
-    GLuint NativeTopColorTex;
-    GLuint NativeSecondColorTex;
-    GLuint NativeMetaTex;
-    GLuint NativeLayerDebugFB;
-    GLuint NativeLayerDebugTex;
-    GLuint NativeExactFinalFB;
-    GLuint NativeExactFinalTex;
-    GLuint NativeDirect3DFB;
-    GLuint NativeDirect3DTex;
-    GLuint NativeDirect3DSemanticsTex;
-    GLuint NativeDirect3DCompositorTex;
-    GLuint NativeOverlayBlack3DTex;
-    GLuint NativeOverlayWhite3DTex;
-    GLuint NativeOverlayBlackCapture128Tex;
-    GLuint NativeOverlayWhiteCapture128Tex;
-    GLuint NativeOverlayBlackCapture256Tex;
-    GLuint NativeOverlayWhiteCapture256Tex;
-    GLuint NativeOverlayTrueFinalTex;
-    GLuint NativeOverlayReconstructedTex;
-    GLuint NativeOverlayErrorTex;
-    GLuint NativeOverlayConfidenceTex;
+    // Lazily allocated native-resolution assembled ordinary-OBJ band storage.
+    // Three layers per band mirror the regular OBJ color/flags/coverage
+    // contract. Debug views expose every admitted band; the first bounded
+    // single-foreground-band recipe may also consume its scaled product.
+    GLuint OrdinaryOBJBandLayerFB {};
+    GLuint OrdinaryOBJBandLayerTex {};
+    GLuint OrdinaryOBJBandScaledFB {};
+    GLuint OrdinaryOBJBandScaledTex {};
+    u32 OrdinaryOBJBandScaledWidth = 0;
+    u32 OrdinaryOBJBandScaledHeight = 0;
+    u64 OrdinaryOBJOperandPlanHash = 0;
+    WholeSceneOBJBandClassification OrdinaryOBJBandProducts;
+    bool OrdinaryOBJBandProductsValid = false;
+    bool OrdinaryOBJBandScaledProductsValid = false;
+    bool OrdinaryOBJBandPresentationConsumed = false;
 
-    GLuint UpscaledStateFB;
-    GLuint UpscaledTopColorTex;
-    GLuint UpscaledSecondColorTex;
-    GLuint UpscaledMetaTex;
-    GLuint UpscaledCoverageTex;
-    GLuint UpscaledExactFinalTex;
-    GLuint UpscaledGuardColorTex;
-    GLuint UpscaledOverlayUnderlayWeightTex;
-    GLuint UpscaledOverlayOwnershipTex;
-    GLuint HybridForegroundTex;
-    GLuint HybridNativeFallbackTex;
-    GLuint Hybrid2DBaseTex;
-    GLuint HybridLegacyCandidateTex;
-    GLuint HybridSelectorTex;
-    GLuint HybridCoverageMissTex;
-    GLuint HybridForegroundAlphaTex;
-    GLuint HybridFinalSourceTex;
+    // Dedicated storage lets the unified ordinary-OBJ product survive
+    // affine-only motion without being overwritten by the older band path.
+    GLuint ResolvedOrdinaryOBJFB {};
+    GLuint ResolvedOrdinaryOBJNativeLayerTex {};
+    GLuint ResolvedOrdinaryOBJNativeLayerFB {};
+    GLuint ResolvedOrdinaryOBJTex {};
+    u32 ResolvedOrdinaryOBJWidth = 0;
+    u32 ResolvedOrdinaryOBJHeight = 0;
+    struct ResolvedOrdinaryOBJProductKey
+    {
+        u64 SourceGeneration = 0;
+        u64 OrdinaryOAMHash = 0;
+        u32 SourceEnhancement = 0;
+        s32 SourceModelIndex = -1;
+        u32 SourceScale = 0;
+        u32 Width = 0;
+        u32 Height = 0;
+        u32 AlphaTreatment = 0;
+
+        bool operator==(const ResolvedOrdinaryOBJProductKey& other) const
+        {
+            return SourceGeneration == other.SourceGeneration &&
+                   OrdinaryOAMHash == other.OrdinaryOAMHash &&
+                   SourceEnhancement == other.SourceEnhancement &&
+                   SourceModelIndex == other.SourceModelIndex &&
+                   SourceScale == other.SourceScale &&
+                   Width == other.Width && Height == other.Height &&
+                   AlphaTreatment == other.AlphaTreatment;
+        }
+    };
+    ResolvedOrdinaryOBJProductKey ResolvedOrdinaryOBJKey {};
+    bool ResolvedOrdinaryOBJValid = false;
+
+    GLuint NativeOutputFB {};
+    GLuint NativeOutputTex {};
+    GLuint NativeTopColorTex {};
+    GLuint NativeSecondColorTex {};
+    GLuint NativeMetaTex {};
+    GLuint NativeOrdinaryOBJRGBATex {};
+    GLuint NativeOrdinaryOBJPreparedTex {};
+    GLuint NativeLayerDebugFB {};
+    GLuint NativeLayerDebugTex {};
+    GLuint NativeExactFinalFB {};
+    GLuint NativeExactFinalTex {};
+    GLuint NativeDirect3DFB {};
+    GLuint NativeDirect3DTex {};
+    GLuint NativeDirect3DSemanticsTex {};
+    GLuint NativeDirect3DOperatorTex {};
+    GLuint NativeDirect3DCompositorTex {};
+    GLuint NativeOverlayBlack3DTex {};
+    GLuint NativeOverlayWhite3DTex {};
+    GLuint NativeOverlayBlackCapture128Tex {};
+    GLuint NativeOverlayWhiteCapture128Tex {};
+    GLuint NativeOverlayBlackCapture256Tex {};
+    GLuint NativeOverlayWhiteCapture256Tex {};
+    GLuint NativeOverlayTrueFinalTex {};
+    GLuint NativeOverlayReconstructedTex {};
+    GLuint NativeOverlayErrorTex {};
+    GLuint NativeOverlayConfidenceTex {};
+
+    GLuint UpscaledStateFB {};
+    GLuint UpscaledTopColorTex {};
+    GLuint UpscaledSecondColorTex {};
+    GLuint UpscaledMetaTex {};
+    GLuint UpscaledCoverageTex {};
+    GLuint UpscaledOrdinaryOBJRGBATex {};
+    GLuint UpscaledExactFinalTex {};
+    GLuint UpscaledOverlayOpaqueWhiteTex {};
+    GLuint UpscaledGuardColorTex {};
+    GLuint UpscaledOverlayUnderlayWeightTex {};
+    GLuint UpscaledOverlayOwnershipTex {};
+    GLuint HybridForegroundTex {};
+    GLuint HybridNativeFallbackTex {};
+    GLuint Hybrid2DBaseTex {};
+    GLuint HybridLegacyCandidateTex {};
+    GLuint HybridSelectorTex {};
+    GLuint HybridCoverageMissTex {};
+    GLuint HybridForegroundAlphaTex {};
+    GLuint HybridFinalSourceTex {};
     static constexpr int kCaptureBackedHandoffRouteSlots = 2;
-    GLuint WholeSceneSourceABlitFB;
+    GLuint WholeSceneSourceABlitFB {};
 
     struct CaptureBackedRouteGLResources
     {
@@ -287,34 +487,39 @@ private:
 
     CaptureBackedRouteGLResources CaptureBackedRouteGL[kCaptureBackedHandoffRouteSlots];
 
-    GLuint ArtCNNYUVTex;
-    GLuint ArtCNNYUVFB;
-    GLuint ArtCNNConv0Tex;
-    GLuint ArtCNNConv0FB;
-    GLuint ArtCNNConvWorkTex[2];
-    GLuint ArtCNNConvWorkFB[2];
-    GLuint ArtCNNPackedTex;
-    GLuint ArtCNNPackedFB;
-    GLuint NNEDI3Vertical4xTex;
-    GLuint ArtCNNLuma2xTex;
-    GLuint NNEDI3Luma4xTex;
-    GLuint ArtCNNYUVA2xTex;
-    GLuint ArtCNNRGBA2xTex;
-    GLuint ArtCNNOutputFB;
-    GLuint NNEDI3VerticalTex;
-    GLuint XBRZInfoTex;
-    GLuint XBRZInfoFB;
+    GLuint ArtCNNYUVTex {};
+    GLuint ArtCNNYUVFB {};
+    GLuint ArtCNNConv0Tex {};
+    GLuint ArtCNNConv0FB {};
+    GLuint ArtCNNConvWorkTex[2] {};
+    GLuint ArtCNNConvWorkFB[2] {};
+    GLuint ArtCNNPackedTex {};
+    GLuint ArtCNNPackedFB {};
+    GLuint NNEDI3Vertical4xTex {};
+    GLuint ArtCNNLuma2xTex {};
+    GLuint NNEDI3Luma4xTex {};
+    GLuint ArtCNNYUVA2xTex {};
+    GLuint ArtCNNRGBA2xTex {};
+    GLuint ArtCNNOutputFB {};
+    u32 ArtCNNWorkNativeWidth = 256;
+    u32 ArtCNNWorkNativeHeight = 192;
+    GLuint NNEDI3VerticalTex {};
+    GLuint XBRZInfoTex {};
+    GLuint XBRZInfoFB {};
+    u32 XBRZInfoWidth = 0;
+    u32 XBRZInfoHeight = 0;
     GLuint CuNNyWorkTex[2] {};
     u32 CuNNyWorkTexWidth[2] {};
     u32 CuNNyWorkTexHeight[2] {};
+    GLuint StrictAffineCuNNy2xTex = 0;
+    u32 StrictAffineCuNNy2xWidth = 0;
+    u32 StrictAffineCuNNy2xHeight = 0;
 
     using WholeSceneScaleEligibility = ::melonDS::WholeSceneScaleEligibility;
     using WholeSceneNative3DSource = ::melonDS::WholeSceneNative3DSource;
     using WholeSceneRenderPath = ::melonDS::WholeSceneRenderPath;
     using WholeSceneCurrentPathReason = ::melonDS::WholeSceneCurrentPathReason;
     using WholeSceneOverlayEndpointFinalMode = ::melonDS::WholeSceneOverlayEndpointFinalMode;
-    using SourceACaptureReplacementMode = ::melonDS::SourceACaptureReplacementMode;
-    using SourceAProductChoiceReason = ::melonDS::SourceAProductChoiceReason;
     using VisibleOBJCaptureDebug = ::melonDS::VisibleOBJCaptureDebug;
     using WholeSceneRenderTrace = ::melonDS::WholeSceneRenderTrace;
     using WholeSceneDebugPoisonState = ::melonDS::WholeSceneDebugPoisonState;
@@ -344,7 +549,70 @@ private:
     bool WholeSceneScaleHybridNativeEffectGuard;
     bool WholeSceneScaleHybridForeground2DBase;
     bool WholeSceneScaleHybridCleanLegacyCandidate;
+    bool WholeSceneScaleHybridStrictAffineHighRes;
+    bool WholeSceneScaleHybridStrictAffineSourceEnhancement;
+    bool WholeSceneScaleHybridStrictAffineOBJSubpixel2x;
+    RendererSettings::AffineAlphaReconstruction AffineAlpha = RendererSettings::AffineAlphaReconstruction::Bilinear;
+    RendererSettings::AffineSampling AffineSampleGrid = RendererSettings::AffineSampling::OutputGrid;
+    bool NNEDI3PremultipliedRGB = false;
+    void EnsureReconstructionAlphaTextures(int width, int height, int scale);
+    bool ReconstructAffineAlpha(GLuint source, GLuint rgb, GLuint target,
+                                int width, int height, int scale,
+                                StrictAffineSourceEnhancementDecision rgbEnhancement);
+    bool WholeSceneScaleHybridStrictAffineConnectedSources = false;
+    bool WholeSceneScaleHybridStrictAffineOpaqueAssemblies = false;
+    bool WholeSceneScaleHybridStrictAffineTopTextBG;
+    bool WholeSceneScaleHybridStrictAffineMaskedOBJMLAA;
+
+    struct StrictAffineBGRoleKey
+    {
+        u32 Size[2] {};
+        u32 Type = 0;
+        u32 PalOffset = 0;
+        u32 TileOffset = 0;
+        u32 MapOffset = 0;
+        u32 Clamp = 0;
+
+        bool operator==(const StrictAffineBGRoleKey& other) const
+        {
+            return Size[0] == other.Size[0] &&
+                   Size[1] == other.Size[1] &&
+                   Type == other.Type &&
+                   PalOffset == other.PalOffset &&
+                   TileOffset == other.TileOffset &&
+                   MapOffset == other.MapOffset &&
+                   Clamp == other.Clamp;
+        }
+    };
+
+    StrictAffineBGRoleKey StrictAffineBGRoleKeys[4] {};
+    u32 StrictAffineBGRoleValidMask = 0;
+    u32 StrictAffineVisibleBGMask = 0;
+    u32 StrictAffineIdentityEquivalentBGMask = 0;
+    u32 StrictAffineTransformedBGMask = 0;
+    u8 StrictAffineIdentityStableFrames[4] {};
+    bool StrictAffineHasAffineOBJ = false;
+    bool StrictAffineHighResolutionGeometryRequired = true;
+    GLuint AffineOverlapDebugTex = 0;
+    GLuint AffineOverlapInputDebugTex = 0;
+    GLuint AffineOverlapCopyFB = 0;
+    int AffineOverlapDebugWidth = 0, AffineOverlapDebugHeight = 0;
+    bool PrepareAffineOverlapDebug(int width, int height);
     std::atomic_bool WholeSceneDebugViewsActive;
+    // Cleared at frame start, renderer/state/settings reset and debug toggles.
+    // Set only after a complete diagnostic pass, never from mode eligibility.
+    struct
+    {
+        bool AffineOverlap = false;
+        bool AffineOverlapPremultiplied = false;
+        bool OverlayNative = false;
+        bool OverlayScaled = false;
+        bool HybridSelector = false;
+        bool HybridCoverageMiss = false;
+        bool HybridForegroundAlpha = false;
+        bool HybridFinalSource = false;
+    } WholeSceneDebugProducts;
+
     WholeSceneScaleEligibility WholeSceneScaleState;
 
     using WholeSceneCaptureAuthority = ::melonDS::WholeSceneCaptureAuthority;
@@ -352,7 +620,6 @@ private:
     using WholeSceneCaptureRequestKind = ::melonDS::WholeSceneCaptureRequestKind;
     using WholeSceneCaptureProductKind = ::melonDS::WholeSceneCaptureProductKind;
     using WholeSceneCaptureEffectOwner = ::melonDS::WholeSceneCaptureEffectOwner;
-    using WholeSceneCaptureEffectAction = ::melonDS::WholeSceneCaptureEffectAction;
     using WholeSceneCaptureProofKind = ::melonDS::WholeSceneCaptureProofKind;
     using WholeSceneCaptureRenderAction = ::melonDS::WholeSceneCaptureRenderAction;
     using WholeSceneCaptureBackedPlanKind = ::melonDS::WholeSceneCaptureBackedPlanKind;
@@ -372,6 +639,12 @@ private:
     using CaptureBackedRouteProductStateQuery = ::melonDS::CaptureBackedRouteProductStateQuery;
     using SourceACaptureResolutionKind = ::melonDS::SourceACaptureResolutionKind;
     using SourceACaptureResolutionInputs = ::melonDS::SourceACaptureResolutionInputs;
+    using SourceACaptureSelectionDecision = ::melonDS::SourceACaptureSelectionDecision;
+    using SourceACaptureSelectionPreference =
+        ::melonDS::SourceACaptureSelectionPreference;
+    using SourceACaptureSelectionReason = ::melonDS::SourceACaptureSelectionReason;
+    using SourceAFullProductPresentationProof =
+        ::melonDS::SourceAFullProductPresentationProof;
     using WholeSceneCaptureRequest = ::melonDS::WholeSceneCaptureRequest;
     using WholeSceneCaptureProductRef = ::melonDS::WholeSceneCaptureProductRef;
     using WholeSceneCaptureBackedPlan = ::melonDS::WholeSceneCaptureBackedPlan;
@@ -385,11 +658,7 @@ private:
         GLuint FullProductTex = 0;
         GLuint BackgroundTex = 0;
         int CaptureBank = -1;
-        bool MainEngineCapturedBGOnly = false;
         bool SubEngineCapturedSourceAOnly = false;
-        bool SubEngineCaptureBackedBGOnly = false;
-        bool SubEngineCapturedOBJOnly = false;
-        bool CanUseCurrentOverlay = false;
         GLRenderer2D* MainRenderer = nullptr;
         GLuint RouteProductTex = 0;
         int RouteSlot = -1;
@@ -406,8 +675,6 @@ private:
         u32 RouteProductStableFrames = 0;
         WholeSceneCaptureProductPresentationClass RouteProductPresentationClass =
             WholeSceneCaptureProductPresentationClass::None;
-        u16 RouteProductStoredMasterBrightness = 0;
-        bool RouteProductHasStoredEffectState = false;
         bool RouteProductLookupAttempted = false;
         bool RouteProductLookupSuccess = false;
         u32 RouteProductLookupResultSource = 0;
@@ -449,15 +716,20 @@ private:
         bool FullProductEventSourceOBJ = false;
         bool FullProductEventScreenSwap = false;
         bool FullProductEventMainFinalBottom = false;
-        bool PreferExactFullProduct = false;
-        bool PreferExactRouteProduct = false;
-        bool AllowExactFullProductCapturePresentation = false;
         bool DirectFinalDisplayConsumer = false;
         bool DirectFinalBottomConsumer = false;
         bool ActiveDisplayCaptureSourceA2D = false;
         bool ActiveFullDisplayCaptureSourceA = false;
         int ActiveDisplayCaptureDstBank = -1;
         int ActiveDisplayCaptureDstOffset = -1;
+    };
+
+    enum class SourceACaptureReplacementExecutionKind : u8
+    {
+        None = 0,
+        MixedCaptureBackedOBJOverlay,
+        MixedSourceACaptureBG,
+        SelectedProduct,
     };
 
     struct GLCaptureProductResolution
@@ -469,8 +741,9 @@ private:
         WholeSceneCaptureRenderAction RenderAction = WholeSceneCaptureRenderAction::None;
         WholeSceneCaptureProductPresentationClass PresentationClass =
             WholeSceneCaptureProductPresentationClass::None;
-        bool PresentationCompatible = false;
-        bool RequiresRePresentation = false;
+        bool RowScopeCompatible = false;
+        int ValidYStart = 0;
+        int ValidYEnd = 192;
     };
 
     struct GLCaptureProductSources
@@ -478,13 +751,11 @@ private:
         GLuint RouteProductTex = 0;
         WholeSceneCaptureProductPresentationClass RouteProductPresentationClass =
             WholeSceneCaptureProductPresentationClass::None;
-        u16 RouteProductStoredMasterBrightness = 0;
-        bool RouteProductHasStoredEffectState = false;
         GLuint FullProductTex = 0;
         GLuint BackgroundTex = 0;
-        u16 BackgroundStoredMasterBrightness = 0;
-        bool BackgroundHasStoredEffectState = false;
         GLuint Direct3DTex = 0;
+        int ValidYStart = 0;
+        int ValidYEnd = 192;
     };
 
     struct GLCaptureProductTraceIdentity
@@ -498,6 +769,42 @@ private:
         u32 CurrentPresentationHash = 0;
     };
 
+    struct SourceACaptureProductAssessment
+    {
+        SourceACaptureResolution Resolution;
+        GLCaptureProductResolution Product;
+        GLCaptureProductTraceIdentity TraceIdentity;
+    };
+
+    struct SourceACaptureReplacementExecutionInput
+    {
+        SourceACaptureReplacementExecutionKind Kind =
+            SourceACaptureReplacementExecutionKind::None;
+        SourceACaptureReplacementChoice Choice;
+        SourceACaptureSelectionDecision Selection;
+        SourceACaptureProductAssessment Primary;
+        SourceACaptureProductAssessment AfterOverlayFailure;
+    };
+
+    struct CaptureEpochOverlayExecutionInput
+    {
+        bool EvidenceValid = false;
+        bool EpochIdentityMatches = false;
+        int RouteSlot = -1;
+        u32 CurrentPresentationHash = 0;
+        u32 CaptureRequest = 0;
+        CaptureEpochOverlayCurrentPlan Plan;
+        u64 EpochSerial = 0;
+        u32 EpochCaptureBank = 0xFFFFFFFFu;
+        u32 EpochSourcePresentationHash = 0;
+        u32 EpochSourceKind = 0;
+        u32 EpochProductMask = 0;
+        WholeSceneCaptureRequest Request;
+        WholeSceneCapturePolicyResult Result;
+        GLCaptureProductResolution Product;
+        GLCaptureProductTraceIdentity TraceIdentity;
+    };
+
     struct HandoffBackgroundChoice
     {
         GLuint Tex = 0;
@@ -505,19 +812,19 @@ private:
         u64 Source3DSerial = 0;
         u32 Source3DSceneHash = 0;
         u32 PresentationHash = 0;
-        u16 StoredMasterBrightness = 0;
-        bool HasStoredEffectState = false;
         SourceABackgroundSource Source = SourceABackgroundSource::None;
         WholeSceneCaptureAuthority Authority = WholeSceneCaptureAuthority::None;
     };
 
-    struct HandoffBackgroundResolveResult
-    {
-        HandoffBackgroundChoice Background;
-        bool Finished = false;
-    };
-
     WholeSceneRenderTrace WholeSceneTrace;
+    WholeSceneOutputPlan WholeScenePlan;
+    WholeSceneOutputRecipePreparation WholeSceneRecipePreparation;
+    WholeSceneOutputExecutionTrace WholeSceneExecutionTrace;
+    StrictAffineOrderedRecipeIntent StrictAffineOrderedAssessment;
+    bool WholeScenePhysicalPresentationBrightnessActive;
+    bool WholeScenePhysicalPresentationBrightnessNextActive;
+    u16 WholeScenePhysicalPresentationBrightnessState;
+    u16 WholeScenePhysicalPresentationBrightnessNextState;
     WholeSceneDebugPoisonState WholeSceneDebugPoison;
     u32 WholeSceneCurrentFramePartialComposites;
     u32 WholeScenePreviousFramePartialComposites;
@@ -532,6 +839,59 @@ private:
     u32 WholeSceneNativeProductValidRows;
     bool WholeSceneNativeProductsFrameComplete;
     bool WholeSceneNativeProductRowValid[192];
+    struct WholeSceneNativeProductRowIdentity
+    {
+        bool Valid = false;
+        int ProductYStart = 0;
+        int ProductYEnd = 0;
+        WholeSceneOutputRepresentationKind Representation =
+            WholeSceneOutputRepresentationKind::None;
+        WholeSceneRenderPath Path = WholeSceneRenderPath::None;
+        u64 SourceGeneration = 0;
+        u64 RowEpochIdentity = 0;
+        u64 ProductIdentity = 0;
+    };
+    WholeSceneNativeProductRowIdentity WholeSceneNativeProductRowIdentities[192];
+    bool WholeSceneNativeProductRowIdentityValid;
+    WholeSceneNativeProductRowIdentityInvalidReason
+        WholeSceneNativeProductRowIdentityFailure;
+    u32 WholeSceneNativeProductIdentityRows;
+    u64 WholeSceneNativeProductFrameIdentity;
+
+    struct DeferredScanlineStrictAffinePlan
+    {
+        DeferredScanlineStrictAffineAssessment Assessment;
+        u32 VisibleBGMask = 0;
+        u32 AffineBGMask = 0;
+        u32 TextBGMask = 0;
+        bool OBJVisible = false;
+        bool HasAffineOBJ = false;
+        bool HasOrdinaryOBJ = false;
+        bool RequiresResolvedOrdinaryOBJ = false;
+        u64 RequiredChannels = 0;
+        u32 SourceEpochCount = 0;
+        int FirstSourceTransitionY = -1;
+        u64 FirstRowSourceGeneration = 0;
+        u64 LiveSourceGeneration = 0;
+    };
+    struct DeferredStrictAffineHistoricalSourceEpoch
+    {
+        bool Valid = false;
+        bool Attempted = false;
+        int YStart = 0;
+        int YEnd = 0;
+        u32 NativeBGMask = 0;
+        u32 EnhancedBGMask = 0;
+        u64 SourceGeneration = 0;
+        u64 SpriteGeneration = 0;
+        u64 BGLayerGeneration[4] {};
+        StrictAffineSourceEnhancementDecision SourceEnhancement =
+            StrictAffineSourceEnhancementDecision::Disabled;
+        int SourceModelIndex = -1;
+    } DeferredStrictAffineHistoricalSourceEpochs
+        [DeferredScanlineStrictAffineInputs::MaxHistoricalSourceEpochs];
+    u32 DeferredStrictAffineHistoricalSourceEpochCount = 0;
+    bool DeferredStrictAffineHistoricalSourceEpochOverflow = false;
     bool WholeSceneNativeProductEpochValid;
     u32 WholeSceneNativeProductEpochInvalidReason;
     bool WholeSceneNativeProductEligibilityInitialized;
@@ -542,7 +902,7 @@ private:
     WholeSceneRenderPath WholeSceneNativeProductLastPath;
     bool WholeSceneNativeProductFinalizerPathSeen;
     bool WholeSceneOverlayEndpointsValid;
-    GLuint WholeSceneOverlayEndpointSourceTex;
+    GLuint WholeSceneOverlayEndpointSourceTex {};
 
     struct CaptureBackedRouteProductWrite
     {
@@ -565,9 +925,98 @@ private:
         u32 StableFrames = 0;
         WholeSceneCaptureProductPresentationClass PresentationClass =
             WholeSceneCaptureProductPresentationClass::None;
-        u16 StoredMasterBrightness = 0;
-        bool HasStoredEffectState = false;
     };
+
+    struct HandoffCaptureProductAssessment
+    {
+        HandoffCaptureResolution Resolution;
+        GLCaptureProductResolution Product;
+        GLCaptureProductTraceIdentity TraceIdentity;
+        CaptureBackedRouteProductLookup RouteProduct;
+    };
+
+    struct SourceAMixedCaptureBackedOBJOverlayExecution
+    {
+    };
+
+    struct SourceAMixedCaptureBackedBGExecution
+    {
+    };
+
+    struct SourceADirectProductExecution
+    {
+        const SourceACaptureReplacementExecutionInput* Input = nullptr;
+        const SourceACaptureProductAssessment* Assessment = nullptr;
+    };
+
+    struct SourceABackgroundOverlayExecution
+    {
+        const SourceACaptureReplacementExecutionInput* Input = nullptr;
+    };
+
+    struct SourceAUnavailableExecution
+    {
+        const SourceACaptureReplacementExecutionInput* Input = nullptr;
+    };
+
+    struct CaptureEpochCurrentOverlayExecution
+    {
+        const CaptureEpochOverlayExecutionInput* Input = nullptr;
+    };
+
+    struct CaptureBackedOverlayFallbackExecution
+    {
+        bool FinalizeFullFrame = false;
+    };
+
+    struct CaptureBackedCurrentExecution
+    {
+        WholeSceneCurrentPathReason Reason =
+            WholeSceneCurrentPathReason::DirectCurrent;
+    };
+
+    struct HandoffDirectProductExecution
+    {
+        HandoffCaptureProductAssessment Assessment;
+        int RouteSlot = -1;
+        CaptureBackedRoutePresentationMode PresentationMode =
+            CaptureBackedRoutePresentationMode::None;
+        CaptureBackedHandoffReuseReason ReuseReason =
+            CaptureBackedHandoffReuseReason::None;
+        u64 BackgroundEpochSerial = 0;
+        u32 CaptureBank = 0xFFFFFFFFu;
+        u32 Source3DSceneHash = 0;
+        u32 CapturePresentationHash = 0;
+        u32 CurrentPresentationHash = 0;
+    };
+
+    struct HandoffBackgroundOverlayExecution
+    {
+        WholeSceneCaptureRequest Request;
+        HandoffBackgroundChoice Background;
+        HandoffCaptureProductAssessment Assessment;
+        int RouteSlot = -1;
+    };
+
+    struct HandoffHybridCompositeExecution
+    {
+        WholeSceneCaptureRequest Request;
+        HandoffBackgroundChoice Background;
+    };
+
+    using PreparedCaptureBackedExecution = std::variant<
+        std::monostate,
+        SourceAMixedCaptureBackedOBJOverlayExecution,
+        SourceAMixedCaptureBackedBGExecution,
+        SourceADirectProductExecution,
+        SourceABackgroundOverlayExecution,
+        SourceAUnavailableExecution,
+        CaptureEpochCurrentOverlayExecution,
+        CaptureBackedOverlayFallbackExecution,
+        CaptureBackedCurrentExecution,
+        HandoffDirectProductExecution,
+        HandoffBackgroundOverlayExecution,
+        HandoffHybridCompositeExecution>;
 
     struct CaptureBackedRouteState
     {
@@ -635,6 +1084,48 @@ private:
             u32 Mosaic;
         } uOAM[128];
     } SpriteConfig;
+
+    struct EnhancedOBJSourceKey
+    {
+        u64 SourceGeneration = 0;
+        u32 Type = 0;
+        u32 Width = 0;
+        u32 Height = 0;
+        u32 PalOffset = 0;
+        u32 TileOffset = 0;
+        u32 TileStride = 0;
+        u32 Algorithm = 0;
+        u32 SourceScale = 0;
+        u32 EnhancementVersion = 0;
+        u64 ConnectedSourceHash = 0;
+
+        bool operator==(const EnhancedOBJSourceKey& other) const
+        {
+            return SourceGeneration == other.SourceGeneration &&
+                   Type == other.Type && Width == other.Width &&
+                   Height == other.Height && PalOffset == other.PalOffset &&
+                   TileOffset == other.TileOffset &&
+                   TileStride == other.TileStride &&
+                   Algorithm == other.Algorithm &&
+                   SourceScale == other.SourceScale &&
+                    EnhancementVersion == other.EnhancementVersion &&
+                    ConnectedSourceHash == other.ConnectedSourceHash;
+        }
+    };
+
+    EnhancedOBJSourceKey EnhancedOBJSourceKeys[128] {};
+    EnhancedOBJSourceKey OpaqueOBJAssemblyKeys[128] {};
+    bool OpaqueOBJAssemblyValid[128] {};
+    std::string OpaqueOBJAssemblyDescription;
+    u64 ConnectedOBJSourceHashes[128] {};
+    s32 EnhancedOBJSourceRegions[128][4] {};
+    u64 EnhancedOBJSourceValidMask[2] {};
+    EnhancedOBJSourceKey SemanticAffineOBJRoleKeys[128] {};
+    u32 SemanticAffineOBJRoleRotscale[128] {};
+    u8 SemanticAffineOBJIdentityGrace[128] {};
+    u64 SemanticAffineOBJRoleMask[2] {};
+    u64 SpriteSourceGeneration = 1;
+    int SpriteOAMIndex[128] {};
     int NumSprites;
     bool SpriteUseMosaic;
 
@@ -647,10 +1138,19 @@ private:
             u32 BackColor;          // 96
             u32 WinRegs;            // 100
             u32 WinMask;            // 104
-            u32 __pad0[1];
+            u32 OBJWindowEnabled; // bit 0: enabled; bit 1: no masks; bits 2/3: clear left/right edge
             s32 WinPos[4];
             u32 BGMosaicEnable[4];
             s32 MosaicSize[4];
+            // Compositor state is captured per row so deferred full-frame
+            // reconstruction uses the state that produced that row rather
+            // than the register values left at VBlank.
+            u32 BGPrio[4];
+            u32 EnableOBJ;
+            u32 Enable3D;
+            u32 BlendCnt;
+            u32 BlendEffect;
+            u32 BlendCoef[4];
         } uScanline[192];
     } ScanlineConfig;
 
@@ -682,6 +1182,8 @@ private:
     u8 EVA, EVB, EVY;
 
     u32 BGVRAMRange[4][4];
+    GLBGVRAMUploadCache BGVRAMUploadCache;
+    u8 WideCoverUnstableBGMask = 0;
 
     bool LayerConfigDirty;
     u8 DeferredLayerPrerenderDirty;
@@ -690,6 +1192,7 @@ private:
 
     int LastSpriteLine;
     u16 OAM[512];
+    u32 WideOBJWindowProofBits = 0;
 
     u32 SpriteDispCnt;
     bool SpriteConfigDirty;
@@ -698,7 +1201,8 @@ private:
     u16 TempPalBuffer[256 * (1 + (4*16))];
 
     bool IsScreenOn();
-    std::string DescribeWholeSceneScaleState() const;
+    std::string DescribeWholeSceneScaleState(WholeScene2DDebugReadContext* context = nullptr) const;
+    std::string BuildWholeSceneScaleStateDescription() const;
     void AppendWholeSceneModeStatus(std::string& status) const;
     void AppendWholeSceneRenderTrace(std::string& status) const;
     void AppendWholeSceneDisplayStateTrace(std::string& status) const;
@@ -720,6 +1224,8 @@ private:
     CaptureBackedHandoffRouteKey BuildCaptureBackedHandoffRouteKey(int ystart, int yend) const;
     int BeginCaptureBackedHandoffRoute(int ystart, int yend);
     int CaptureBackedHandoffRouteSlot(const CaptureBackedHandoffRouteKey& key) const;
+    bool CurrentCaptureEventMatchesHandoffRoute(int slot) const;
+    bool CurrentCaptureEventIsFreshForHandoffRoute(int slot) const;
     bool IsStableCaptureBackedHandoffLiveUpdate(const CaptureBackedHandoffRouteKey& key) const;
     bool CanReuseCaptureBackedHandoffSnapshot(const CaptureBackedHandoffRouteKey& key,
                                               int slot,
@@ -736,7 +1242,6 @@ private:
                                               u32 source3DSceneHash,
                                               u32 sourcePresentationHash,
                                               u32 currentOverlayPresentationHash = 0);
-    void InvalidateCaptureBackedRouteProduct(int slot = -1);
     bool StoreCaptureBackedRouteProduct(const CaptureBackedRouteProductWrite& write);
     bool StoreRawCaptureBackedRouteProduct(int routeSlot,
                                            GLuint sourceTex,
@@ -809,6 +1314,7 @@ private:
     void RecordWholeSceneVisibleBitmapDirtyRows(int layer, int line, int firstRow, int lastRow);
     void UpdateCachedRegistersAndLayerConfig(u8 layerPreDirty);
     void UploadBGVRAM(NonStupidBitField<1024>& bgDirty, int line);
+    void BuildWideCoverPolicies(int ystart, int yend, u32 (&policies)[192][2]) const;
     void UploadBGPalette(u32 paletteDirty, NonStupidBitField<64>& bgExtPalDirty);
     void PrerenderDirtyLayers(u8 layerPreDirty,
                               u8 rowLimitedBitmapMask,
@@ -825,10 +1331,46 @@ private:
     void RecordWholeSceneNativeProductEligibility(WholeSceneScaleEligibility eligibility);
     void RecordWholeSceneNativeProductRenderPath(WholeSceneRenderPath path, int ystart, int yend);
     bool CanFinalizeWholeSceneNativeProducts() const;
-    void RecordWholeSceneNativeProductChunk(int ystart, int yend);
+    void RecordWholeSceneNativeProductChunk(
+        int ystart,
+        int yend,
+        const WholeSceneOutputRepresentationProduct& product);
     bool AreWholeSceneNativeProductsComplete() const;
+    DeferredScanlineStrictAffinePlan
+        BuildDeferredScanlineStrictAffinePlan() const;
+    WholeSceneOutputPlan BuildDeferredScanlineStrictAffineOutputPlan(
+        const DeferredScanlineStrictAffinePlan& deferredPlan) const;
+    bool RenderDeferredScanlineStrictAffine(
+        const DeferredScanlineStrictAffinePlan& deferredPlan);
     bool ShouldUseCompositorExactOverlayEndpoints() const;
     void ResetWholeSceneRenderTrace();
+    HybridCleanLegacyEligibilityInputs BuildHybridCleanLegacyEligibilityInputs() const;
+    u32 BuildWholeSceneConsideredRepresentationMask(
+        const WholeSceneCaptureBackedPlan& pathCapturePlan,
+        const WholeSceneCaptureBackedPlan& scaleCapturePlan,
+        bool strictAffineAvailable) const;
+    u64 BuildWholeSceneRequiredChannelMask(int ystart, int yend) const;
+    bool HasActiveOBJWindowParticipant() const;
+    u64 BuildWholeSceneRepresentationSourceGeneration() const;
+    u64 BuildWholeSceneRowSourceGeneration(
+        int y,
+        const u64* bgSourceGenerations = nullptr,
+        u64 objSourceGeneration = 0) const;
+    u64 BuildWholeSceneRowEpochIdentity(int ystart, int yend) const;
+    WholeSceneOutputPlan BuildWholeSceneOutputPlan(
+        int ystart,
+        int yend,
+        const WholeScenePathDecisionInputs& pathInputs) const;
+    WholeSceneCompositorRecipe BuildStrictAffineSemanticRecipeIntent(
+        int ystart,
+        int yend,
+        bool includeOBJ = true,
+        bool strictPathSelectedOverride = false) const;
+    StrictAffineOrderedRecipeIntent BuildStrictAffineOrderedRecipeIntent(
+        int ystart,
+        int yend,
+        bool strictPathSelectedOverride = false,
+        bool allowNoopBrightness = false) const;
     void RecordWholeSceneRenderTrace(WholeSceneRenderPath path,
                                      int ystart,
                                      int yend,
@@ -866,6 +1408,7 @@ private:
         int yend);
     static SourceACaptureResolution MakeSourceAFullProductResolution(
         const SourceACaptureReplacementChoice& choice,
+        SourceAFullProductPresentationProof presentationProof,
         int ystart,
         int yend);
     static HandoffCaptureResolution MakeHandoffRouteProductResolution(
@@ -906,14 +1449,11 @@ private:
                                       SourceABackgroundSource effectiveBackgroundSource,
                                       u64 effectiveBackgroundEpochSerial,
                                       u32 capturePresentationHash);
-    void RecordSourceACaptureProductTrace(SourceACaptureReplacementMode mode,
-                                          u64 requestBackgroundEpochSerial,
+    void RecordSourceACaptureProductTrace(u64 requestBackgroundEpochSerial,
                                           SourceABackgroundSource effectiveBackgroundSource,
                                           u64 effectiveBackgroundEpochSerial,
                                           u32 capturePresentationHash,
-                                          u32 currentPresentationHash,
-                                          SourceAProductChoiceReason productChoice,
-                                          bool fullProductKeyMatch = false);
+                                          u32 currentPresentationHash);
     void RecordSourceARouteProductTrace(const CaptureBackedRouteProductIdentity& identity,
                                         u64 capturedEventSerial,
                                         u32 stableFrames,
@@ -925,15 +1465,10 @@ private:
         const SourceACaptureReplacementChoice& choice);
     static GLCaptureProductSources RouteCaptureProductSources(
         GLuint routeProductTex,
-        WholeSceneCaptureProductPresentationClass presentationClass,
-        u16 storedMasterBrightness,
-        bool hasStoredEffectState);
+        WholeSceneCaptureProductPresentationClass presentationClass);
     static GLCaptureProductSources FullCaptureProductSources(GLuint fullProductTex);
-    static GLCaptureProductSources BackgroundCaptureProductSources(
-        GLuint backgroundTex,
-        u16 storedMasterBrightness = 0,
-        bool hasStoredEffectState = false);
-    GLCaptureProductResolution ResolveCaptureProduct(
+    static GLCaptureProductSources BackgroundCaptureProductSources(GLuint backgroundTex);
+    GLCaptureProductResolution AssessCaptureProduct(
         const WholeSceneCapturePolicyResult& result,
         const WholeSceneCaptureRequest& request,
         const GLCaptureProductSources& sources);
@@ -954,22 +1489,21 @@ private:
         u64 source3DSerial,
         u32 source3DSceneHash,
         u32 presentationHash);
-    GLCaptureProductResolution RecordSourceARouteProductChoiceTrace(
+    SourceACaptureProductAssessment AssessSourceACaptureProduct(
         const SourceACaptureReplacementChoice& choice,
+        const SourceACaptureSelectionDecision& selection,
+        SourceACaptureResolutionKind kind,
         int ystart,
         int yend);
-    GLCaptureProductResolution RecordSourceABackgroundOverlayChoiceTrace(
+    void RecordSourceACaptureProductAssessmentTrace(
         const SourceACaptureReplacementChoice& choice,
-        int ystart,
-        int yend);
-    GLCaptureProductResolution RecordSourceAFullProductChoiceTrace(
-        const SourceACaptureReplacementChoice& choice,
+        const SourceACaptureProductAssessment& assessment,
         int ystart,
         int yend);
     void RecordSourceARejectedChoiceTrace(const SourceACaptureReplacementChoice& choice,
                                           int ystart,
                                           int yend);
-    GLCaptureProductResolution RecordHandoffRouteProductTrace(
+    HandoffCaptureProductAssessment AssessHandoffRouteProduct(
         const WholeSceneCaptureRequest& baseRequest,
         const CaptureBackedRouteProductLookup& routeProduct,
         GLuint routeProductTex,
@@ -977,29 +1511,25 @@ private:
         u64 captureEventSerial,
         u64 backgroundEpochSerial,
         u32 capturePresentationHash,
-        u32 currentPresentationHash,
-        int ystart,
-        int yend);
-    GLCaptureProductResolution RecordHandoffFullProductTrace(
+        u32 currentPresentationHash);
+    HandoffCaptureProductAssessment AssessHandoffFullProduct(
         const WholeSceneCaptureRequest& baseRequest,
         GLuint fullProductTex,
         u32 captureBank,
         u64 captureEventSerial,
         u64 backgroundEpochSerial,
         u32 capturePresentationHash,
-        u32 currentPresentationHash,
-        int ystart,
-        int yend);
-    GLCaptureProductResolution RecordHandoffBackgroundOverlayTrace(
+        u32 currentPresentationHash);
+    HandoffCaptureProductAssessment AssessHandoffBackgroundOverlayProduct(
         const WholeSceneCaptureRequest& baseRequest,
         SourceABackgroundSource backgroundSource,
         WholeSceneCaptureAuthority authority,
         GLuint backgroundTex,
         u64 backgroundEpochSerial,
         u32 capturePresentationHash,
-        u32 currentPresentationHash,
-        u16 storedMasterBrightness,
-        bool hasStoredEffectState,
+        u32 currentPresentationHash);
+    void RecordHandoffCaptureProductAssessmentTrace(
+        const HandoffCaptureProductAssessment& assessment,
         int ystart,
         int yend);
     void RecordHandoffHybridTrace(const WholeSceneCaptureRequest& baseRequest,
@@ -1012,17 +1542,8 @@ private:
                                   bool hasHighResBackground,
                                   int ystart,
                                   int yend);
-    GLCaptureProductResolution RecordCaptureEpochOverlayTrace(
-        int routeSlot,
-        u32 captureBank,
-        SourceABackgroundSource backgroundSource,
-        GLuint backgroundTex,
-        u64 requestBackgroundEpochSerial,
-        u64 routeProductBackgroundSerial,
-        u32 routeProductPresentationHash,
-        u32 currentPresentationHash,
-        u16 storedMasterBrightness,
-        bool hasStoredEffectState,
+    void RecordCaptureEpochOverlayTrace(
+        const CaptureEpochOverlayExecutionInput& input,
         int ystart,
         int yend);
     void RenderScreenWholeSceneFinalizeFinalUpscaleFullFrame();
@@ -1042,10 +1563,13 @@ private:
     bool CanUseWholeSceneHighResPath() const;
     bool CanUseWholeSceneOverlayOperatorPath() const;
     bool CanUseWholeSceneFinalUpscalePath() const;
+    bool CanUseWholeSceneNativeExactFloorPath() const;
     bool CanUsePhysicalFinalPostprocessNativeInputPath() const;
     bool CanUseWholeSceneHybridCleanLegacyCandidatePath() const;
+    bool CanUseWholeSceneIdentityEquivalentAffineFallbackPath() const;
     bool CanUseWholeSceneSplitLegacyFallbackPath() const;
     bool CanUseWholeSceneFullFrameFinalizerPath() const;
+    bool CanUseWholeSceneRowOwnedDeferredFinalizerPath() const;
     bool CanUseWholeSceneForegroundOverlayPath() const;
     bool CanUseWholeSceneArtCNNPath() const;
     bool CanUseWholeSceneNNEDI3Path() const;
@@ -1054,6 +1578,11 @@ private:
     int WholeSceneHighResLayerFilterMode() const;
     bool WholeSceneHighResLayerFilterNoWrap() const;
     int WholeSceneHighResSpriteFilterMode() const;
+    StrictAffineSourceEnhancementDecision CurrentStrictAffineSourceEnhancementDecision(
+        bool strictPathSelectedOverride = false) const;
+    StrictAffineSourceEnhancementDecision CurrentStrictAffineOrdinaryScalingDecision(
+        bool strictPathSelectedOverride = false) const;
+    void RecordStrictAffineConstantBackdropUnderlayProofs(int ystart, int yend);
     int WholeSceneArtCNNModelIndex() const;
 
     void UpdateAndRender(int line);
@@ -1061,7 +1590,7 @@ private:
     void UpdateScanlineConfig(int line);
     void UpdateLayerConfig();
     void UpdateOAM(int ystart, int yend);
-    void UpdateCompositorConfig();
+    void UpdateCompositorConfig(int ystart = -1, int yend = -1);
 
     void PrerenderSprites();
     void PrerenderLayer(int layer);
@@ -1069,7 +1598,153 @@ private:
 
     void DoRenderSprites(int line);
     void DoRenderSpritesNative(int line);
-    void RenderSprites(bool window, int ystart, int yend);
+    void RenderSpritesToLayer(int ystart, int yend,
+                              int spriteFilterMode,
+                              bool affineSourceEnhancementOnly,
+                              bool useEnhancedSpriteSource = false,
+                              GLuint targetFB = 0,
+                              bool affineOnly = false,
+                              int targetScale = 0,
+                              bool linearEnhancedSource = false,
+                              bool excludeOrdinaryEquivalentAffine = false,
+                              bool xbrzPresentationOnly = false,
+                              int affineOBJPresentationCoverageMode = 0,
+                              const u32* includedSpriteMask = nullptr,
+                              bool orderedPresentationBand = false,
+                              const int* assembledSlots = nullptr);
+    void RenderSprites(bool window, int ystart, int yend,
+                       bool affineOnly = false,
+                       bool excludeOrdinaryEquivalentAffine = false,
+                       const u32* includedSpriteMask = nullptr,
+                       bool reverseOrder = false);
+    bool IsOrdinaryEquivalentAffineSprite(int sprite) const;
+    void UpdateSemanticAffineOBJRoleContinuity();
+    bool IsSemanticAffineOBJRole(int sprite) const;
+    void GetOrdinaryEquivalentAffineSpriteMask(u32 (&mask)[4]) const;
+    bool RenderOrdinaryOBJBandProducts(
+        const WholeSceneOBJBandClassification& classification,
+        int ystart,
+        int yend,
+        StrictAffineSourceEnhancementDecision sourceEnhancement,
+        int sourceModelIndex,
+        const WholeSceneOBJOperandPlan* operandPlan = nullptr);
+    bool RenderResolvedOrdinaryOBJProduct(
+        int ystart,
+        int yend,
+        StrictAffineSourceEnhancementDecision sourceEnhancement,
+        int sourceModelIndex);
+    void RenderResolvedOBJMerge(GLuint semanticOBJLayerTex);
+    void RenderOrdinaryOBJBandPresentation(GLuint baseTex,
+                                            GLuint targetFB,
+                                            int ystart,
+                                            int yend,
+                                            int bandIndex = 0,
+                                            GLuint presentationTex = 0,
+                                            bool useSeparateCoverage = false,
+                                            bool useSubpixelPresentation = false,
+                                            bool usePremultipliedPresentation = false,
+                                            int objPriority = -1);
+    void RenderOrdinaryOBJSpecialComposite(GLuint baseTex,
+                                            GLuint targetFB,
+                                            int ystart,
+                                            int yend,
+                                            int presentationIndex = -1,
+                                            int objPriority = -1,
+                                            bool useSubpixelPresentation = false);
+
+    struct OrderedOBJPresentationPolicy
+    {
+        int SpriteFilterMode = 0;
+        bool UseEnhancedSource = false;
+        bool LinearSubpixelSource = false;
+        int OutputGridCoverageMode = 0;
+        int SubpixelCoverageMode = 0;
+    };
+    OrderedOBJPresentationPolicy BuildOrderedOBJPresentationPolicy(
+        StrictAffineSourceEnhancementDecision sourceEnhancement,
+        bool enhancedOBJReady,
+        bool reconstructedContour) const;
+    GLuint RenderOrderedOBJPresentationRecipe(
+        const WholeSceneCompositorRecipe& recipe,
+        std::size_t firstOperand,
+        int ystart,
+        int yend,
+        const OrderedOBJPresentationPolicy& policy);
+    bool CopyOrderedOBJPresentationResult(GLuint sourceTex,
+                                          GLuint targetTex,
+                                          int ystart,
+                                          int yend);
+
+    EnhancedOBJSourceKey BuildEnhancedOBJSourceKey(
+        int sprite,
+        StrictAffineSourceEnhancementDecision sourceEnhancement =
+            StrictAffineSourceEnhancementDecision::Disabled) const;
+    bool IsEnhancedOBJSourceValid(int sprite,
+                                  const EnhancedOBJSourceKey& key) const;
+    void MarkEnhancedOBJSourceValid(int sprite,
+                                    const EnhancedOBJSourceKey& key);
+    void InvalidateEnhancedOBJSources();
+    bool EnsureEnhancedOBJTextures(int sourceScale);
+    bool EnsureStrictAffineCuNNy2xTexture(int width, int height);
+    bool RenderCuNNyRGB2x(int modelIndex, GLuint sourceTex, GLuint targetTex,
+                          int sourceWidth, int sourceHeight);
+    bool RenderCuNNyRGBAtScale(int modelIndex, GLuint sourceTex,
+                               GLuint targetTex, int sourceWidth,
+                               int sourceHeight, int sourceScale);
+    bool RenderNNEDI3RGBAtScale(GLuint sourceTex, GLuint targetTex,
+                                int sourceWidth, int sourceHeight,
+                                int sourceScale,
+                                bool alphaOnly = false,
+                                bool premultipliedRGB = false);
+    bool RenderStrictAffineCachedRGB(
+        StrictAffineSourceEnhancementDecision sourceEnhancement,
+        int sourceModelIndex,
+        GLuint sourceTex,
+        GLuint targetTex,
+        int sourceWidth,
+        int sourceHeight,
+        int sourceScale);
+    bool EnsureStrictAffineSupersampleTargets(int width, int height);
+    bool RebuildEnhancedOBJSource(
+        int sprite,
+        StrictAffineSourceEnhancementDecision sourceEnhancement,
+        int sourceModelIndex,
+        const ConnectedOBJSourcePair* pair = nullptr,
+        const std::vector<int>* assembly = nullptr, int assemblySlot = -1);
+    bool PrepareOpaqueOBJAssemblies(u32* spriteMask, int* slots,
+                                   int ystart, int yend);
+    bool PrepareStrictAffineEnhancedOBJSources(
+        StrictAffineSourceEnhancementDecision sourceEnhancement,
+        int sourceModelIndex);
+    bool EnsureEnhancedBGLayerTexture(int layer, int width, int height);
+    bool EnsureDeferredStrictAffineHistoricalBGLayerTexture(
+        int epoch, int layer, int width, int height);
+    bool EnsureDeferredStrictAffineHistoricalEnhancedBGLayerTexture(
+        int epoch, int layer, int width, int height);
+    void PreserveDeferredStrictAffineHistoricalSourceEpoch(
+        int line,
+        u8 layerPreDirty,
+        u8 registerLayerPreDirty,
+        u8 vramLayerPreDirty,
+        u8 paletteLayerPreDirty,
+        u8 deferredLayerPreDirty);
+    bool EnsureEnhancedBGScratchTextures(int width, int height,
+                                         int sourceScale);
+    bool RebuildEnhancedBGLayer(
+        int layer,
+        StrictAffineSourceEnhancementDecision sourceEnhancement,
+        int sourceModelIndex,
+        int sourceScaleOverride = 0,
+        u32 affineConstantBackdropPrecomposeMask = 0,
+        bool allowTextBG = false);
+    u32 PrepareStrictAffineEnhancedBGSources(
+        StrictAffineSourceEnhancementDecision sourceEnhancement,
+        int sourceModelIndex,
+        int sourceScaleOverride = 0,
+        bool recordTrace = true,
+        u32 affineConstantBackdropPrecomposeMask = 0,
+        u32 additionalTextBGMask = 0,
+        u32 enabledBGMaskOverride = 0);
 
     void RenderCompositorPass(GLuint outputFB, GLuint objLayerTex,
                               int viewportW, int viewportH,
@@ -1084,7 +1759,23 @@ private:
                               bool forceOBJDisabled = false,
                               bool preserveCompositorConfig = false,
                               GLuint capture128Tex = 0,
-                              GLuint capture256Tex = 0);
+                              GLuint capture256Tex = 0,
+                              bool affineSourceEnhancementOnly = false,
+                              u32 enhancedBGMask = 0,
+                              bool useEnhancedOBJPresentationCoverage = false,
+                              bool linearEnhancedBGSource = false,
+                               bool bilinearAffineBGPresentation = false,
+                               u32 affineConstantBackdropProofMask = 0,
+                               u32 enhancedBGCoverageMask = 0,
+                               GLuint xbrzPresentationOBJLayerTex = 0,
+                               bool debugSelector = false,
+                               int direct3DEndpointMode = 0,
+                               bool useScanlineCompositorState = false,
+                               u32 reconstructedBGCandidateMask = 0,
+                               const GLuint* bgLayerTexOverride = nullptr,
+                               const GLuint* bgLayerMetaTexOverride = nullptr,
+                               const GLuint* enhancedBGLayerTexOverride = nullptr,
+                               bool presentationContourPremultiplied = false);
     void RenderNativePrepass(int ystart, int yend);
     void RenderScreenPhysicalFinalPostprocessNativeInput(int ystart, int yend);
     void PrepareFinalUpscaleNative3DInput(GLuint& direct3DTex,
@@ -1092,7 +1783,7 @@ private:
                                           bool& highRes3D);
     void RenderNativeLayerDebugView(int debugLayer) const;
     void RenderNativeExactFinal(int ystart, int yend, bool debugTint = false, GLuint direct3DTex = 0, GLuint direct3DCoverageTex = 0);
-    void RenderNativeExactFinalToTexture(GLuint targetTex, int ystart, int yend, bool debugTint = false, GLuint direct3DTex = 0, GLuint direct3DCoverageTex = 0, bool preserveCompositorConfig = false, GLuint capture128Tex = 0, GLuint capture256Tex = 0, bool forceOBJDisabled = false);
+    void RenderNativeExactFinalToTexture(GLuint targetTex, int ystart, int yend, bool debugTint = false, GLuint direct3DTex = 0, GLuint direct3DCoverageTex = 0, bool preserveCompositorConfig = false, GLuint capture128Tex = 0, GLuint capture256Tex = 0, bool forceOBJDisabled = false, GLuint objLayerTex = 0, int direct3DEndpointMode = 0);
     void RenderNativeResolvedExactFinalToTexture(GLuint targetTex, GLuint direct3DTex);
     void RenderNativeUpscale(int ystart, int yend);
     void RenderNativeFinalUpscale(GLuint sourceTex);
@@ -1110,6 +1801,11 @@ private:
                                                             bool applyMasterBrightness = false,
                                                             GLuint* rawCompositeTex = nullptr,
                                                             bool* outputMasterBrightnessApplied = nullptr);
+    bool TryPromoteTwoPartAffineOBJPresentation(GLuint targetTex,
+                                                GLuint highResBackgroundTex,
+                                                GLuint nativeDirect3DCoverageTex,
+                                                int ystart,
+                                                int yend);
     bool ApplyMasterBrightnessToTexture(GLuint targetTex,
                                         GLuint sourceTex,
                                         int width,
@@ -1134,6 +1830,12 @@ private:
     void PoisonWholeSceneDebugTexture(GLuint texture, int width, int height, bool forceAlphaOpaque);
     void EnsureWholeSceneOverlayEndpoints(GLuint nativeDirect3DTex);
     void RenderOverlay3DEndpoint(GLuint targetTex, GLuint nativeDirect3DTex, bool whiteEndpoint);
+    bool RenderStrictAffineOperandExcludedOverlayBase(
+        int ystart,
+        int yend,
+        const WholeSceneOperandExcludedOverlayRecipe& recipe,
+        GLuint highResDirect3DTex,
+        u64& excludedOAMHash);
     void RenderOverlayComposite(GLuint overlayBlackTex,
                                 GLuint overlayWhiteTex,
                                 GLuint direct3DTex,
@@ -1149,7 +1851,12 @@ private:
                                 int hybridDebugMode = 0,
                                 int ystart = 0,
                                 int yend = 192,
-                                bool direct3DPresentationSpace = false);
+                                bool direct3DPresentationSpace = false,
+                                bool straightDirect3DColor = false,
+                                GLuint overlayOpaqueWhiteTex = 0,
+                                GLuint native3DSemanticsTex = 0,
+                                GLuint native3DOperatorTex = 0,
+                                bool explicit3DOperator = false);
     void RenderOverlayDebugTexture(GLuint targetTex,
                                    int width,
                                    int height,
@@ -1161,28 +1868,67 @@ private:
     void RenderNativeMetaCoverage(int ystart, int yend);
     void RenderFullscreenPassToTexture(GLuint shader, GLuint targetTex, int width, int height, GLuint source0, GLuint source1);
     void RenderFullscreenPass(GLuint shader, GLuint outputFB, int width, int height, GLuint source0, GLuint source1);
-    void RenderArtCNNComputePass(GLuint shader, GLuint targetTex, int pass);
+    void RenderArtCNNComputePass(GLuint shader, GLuint targetTex, int pass,
+                                 int nativeWidth, int nativeHeight);
     bool RenderArtCNN2x(int modelIndex, GLuint sourceTex, GLuint targetTex);
+    bool RenderArtCNNRGBAtScale(int modelIndex, GLuint sourceTex,
+                                GLuint targetTex, int sourceWidth,
+                                int sourceHeight, int sourceScale);
     bool RenderArtCNN2xGuarded(int modelIndex, GLuint sourceTex, GLuint targetTex, bool secondLayer);
-    void RenderSpline36(GLuint sourceTex, GLuint targetTex, int width, int height, float sourceShiftX = 0.0f, float sourceShiftY = 0.0f);
-    bool RenderNNEDI32x(GLuint sourceTex, GLuint targetTex);
+    void RenderSpline36(GLuint sourceTex, GLuint targetTex, int width, int height,
+                        float sourceShiftX = 0.0f,
+                        float sourceShiftY = 0.0f,
+                        bool transparentSourceAware = false,
+                        bool boundedCoverageAlpha = false,
+                        bool resolvePremultipliedRGB = false,
+                        GLuint coverageSource = 0);
+    bool RenderNNEDI32x(GLuint sourceTex, GLuint targetTex,
+                        bool predictAlpha = false);
     bool RenderNNEDI32xGuarded(GLuint sourceTex, GLuint targetTex, bool secondLayer);
     void RenderXBRZ(GLuint sourceTex, GLuint targetTex);
     void RenderXBRZGuarded(GLuint sourceTex, GLuint targetTex, bool secondLayer);
+    bool EnsureXBRZInfoTexture(int width, int height);
+    bool RenderXBRZAtScale(GLuint sourceTex, GLuint targetTex,
+                           int sourceWidth, int sourceHeight,
+                           int sourceScale);
     bool EnsureCuNNyPrograms();
     bool EnsureArtCNNComputePrograms();
+    bool EnsureArtCNNWorkTextures(int nativeWidth, int nativeHeight);
     bool EnsureNNEDI3ComputePrograms();
     bool EnsureCuNNyWorkTexture(int index, int width, int height);
     void CopyCuNNyProgramsFrom(const GLRenderer2D& other);
     void CopyArtCNNProgramsFrom(const GLRenderer2D& other);
     void CopyNNEDI3ComputeProgramsFrom(const GLRenderer2D& other);
     void RenderNNEDI3ComputePass(GLuint shader, GLuint sourceTex, GLuint targetTex,
-                                 int sourceWidth, int sourceHeight);
+                                 int sourceWidth, int sourceHeight,
+                                 bool predictAlpha = false,
+                                 bool alphaOnly = false,
+                                 bool boundedCoverageAlpha = false,
+                                 bool premultiplyInput = false);
     void RenderCuNNyComputePass(GLuint shader, GLuint sourceTex, GLuint baseTex, GLuint targetTex,
                                 int sourceWidth, int sourceHeight,
                                 int nativeWidth, int nativeHeight);
     bool RenderCuNNy2x(int modelIndex, GLuint sourceTex, GLuint targetTex);
     bool RenderCuNNy2xGuarded(int modelIndex, GLuint sourceTex, GLuint targetTex, bool secondLayer);
+    bool PrepareStrictAffineOrdinaryOBJNativeStack(
+        StrictAffineSourceEnhancementDecision sourceEnhancement,
+        int sourceModelIndex,
+        int ystart,
+        int yend);
+    void RenderStrictAffineOrdinaryOBJComposite(int ystart, int yend,
+                                                u32 nativeStackBGMask,
+                                                GLuint baseTex,
+                                                GLuint targetFB,
+                                                bool buildAffineUnderlay);
+    void RenderStrictAffineMaskedOBJMask(int ystart, int yend,
+                                         u32 ownerMask = 0);
+    void RenderStrictAffineMaskedOBJMLAA(int ystart, int yend,
+                                         GLuint sourceTex, GLuint targetFB,
+                                         bool debugCoverage = false);
+    void RenderAffineOBJPresentationComposite(
+        int ystart, int yend,
+        bool subpixelPresentationCoverage = false,
+        bool premultipliedSubpixelPresentation = false);
     void RenderNativeBoundaryGuard(GLuint scaledTex, GLuint nativeTex, GLuint targetTex, bool secondLayer);
     void RenderNativeResolve(int ystart, int yend);
     void RenderScreenCurrent(int ystart, int yend,
@@ -1190,31 +1936,71 @@ private:
                              WholeSceneCurrentPathReason reason = WholeSceneCurrentPathReason::DirectCurrent);
     void RenderScreenWholeSceneLegacy(int ystart, int yend, bool cleanHybridCandidate = false);
     void RenderScreenWholeSceneHighRes(int ystart, int yend);
-    WholeSceneScaleDecision ChooseWholeSceneScaleDecision(int ystart, int yend) const;
-    WholeScenePathDecision ChooseWholeScenePathDecision(int ystart, int yend) const;
+    void RenderScreenWholeSceneStrictAffineHighRes(int ystart, int yend);
+    void RenderStrictAffineDebugProducts(int ystart, int yend);
+    bool IsStrictAffineBGIdentityEquivalentForRange(int layer,
+                                                    int ystart,
+                                                    int yend) const;
+    void UpdateStrictAffineGeometryDemand(int ystart, int yend);
+    void ResetStrictAffineGeometryDemand();
+    StrictAffineHighResEligibilityInputs BuildStrictAffineHighResEligibilityInputs(
+        int ystart,
+        int yend,
+        u64 requiredChannels) const;
+    WholeSceneScaleCandidateInputs BuildWholeSceneScaleCandidateInputs(
+        int ystart,
+        int yend,
+        const WholeSceneCaptureBackedPlan& capturePlan,
+        u64 requiredChannels) const;
+    WholeScenePathDecisionInputs BuildWholeScenePathDecisionInputs(
+        int ystart,
+        int yend) const;
     WholeSceneCaptureBackedPlan ChooseWholeSceneCaptureBackedPlan(int ystart, int yend) const;
-    void RenderScreenWholeSceneCaptureBackedPlan(const WholeSceneCaptureBackedPlan& plan, int ystart, int yend);
-    void RenderScreenWholeSceneCaptureBackedHybridFallback(int ystart, int yend);
-    void RenderScreenWholeSceneSourceACaptureReplacement(int ystart, int yend);
-    bool TryRenderHandoffBackgroundOverlayProduct(const WholeSceneCaptureRequest& request,
-                                                  int handoffSlot,
-                                                  const HandoffBackgroundChoice& background,
-                                                  int ystart,
-                                                  int yend);
-    bool TryPrepareStableHandoffLiveBackground(int handoffSlot,
-                                               HandoffBackgroundChoice& background,
-                                               int ystart,
-                                               int yend);
-    HandoffBackgroundResolveResult ResolveCapturedHandoffBackgroundChoice(
+    PreparedCaptureBackedExecution PrepareSourceAExecution(
+        const SourceACaptureReplacementExecutionInput& input) const;
+    PreparedCaptureBackedExecution PrepareCaptureEpochExecution(
+        const CaptureEpochOverlayExecutionInput& input) const;
+    PreparedCaptureBackedExecution PrepareCaptureBackedExecution(
+        const WholeSceneCaptureBackedPlan& plan,
+        const SourceACaptureReplacementExecutionInput& sourceAInput,
+        const CaptureEpochOverlayExecutionInput& captureEpochInput,
+        int ystart,
+        int yend);
+    void ExecutePreparedCaptureBackedExecution(
+        const PreparedCaptureBackedExecution& execution,
+        int ystart,
+        int yend);
+    CaptureEpochOverlayExecutionInput PrepareCaptureEpochOverlayExecutionInput(
+        const WholeSceneCaptureBackedPlan& plan,
+        int ystart,
+        int yend);
+    PreparedCaptureBackedExecution PrepareCaptureBackedHandoffExecution(
+        int ystart,
+        int yend);
+    PreparedCaptureBackedExecution PrepareStableHandoffLiveExecution(
         const WholeSceneCaptureRequest& request,
         int handoffSlot,
+        int ystart,
+        int yend);
+    PreparedCaptureBackedExecution PrepareCapturedHandoffExecution(
+        const WholeSceneCaptureRequest& request,
+        int handoffSlot,
+        int ystart,
+        int yend);
+    PreparedCaptureBackedExecution PrepareHandoffBackgroundExecution(
+        const WholeSceneCaptureRequest& request,
+        int handoffSlot,
+        const HandoffBackgroundChoice& background);
+    bool ExecuteHandoffBackgroundOverlay(
+        const HandoffBackgroundOverlayExecution& execution,
         int ystart,
         int yend);
     void RenderHandoffHybridComposite(const WholeSceneCaptureRequest& request,
                                       const HandoffBackgroundChoice& background,
                                       int ystart,
                                       int yend);
-    SourceACaptureReplacementChoice ChooseSourceACaptureReplacement(int ystart, int yend);
+    SourceACaptureReplacementExecutionInput
+        PrepareSourceACaptureReplacementExecutionInput(int ystart, int yend);
     void ResolveSourceARouteProductChoice(SourceACaptureReplacementChoice& choice,
                                           u64 captureEventSerial,
                                           u64 source3DSerial,
@@ -1248,14 +2034,13 @@ private:
     void BlitWholeSceneSourceAProduct(const GLCaptureProductResolution& product,
                                       int ystart,
                                       int yend);
-    void BlitWholeSceneSourceAReplacement(GLuint sourceTex,
-                                           int ystart,
-                                           int yend,
-                                           bool applySourceAMasterBrightness = false);
-    void RenderScreenWholeSceneCaptureEpochOverlay(int ystart, int yend);
+    void ExecuteCaptureEpochCurrentOverlay(
+        const CaptureEpochOverlayExecutionInput& input,
+        int ystart,
+        int yend);
     void RenderScreenWholeSceneFinalUpscale(int ystart, int yend, bool hybridFragmentationFallback = false);
+    void RenderScreenWholeSceneNativeExactFloor(int ystart, int yend);
     void RenderScreenWholeSceneOverlayOperator(int ystart, int yend);
-    void RenderScreenWholeSceneCaptureBackedHandoff(int ystart, int yend);
     void RenderScreenWholeSceneFinalizeFullFrame();
     void RenderScreenWholeScene(int ystart, int yend);
     void RenderScreen(int ystart, int yend);

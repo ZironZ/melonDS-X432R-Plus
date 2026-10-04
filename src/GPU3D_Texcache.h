@@ -7,11 +7,14 @@
 #include "GPU3D_TexcacheMip.h"
 #include "GPU3D_TexcacheScale.h"
 #include "GPU3D_TextureTypes.h"
+#include "GPU3D_TextureCacheLifetime.h"
+#include "GPU3D_TextureReconstruction.h"
 
 #include <algorithm>
 #include <assert.h>
 #include <chrono>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #define XXH_STATIC_LINKING_ONLY
@@ -55,9 +58,13 @@ private:
         bool DeferredScalePending = false;
         bool DeferredScaleQueued = false;
         bool SamplingBoundsEdgeExtendMargins = false;
+        // Outside the bounds-keyed sampling region, a partial neural result
+        // is not a full-sheet preview. Debug exports must rebuild it in full.
+        bool RestrictedScale = false;
         u32 DeferredUseCount = 0;
         u64 DeferredFirstSeenFrame = 0;
         u64 CreatedFrame = 0;
+        u64 LastUsedFrame = 0;
 
         u64 TextureHash[2];
         u64 TexPalHash;
@@ -87,6 +94,137 @@ private:
     };
 
 public:
+    struct ReconstructedTexture
+    {
+        TexHandleT Handle {};
+        u32 LastVariant = 0;
+        u64 LastUsedFrame = 0;
+        int Width = 0, Height = 0;
+        bool FractionalAlpha = false;
+        std::vector<u32> Source;
+        std::vector<u8> Domain;
+    };
+
+    // One immutable VRAM snapshot is used while preparing a reconstruction
+    // plan. Reuse the last decoded atlas across its groups, never across plans.
+    void BeginTextureReconstruction() { ReconstructionAtlasValid = false; }
+
+    const TextureReconstructionPlan& GetTextureReconstructionPlan(const std::vector<Polygon*>& polygons,
+        bool shareEdgeContext, bool includeFractional)
+    {
+        const u32 maxPreparedTexels = TexLoader.UseSourceMipScaling() ? 0 :
+            u32(MaxReconstructionTexels / (u64(TextureScaleFactor)*TextureScaleFactor));
+        return ReconstructionPlan.Get(polygons, shareEdgeContext, includeFractional, maxPreparedTexels);
+    }
+
+    // Groups must come from GetTextureReconstructionPlan so their geometry-only
+    // domain and copy spans have been prepared within the existing area budget.
+    ReconstructedTexture* GetReconstructedTexture(const TextureReconstructionGroup& group)
+    {
+        if (TextureScaleFactor <= 1 || !ReconstructCompatible3D || TexLoader.UseSourceMipScaling()) return nullptr;
+        const u64 texels = u64(group.Width) * group.Height * TextureScaleFactor * TextureScaleFactor;
+        if (texels > MaxReconstructionTexels) return nullptr;
+        ScopedTextureCacheTiming timing(*this, TextureFrameTiming.BoundsProcess);
+        const u32 format = (group.TexParam >> 26) & 7;
+        if (format < 1 || format > 6 || format == 5) return nullptr;
+        const bool fractionalGroup = group.HasFractionalAlpha();
+        // Reconstruct from the coherent native source, never a scaled cache
+        // readback. Exact assembled bytes also keep unrelated atlas writes
+        // from invalidating a reusable reconstruction.
+        auto& source = ReconstructionSource;
+        source.assign(group.Width*group.Height, 0);
+        const auto& domain = group.Domain;
+        const u32 palette = format == 2 ? ((group.Palette*16) >> 1) & 0x1FFFF : (group.Palette*16) & 0x1FFFF;
+        // Members do not overlap. Process them by source address to decode
+        // each atlas once per group without retaining multiple large atlases.
+        for (int member : group.SourceOrder)
+        {
+            const auto& piece = group.Pieces[member];
+            const u32 memberWidth = TextureWidth(piece.TexParam), memberHeight = TextureHeight(piece.TexParam);
+            if (!ReconstructionAtlasValid || ReconstructionAtlasParam != piece.TexParam || ReconstructionAtlasPalette != palette)
+            {
+                ReconstructionAtlas.resize(memberWidth*memberHeight);
+                TextureScaleDecodeSourceRGBA8(format, memberWidth, memberHeight, ReconstructionAtlas.data(),
+                    (piece.TexParam & 0xFFFF)*8, 0, palette, (piece.TexParam & (1u<<29)) != 0, VRAMView());
+                ReconstructionAtlasValid = true;
+                ReconstructionAtlasParam = piece.TexParam;
+                ReconstructionAtlasPalette = palette;
+            }
+            CopyTextureReconstructionPiece(group, piece, memberWidth, ReconstructionAtlas.data(), source.data(), nullptr);
+        }
+
+        for (const auto& span : group.ContextSpans)
+        {
+            const auto& piece = group.ContextPieces[span.Donor];
+            if (!ReconstructionAtlasValid || ReconstructionAtlasParam != piece.TexParam || ReconstructionAtlasPalette != palette)
+            {
+                const u32 width = TextureWidth(piece.TexParam), height = TextureHeight(piece.TexParam);
+                ReconstructionAtlas.resize(width*height);
+                TextureScaleDecodeSourceRGBA8(format, width, height, ReconstructionAtlas.data(),
+                    (piece.TexParam & 0xFFFF)*8, 0, palette, (piece.TexParam & (1u<<29)) != 0, VRAMView());
+                ReconstructionAtlasValid = true;
+                ReconstructionAtlasParam = piece.TexParam;
+                ReconstructionAtlasPalette = palette;
+            }
+            const auto* row = ReconstructionAtlas.data()+span.Source;
+            if (piece.FlipX) std::reverse_copy(row-span.Count+1, row+1, source.data()+span.Destination);
+            else std::copy_n(row, span.Count, source.data()+span.Destination);
+        }
+        for (auto& entry : ReconstructedTextures)
+            if (entry.FractionalAlpha == fractionalGroup && entry.Width == group.Width && entry.Height == group.Height && entry.Source == source && entry.Domain == domain)
+            {
+                entry.LastUsedFrame = FrameIndex;
+                ReconstructionHits++;
+                return &entry;
+            }
+        // Bound retained GPU area and avoid evicting a texture referenced by
+        // this frame's draws. No stale-content fallback on source changes.
+        u64 retained = 0;
+        for (const auto& entry : ReconstructedTextures)
+            retained += u64(entry.Width)*entry.Height*TextureScaleFactor*TextureScaleFactor;
+        // Retention is independent of the planner's admission limit. Keep
+        // previous recipes when space allows, without increasing the cache
+        // budget as more groups become eligible for reconstruction.
+        while (ReconstructedTextures.size() >= MaxReconstructionEntries || retained + texels > MaxReconstructionTexels)
+        {
+            auto oldest = std::min_element(ReconstructedTextures.begin(), ReconstructedTextures.end(),
+                [](const auto& a, const auto& b) { return a.LastUsedFrame < b.LastUsedFrame; });
+            if (oldest == ReconstructedTextures.end() || oldest->LastUsedFrame == FrameIndex) return nullptr;
+            retained -= u64(oldest->Width)*oldest->Height*TextureScaleFactor*TextureScaleFactor;
+            TexLoader.DeleteTexture(oldest->Handle);
+            ReconstructedTextures.erase(oldest);
+        }
+        ReconstructedTexture entry;
+        entry.Width = group.Width; entry.Height = group.Height; entry.LastUsedFrame = FrameIndex;
+        entry.FractionalAlpha = fractionalGroup;
+        entry.Source = source;
+        entry.Domain = domain;
+        ExtendTextureReconstructionDomain(group.Width, group.Height, source, domain);
+        if (!fractionalGroup && !TexLoader.UseLegacyAlphaHandling())
+        {
+            if (TexLoader.UseQualityAlphaHandling()) PadTransparentTextureRGB(group.Width, group.Height, source.data());
+            else PadTransparentTextureRGBFast(group.Width, group.Height, source.data());
+        }
+        entry.Handle = TexLoader.GenerateTexture(group.Width*TextureScaleFactor, group.Height*TextureScaleFactor, 1, TextureScaleFactor);
+        bool ok;
+        {
+            ScopedTextureCacheTiming scaleTiming(*this, TextureFrameTiming.GPUScale);
+            ok = TexLoader.ProcessTextureGPUScaleToCacheLayer(group.Width, group.Height, TextureScaleFactor,
+                source.data(), TexLoader.PreferredOutputFormat(), RGB6RepackPolicy::NativeRGB5Expansion,
+                !fractionalGroup, entry.Handle, 0, nullptr,
+                TexLoader.FilterableSamplingEnabled() && TexLoader.UseFilterableMipAlphaHandling(),
+                false, !TexLoader.UseLegacyAlphaHandling());
+        }
+        if (!ok) { TexLoader.DeleteTexture(entry.Handle); return nullptr; }
+        ReconstructedTextures.push_back(std::move(entry));
+        ReconstructionBuilds++;
+        ReconstructionBuiltTexels += texels;
+        return &ReconstructedTextures.back();
+    }
+    u32 GetReconstructionHits() const { return ReconstructionHits; }
+    u32 GetReconstructionBuilds() const { return ReconstructionBuilds; }
+    u64 GetReconstructionBuiltTexels() const { return ReconstructionBuiltTexels; }
+
     struct TextureCacheTimingPhase
     {
         u64 TotalUS = 0;
@@ -162,6 +300,10 @@ public:
         return false;
     }
 
+    // Reused frames do not perform texture lookups. Keep their last prepared
+    // working set protected until a different frame has actually been drawn.
+    void BeginRenderFrame() { LastRenderedFrame = FrameIndex; }
+
     bool Update(u8& clrBitmapDirty)
     {
         FrameIndex++;
@@ -179,7 +321,7 @@ public:
         FrequentChangeFallbackPromotionTexelsThisFrame = 0;
         TextureFrameTiming = {};
         PruneEdgeExtendChurnState();
-        bool cacheStateChanged = false;
+        bool cacheStateChanged = TrimInactivePaletteVariants();
         std::unordered_map<u64, bool> frequentChangeInvalidatedBases;
 
         auto textureDirty = GPU.VRAMDirty_Texture.DeriveState(GPU.VRAMMap_Texture, GPU);
@@ -299,7 +441,7 @@ public:
 
     void GetTexture(u32 texParam, u32 palBase, TexHandleT& textureHandle, u32& layer, u32*& helper,
                     bool* binaryAlphaTexture = nullptr, const TextureSamplingBounds* samplingBounds = nullptr,
-                    bool* cacheHit = nullptr, u32* actualScaleFactor = nullptr)
+                    bool* cacheHit = nullptr, u32* actualScaleFactor = nullptr, bool forceNative = false)
     {
         u32 rawTexParam = texParam;
         // remove sampling and texcoord gen params
@@ -313,7 +455,7 @@ public:
         bool color0Transparent = texParam & (1 << 29);
         u32 addr = (texParam & 0xFFFF) * 8;
         TextureSamplingBounds activeSamplingBounds;
-        bool hasSamplingBounds = NormalizeSamplingBounds(width, height, samplingBounds, activeSamplingBounds);
+        bool hasSamplingBounds = !forceNative && NormalizeSamplingBounds(width, height, samplingBounds, activeSamplingBounds);
         bool useSubrectHandling =
             hasSamplingBounds && !activeSamplingBounds.EdgeExtendMargins &&
             TexLoader.UseFilterableMipSubrectHandling();
@@ -353,7 +495,9 @@ public:
             }
         }
 
-        u64 baseKey = MakeBaseKey(texParam, fmt);
+        // Native protected draws coexist with scaled draws of the same atlas.
+        // Raw texture parameters occupy only the low 32 bits of this base key.
+        u64 baseKey = MakeBaseKey(texParam, fmt) | (forceNative ? (u64(1) << 32) : 0);
         u64 subrectKey = useSamplingBoundsKey ? MakeSubrectKey(activeSamplingBounds) : 0;
         u64 texPalHash = 0;
         if (texPalSize > 0)
@@ -390,17 +534,27 @@ public:
                     RecordEdgeExtendVariantMiss(baseKey);
             }
         }
-        bool deferScaleOnMiss = DeferredScalingEnabled && !InDeferredPromotion && !useSamplingBoundsKey &&
+        bool deferScaleOnMiss = !forceNative && DeferredScalingEnabled && !InDeferredPromotion && !useSamplingBoundsKey &&
             TextureScaleFactor > 1 && texPalSize > 0;
-        u32 effectiveScaleFactor = deferScaleOnMiss ? 1 : TextureScaleFactor;
+        u32 effectiveScaleFactor = (forceNative || deferScaleOnMiss) ? 1 : TextureScaleFactor;
         u32 scaledWidth = width * effectiveScaleFactor;
         u32 scaledHeight = height * effectiveScaleFactor;
-        u8 storageBucket = deferScaleOnMiss ? StorageBucketNative : StorageBucketScaled;
+        u8 storageBucket = (forceNative || deferScaleOnMiss) ? StorageBucketNative : StorageBucketScaled;
         //printf("%" PRIx64 " %" PRIx32 " %" PRIx32 "\n", key, texParam, palBase);
 
         assert(fmt != 0 && "no texture is not a texture format!");
 
         auto it = Cache.find(key);
+
+        const bool expandRestrictedScale = it != Cache.end() && it->second.RestrictedScale &&
+            !InDeferredPromotion && Debug.IsFrameTextureCaptureActive();
+        if (expandRestrictedScale)
+        {
+            ReleaseStoragePlace(it->second);
+            RemoveVariantKey(it->second.BaseKey, key);
+            Cache.erase(it);
+            it = Cache.end();
+        }
 
         if (it != Cache.end())
         {
@@ -418,7 +572,7 @@ public:
 
                 InFrequentChangeFallbackPromotion = true;
                 GetTexture(rawTexParam, palBase, textureHandle, layer, helper, binaryAlphaTexture, samplingBounds,
-                           cacheHit, actualScaleFactor);
+                           cacheHit, actualScaleFactor, forceNative);
                 InFrequentChangeFallbackPromotion = false;
                 return;
             }
@@ -426,7 +580,7 @@ public:
             if (cacheHit)
                 *cacheHit = true;
 
-            TouchVariantKey(baseKey, key);
+            TouchVariantKey(key, it->second);
             if (it->second.DeferredScalePending)
             {
                 it->second.DeferredUseCount++;
@@ -487,7 +641,9 @@ public:
 
         if (!InDeferredPromotion)
             Debug.PopulateInvalidation(baseKey, lastMiss);
-        bool useFrequentChangeFallback = !deferScaleOnMiss && !InFrequentChangeFallbackPromotion &&
+        // Expanding an already scaled entry for inspection must retain its scaler.
+        // A later hot-texture classification applies to real misses, not this refresh.
+        bool useFrequentChangeFallback = !expandRestrictedScale && !forceNative && !deferScaleOnMiss && !InFrequentChangeFallbackPromotion &&
             ShouldUseFrequentChangeFallback(baseKey);
 
         TexCacheEntry entry = {0};
@@ -774,7 +930,9 @@ public:
                         capturePreviewImages ? &ScaledRGBA8Storage : nullptr,
                         useImprovedFilterableMipPath,
                         useDefaultFilterableBinaryAlphaMips,
-                        useImprovedFilterableMipPath && sourceTransparentRGBPadded);
+                        useImprovedFilterableMipPath && sourceTransparentRGBPadded,
+                        useMarginExtension ? &activeSamplingBounds : nullptr,
+                        &entry.RestrictedScale);
                 }
                 if (processedGPUDirect)
                 {
@@ -1130,11 +1288,12 @@ public:
             textureHandle = storagePlace.TextureID;
             layer = storagePlace.Layer;
             entry.BinaryAlphaTexture = binaryAlphaTextureValue;
-            EvictOldPaletteVariantIfNeeded(baseKey, key);
-            helper = &Cache.emplace(std::make_pair(key, entry)).first->second.LastVariant;
+            auto inserted = Cache.emplace(std::make_pair(key, entry));
+            helper = &inserted.first->second.LastVariant;
             if (binaryAlphaTexture)
                 *binaryAlphaTexture = binaryAlphaTextureValue;
-            TouchVariantKey(baseKey, key);
+            TouchVariantKey(key, inserted.first->second);
+            TrimPaletteVariantsAfterInsert(baseKey);
         }
         if (captureFrameTexture)
         {
@@ -1182,6 +1341,14 @@ public:
 
     void Reset()
     {
+        for (auto& entry : ReconstructedTextures) TexLoader.DeleteTexture(entry.Handle);
+        ReconstructedTextures.clear();
+        ReconstructionAtlasValid = false;
+        std::vector<u32>().swap(ReconstructionAtlas);
+        std::vector<u32>().swap(ReconstructionSource);
+        ReconstructionPlan.Reset();
+        ReconstructionHits = ReconstructionBuilds = 0;
+        ReconstructionBuiltTexels = 0;
         for (const auto& cacheEntry : Cache)
         {
             if (cacheEntry.second.Texture.Dedicated)
@@ -1207,6 +1374,7 @@ public:
         FrequentChangeByBase.clear();
         EdgeExtendChurnByBase.clear();
         VariantKeysByBase.clear();
+        OverBudgetPaletteBases.clear();
         DeferredScaleQueue.clear();
         Debug.ResetCacheState();
         EdgeExtendNewVariantsThisFrame = 0;
@@ -1223,6 +1391,7 @@ public:
         TextureFrameTiming = {};
         InFrequentChangeFallbackPromotion = false;
         FrameIndex = 0;
+        LastRenderedFrame = 0;
     }
 
     void GetDebugStats(TextureScalingDebugStats& stats, bool usesComputeBackend, bool readableTextureCache) const
@@ -1236,8 +1405,7 @@ public:
             DeferredScalingEnabled,
             TexLoader.UseLegacyAlphaHandling(),
             TexLoader.UseQualityAlphaHandling(),
-            TexLoader.UseAlphaXBRZ(),
-            TexLoader.UseSpline36Alpha(),
+            static_cast<int>(TexLoader.AlphaAlgorithm()),
             RendererSettings::GetGLScaleAlgorithmIndex(TexLoader.ScalingAlgorithm()),
             TextureScaleFactor,
             static_cast<u32>(Cache.size()),
@@ -1247,11 +1415,17 @@ public:
             SecondaryCacheMaxTexels,
             CountFreeLayers(),
             CountTextureArrays());
+        stats.ReconstructionEntries = static_cast<u32>(ReconstructedTextures.size());
+        stats.ReconstructionHits = ReconstructionHits;
+        stats.ReconstructionBuilds = ReconstructionBuilds;
+        stats.ReconstructionBuiltTexels = ReconstructionBuiltTexels;
     }
 
     void ResetDebugStats()
     {
         Debug.ResetCounters();
+        ReconstructionHits = ReconstructionBuilds = 0;
+        ReconstructionBuiltTexels = 0;
     }
 
     void GetDebugLastMiss(TextureScalingDebugLastMiss& miss)
@@ -1340,6 +1514,21 @@ public:
     {
         const u32 textureScaleFactor = scaling.Enabled ? renderScaleFactor : 1;
         bool changed = false;
+        if (ReconstructCompatible3D != scaling.ReconstructCompatible3D)
+        {
+            ReconstructCompatible3D = scaling.ReconstructCompatible3D;
+            changed = true;
+        }
+        if (ReconstructCompatible3DFractionalAlpha != scaling.ReconstructCompatible3DFractionalAlpha)
+        {
+            ReconstructCompatible3DFractionalAlpha = scaling.ReconstructCompatible3DFractionalAlpha;
+            changed = true;
+        }
+        if (ReconstructCompatible3DEdgeContext != scaling.ReconstructCompatible3DEdgeContext)
+        {
+            ReconstructCompatible3DEdgeContext = scaling.ReconstructCompatible3DEdgeContext;
+            changed = true;
+        }
 
         changed |= SetScaleFactor(textureScaleFactor);
         changed |= SetScalingAlgorithm(scaling.Algorithm);
@@ -1350,8 +1539,7 @@ public:
         changed |= SetTextureScalingEdgeExtendUnusedMargins(scaling.EdgeExtendUnusedMargins);
         changed |= SetLegacyAlphaHandling(scaling.LegacyAlphaHandling);
         changed |= SetQualityAlphaHandling(scaling.QualityAlphaHandling);
-        changed |= SetAlphaXBRZ(scaling.AlphaXBRZ);
-        changed |= SetSpline36Alpha(scaling.Spline36Alpha);
+        changed |= TexLoader.SetAlpha(scaling.Alpha);
         changed |= SetFilterableMipTopologyHandling(filter.TopologyAwareMipHandling);
         changed |= SetFilterableMipSubrectHandling(filter.MipmapSubrectHandling);
         changed |= SetFilterableMipAlphaHandling(filter.MipmapAlphaHandling);
@@ -1425,14 +1613,7 @@ public:
     {
         return TexLoader.SetQualityAlphaHandling(qualityAlphaHandling);
     }
-    bool SetAlphaXBRZ(bool alphaXBRZ)
-    {
-        return TexLoader.SetAlphaXBRZ(alphaXBRZ);
-    }
-    bool SetSpline36Alpha(bool spline36Alpha)
-    {
-        return TexLoader.SetSpline36Alpha(spline36Alpha);
-    }
+
     bool SetLegacyAlphaHandling(bool legacyAlphaHandling)
     {
         return TexLoader.SetLegacyAlphaHandling(legacyAlphaHandling);
@@ -1675,6 +1856,10 @@ private:
         if (entry.DeferredScalePending || TextureScaleFactor <= 1)
             return false;
         if (entry.CreatedFrame >= FrameIndex)
+            return false;
+        // A later lookup in the same draw list must not replace a fallback
+        // texture that earlier polygons already reference.
+        if (entry.LastUsedFrame == FrameIndex)
             return false;
         if (FrequentChangeFallbackPromotionsThisFrame >= FrequentChangeFallbackPromotionBudgetPerFrame)
             return false;
@@ -1931,9 +2116,10 @@ private:
             VariantKeysByBase.erase(variantsIt);
     }
 
-    void TouchVariantKey(u64 baseKey, u64 key)
+    void TouchVariantKey(u64 key, TexCacheEntry& entry)
     {
-        auto& variants = VariantKeysByBase[baseKey];
+        entry.LastUsedFrame = FrameIndex;
+        auto& variants = VariantKeysByBase[entry.BaseKey];
         variants.erase(std::remove(variants.begin(), variants.end(), key), variants.end());
         variants.push_back(key);
     }
@@ -1945,31 +2131,46 @@ private:
             variantsIt->second.size() >= MaxPaletteVariantsPerBaseKey;
     }
 
-    void EvictOldPaletteVariantIfNeeded(u64 baseKey, u64 keepKey)
+    void TrimPaletteVariantsAfterInsert(u64 baseKey)
     {
         auto variantsIt = VariantKeysByBase.find(baseKey);
         if (variantsIt == VariantKeysByBase.end())
             return;
 
         auto& variants = variantsIt->second;
-        while (variants.size() >= MaxPaletteVariantsPerBaseKey)
+        TrimTexturePaletteVariants(variants, Cache, MaxPaletteVariantsPerBaseKey, FrameIndex,
+            [this](const TexCacheEntry& entry) { ReleaseStoragePlace(entry); });
+        if (variants.size() > MaxPaletteVariantsPerBaseKey)
+            OverBudgetPaletteBases.insert(baseKey);
+        else
+            OverBudgetPaletteBases.erase(baseKey);
+    }
+
+    bool TrimInactivePaletteVariants()
+    {
+        bool changed = false;
+        for (auto it = OverBudgetPaletteBases.begin(); it != OverBudgetPaletteBases.end();)
         {
-            u64 victimKey = variants.front();
-            variants.erase(variants.begin());
-            if (victimKey == keepKey)
+            auto variantsIt = VariantKeysByBase.find(*it);
+            if (variantsIt == VariantKeysByBase.end())
+            {
+                it = OverBudgetPaletteBases.erase(it);
                 continue;
+            }
 
-            auto cacheIt = Cache.find(victimKey);
-            if (cacheIt == Cache.end())
-                continue;
-
-            const TexCacheEntry& victim = cacheIt->second;
-            ReleaseStoragePlace(victim);
-            Cache.erase(cacheIt);
+            auto& variants = variantsIt->second;
+            // Update starts a new frame. Preserve the previous frame's working
+            // set here: it may be reused without any texture misses. Only trim
+            // excess variants after a frame has actually stopped using them.
+            changed |= TrimTexturePaletteVariants(variants, Cache,
+                MaxPaletteVariantsPerBaseKey, LastRenderedFrame,
+                [this](const TexCacheEntry& entry) { ReleaseStoragePlace(entry); });
+            if (variants.size() <= MaxPaletteVariantsPerBaseKey)
+                it = OverBudgetPaletteBases.erase(it);
+            else
+                ++it;
         }
-
-        if (variants.empty())
-            VariantKeysByBase.erase(variantsIt);
+        return changed;
     }
 
     u64 MakeSecondaryCacheKey(u64 key, const TexCacheEntry& entry) const
@@ -2132,6 +2333,13 @@ private:
 
         const u64 secondaryKey = MakeSecondaryCacheKey(key, probe);
         auto secondaryIt = SecondaryCache.find(secondaryKey);
+        if (secondaryIt != SecondaryCache.end() && secondaryIt->second.Entry.RestrictedScale &&
+            !InDeferredPromotion && Debug.IsFrameTextureCaptureActive())
+        {
+            if (edgeExtendRestore)
+                EdgeExtendSecondaryRestoreSkippedThisFrame++;
+            return false;
+        }
         if (secondaryIt == SecondaryCache.end())
         {
             if (edgeExtendRestore)
@@ -2154,10 +2362,12 @@ private:
 
         const TexArrayEntry restoredTexture = restored.Texture;
         const bool restoredBinaryAlphaTexture = restored.BinaryAlphaTexture;
+        const bool restoredRestrictedScale = restored.RestrictedScale;
         const u32 restoredLastVariant = restored.LastVariant;
         restored = probe;
         restored.Texture = restoredTexture;
         restored.BinaryAlphaTexture = restoredBinaryAlphaTexture;
+        restored.RestrictedScale = restoredRestrictedScale;
         restored.LastVariant = restoredLastVariant;
         restored.UsedFrequentChangeFallback = false;
         restored.DeferredScalePending = false;
@@ -2165,7 +2375,8 @@ private:
 
         auto inserted = Cache.emplace(std::make_pair(key, restored));
         TexCacheEntry& entry = inserted.first->second;
-        TouchVariantKey(entry.BaseKey, key);
+        TouchVariantKey(key, entry);
+        TrimPaletteVariantsAfterInsert(entry.BaseKey);
 
         textureHandle = entry.Texture.TextureID;
         layer = entry.Texture.Layer;
@@ -2257,8 +2468,22 @@ private:
     std::unordered_map<u64, FrequentChangeEntry> FrequentChangeByBase;
     std::unordered_map<u64, EdgeExtendChurnEntry> EdgeExtendChurnByBase;
     std::unordered_map<u64, std::vector<u64>> VariantKeysByBase;
+    std::unordered_set<u64> OverBudgetPaletteBases;
 
     TexLoaderT TexLoader;
+    bool ReconstructCompatible3D = false;
+    bool ReconstructCompatible3DFractionalAlpha = false;
+    bool ReconstructCompatible3DEdgeContext = false;
+    static constexpr size_t MaxReconstructionEntries = 64;
+    static constexpr u64 MaxReconstructionTexels = 4*1024*1024;
+    std::vector<ReconstructedTexture> ReconstructedTextures;
+    std::vector<u32> ReconstructionAtlas;
+    std::vector<u32> ReconstructionSource;
+    TextureReconstructionPlanCache ReconstructionPlan;
+    bool ReconstructionAtlasValid = false;
+    u32 ReconstructionAtlasParam = 0, ReconstructionAtlasPalette = 0;
+    u32 ReconstructionHits = 0, ReconstructionBuilds = 0;
+    u64 ReconstructionBuiltTexels = 0;
 
     std::vector<TexArrayEntry> FreeTextures[8][8][2];
     std::vector<TexHandleT> TexArrays[8][8][2];
@@ -2293,6 +2518,7 @@ private:
     u32 EdgeExtendSecondaryStoreThisFrame = 0;
     u32 EdgeExtendSecondaryEvictionThisFrame = 0;
     u64 FrameIndex = 0;
+    u64 LastRenderedFrame = 0;
     TextureCacheFrameTiming TextureFrameTiming;
     TextureScalingDebugTracker Debug;
 };

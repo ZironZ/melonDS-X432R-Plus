@@ -19,6 +19,7 @@
 #include <string.h>
 #include "NDS.h"
 #include "GPU.h"
+#include "WideMelon.h"
 
 #include "ARMJIT.h"
 
@@ -327,6 +328,13 @@ void GPU::SetRenderer(std::unique_ptr<Renderer>&& renderer) noexcept
         }
         else
         {
+            // WideMelon's projection cannot be rendered correctly by the
+            // software fallback. Keep its explicit failure behavior in wide mode.
+            if (WideMelon::Enabled())
+            {
+                Log(LogLevel::Error, "Widescreen: OpenGL renderer initialization failed. Start with WIDEMELON_VIEW_WIDTH=256 and WIDEMELON_VIEW_HEIGHT=192 to disable widescreen.\n");
+                std::exit(EXIT_FAILURE);
+            }
             // TODO: report error to platform
         }
     }

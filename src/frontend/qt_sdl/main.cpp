@@ -55,6 +55,7 @@
 #include "Config.h"
 
 #include "EmuInstance.h"
+#include "WideMelon.h"
 #include "ArchiveUtil.h"
 #include "CameraManager.h"
 #include "MPInterface.h"
@@ -62,6 +63,10 @@
 
 #include "CLI.h"
 #include "RendererTest.h"
+
+#ifdef BUILD_GL_LIFETIME_TESTS
+int RunGLRendererLifetimeTests();
+#endif
 
 #include "Net_PCap.h"
 #include "Net_Slirp.h"
@@ -328,6 +333,12 @@ int main(int argc, char** argv)
         printf("did you just call me a derp???\n");
 
     MelonApplication melon(argc, argv);
+#ifdef BUILD_GL_LIFETIME_TESTS
+    // The synthetic lifetime test needs Qt and a GL context, but no user config,
+    // ROM, audio device, or emulator window.
+    if (melon.arguments().contains("--test-gl-lifetime"))
+        return RunGLRendererLifetimeTests();
+#endif
     pathInit();
 
     CLI::CommandLineOptions* options = CLI::ManageArgs(melon);
@@ -368,6 +379,12 @@ int main(int argc, char** argv)
         QMessageBox::critical(nullptr,
                               "melonDS",
                               "Unable to write to config.\nPlease check the write permissions of the folder you placed melonDS in.");
+
+    WideMelon::Configure(Config::GetGlobalTable().GetInt("3D.GL.WidescreenWidth"),
+        Config::GetGlobalTable().GetInt("3D.GL.WidescreenDisplay"),
+        Config::GetGlobalTable().GetInt("3D.GL.WidescreenHeight"),
+        Config::GetGlobalTable().GetBool("3D.GL.WidescreenExtendWindows"),
+        Config::GetGlobalTable().GetBool("3D.GL.WidescreenExpandNarrowBorders"));
 
     camStarted[0] = false;
     camStarted[1] = false;

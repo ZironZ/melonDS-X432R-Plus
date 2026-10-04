@@ -2,6 +2,7 @@
 #define GPU3D_TEXCACHEOPENGL
 
 #include "GPU3D_Texcache.h"
+#include "GPU3D_TextureScaleRegion.h"
 #include "OpenGLSupport.h"
 #include "RendererSettings.h"
 
@@ -108,22 +109,13 @@ public:
         return true;
     }
     bool UseQualityAlphaHandling() const { return QualityAlphaHandling; }
-    bool SetAlphaXBRZ(bool alphaXBRZ)
+    bool SetAlpha(RendererSettings::TextureAlpha alpha)
     {
-        if (AlphaXBRZ == alphaXBRZ)
-            return false;
-        AlphaXBRZ = alphaXBRZ;
+        if (Alpha == alpha) return false;
+        Alpha = alpha;
         return true;
     }
-    bool UseAlphaXBRZ() const { return AlphaXBRZ; }
-    bool SetSpline36Alpha(bool spline36Alpha)
-    {
-        if (Spline36Alpha == spline36Alpha)
-            return false;
-        Spline36Alpha = spline36Alpha;
-        return true;
-    }
-    bool UseSpline36Alpha() const { return Spline36Alpha; }
+    RendererSettings::TextureAlpha AlphaAlgorithm() const { return Alpha; }
     bool SetLegacyAlphaHandling(bool legacyAlphaHandling)
     {
         if (LegacyAlphaHandling == legacyAlphaHandling)
@@ -132,7 +124,11 @@ public:
         return true;
     }
     bool UseLegacyAlphaHandling() const { return LegacyAlphaHandling; }
-    bool ProcessTextureGPUScaleToTexture(u32 width, u32 height, u32 scaleFactor, const u32* sourceRGBA, GLuint& outputTexture);
+    // edgeBounds opts into a partial result for an edge-extended, bounds-keyed
+    // variant. Only its sampling region is guaranteed complete. Readbacks and
+    // consumers of the whole sheet must omit it. restrictedScale reports use.
+    bool ProcessTextureGPUScaleToTexture(u32 width, u32 height, u32 scaleFactor, const u32* sourceRGBA, GLuint& outputTexture,
+                                         const TextureSamplingBounds* edgeBounds = nullptr, bool* restrictedScale = nullptr);
     bool ProcessTextureGPUScaleToCacheLayer(u32 width, u32 height, u32 scaleFactor, const u32* sourceRGBA,
                                             int outputFmt, RGB6RepackPolicy repackPolicy,
                                             bool binaryAlpha,
@@ -140,7 +136,9 @@ public:
                                             std::vector<u32>* outputPreviewRGBA = nullptr,
                                             bool alphaAwareMipChain = false,
                                             bool allowFilterableBinaryAlphaDefaultMips = false,
-                                            bool preserveTransparentRGB = false);
+                                            bool preserveTransparentRGB = false,
+                                            const TextureSamplingBounds* edgeBounds = nullptr,
+                                            bool* restrictedScale = nullptr);
     bool ProcessTextureGPUScale(u32 width, u32 height, u32 scaleFactor, const u32* sourceRGBA, std::vector<u32>& outputRGBA);
     bool ReadTextureLayerPreviewRGBA8(GLuint sourceArrayTexture, u32 layer, u32 width, u32 height,
                                       int outputFmt, std::vector<u32>& outputRGBA);
@@ -159,16 +157,23 @@ private:
     std::string BuildTexcacheRepackShaderSource(bool filterable) const;
     void RenderFullscreenPass(GLuint shader, GLuint outputTex, int width, int height, GLuint source0, GLuint source1,
                           GLuint source2 = 0);
-    void RenderSpline36(GLuint sourceTex, GLuint targetTex, int width, int height, float sourceShiftX = 0.0f, float sourceShiftY = 0.0f);
-    void RenderXBRZ(GLuint sourceTex, GLuint targetTex, int width, int height, u32 scaleFactor);
+    void RenderSpline36(GLuint sourceTex, GLuint targetTex, int width, int height, float sourceShiftX = 0.0f, float sourceShiftY = 0.0f,
+                        bool boundedAlpha = false, bool bilinearAlpha = false);
+    void RenderXBRZ(GLuint sourceTex, GLuint targetTex, int width, int height, u32 scaleFactor,
+                    bool bilinearAlpha = false);
     void RenderMidpointAlphaReplace(GLuint colorTex, GLuint alphaTex, GLuint targetTex, int width, int height);
     void RenderAlphaReplace(GLuint colorTex, GLuint alphaTex, GLuint targetTex, int width, int height);
     void RenderArtCNNComputePass(GLuint shader, GLuint targetTex, int pass, int nativeWidth, int nativeHeight);
     void RenderNNEDI3ComputePass(GLuint shader, GLuint sourceTex, GLuint targetTex,
-                                 int sourceWidth, int sourceHeight);
+                                 int sourceWidth, int sourceHeight, const TextureScaleRegion& region,
+                                 bool predictAlpha, bool alphaOnly);
+    bool RenderNNEDI3AtScale(GLuint source, GLuint target, int width, int height, int scale,
+                            const TextureScaleRegion& region, bool predictAlpha, bool alphaOnly);
     void RenderCuNNyComputePass(GLuint shader, GLuint sourceTex, GLuint baseTex, GLuint targetTex,
-                                int sourceWidth, int sourceHeight, int nativeWidth, int nativeHeight);
-    bool RenderCuNNy2x(int modelIndex, GLuint sourceBaseTex, GLuint targetTex, int width, int height);
+                                int sourceWidth, int sourceHeight, int nativeWidth, int nativeHeight,
+                                const TextureScaleRegion& region);
+    bool RenderCuNNy2x(int modelIndex, GLuint sourceBaseTex, GLuint targetTex, int width, int height,
+                       const TextureScaleRegion& region);
     void RenderAlphaAwareMipLevel(GLuint sourceTex, GLuint targetTex,
                                   int sourceWidth, int sourceHeight, int targetWidth, int targetHeight);
     bool ReadScaledTextureRGBA8(GLuint sourceTex, u32 width, u32 height, std::vector<u32>& outputRGBA);
@@ -196,8 +201,7 @@ private:
     RendererSettings::GLScaleAlgorithm ScaleAlgorithm = RendererSettings::GLScaleAlgorithm::Spline36;
     bool LegacyAlphaHandling = false;
     bool QualityAlphaHandling = false;
-    bool AlphaXBRZ = false;
-    bool Spline36Alpha = false;
+    RendererSettings::TextureAlpha Alpha = RendererSettings::TextureAlpha::Bilinear;
     bool ArtCNNProgramsReady = false;
     bool ArtCNNProgramsFailed = false;
     bool ArtCNNComputeProgramsReady = false;

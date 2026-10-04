@@ -17,6 +17,9 @@
 */
 
 #include "GPU_OpenGL.h"
+#include "WideMelon.h"
+#include "WideTransitionPolicy.h"
+#include "GPU3D_Texture2DPolicy.h"
 
 #include <assert.h>
 #include <algorithm>
@@ -29,6 +32,7 @@
 #include "OpenGLSupport.h"
 
 #include "GPU3D_Compute_shaders.h"
+#include "GPU3D_ComputeGeometry.h"
 
 namespace melonDS
 {
@@ -405,6 +409,16 @@ bool ComputeRenderer3D::CompileShader(GLuint& shader, const std::string& source,
     shaderSource += std::to_string(ScreenWidth);
     shaderSource += "\n#define ScreenHeight ";
     shaderSource += std::to_string(ScreenHeight);
+    shaderSource += "\n#define OutputWidth ";
+    shaderSource += std::to_string(OutputWidth);
+    shaderSource += "\n#define OutputHeight ";
+    shaderSource += std::to_string(OutputHeight);
+    shaderSource += "\n#define NativeWidth ";
+    shaderSource += std::to_string(256 * ScaleFactor);
+    shaderSource += "\n#define NativeHeight ";
+    shaderSource += std::to_string(192 * ScaleFactor);
+    if (WideMelon::Enabled())
+        shaderSource += "\n#define Widescreen";
     shaderSource += "\n#define MaxWorkTiles ";
     shaderSource += std::to_string(MaxWorkTiles);
     shaderSource += "\n#define TileSize ";
@@ -627,6 +641,7 @@ ComputeRenderer3D::~ComputeRenderer3D()
     glDeleteBuffers(1, &YSpanIndicesTextureMemory);
     glDeleteTextures(1, &YSpanIndicesTexture);
     glDeleteTextures(1, &Framebuffer);
+    glDeleteTextures(1, &NativeCenterTex);
     glDeleteBuffers(1, &MetaUniformMemory);
 
     glDeleteSamplers(18, Samplers);
@@ -750,8 +765,8 @@ void ComputeRenderer3D::SetRenderSettings(int scale, bool highResolutionCoordina
     u8 TileScale;
 
     ScaleFactor = scale;
-    ScreenWidth = 256 * ScaleFactor;
-    ScreenHeight = 192 * ScaleFactor;
+    OutputWidth = WideMelon::Width() * ScaleFactor;
+    OutputHeight = WideMelon::Height() * ScaleFactor;
 
     //Starting at 4.5x we want to double TileSize every time scale doubles
     TileScale = 2 * ScaleFactor / 9;
@@ -768,6 +783,11 @@ void ComputeRenderer3D::SetRenderSettings(int scale, bool highResolutionCoordina
     CoarseTileArea = CoarseTileCountX * CoarseTileCountY;
     CoarseTileW = CoarseTileCountX * TileSize;
     CoarseTileH = CoarseTileCountY * TileSize;
+
+    // Storage/dispatches cover complete coarse tiles. Projection and the
+    // published image retain the exact requested dimensions, without stretching.
+    ScreenWidth = ((OutputWidth + CoarseTileW - 1) / CoarseTileW) * CoarseTileW;
+    ScreenHeight = ((OutputHeight + CoarseTileH - 1) / CoarseTileH) * CoarseTileH;
 
     TilesPerLine = ScreenWidth/TileSize;
     TileLines = ScreenHeight/TileSize;
@@ -799,9 +819,23 @@ void ComputeRenderer3D::SetRenderSettings(int scale, bool highResolutionCoordina
         glDeleteTextures(1, &Framebuffer);
     glGenTextures(1, &Framebuffer);
     glBindTexture(GL_TEXTURE_2D, Framebuffer);
-    glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, ScreenWidth, ScreenHeight);
+    // Match Classic when the compositor enlarges native-resolution 3D output.
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, OutputWidth, OutputHeight);
 
     Parent.OutputTex3D = Framebuffer;
+    if (WideMelon::Enabled())
+    {
+        glDeleteTextures(1, &NativeCenterTex);
+        glGenTextures(1, &NativeCenterTex);
+        glBindTexture(GL_TEXTURE_2D, NativeCenterTex);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, 256 * ScaleFactor, 192 * ScaleFactor);
+        Parent.OutputTex3D = NativeCenterTex;
+        Parent.WideOutputTex3D = Framebuffer;
+    }
 
     // eh those are pretty bad guesses
     // though real hw shouldn't be eable to render all 2048 polygons on every line either
@@ -951,18 +985,21 @@ void ComputeRenderer3D::SetupYSpan(RenderPolygon* rp, SpanSetupY* span, Polygon*
     else
     {
         s32 yrecip = (1<<18) / ylen;
-        span->Increment = (span->X1-span->X0) * yrecip;
-        if (span->Increment < 0) span->Increment = -span->Increment;
+        // Wide, high-resolution spans can exceed signed 14.18 storage.
+        // The magnitude still fits u32; GLSL decodes it unsigned for wide spans.
+        span->Increment = static_cast<s32>(static_cast<u32>(
+            std::abs(static_cast<s64>(span->X1-span->X0) * yrecip)));
     }
 
-    bool xMajor = (span->Increment > 0x40000);
+    const u32 increment = static_cast<u32>(span->Increment);
+    bool xMajor = (increment > 0x40000);
 
     if (side)
     {
         // right
 
         if (xMajor)
-            span->DxInitial = negative ? (0x20000 + 0x40000) : (span->Increment - 0x20000);
+            span->DxInitial = negative ? (0x20000 + 0x40000) : static_cast<s32>(increment - 0x20000U);
         else if (span->Increment != 0)
             span->DxInitial = negative ? 0x40000 : 0;
         else
@@ -973,7 +1010,7 @@ void ComputeRenderer3D::SetupYSpan(RenderPolygon* rp, SpanSetupY* span, Polygon*
         // left
 
         if (xMajor)
-            span->DxInitial = negative ? ((span->Increment - 0x20000) + 0x40000) : 0x20000;
+            span->DxInitial = negative ? static_cast<s32>(increment + 0x20000U) : 0x20000;
         else if (span->Increment != 0)
             span->DxInitial = negative ? 0x40000 : 0;
         else
@@ -1031,13 +1068,14 @@ struct Variant
     u32 TextureScaleFactor = 1;
     int CaptureYOffset = -1;
     bool BinaryAlphaTexture = false;
+    bool ReconstructedTexture = false;
 
     bool operator==(const Variant& other)
     {
         return Texture == other.Texture && Sampler == other.Sampler && BlendMode == other.BlendMode &&
                CaptureYOffset == other.CaptureYOffset && BinaryAlphaTexture == other.BinaryAlphaTexture &&
                Width == other.Width && Height == other.Height &&
-               TextureScaleFactor == other.TextureScaleFactor;
+               TextureScaleFactor == other.TextureScaleFactor && ReconstructedTexture == other.ReconstructedTexture;
     }
 };
 
@@ -1066,6 +1104,10 @@ void ComputeRenderer3D::RenderFrame()
         LastRenderFrameSkipped = true;
         return;
     }
+
+    Texcache.BeginRenderFrame();
+    const auto transitionPlan = BuildWideTransitionPlan(GPU3D.RenderPolygonRAM.data(), GPU3D.RenderNumPolygons,
+        WideMelon::Width() > 256 && WideMelon::ExtendWindows);
 
     // figure out which chunks of texture memory contain display captures
     int captureinfo[16];
@@ -1114,6 +1156,7 @@ void ComputeRenderer3D::RenderFrame()
 
     int numYSpans = 0;
     int numSetupIndices = 0;
+    const size_t oldSpanCapacity = YSpanIndices.size();
 
     /*
         Some games really like to spam small textures, often
@@ -1132,6 +1175,24 @@ void ComputeRenderer3D::RenderFrame()
     u32 capLastVariant[16] = {0};
 
     bool enableTextureMaps = GPU3D.RenderDispCnt & (1<<0);
+    const TextureReconstructionPlan emptyReconstruction;
+    const TextureReconstructionPlan* reconstructionPlan = &emptyReconstruction;
+    std::vector<GLuint> reconstructedTextures;
+    std::vector<u32> reconstructedVariants;
+    if (TextureScaling.ReconstructCompatible3D && TextureScaling.Enabled && ScaleFactor > 1 && enableTextureMaps)
+    {
+        std::vector<Polygon*> inputs(GPU3D.RenderPolygonRAM.begin(), GPU3D.RenderPolygonRAM.begin() + GPU3D.RenderNumPolygons);
+        reconstructionPlan = &Texcache.GetTextureReconstructionPlan(inputs,
+            TextureScaling.ReconstructCompatible3DEdgeContext, TextureScaling.ReconstructCompatible3DFractionalAlpha);
+        Texcache.BeginTextureReconstruction();
+        for (const auto& group : reconstructionPlan->Groups)
+        {
+            auto* texture = Texcache.GetReconstructedTexture(group);
+            reconstructedTextures.push_back(texture ? texture->Handle : 0);
+            reconstructedVariants.push_back(0);
+        }
+    }
+    const auto& reconstruction = *reconstructionPlan;
     std::vector<TextureFrameEdgeExtendCandidate> edgeExtendCandidates;
     TextureFrameEdgeExtendCandidateMap edgeExtendCandidateMap;
     if (TextureScaling.EdgeExtendUnusedMargins && TextureScaling.Enabled && ScaleFactor > 1)
@@ -1142,11 +1203,16 @@ void ComputeRenderer3D::RenderFrame()
                                                    enableTextureMaps, edgeExtendCandidates, edgeExtendCandidateMap);
     }
 
-    auto buildSamplingBounds = [&](const Polygon* poly, TextureSamplingBounds& bounds)
+    auto useNativeTexture = [&](const Polygon* poly)
+    {
+        return enableTextureMaps && TextureScaling.Enabled && ScaleFactor > 1 &&
+            TextureFilter.Smart2DFiltering && IsStretchedTexture2DStrip(*poly);
+    };
+    auto buildSamplingBounds = [&](const Polygon* poly, bool nativeTexture, TextureSamplingBounds& bounds)
     {
         bounds = {};
         const u32 textype = (poly->TexParam >> 26) & 0x7;
-        if (!enableTextureMaps || !textype)
+        if (!enableTextureMaps || !textype || nativeTexture)
             return;
 
         const u32 texWidth = TextureWidth(poly->TexParam);
@@ -1161,11 +1227,12 @@ void ComputeRenderer3D::RenderFrame()
         }
     };
 
-    auto shouldForceNearestTexture = [&](const Polygon* poly, const TextureSamplingBounds& bounds)
+    auto shouldForceNearestTexture = [&](const Polygon* poly, bool nativeTexture, const TextureSamplingBounds& bounds)
     {
         const u32 textype = (poly->TexParam >> 26) & 0x7;
         if (!enableTextureMaps || !textype || TextureBoundsRemapCoordinates(bounds))
             return false;
+        if (nativeTexture) return true;
 
         TextureSpriteUVInsetBounds spriteUVInsetBounds;
         const bool spriteTexture = BuildSpriteUVInsetBounds(poly, TextureWidth(poly->TexParam),
@@ -1177,19 +1244,29 @@ void ComputeRenderer3D::RenderFrame()
                 IsLargeTranslucentTextureDraw(poly));
     };
 
+    int previousGroup = -1;
+    bool previousNativeTexture = false, previousForceNearestTexture = false;
+    TextureSamplingBounds previousSamplingBounds;
     for (int i = 0; i < GPU3D.RenderNumPolygons; i++)
     {
         Polygon* polygon = GPU3D.RenderPolygonRAM[i];
+        int groupIndex = reconstruction.Membership.empty() ? -1 : reconstruction.Membership[i];
+        if (groupIndex >= 0 && !reconstructedTextures[groupIndex]) groupIndex = -1;
+        Polygon reconstructedPolygon;
+        std::array<Vertex,4> reconstructedVertices;
+        if (groupIndex >= 0)
+        {
+            RemapTextureReconstructionPolygon(*polygon, reconstruction.Groups[groupIndex], reconstructedPolygon, reconstructedVertices);
+            polygon = &reconstructedPolygon;
+        }
         TextureSamplingBounds samplingBounds;
         u32 polygonTextype = (polygon->TexParam >> 26) & 0x7;
-        buildSamplingBounds(polygon, samplingBounds);
-        const bool currentForceNearestTexture = shouldForceNearestTexture(polygon, samplingBounds);
+        const bool nativeTexture = groupIndex < 0 && useNativeTexture(polygon);
+        if (groupIndex < 0) buildSamplingBounds(polygon, nativeTexture, samplingBounds);
+        const bool currentForceNearestTexture = groupIndex < 0 && shouldForceNearestTexture(polygon, nativeTexture, samplingBounds);
 
         u32 nverts = polygon->NumVertices;
         u32 vtop = polygon->VTop, vbot = polygon->VBottom;
-
-        u32 curVL = vtop, curVR = vtop;
-        u32 nextVL, nextVR;
 
         RenderPolygons[i].FirstXSpan = numSetupIndices;
         RenderPolygons[i].Attr = polygon->Attr;
@@ -1206,13 +1283,17 @@ void ComputeRenderer3D::RenderFrame()
                 && prevPolygon->IsShadowMask == polygon->IsShadowMask;
             if (foundVariant)
             {
-                TextureSamplingBounds prevSamplingBounds;
-                buildSamplingBounds(prevPolygon, prevSamplingBounds);
                 foundVariant =
-                    samplingBounds == prevSamplingBounds &&
-                    currentForceNearestTexture == shouldForceNearestTexture(prevPolygon, prevSamplingBounds);
+                    previousGroup == groupIndex &&
+                    nativeTexture == previousNativeTexture &&
+                    samplingBounds == previousSamplingBounds &&
+                    currentForceNearestTexture == previousForceNearestTexture;
             }
         }
+        previousGroup = groupIndex;
+        previousNativeTexture = nativeTexture;
+        previousSamplingBounds = samplingBounds;
+        previousForceNearestTexture = currentForceNearestTexture;
 
         if (!foundVariant)
         {
@@ -1253,7 +1334,19 @@ void ComputeRenderer3D::RenderFrame()
                     }
                 }
 
-                if (capblock != -1)
+                if (groupIndex >= 0)
+                {
+                    variant.Texture = reconstructedTextures[groupIndex];
+                    variant.Width = reconstruction.Groups[groupIndex].Width;
+                    variant.Height = reconstruction.Groups[groupIndex].Height;
+                    variant.TextureScaleFactor = ScaleFactor;
+                    variant.ReconstructedTexture = true;
+                    variant.BinaryAlphaTexture = !reconstruction.Groups[groupIndex].HasFractionalAlpha();
+                    variant.CaptureYOffset = -1;
+                    prevTexLayer = 0;
+                    textureLastVariant = &reconstructedVariants[groupIndex];
+                }
+                else if (capblock != -1)
                 {
                     if (texwidth == 128)
                     {
@@ -1274,7 +1367,7 @@ void ComputeRenderer3D::RenderFrame()
                 {
                     Texcache.GetTexture(polygon->TexParam, polygon->TexPalette, variant.Texture, prevTexLayer, textureLastVariant,
                                         &variant.BinaryAlphaTexture, samplingBounds.Valid ? &samplingBounds : nullptr,
-                                        nullptr, &variant.TextureScaleFactor);
+                                        nullptr, &variant.TextureScaleFactor, nativeTexture);
                     variant.CaptureYOffset = -1;
                     if (TextureBoundsRemapCoordinates(samplingBounds))
                     {
@@ -1335,7 +1428,7 @@ void ComputeRenderer3D::RenderFrame()
         RenderPolygons[i].TextureInsetV0 = 0.0f;
         RenderPolygons[i].TextureInsetU1 = 0.0f;
         RenderPolygons[i].TextureInsetV1 = 0.0f;
-        if (TextureFilter.SpriteUVInset && enableTextureMaps && polygonTextype &&
+        if (groupIndex < 0 && TextureFilter.SpriteUVInset && enableTextureMaps && polygonTextype &&
             !TextureBoundsRemapCoordinates(samplingBounds) &&
             variants[prevVariant].Texture != static_cast<GLuint>(-1) &&
             variants[prevVariant].Texture != static_cast<GLuint>(-2))
@@ -1358,21 +1451,6 @@ void ComputeRenderer3D::RenderFrame()
             }
         }
 
-        if (polygon->FacingView)
-        {
-            nextVL = curVL + 1;
-            if (nextVL >= nverts) nextVL = 0;
-            nextVR = curVR - 1;
-            if ((s32)nextVR < 0) nextVR = nverts - 1;
-        }
-        else
-        {
-            nextVL = curVL - 1;
-            if ((s32)nextVL < 0) nextVL = nverts - 1;
-            nextVR = curVR + 1;
-            if (nextVR >= nverts) nextVR = 0;
-        }
-
         s32 scaledPositions[10][2];
         s32 ytop = ScreenHeight, ybot = 0;
         for (int i = 0; i < polygon->NumVertices; i++)
@@ -1387,6 +1465,25 @@ void ComputeRenderer3D::RenderFrame()
                 scaledPositions[i][0] = polygon->Vertices[i]->FinalPosition[0] * ScaleFactor;
                 scaledPositions[i][1] = polygon->Vertices[i]->FinalPosition[1] * ScaleFactor;
             }
+            if (WideMelon::Enabled())
+            {
+                const u64 wideX = static_cast<u64>(polygon->Vertices[i]->HiresPosition[0]) * WideMelon::Width();
+                scaledPositions[i][0] = HiresCoordinates
+                    ? static_cast<s32>((wideX * ScaleFactor) / (16 * 256))
+                    : static_cast<s32>(wideX / (16 * 256)) * ScaleFactor;
+            }
+            if (WideMelon::Vertical())
+            {
+                const auto* vertex = polygon->Vertices[i];
+                const s64 nativeY = s64(vertex->NativeSourcePosition[1]) + (WideMelon::Height() - 192) * 8;
+                const s64 wideY = vertex->NativeSourceValid && nativeY >= 0 && nativeY <= WideMelon::Height() * 16
+                    ? nativeY : (u64(vertex->HiresPosition[1]) * WideMelon::Height()) / 192;
+                scaledPositions[i][1] = HiresCoordinates
+                    ? static_cast<s32>((wideY * ScaleFactor) >> 4)
+                    : static_cast<s32>(wideY >> 4) * ScaleFactor;
+            }
+            scaledPositions[i][0] = WideTransitionX(transitionPlan, polygon, polygon->Vertices[i],
+                scaledPositions[i][0], OutputWidth);
             ytop = std::min(scaledPositions[i][1], ytop);
             ybot = std::max(scaledPositions[i][1], ybot);
         }
@@ -1394,6 +1491,12 @@ void ComputeRenderer3D::RenderFrame()
         RenderPolygons[i].YBot = ybot;
         RenderPolygons[i].XMin = ScreenWidth;
         RenderPolygons[i].XMax = 0;
+
+        // Tall views can exceed the initial scanline estimate. Grow both CPU
+        // and GPU span storage together, retaining the capacity across frames.
+        const size_t requiredSpans = size_t(numSetupIndices) + std::max(1, ybot - ytop);
+        if (requiredSpans > YSpanIndices.size())
+            YSpanIndices.resize(std::max(requiredSpans, YSpanIndices.size() * 2));
 
         if (ybot == ytop)
         {
@@ -1424,6 +1527,29 @@ void ComputeRenderer3D::RenderFrame()
         }
         else
         {
+            // Native extrema may refer to different vertices after subpixel
+            // scaling. Use raster-space extrema for both ends of the walk,
+            // without changing the DS polygon bounds or sorting metadata.
+            if (HiresCoordinates && ScaleFactor > 1)
+                SelectComputePolygonExtrema(scaledPositions, nverts, vtop, vbot);
+
+            u32 curVL = vtop, curVR = vtop;
+            u32 nextVL, nextVR;
+            if (polygon->FacingView)
+            {
+                nextVL = curVL + 1;
+                if (nextVL >= nverts) nextVL = 0;
+                nextVR = curVR - 1;
+                if ((s32)nextVR < 0) nextVR = nverts - 1;
+            }
+            else
+            {
+                nextVL = curVL - 1;
+                if ((s32)nextVL < 0) nextVL = nverts - 1;
+                nextVR = curVR + 1;
+                if (nextVR >= nverts) nextVR = 0;
+            }
+
             u32 curSpanL = numYSpans;
             assert(numYSpans < MaxYSpanSetups);
             SetupYSpan(&RenderPolygons[i], &YSpanSetups[numYSpans++], polygon, curVL, nextVL, 0, scaledPositions, samplingBounds);
@@ -1433,9 +1559,9 @@ void ComputeRenderer3D::RenderFrame()
 
             for (u32 y = ytop; y < ybot; y++)
             {
-                if (y >= scaledPositions[nextVL][1] && curVL != polygon->VBottom)
+                if (y >= scaledPositions[nextVL][1] && curVL != vbot)
                 {
-                    while (y >= scaledPositions[nextVL][1] && curVL != polygon->VBottom)
+                    while (y >= scaledPositions[nextVL][1] && curVL != vbot)
                     {
                         curVL = nextVL;
                         if (polygon->FacingView)
@@ -1457,9 +1583,9 @@ void ComputeRenderer3D::RenderFrame()
                     curSpanL = numYSpans;
                     SetupYSpan(&RenderPolygons[i], &YSpanSetups[numYSpans++], polygon, curVL, nextVL, 0, scaledPositions, samplingBounds);
                 }
-                if (y >= scaledPositions[nextVR][1] && curVR != polygon->VBottom)
+                if (y >= scaledPositions[nextVR][1] && curVR != vbot)
                 {
-                    while (y >= scaledPositions[nextVR][1] && curVR != polygon->VBottom)
+                    while (y >= scaledPositions[nextVR][1] && curVR != vbot)
                     {
                         curVR = nextVR;
                         if (polygon->FacingView)
@@ -1505,6 +1631,13 @@ void ComputeRenderer3D::RenderFrame()
 
     if (numYSpans > 0)
     {
+        if (YSpanIndices.size() != oldSpanCapacity)
+        {
+            glBindBuffer(GL_TEXTURE_BUFFER, YSpanIndicesTextureMemory);
+            glBufferData(GL_TEXTURE_BUFFER, YSpanIndices.size() * 8, nullptr, GL_DYNAMIC_DRAW);
+            glBindBuffer(GL_SHADER_STORAGE_BUFFER, XSpanSetupMemory);
+            glBufferData(GL_SHADER_STORAGE_BUFFER, YSpanIndices.size() * sizeof(SpanSetupX), nullptr, GL_DYNAMIC_DRAW);
+        }
         glBindBuffer(GL_SHADER_STORAGE_BUFFER, YSpanSetupMemory);
         glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, sizeof(SpanSetupY)*numYSpans, YSpanSetups);
 
@@ -1590,7 +1723,7 @@ void ComputeRenderer3D::RenderFrame()
     glBindBufferBase(GL_UNIFORM_BUFFER, 0, MetaUniformMemory);
 
     glUseProgram(ShaderClearCoarseBinMask);
-    glDispatchCompute(TilesPerLine*TileLines/ClearCoarseBinMaskLocalSize, 1, 1);
+    glDispatchCompute((TilesPerLine*TileLines + ClearCoarseBinMaskLocalSize - 1)/ClearCoarseBinMaskLocalSize, 1, 1);
 
     bool wbuffer = false;
     if (numYSpans > 0)
@@ -1603,7 +1736,11 @@ void ComputeRenderer3D::RenderFrame()
         // calculate x-spans
         glBindImageTexture(0, YSpanIndicesTexture, 0, GL_FALSE, 0, GL_READ_ONLY, GL_RGBA16UI);
         glUseProgram(ShaderInterpXSpans[wbuffer]);
-        glDispatchCompute((numSetupIndices + 31) / 32, 1, 1);
+        glUniform1ui(glGetUniformLocation(ShaderInterpXSpans[wbuffer], "SetupCount"), numSetupIndices);
+        const int spanGroups = (numSetupIndices + 31) / 32;
+        // 65535 groups per dimension are guaranteed by OpenGL 4.3. Tall,
+        // heavily overlapping views can need more than one row of groups.
+        glDispatchCompute(std::min(spanGroups, 65535), (spanGroups + 65534) / 65535, 1);
         glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_COMMAND_BARRIER_BIT);
 
         // bin polygons
@@ -1706,6 +1843,12 @@ void ComputeRenderer3D::RenderFrame()
 
                 glUniform1ui(UniformIdxCurVariant, i);
                 glUniform2f(UniformIdxTextureSize, 1.f / variants[i].Width, 1.f / variants[i].Height);
+                // Only assembled nearest-sampled sources use integer texel
+                // addresses. Native textures, captures and filtering retain
+                // their existing coordinate and sampler behavior.
+                if (TextureFilter.Anisotropy <= 1 && variants[i].Texture != 0 && variants[i].BlendMode != 4)
+                    glUniform1i(UniformIdxReconstructionTexelScale,
+                        variants[i].ReconstructedTexture ? variants[i].TextureScaleFactor : 0);
                 if (variants[i].CaptureYOffset != -1)
                 {
                     if (variants[i].Width == 128)
@@ -1738,6 +1881,8 @@ void ComputeRenderer3D::RenderFrame()
     glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
 
     glBindImageTexture(0, Framebuffer, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA8);
+    if (WideMelon::Enabled())
+        glBindImageTexture(1, NativeCenterTex, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA8);
     u32 finalPassShader = 0;
     if (MSAA || (GPU3D.RenderDispCnt & (1<<4)))
         finalPassShader |= 0x4;
@@ -1748,7 +1893,7 @@ void ComputeRenderer3D::RenderFrame()
     
     glUseProgram(ShaderFinalPass[finalPassShader]);
     glDispatchCompute(ScreenWidth/32, ScreenHeight, 1);
-    glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
+    glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT);
 
     glBindSampler(0, 0);
     glBindSampler(1, 0);

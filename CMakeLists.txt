@@ -22,6 +22,12 @@ project(melonDS
     HOMEPAGE_URL "https://melonds.kuribo64.net"
     LANGUAGES C CXX)
 
+set(MELONDS_FORK_VERSION "0.3.0")
+set(MELONDS_VERSION_SUFFIX "$ENV{MELONDS_VERSION_SUFFIX}" CACHE STRING "Suffix to add to displayed melonDS version")
+if (NOT MELONDS_VERSION_SUFFIX)
+    set(MELONDS_VERSION_SUFFIX " X432R+ ${MELONDS_FORK_VERSION}")
+endif()
+
 include(CheckSymbolExists)
 include(CheckLibraryExists)
 include(CMakeDependentOption)

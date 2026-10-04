@@ -193,42 +193,67 @@ int CalcYFactorY(YSpanSetup span, int i)
     return CalcYFactorYShift(span, i, YFactorShift);
 }
 
-int CalculateDx(int y, YSpanSetup span)
+#if OutputWidth > 4096
+// Keep the DS reciprocal/rounding, but do not overflow a signed 32-bit slope
+// when the widened output exceeds the native renderer's maximum width.
+// GL 4.3 doubles represent these fixed-point integers exactly. Only span
+// setup uses them; pixel rasterization and depth/blending remain unchanged.
+#define SlopeValue double
+double SlopeIncrement(YSpanSetup span) { return double(uint(span.Increment)); }
+double SlopeInitial(YSpanSetup span)
 {
-    return span.DxInitial + (y - span.Y0) * span.Increment;
+    return span.Increment == 0 ? double(span.DxInitial) : double(uint(span.DxInitial));
+}
+int SlopeShift(double value, int bits) { return int(floor(value / double(1 << bits))); }
+#else
+#define SlopeValue int
+int SlopeIncrement(YSpanSetup span) { return span.Increment; }
+int SlopeInitial(YSpanSetup span) { return span.DxInitial; }
+int SlopeShift(int value, int bits) { return value >> bits; }
+#endif
+
+SlopeValue CalculateDx(int y, YSpanSetup span)
+{
+    return SlopeInitial(span) + SlopeValue(y - span.Y0) * SlopeIncrement(span);
 }
 
-int CalculateX(int dx, YSpanSetup span)
+int CalculateX(SlopeValue dx, YSpanSetup span)
 {
     int x = span.X0;
     if (span.X1 < span.X0)
-        x -= dx >> 18;
+        x -= SlopeShift(dx, 18);
     else
-        x += dx >> 18;
+        x += SlopeShift(dx, 18);
     return clamp(x, span.XMin, span.XMax);
 }
 
-void EdgeParams_XMajor(bool side, int dx, YSpanSetup span, out int edgelen, out int edgecov)
+void EdgeParams_XMajor(bool side, SlopeValue dx, YSpanSetup span, out int edgelen, out int edgecov)
 {
     bool negative = span.X1 < span.X0;
     int len;
     if (side != negative)
-        len = (dx >> 18) - ((dx-span.Increment) >> 18);
+        len = SlopeShift(dx, 18) - SlopeShift(dx-SlopeIncrement(span), 18);
     else
-        len = ((dx+span.Increment) >> 18) - (dx >> 18);
+        len = SlopeShift(dx+SlopeIncrement(span), 18) - SlopeShift(dx, 18);
     edgelen = len;
 
     int xlen = span.XMax + 1 - span.XMin;
-    int startx = dx >> 18;
+    int startx = SlopeShift(dx, 18);
     if (negative) startx = xlen - startx;
     if (side) startx = startx - len + 1;
 
     uint r;
+#if OutputWidth > 4096 || OutputHeight > 3072
+    uint hi, lo;
+    umulExtended(uint((startx << 10) + 0x1FF), uint(span.Y1 - span.Y0), hi, lo);
+    int startcov = int(Div64_32_32(hi, lo, uint(xlen)));
+#else
     int startcov = int(Div(uint(((startx << 10) + 0x1FF) * (span.Y1 - span.Y0)), uint(xlen), r));
+#endif
     edgecov = (1<<31) | ((startcov & 0x3FF) << 12) | (span.XCovIncr & 0x3FF);
 }
 
-void EdgeParams_YMajor(bool side, int dx, YSpanSetup span, out int edgelen, out int edgecov)
+void EdgeParams_YMajor(bool side, SlopeValue dx, YSpanSetup span, out int edgelen, out int edgecov)
 {
     bool negative = span.X1 < span.X0;
     edgelen = 1;
@@ -239,8 +264,8 @@ void EdgeParams_YMajor(bool side, int dx, YSpanSetup span, out int edgelen, out 
     }
     else
     {
-        int cov = ((dx >> 9) + (span.Increment >> 10)) >> 4;
-        if ((cov >> 5) != (dx >> 18)) cov = 31;
+        int cov = (SlopeShift(dx, 9) + SlopeShift(SlopeIncrement(span), 10)) >> 4;
+        if ((cov >> 5) != SlopeShift(dx, 18)) cov = 31;
         cov &= 0x1F;
         if (side == negative) cov = 0x1F - cov;
 
@@ -289,6 +314,7 @@ layout (std430, binding = 6) buffer BinResultBuffer
 {
     uvec4 VariantWorkCount[MaxVariants];
     uint SortedWorkOffset[MaxVariants];
+    uint VariantWorkRealCount[MaxVariants];
 
     uvec4 SortWorkWorkCount;
 
@@ -297,6 +323,14 @@ layout (std430, binding = 6) buffer BinResultBuffer
     //uint BinnedMask[TilesPerLine*TileLines*BinStride];
     //uint WorkOffsets[TilesPerLine*TileLines*BinStride];
 };
+
+// Every OpenGL 4.3 implementation supports at least 65535 groups per axis.
+// Balance oversized batches across Y/Z, with fewer than Y unused tail groups.
+bool GetRasteriseWorkIndex(uint variant, out uint index)
+{
+    index = gl_WorkGroupID.y * gl_NumWorkGroups.z + gl_WorkGroupID.z;
+    return index < VariantWorkRealCount[variant];
+}
 
 const int BinningCoarseMaskStart = 0;
 const int BinningMaskStart = BinningCoarseMaskStart+TilesPerLine*TileLines*CoarseBinStride;
@@ -667,10 +701,13 @@ const std::string InterpSpans =
 layout (local_size_x = 32) in;
 
 layout (binding = 0, rgba16ui) uniform readonly uimageBuffer SetupIndices;
+uniform uint SetupCount;
 
 void main()
 {
-    uvec4 setup = imageLoad(SetupIndices, int(gl_GlobalInvocationID.x));
+    uint setupIndex = gl_GlobalInvocationID.x + gl_GlobalInvocationID.y * gl_NumWorkGroups.x * 32U;
+    if (setupIndex >= SetupCount) return;
+    uvec4 setup = imageLoad(SetupIndices, int(setupIndex));
 
     YSpanSetup spanL = YSpanSetups[setup.y];
     YSpanSetup spanR = YSpanSetups[setup.z];
@@ -680,8 +717,8 @@ void main()
 
     int y = int(setup.w);
 
-    int dxl = CalculateDx(y, spanL);
-    int dxr = CalculateDx(y, spanR);
+    SlopeValue dxl = CalculateDx(y, spanL);
+    SlopeValue dxr = CalculateDx(y, spanR);
 
     int xl = CalculateX(dxl, spanL);
     int xr = CalculateX(dxr, spanR);
@@ -706,11 +743,11 @@ void main()
     else
     {
         // edges are the right way
-        if (spanL.Increment > 0x40000)
+        if (SlopeIncrement(spanL) > 0x40000)
             EdgeParams_XMajor(false, dxl, spanL, edgeLenL, xspan.EdgeCovL);
         else
             EdgeParams_YMajor(false, dxl, spanL, edgeLenL, xspan.EdgeCovL);
-        if (spanR.Increment > 0x40000)
+        if (SlopeIncrement(spanR) > 0x40000)
             EdgeParams_XMajor(true, dxr, spanR, edgeLenR, xspan.EdgeCovR);
         else
             EdgeParams_YMajor(true, dxr, spanR, edgeLenR, xspan.EdgeCovR);
@@ -742,9 +779,9 @@ void main()
     bool isShadowMask = ((polygon.Attr & 0x3F000030U) == 0x00000030U);
     bool fillAllEdges = polyalpha < 31 || (DispCnt & (3U<<4)) != 0U;
 
-    if (fillAllEdges || spanL.X1 < spanL.X0 || spanL.Increment <= 0x40000)
+    if (fillAllEdges || spanL.X1 < spanL.X0 || SlopeIncrement(spanL) <= 0x40000)
         xspan.Flags |= XSpanSetup_FillLeft;
-    if (fillAllEdges || (spanR.X1 >= spanR.X0 && spanR.Increment > 0x40000) || spanR.Increment == 0)
+    if (fillAllEdges || (spanR.X1 >= spanR.X0 && SlopeIncrement(spanR) > 0x40000) || spanR.Increment == 0)
         xspan.Flags |= XSpanSetup_FillRight;
 
     if (spanL.I0 == spanL.I1)
@@ -759,7 +796,7 @@ void main()
     }
     else
     {
-        int i = (spanL.Increment > 0x40000 ? xl : y) - spanL.I0;
+        int i = (SlopeIncrement(spanL) > 0x40000 ? xl : y) - spanL.I0;
         int ifactor = CalcYFactorY(spanL, i);
         int idiff = spanL.I1 - spanL.I0;
 
@@ -815,7 +852,7 @@ void main()
     }
     else
     {
-        int i = (spanR.Increment > 0x40000 ? xr : y) - spanR.I0;
+        int i = (SlopeIncrement(spanR) > 0x40000 ? xr : y) - spanR.I0;
         int ifactor = CalcYFactorY(spanR, i);
         int idiff = spanR.I1 - spanR.I0;
 
@@ -871,7 +908,7 @@ void main()
         xspan.XRecip = int(Div(1U<<30, uint(xspan.X1 - xspan.X0), r));
     }
 
-    XSpanSetups[gl_GlobalInvocationID.x] = xspan;
+    XSpanSetups[setupIndex] = xspan;
 }
 
 )";
@@ -894,6 +931,7 @@ layout (local_size_x = ClearCoarseBinMaskLocalSize) in;
 
 void main()
 {
+    if (gl_GlobalInvocationID.x >= uint(TilesPerLine * TileLines)) return;
     BinningMaskAndOffset[BinningCoarseMaskStart + gl_GlobalInvocationID.x*CoarseBinStride+0] = 0;
     BinningMaskAndOffset[BinningCoarseMaskStart + gl_GlobalInvocationID.x*CoarseBinStride+1] = 0;
 }
@@ -1065,7 +1103,13 @@ void main()
             // a bit of a cheat putting this here, but this shader won't run that often
             SortWorkWorkCount = uvec4((VariantWorkCount[0].w + 31) / 32, 1, 1, 0);
         }
-        SortedWorkOffset[gl_GlobalInvocationID.x] = atomicAdd(VariantWorkCount[1].w, VariantWorkCount[gl_GlobalInvocationID.x].z);
+        uint variant = gl_GlobalInvocationID.x;
+        uint count = VariantWorkCount[variant].z;
+        SortedWorkOffset[variant] = atomicAdd(VariantWorkCount[1].w, count);
+        VariantWorkRealCount[variant] = count;
+        uint rows = max(1U, (count + 65534U) / 65535U);
+        VariantWorkCount[variant].y = rows;
+        VariantWorkCount[variant].z = (count + rows - 1U) / rows;
     }
 }
 
@@ -1117,6 +1161,9 @@ layout (location = 1) uniform vec2 InvTextureSize;
 layout (location = 2) uniform int TexIsCapture;
 layout (location = 3) uniform float CaptureYOffset;
 layout (location = 4) uniform int uBinaryAlphaTexture;
+#ifndef FILTERABLE_TEXTURE_CACHE
+layout (location = 5) uniform int uReconstructionTexelScale;
+#endif
 
 vec2 ApplyTextureInset(Polygon polygon, vec2 uvf)
 {
@@ -1258,7 +1305,10 @@ vec4 SampleCurrentTextureFiltered(Polygon polygon, ivec2 position, XSpanSetup xs
 
 void main()
 {
-    uvec2 workDesc = WorkDescs[WorkDescsSortedStart + SortedWorkOffset[CurVariant] + gl_WorkGroupID.z];
+    uint workIndex;
+    if (!GetRasteriseWorkIndex(CurVariant, workIndex))
+        return;
+    uvec2 workDesc = WorkDescs[WorkDescsSortedStart + SortedWorkOffset[CurVariant] + workIndex];
     Polygon polygon = Polygons[bitfieldExtract(workDesc.y, 0, 11)];
     ivec2 position = ivec2(bitfieldExtract(workDesc.x, 0, 16), bitfieldExtract(workDesc.x, 16, 16)) + ivec2(gl_LocalInvocationID.xy);
     int tileOffset = int(bitfieldExtract(workDesc.y, 11, 21)) * TileSize * TileSize + TileSize * int(gl_LocalInvocationID.y) + int(gl_LocalInvocationID.x);
@@ -1442,7 +1492,17 @@ void main()
                         texcolorf.rgb = vec3(0.0);
                 }
 #else
-                texcolor = texture(CurrentTexture, vec3(uvf, polygon.TextureLayer));
+                if (uReconstructionTexelScale > 0)
+                {
+                    // Keep the rasterizer's fixed-point interpolation. Avoid
+                    // a normalized-float round trip at texel boundaries in
+                    // assembled textures whose sizes need not be powers of two.
+                    ivec2 size = textureSize(CurrentTexture, 0).xy;
+                    ivec2 texel = (ivec2(u, v) * uReconstructionTexelScale) >> 4;
+                    texcolor = texelFetch(CurrentTexture,
+                        ivec3(clamp(texel, ivec2(0), size-1), int(polygon.TextureLayer)), 0);
+                }
+                else texcolor = texture(CurrentTexture, vec3(uvf, polygon.TextureLayer));
 #endif
             }
 
@@ -1746,8 +1806,10 @@ void main()
     uvec2 attr = uvec2(ClearAttr, 0U);
     if ((DispCnt & (1<<14)) != 0U)
     {
-        float scale = 1.0 / ScreenWidth;
-        vec2 pos = (vec2(gl_GlobalInvocationID.xy) * scale) + ClearBitmapOffset;
+        // Clear-image memory remains 256x256 with native DS offsets. A wider
+        // view must not stretch it vertically or shift its central pixels.
+        float scale = 1.0 / NativeWidth;
+        vec2 pos = (vec2(gl_GlobalInvocationID.xy) - vec2((OutputWidth - NativeWidth) / 2, (OutputHeight - NativeHeight) / 2)) * scale + ClearBitmapOffset;
         color = uvec2(texture(ClearBitmapColor, pos).r, 0U);
         depth = uvec2(texture(ClearBitmapDepth, pos).r, 0U);
         attr.x = (attr.x & ~0x8000U) | ((depth.x >> 9) & 0x8000U);
@@ -1782,6 +1844,9 @@ const std::string FinalPass =
 layout (local_size_x = 32) in;
 
 layout (binding = 0, rgba8) writeonly uniform image2D FinalFB;
+#ifdef Widescreen
+layout (binding = 1, rgba8) writeonly uniform image2D NativeCenterFB;
+#endif
 
 uint BlendFog(uint color, uint depth)
 {
@@ -1829,6 +1894,7 @@ uint BlendFog(uint color, uint depth)
 void main()
 {
     int srcX = int(gl_GlobalInvocationID.x);
+    if (srcX >= OutputWidth || gl_GlobalInvocationID.y >= OutputHeight) return;
     int resultOffset = int(srcX) + int(gl_GlobalInvocationID.y) * ScreenWidth;
 
     uvec2 color = uvec2(ResultValue[resultOffset+ResultColorStart], ResultValue[resultOffset+FramebufferStride+ResultColorStart]);
@@ -1846,7 +1912,7 @@ void main()
             otherAttr.x = ResultValue[resultOffset-1+ResultAttrStart];
             otherDepth.x = ResultValue[resultOffset-1+ResultDepthStart];
         }
-        if (srcX < ScreenWidth-1)
+        if (srcX < OutputWidth-1)
         {
             otherAttr.y = ResultValue[resultOffset+1+ResultAttrStart];
             otherDepth.y = ResultValue[resultOffset+1+ResultDepthStart];
@@ -1856,7 +1922,7 @@ void main()
             otherAttr.z = ResultValue[resultOffset-ScreenWidth+ResultAttrStart];
             otherDepth.z = ResultValue[resultOffset-ScreenWidth+ResultDepthStart];
         }
-        if (gl_GlobalInvocationID.y < ScreenHeight-1)
+        if (gl_GlobalInvocationID.y < OutputHeight-1)
         {
             otherAttr.w = ResultValue[resultOffset+ScreenWidth+ResultAttrStart];
             otherDepth.w = ResultValue[resultOffset+ScreenWidth+ResultDepthStart];
@@ -1940,6 +2006,12 @@ void main()
     vec4 result = vec4(color.x & 0x3FU, bitfieldExtract(color.x, 8, 8), bitfieldExtract(color.x, 16, 8), bitfieldExtract(color.x, 24, 8));
     result /= vec4(63.0, 63.0, 63.0, 31.0);
     imageStore(FinalFB, ivec2(gl_GlobalInvocationID.xy), result);
+#ifdef Widescreen
+    int centerX = srcX - (OutputWidth - NativeWidth) / 2;
+    int centerY = int(gl_GlobalInvocationID.y) - (OutputHeight - NativeHeight) / 2;
+    if (centerX >= 0 && centerX < NativeWidth && centerY >= 0 && centerY < NativeHeight)
+        imageStore(NativeCenterFB, ivec2(centerX, centerY), result);
+#endif
 }
 
 )";

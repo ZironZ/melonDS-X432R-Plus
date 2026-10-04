@@ -1,20 +1,5 @@
-/*
-    Copyright 2026 ZironZ
-
-    This file is part of melonDS.
-
-    melonDS is free software: you can redistribute it and/or modify it under
-    the terms of the GNU General Public License as published by the Free
-    Software Foundation, either version 3 of the License, or (at your option)
-    any later version.
-
-    melonDS is distributed in the hope that it will be useful, but WITHOUT ANY
-    WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
-    FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
-
-    You should have received a copy of the GNU General Public License along
-    with melonDS. If not, see http://www.gnu.org/licenses/.
-*/
+// Copyright 2026 ZironZ
+// SPDX-License-Identifier: GPL-3.0-or-later
 
 #include "WholeSceneCapturePolicy.h"
 
@@ -231,58 +216,12 @@ bool DoesCaptureBackedRouteProductMatchSource3DSceneQuery(
                query.CapturePresentationHash;
 }
 
-WholeSceneCaptureProductPresentationClass CaptureProductPresentationClassForProduct(
-    WholeSceneCaptureProductKind product,
-    WholeSceneCaptureRenderAction action)
-{
-    if (action == WholeSceneCaptureRenderAction::RenderNormalHybridFallback)
-        return WholeSceneCaptureProductPresentationClass::Fallback;
-
-    switch (product)
-    {
-    case WholeSceneCaptureProductKind::RouteProduct:
-    case WholeSceneCaptureProductKind::RouteEventProduct:
-    case WholeSceneCaptureProductKind::RouteStateProduct:
-    case WholeSceneCaptureProductKind::BackgroundProduct:
-    case WholeSceneCaptureProductKind::HandoffSnapshot:
-    case WholeSceneCaptureProductKind::ParentOutput3D:
-        return WholeSceneCaptureProductPresentationClass::RawContent;
-    case WholeSceneCaptureProductKind::FullCaptureProduct:
-        return WholeSceneCaptureProductPresentationClass::AlreadyPresented;
-    case WholeSceneCaptureProductKind::None:
-    default:
-        return WholeSceneCaptureProductPresentationClass::None;
-    }
-}
-
-bool ShouldApplySourceAReplacementPresentationEffect(
-    WholeSceneCaptureProductPresentationClass productClass,
-    WholeSceneCaptureRequestKind requestKind,
-    bool sourceEngineIsSub)
-{
-    if (!sourceEngineIsSub ||
-        productClass != WholeSceneCaptureProductPresentationClass::RawContent)
-    {
-        return false;
-    }
-
-    return requestKind == WholeSceneCaptureRequestKind::CapturedLayerConsumer ||
-           requestKind == WholeSceneCaptureRequestKind::DirectFinalConsumer;
-}
-
 bool ShouldApplyHandoffPresentationEffect(
     WholeSceneCaptureProductPresentationClass productClass,
     WholeSceneCaptureRequestKind requestKind)
 {
     return requestKind == WholeSceneCaptureRequestKind::HandoffConsumer &&
            productClass == WholeSceneCaptureProductPresentationClass::RawContent;
-}
-
-bool IsMasterBrightnessEffectActive(u16 masterBrightness)
-{
-    const u32 mode = (masterBrightness >> 14) & 0x3;
-    const u32 factor = masterBrightness & 0x1F;
-    return (mode == 1 || mode == 2) && factor > 0;
 }
 
 u16 ConsumerFullScreenBrightnessColorEffect(u16 blendCnt, u8 evy)
@@ -357,10 +296,30 @@ WholeSceneCaptureProductUseDecision CanUseWholeSceneCaptureProduct(
 {
     WholeSceneCaptureProductUseDecision decision = {};
 
+    const bool requestRangeValid =
+        inputs.RequestYStart >= 0 &&
+        inputs.RequestYEnd <= 192 &&
+        inputs.RequestYStart < inputs.RequestYEnd;
+    const bool productRangeValid =
+        inputs.ProductYStart >= 0 &&
+        inputs.ProductYEnd <= 192 &&
+        inputs.ProductYStart < inputs.ProductYEnd;
+    const bool productCoversRequest =
+        productRangeValid && requestRangeValid &&
+        inputs.ProductYStart <= inputs.RequestYStart &&
+        inputs.ProductYEnd >= inputs.RequestYEnd;
+    const bool fullFrameOverlayScope =
+        inputs.RenderAction !=
+            WholeSceneCaptureRenderAction::CompositeCurrentOverlay ||
+        (inputs.RequestYStart == 0 && inputs.RequestYEnd == 192);
+    decision.RowScopeCompatible =
+        productCoversRequest && fullFrameOverlayScope;
+
     if (!inputs.PolicyAccepted ||
         !inputs.HasTexture ||
         inputs.ProductKind == WholeSceneCaptureProductKind::None ||
-        inputs.RenderAction == WholeSceneCaptureRenderAction::None)
+        inputs.RenderAction == WholeSceneCaptureRenderAction::None ||
+        !decision.RowScopeCompatible)
     {
         return decision;
     }
@@ -368,25 +327,11 @@ WholeSceneCaptureProductUseDecision CanUseWholeSceneCaptureProduct(
     switch (inputs.PresentationClass)
     {
     case WholeSceneCaptureProductPresentationClass::RawContent:
-        // Weak route-state reuse can leak pre-fade pixels after the source
-        // brightness effect releases. Exact capture-event proof is allowed:
-        // that product represents the event being consumed, not just a similar
-        // route state.
-        if (inputs.HasStoredEffectState &&
-            inputs.StoredEffectActive &&
-            !inputs.ConsumeEffectActive &&
-            inputs.ProofKind != WholeSceneCaptureProofKind::ExactCaptureEvent)
-        {
-            decision.EffectPhaseIncompatible = true;
-            return decision;
-        }
         decision.Accepted = true;
-        decision.PresentationCompatible =
-            inputs.ProductPresentationHash == 0 ||
-            inputs.RequestPresentationHash == 0 ||
-            DoesCaptureProductPresentationMatchRequest(inputs.ProductPresentationHash,
-                                                       inputs.RequestPresentationHash);
-        decision.RequiresRePresentation = !decision.PresentationCompatible;
+        // Raw products carry content, not a completed presentation. Their
+        // downstream transforms are owned by the selected OutputPlan, so a
+        // presentation-hash comparison cannot prove compatibility here.
+        decision.PresentationCompatible = true;
         return decision;
     case WholeSceneCaptureProductPresentationClass::AlreadyPresented:
         decision.PresentationCompatible =
@@ -486,42 +431,101 @@ WholeSceneCaptureProofKind CaptureProofKindForBackgroundSource(
     return WholeSceneCaptureProofKind::None;
 }
 
-SourceACaptureResolutionKind ChooseSourceACaptureResolutionKind(
-    const SourceACaptureResolutionInputs& inputs)
+static SourceACaptureResolutionKind ChooseSourceACaptureResolutionKindForInputs(
+    const SourceACaptureResolutionInputs& inputs,
+    SourceACaptureSelectionReason& reason)
 {
-    if (inputs.PreferExactFullProduct &&
+    if (inputs.Preference ==
+            SourceACaptureSelectionPreference::ExactFullProduct &&
         inputs.HasFullProduct)
     {
+        reason = SourceACaptureSelectionReason::ExactFullProductPreference;
         return SourceACaptureResolutionKind::FullProduct;
     }
 
-    if (inputs.PreferExactRouteProduct &&
+    if (inputs.Preference ==
+            SourceACaptureSelectionPreference::ExactRouteProduct &&
         inputs.HasRouteProduct)
     {
+        reason = SourceACaptureSelectionReason::ExactRouteProductPreference;
         return SourceACaptureResolutionKind::RouteProduct;
     }
 
     if (inputs.HasRouteProduct &&
-        inputs.RouteProductNeedsRePresentation &&
+        inputs.RouteProductCompositionMismatch &&
         inputs.AllowCurrentOverlay &&
         inputs.CanUseCurrentOverlay)
     {
+        reason = SourceACaptureSelectionReason::RouteProductCompositionRebuild;
         return SourceACaptureResolutionKind::BackgroundOverlay;
     }
 
     if (inputs.HasRouteProduct)
+    {
+        reason = SourceACaptureSelectionReason::RouteProductAvailable;
         return SourceACaptureResolutionKind::RouteProduct;
+    }
 
     if (inputs.AllowCurrentOverlay && inputs.CanUseCurrentOverlay)
+    {
+        reason = SourceACaptureSelectionReason::CurrentOverlayAvailable;
         return SourceACaptureResolutionKind::BackgroundOverlay;
+    }
 
     if (!inputs.HasFullProduct)
+    {
+        reason = SourceACaptureSelectionReason::NoUsableProduct;
         return SourceACaptureResolutionKind::RejectedFallback;
+    }
 
+    reason = SourceACaptureSelectionReason::FullProductAvailable;
     return SourceACaptureResolutionKind::FullProduct;
 }
 
-bool ShouldPreferSourceAExactRouteProductForDirectBottom(
+SourceACaptureSelectionDecision ChooseSourceACaptureSelectionDecision(
+    const SourceACaptureResolutionInputs& inputs)
+{
+    SourceACaptureSelectionDecision decision = {};
+    decision.FullProductPresentationProof =
+        inputs.FullProductPresentationProof;
+    decision.Primary = ChooseSourceACaptureResolutionKindForInputs(
+        inputs, decision.PrimaryReason);
+
+    SourceACaptureResolutionInputs afterOverlayFailure = inputs;
+    afterOverlayFailure.AllowCurrentOverlay = false;
+    decision.AfterOverlayFailure =
+        ChooseSourceACaptureResolutionKindForInputs(
+            afterOverlayFailure, decision.AfterOverlayFailureReason);
+    return decision;
+}
+
+SourceAFullProductPresentationProof ProveSourceAFullProductPresentation(
+    const SourceAFullProductPresentationProofInputs& inputs)
+{
+    const bool directFinalConsumer =
+        inputs.DirectFinalBottomConsumer ||
+        (inputs.DirectFinalDisplayConsumer && inputs.SubEngineCapturedOBJOnly) ||
+        (inputs.DirectFinalDisplayConsumer &&
+         inputs.MainEngineCapturedBGOnly &&
+         inputs.FullProductEventRouteMatches);
+    const bool captureBackedSource =
+        inputs.SubEngineCapturedSourceAOnly ||
+        inputs.MainEngineCapturedBGOnly;
+    if (!directFinalConsumer ||
+        !captureBackedSource ||
+        !inputs.HasFullProduct ||
+        !inputs.FullProductEventValid ||
+        !inputs.FullProductEventFullEquivalent ||
+        !inputs.FullProductEventCleanEngineA2DOutput ||
+        !inputs.FullProductEventAccepted)
+    {
+        return SourceAFullProductPresentationProof::None;
+    }
+
+    return SourceAFullProductPresentationProof::ExactFullEquivalentDirectFinal;
+}
+
+static bool CanPreferSourceAExactRouteProductForDirectBottom(
     const SourceAExactRouteProductPreferenceInputs& inputs)
 {
     if (!inputs.DirectFinalBottomConsumer ||
@@ -571,7 +575,7 @@ bool ShouldPreferSourceAExactRouteProductForDirectBottom(
     return true;
 }
 
-bool ShouldPreferSourceAExactFullProductForDirectBottom(
+static bool CanPreferSourceAExactFullProductForDirectBottom(
     const SourceAExactFullProductPreferenceInputs& inputs)
 {
     if (!inputs.DirectFinalBottomConsumer ||
@@ -592,6 +596,19 @@ bool ShouldPreferSourceAExactFullProductForDirectBottom(
     }
 
     return inputs.FullProductEventSourceOBJVisible;
+}
+
+SourceACaptureSelectionPreference ChooseSourceAExactProductPreference(
+    const SourceAExactFullProductPreferenceInputs& fullProductInputs,
+    const SourceAExactRouteProductPreferenceInputs& routeProductInputs)
+{
+    if (CanPreferSourceAExactFullProductForDirectBottom(fullProductInputs))
+        return SourceACaptureSelectionPreference::ExactFullProduct;
+
+    if (CanPreferSourceAExactRouteProductForDirectBottom(routeProductInputs))
+        return SourceACaptureSelectionPreference::ExactRouteProduct;
+
+    return SourceACaptureSelectionPreference::None;
 }
 
 bool DoesDirectFinalRouteMatch(
@@ -757,6 +774,37 @@ bool ShouldUseHandoffRouteBackgroundOverlay(
            !inputs.CapturedBitmapUpdatedThisFrame;
 }
 
+bool IsHandoffStableLiveCandidate(
+    const HandoffStableLiveCandidateInputs& inputs)
+{
+    return inputs.Direct3DOnlyLiveBackground &&
+           inputs.HasProvenRouteProduct &&
+           (inputs.RouteHasCapturedPhase ||
+            (inputs.CurrentCaptureEventMatchesRoute &&
+             inputs.CurrentCaptureEventFresh)) &&
+           inputs.HasNoBGUpload &&
+           inputs.NativeProductEpochValid;
+}
+
+bool ShouldUseHandoffPresentation(
+    const HandoffPresentationEligibilityInputs& inputs)
+{
+    if (inputs.Phase == CaptureBackedHandoffPhase::CapturedBitmap)
+    {
+        return inputs.HasOnlyFullDisplaySourceACapture ||
+               inputs.RouteHasCapturedPhase;
+    }
+
+    if (inputs.Phase == CaptureBackedHandoffPhase::Live3D)
+    {
+        return inputs.RouteHasCapturedPhase ||
+               (inputs.CurrentCaptureEventMatchesRoute &&
+                inputs.CurrentCaptureEventFresh);
+    }
+
+    return false;
+}
+
 WholeSceneCaptureBackedPlan MakeWholeSceneCaptureBackedHandoffPlan()
 {
     WholeSceneCaptureBackedPlan plan = {};
@@ -764,9 +812,6 @@ WholeSceneCaptureBackedPlan MakeWholeSceneCaptureBackedHandoffPlan()
     plan.Stage = WholeSceneCaptureBackedPlanStage::BeforeGeneralFallbacks;
     plan.Role = WholeSceneCaptureBackedPlanRole::RouteHandoff;
     plan.RequestKind = WholeSceneCaptureRequestKind::HandoffConsumer;
-    plan.ProductKind = WholeSceneCaptureProductKind::HandoffSnapshot;
-    plan.ProofKind = WholeSceneCaptureProofKind::HandoffRouteKey;
-    plan.RenderAction = WholeSceneCaptureRenderAction::RenderHandoffHybrid;
     return plan;
 }
 
@@ -777,9 +822,6 @@ WholeSceneCaptureBackedPlan MakeWholeSceneSourceACaptureReplacementPlan()
     plan.Stage = WholeSceneCaptureBackedPlanStage::AfterGeneralFallbacks;
     plan.Role = WholeSceneCaptureBackedPlanRole::RouteConsumer;
     plan.RequestKind = WholeSceneCaptureRequestKind::CapturedLayerConsumer;
-    plan.ProductKind = WholeSceneCaptureProductKind::FullCaptureProduct;
-    plan.ProofKind = WholeSceneCaptureProofKind::ExactCaptureEvent;
-    plan.RenderAction = WholeSceneCaptureRenderAction::BlitExactProduct;
     return plan;
 }
 
@@ -792,9 +834,6 @@ WholeSceneCaptureBackedPlan MakeWholeSceneCaptureEpochOverlayPlan(
     plan.Stage = WholeSceneCaptureBackedPlanStage::AfterGeneralFallbacks;
     plan.Role = WholeSceneCaptureBackedPlanRole::RouteProducer;
     plan.RequestKind = WholeSceneCaptureRequestKind::LiveOverlayProducer;
-    plan.ProductKind = WholeSceneCaptureProductKind::BackgroundProduct;
-    plan.ProofKind = WholeSceneCaptureProofKind::ActiveBackgroundEpoch;
-    plan.RenderAction = WholeSceneCaptureRenderAction::CompositeCurrentOverlay;
     plan.CaptureEpochOverlayRouteSlot = routeSlot;
     plan.CanRunDuringHybridPresentationGuard = canRunDuringHybridPresentationGuard;
     return plan;
@@ -986,6 +1025,7 @@ WholeSceneCapturePolicyResult MakeWholeSceneCapturePolicyResult(
     WholeSceneCaptureProductKind product,
     WholeSceneCaptureProofKind proof,
     WholeSceneCaptureRenderAction action,
+    WholeSceneCaptureProductPresentationClass presentationClass,
     WholeSceneCaptureAuthority authority,
     SourceABackgroundSource backgroundSource,
     bool accepted)
@@ -997,6 +1037,7 @@ WholeSceneCapturePolicyResult MakeWholeSceneCapturePolicyResult(
     result.Authority = authority;
     result.ProofKind = proof;
     result.RenderAction = action;
+    result.PresentationClass = presentationClass;
     return result;
 }
 
@@ -1008,6 +1049,7 @@ WholeSceneCapturePolicyResult MakeRouteProductCapturePolicyResult(
         CaptureProductKindForRouteLookup(source),
         CaptureProofKindForRouteLookup(source),
         WholeSceneCaptureRenderAction::BlitExactProduct,
+        WholeSceneCaptureProductPresentationClass::RawContent,
         authority,
         SourceABackgroundSource::RouteProduct);
 }
@@ -1020,6 +1062,7 @@ WholeSceneCapturePolicyResult MakeRouteProductCapturePolicyResult(
     return MakeWholeSceneCapturePolicyResult(product,
                                              proof,
                                              WholeSceneCaptureRenderAction::BlitExactProduct,
+                                             WholeSceneCaptureProductPresentationClass::RawContent,
                                              authority,
                                              SourceABackgroundSource::RouteProduct);
 }
@@ -1036,6 +1079,7 @@ WholeSceneCapturePolicyResult MakeBackgroundCapturePolicyResult(
             ? proofOverride
             : CaptureProofKindForBackgroundSource(backgroundSource),
         action,
+        WholeSceneCaptureProductPresentationClass::RawContent,
         authority,
         backgroundSource);
 }
@@ -1047,6 +1091,7 @@ WholeSceneCapturePolicyResult MakeFullProductCapturePolicyResult(
     return MakeWholeSceneCapturePolicyResult(WholeSceneCaptureProductKind::FullCaptureProduct,
                                              proof,
                                              WholeSceneCaptureRenderAction::BlitExactProduct,
+                                             WholeSceneCaptureProductPresentationClass::AlreadyPresented,
                                              authority,
                                              SourceABackgroundSource::FullCaptureProduct);
 }
@@ -1057,6 +1102,7 @@ WholeSceneCapturePolicyResult MakeRejectedCapturePolicyResult(
     return MakeWholeSceneCapturePolicyResult(WholeSceneCaptureProductKind::None,
                                              WholeSceneCaptureProofKind::None,
                                              action,
+                                             WholeSceneCaptureProductPresentationClass::Fallback,
                                              WholeSceneCaptureAuthority::None,
                                              SourceABackgroundSource::None,
                                              false);

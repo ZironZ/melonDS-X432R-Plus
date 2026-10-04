@@ -5,10 +5,15 @@
 
 uniform sampler2D OverlayBlackTex;
 uniform sampler2D OverlayWhiteTex;
+uniform sampler2D OverlayOpaqueWhiteTex;
 uniform sampler2D Direct3DTexture;
+uniform sampler2D Native3DSemanticsTex;
+uniform sampler2D Native3DOperatorTex;
 uniform bool uDebugTintBySource;
 uniform bool uLegacyUnderlayEndpoint;
 uniform bool uDirect3DPresentationSpace;
+uniform bool uStraightDirect3DColor;
+uniform bool uExplicit3DOperator;
 uniform int uScaleFactor;
 
 struct sScanline
@@ -21,6 +26,12 @@ struct sScanline
     ivec4 WinPos;
     bvec4 BGMosaicEnable;
     ivec4 MosaicSize;
+    ivec4 BGPrio;
+    bool EnableOBJ;
+    bool Enable3D;
+    int BlendCnt;
+    int BlendEffect;
+    ivec3 BlendCoef;
 };
 
 layout(std140) uniform ubScanlineConfig
@@ -76,6 +87,9 @@ vec3 Direct3DCompositorEndpoint(vec4 direct3D)
 
 vec3 Direct3DUnderlayColor(vec4 direct3D)
 {
+    if (uStraightDirect3DColor)
+        return clamp(direct3D.rgb, 0.0, 1.0);
+
     if (uDirect3DPresentationSpace)
         return clamp(direct3D.rgb, 0.0, 1.0) * clamp(direct3D.a, 0.0, 1.0);
 
@@ -97,6 +111,42 @@ bool PresentationEndpointLooksPassThrough(vec3 overlayBlack, vec3 underWeight)
            channelSpread <= (4.0 / 255.0);
 }
 
+float Explicit3DOperatorAlpha(ivec2 outputCoord, vec4 direct3D)
+{
+    ivec2 outputSize = textureSize(OverlayBlackTex, 0);
+    ivec2 nativeSize = textureSize(Native3DSemanticsTex, 0);
+    ivec2 nativeCoord = ivec2(floor((vec2(outputCoord) + vec2(0.5)) *
+                                    vec2(nativeSize) /
+                                    vec2(max(outputSize, ivec2(1)))));
+    nativeCoord = clamp(nativeCoord, ivec2(0), nativeSize - ivec2(1));
+    vec4 semantics = texelFetch(Native3DSemanticsTex, nativeCoord, 0);
+    vec4 operatorSemantics = texelFetch(Native3DOperatorTex,
+                                        nativeCoord, 0);
+
+    // At a genuine exterior cell, retain resolved high-resolution coverage.
+    // Inside a fully present native 3D cell, however, alpha is not implicitly
+    // transparency: the DS compositor uses it only for the special BG0 blend
+    // when the selected underlay is Target 2. The probe records that exact
+    // decision. Otherwise any nonzero Direct3D texel is the selected sample.
+    if (semantics.r < (254.5 / 255.0))
+        return clamp(direct3D.a, 0.0, 1.0);
+
+    float presence = direct3D.a > (0.5 / 255.0) ? 1.0 : 0.0;
+    if (operatorSemantics.r < 0.5)
+        return presence;
+
+    // Match the compositor's 5-bit alpha conversion and mandatory +1 used
+    // by the Direct3D special blend instead of treating RGBA8 alpha as a
+    // conventional continuous opacity value.
+    if (presence > 0.0)
+    {
+        float alpha5 = floor(clamp(direct3D.a, 0.0, 1.0) * 255.0 + 0.5) / 8.0;
+        alpha5 = floor(alpha5);
+        return clamp((alpha5 + 1.0) / 32.0, 0.0, 1.0);
+    }
+    return 0.0;
+}
+
 void main()
 {
     ivec2 size = textureSize(OverlayBlackTex, 0);
@@ -109,7 +159,23 @@ void main()
     vec4 direct3D = FetchDirect3D(coord);
     vec3 directColor = Direct3DUnderlayColor(direct3D);
     vec3 finalColor = clamp(overlayBlack + (underWeight * directColor), 0.0, 1.0);
-    if (uDirect3DPresentationSpace && PresentationEndpointLooksPassThrough(overlayBlack, underWeight))
+    if (uExplicit3DOperator)
+    {
+        // The three scaled inputs were composed with Direct3D absent, opaque
+        // black, and opaque white. None contains the native-resolved 3D alpha
+        // boundary. Reconstruct the opaque color response first, then apply
+        // the actual high-resolution Direct3D alpha exactly once.
+        vec3 absent3D = overlayBlack;
+        vec3 opaqueBlack = overlayWhite;
+        vec3 opaqueWhite = clamp(
+            texelFetch(OverlayOpaqueWhiteTex, coord, 0).rgb, 0.0, 1.0);
+        vec3 colorWeight = clamp(opaqueWhite - opaqueBlack, 0.0, 1.0);
+        vec3 opaqueResult = clamp(
+            opaqueBlack + (colorWeight * directColor), 0.0, 1.0);
+        finalColor = mix(absent3D, opaqueResult,
+                         Explicit3DOperatorAlpha(coord, direct3D));
+    }
+    else if (uDirect3DPresentationSpace && PresentationEndpointLooksPassThrough(overlayBlack, underWeight))
         finalColor = directColor;
 
     if (uDebugTintBySource)

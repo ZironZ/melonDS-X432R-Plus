@@ -20,6 +20,7 @@
 #define SCREEN_H
 
 #include <optional>
+#include <array>
 #include <deque>
 #include <map>
 
@@ -50,6 +51,14 @@ const struct { int id; float ratio; const char* label; } aspectRatios[] =
 };
 constexpr int AspectRatiosNum = sizeof(aspectRatios) / sizeof(aspectRatios[0]);
 
+enum ScreenLCDGhostingMode
+{
+    screenLCDGhosting_Off = 0,
+    screenLCDGhosting_Smart,
+    screenLCDGhosting_Accurate,
+    screenLCDGhosting_MAX
+};
+
 namespace melonDS
 {
 void SetScreenPresentationTimingEnabled(bool enabled);
@@ -69,6 +78,7 @@ public:
 
     void setFilter(bool filter);
     void setSharpenStrength(int strength);
+    void setLCDGhostingMode(int mode);
 
     void setMouseHide(bool enable, int delay);
 
@@ -92,6 +102,7 @@ protected:
 
     bool filter;
     int sharpenStrength;
+    int lcdGhostingMode;
 
     int screenRotation;
     int screenGap;
@@ -216,6 +227,8 @@ public:
     GL::Context* getContext() { return glContext.get(); }
 
     void transferLayout();
+    // Call with this panel's GL context borrowed from the emulation thread.
+    bool captureFinalDisplays(std::array<QImage, 2>& images, QString* error);
 protected:
 
     qreal devicePixelRatioFromScreen() const;
@@ -235,6 +248,22 @@ private:
     GLuint screenShaderProgram;
     GLint screenShaderTransformULoc, screenShaderScreenSizeULoc;
     GLint screenShaderSharpenAmountULoc;
+    GLint screenShaderLCDGhostingModeULoc, screenShaderLCDGhostingHistorySlotsULoc;
+
+    GLuint lcdGhostingHistoryTexture = 0;
+    GLuint lcdGhostingReadFramebuffer = 0;
+    GLuint lcdGhostingDrawFramebuffer = 0;
+    int lcdGhostingHistoryWidth = 0;
+    int lcdGhostingHistoryHeight = 0;
+    int lcdGhostingHistorySlotCount = 0;
+    int lcdGhostingCurrentSlot = -1;
+    int lcdGhostingStoredFrames = 0;
+    melonDS::u32 lcdGhostingLastFrame = 0;
+    bool lcdGhostingLastFrameValid = false;
+
+    void resetLCDGhostingHistory();
+    bool updateLCDGhostingHistory(GLuint sourceTexture, melonDS::u32 frameNumber);
+    void prepareScreenShader(GLuint sourceTexture, melonDS::u32 frameNumber);
 
     QMutex screenSettingsLock;
     WindowInfo windowInfo;

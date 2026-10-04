@@ -1,20 +1,5 @@
-/*
-    Copyright 2026 ZironZ
-
-    This file is part of melonDS.
-
-    melonDS is free software: you can redistribute it and/or modify it under
-    the terms of the GNU General Public License as published by the Free
-    Software Foundation, either version 3 of the License, or (at your option)
-    any later version.
-
-    melonDS is distributed in the hope that it will be useful, but WITHOUT ANY
-    WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
-    FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
-
-    You should have received a copy of the GNU General Public License along
-    with melonDS. If not, see http://www.gnu.org/licenses/.
-*/
+// Copyright 2026 ZironZ
+// SPDX-License-Identifier: GPL-3.0-or-later
 
 #ifndef RENDERERSETTINGS_H
 #define RENDERERSETTINGS_H
@@ -78,6 +63,17 @@ struct RendererSettings
     static constexpr bool IsGLCuNNyAlgorithm(GLScaleAlgorithm value)
     {
         return value == GLScaleAlgorithm::CuNNy4x32;
+    }
+
+    static constexpr bool ScaleAlgorithmRequiresCompute(GLScaleAlgorithm value)
+    {
+        return IsGLArtCNNAlgorithm(value) || IsGLNNEDI3Algorithm(value) ||
+               IsGLCuNNyAlgorithm(value);
+    }
+
+    static constexpr GLScaleAlgorithm SupportedScaleAlgorithm(GLScaleAlgorithm value, bool compute)
+    {
+        return !compute && ScaleAlgorithmRequiresCompute(value) ? GLScaleAlgorithm::Spline36 : value;
     }
 
     static constexpr int GetGLCuNNyModelIndex(GLScaleAlgorithm)
@@ -222,6 +218,45 @@ struct RendererSettings
     // scale factor, for renderers that support upscaling
     int ScaleFactor;
 
+    // Explicit display alpha choices are independent of RGB. Automatic follows
+    // the selected upscaler and is resolved before choosing presentation paths.
+    enum class AffineAlphaReconstruction : int
+    {
+        NativeMask = 0, Bilinear, Spline36, NNEDI3, XBRZ, Automatic
+    };
+    enum class AffineSampling : int
+    {
+        OutputGrid = 0, Supersample2x = 1
+    };
+    static constexpr AffineAlphaReconstruction GetAffineAlphaReconstruction(int value)
+    {
+        return value >= 0 && value <= 5
+            ? static_cast<AffineAlphaReconstruction>(value)
+            : AffineAlphaReconstruction::Bilinear;
+    }
+    static constexpr AffineAlphaReconstruction ResolveAffineAlphaReconstruction(
+        AffineAlphaReconstruction alpha, GLScaleAlgorithm algorithm)
+    {
+        if (alpha != AffineAlphaReconstruction::Automatic) return alpha;
+        switch (algorithm)
+        {
+        case GLScaleAlgorithm::Spline36: return AffineAlphaReconstruction::Spline36;
+        case GLScaleAlgorithm::XBRZ: return AffineAlphaReconstruction::XBRZ;
+        default: return AffineAlphaReconstruction::NNEDI3;
+        }
+    }
+    static constexpr AffineAlphaReconstruction SupportedAffineAlpha(
+        AffineAlphaReconstruction value, bool compute)
+    {
+        return !compute && value == AffineAlphaReconstruction::NNEDI3
+            ? AffineAlphaReconstruction::Automatic : value;
+    }
+    static constexpr AffineSampling GetAffineSampling(int value)
+    {
+        return value >= 0 && value <= 1 ? static_cast<AffineSampling>(value)
+                                        : AffineSampling::OutputGrid;
+    }
+
     struct WholeScene2DScaleSettings
     {
         // request the experimental whole-scene 2D GL scaling path
@@ -309,9 +344,35 @@ struct RendererSettings
         // overlay/finalizer path for simple direct-3D + 2D scenes
         bool HybridCleanLegacyCandidate = false;
 
+        // render the deliberately narrow single tiled-affine-BG candidate at
+        // output resolution before final-image scaling
+        bool HybridStrictAffineHighRes = false;
+        AffineAlphaReconstruction HybridAffineAlpha = AffineAlphaReconstruction::Automatic;
+        AffineSampling HybridAffineSampling = AffineSampling::OutputGrid;
+        bool HybridNNEDI3PremultipliedRGB = false;
+
+        // optionally reconstruct affine BG/OBJ source color before path 12
+        // samples it; separate from high-resolution affine geometry
+        bool HybridStrictAffineSourceEnhancement = false;
+
+        bool HybridStrictAffineConnectedSources = false;
+        bool HybridStrictAffineOpaqueAssemblies = false;
+
+        // reconstruct enabled ordinary text BG companions in an admitted
+        // strict-affine scene with the selected source scaler;
+        // analytic/neural families use binary ownership plus a thin semantic
+        // AA contour, while xBRZ retains reconstructed RGBA
+        bool HybridStrictAffineTopTextBG = false;
+
+        // apply directional edge AA after composition
+        bool HybridStrictAffineMaskedOBJMLAA = false;
+
         bool operator==(const WholeScene2DScaleSettings& other) const
         {
-            return Enabled == other.Enabled &&
+            return HybridAffineAlpha == other.HybridAffineAlpha &&
+                HybridAffineSampling == other.HybridAffineSampling &&
+                HybridNNEDI3PremultipliedRGB == other.HybridNNEDI3PremultipliedRGB &&
+                Enabled == other.Enabled &&
                 SourceBoundaryGuard == other.SourceBoundaryGuard &&
                 Mode == other.Mode &&
                 Algorithm == other.Algorithm &&
@@ -332,7 +393,13 @@ struct RendererSettings
                 HybridTarget2AlphaBlendAssist == other.HybridTarget2AlphaBlendAssist &&
                 HybridNativeEffectGuard == other.HybridNativeEffectGuard &&
                 HybridForeground2DBase == other.HybridForeground2DBase &&
-                HybridCleanLegacyCandidate == other.HybridCleanLegacyCandidate;
+                HybridCleanLegacyCandidate == other.HybridCleanLegacyCandidate &&
+                HybridStrictAffineHighRes == other.HybridStrictAffineHighRes &&
+                HybridStrictAffineSourceEnhancement == other.HybridStrictAffineSourceEnhancement &&
+                HybridStrictAffineConnectedSources == other.HybridStrictAffineConnectedSources &&
+                HybridStrictAffineOpaqueAssemblies == other.HybridStrictAffineOpaqueAssemblies &&
+                HybridStrictAffineTopTextBG == other.HybridStrictAffineTopTextBG &&
+                HybridStrictAffineMaskedOBJMLAA == other.HybridStrictAffineMaskedOBJMLAA;
         }
 
         bool operator!=(const WholeScene2DScaleSettings& other) const
@@ -391,6 +458,31 @@ struct RendererSettings
         }
     };
 
+    enum class TextureAlpha : u8
+    {
+        Bilinear = 0,
+        Spline36 = 1,
+        NNEDI3 = 2,
+        XBRZ = 3,
+    };
+
+    static constexpr TextureAlpha GetTextureAlpha(int value)
+    {
+        return value >= 0 && value <= 3 ? static_cast<TextureAlpha>(value) : TextureAlpha::Bilinear;
+    }
+
+    static constexpr TextureAlpha SupportedTextureAlpha(TextureAlpha value, bool compute)
+    {
+        return !compute && value == TextureAlpha::NNEDI3 ? TextureAlpha::Bilinear : value;
+    }
+
+    static constexpr TextureAlpha MigrateTextureAlpha(bool xbrz, bool spline36, GLScaleAlgorithm rgb)
+    {
+        // Previously xBRZ RGB always supplied its own alpha.
+        return xbrz || rgb == GLScaleAlgorithm::XBRZ ? TextureAlpha::XBRZ :
+               spline36 ? TextureAlpha::Spline36 : TextureAlpha::Bilinear;
+    }
+
     struct TextureScalingSettings
     {
         // scale cached 3D textures to match the internal resolution factor
@@ -413,6 +505,10 @@ struct RendererSettings
 
         // edge-extend unused texture margins before scaling
         bool EdgeExtendUnusedMargins = false;
+        // Experimental source assembly for compatible pixel-aligned 3D quads.
+        bool ReconstructCompatible3D = false;
+        bool ReconstructCompatible3DEdgeContext = false;
+        bool ReconstructCompatible3DFractionalAlpha = false;
 
         // use the old GPU 3D texture alpha-edge handling with no transparent RGB padding
         bool LegacyAlphaHandling = false;
@@ -420,11 +516,7 @@ struct RendererSettings
         // use the full GPU 3D texture alpha-edge padding for comparison
         bool QualityAlphaHandling = false;
 
-        // use xBRZ instead of Spline36 for eligible GPU texture-scaling alpha
-        bool AlphaXBRZ = false;
-
-        // use Spline36 instead of center-aligned linear alpha for GPU texture scaling
-        bool Spline36Alpha = false;
+        TextureAlpha Alpha = TextureAlpha::Bilinear;
 
         bool operator==(const TextureScalingSettings& other) const
         {
@@ -435,10 +527,12 @@ struct RendererSettings
                 NativeMipFloor == other.NativeMipFloor &&
                 SourceMips == other.SourceMips &&
                 EdgeExtendUnusedMargins == other.EdgeExtendUnusedMargins &&
+                ReconstructCompatible3D == other.ReconstructCompatible3D &&
+                ReconstructCompatible3DEdgeContext == other.ReconstructCompatible3DEdgeContext &&
+                ReconstructCompatible3DFractionalAlpha == other.ReconstructCompatible3DFractionalAlpha &&
                 LegacyAlphaHandling == other.LegacyAlphaHandling &&
                 QualityAlphaHandling == other.QualityAlphaHandling &&
-                AlphaXBRZ == other.AlphaXBRZ &&
-                Spline36Alpha == other.Spline36Alpha;
+                Alpha == other.Alpha;
         }
 
         bool operator!=(const TextureScalingSettings& other) const
@@ -470,6 +564,16 @@ struct RendererSettings
 
     // "improved polygon splitting" (regular OpenGL renderer)
     bool BetterPolygons;
+
+    // Apply before resolving Automatic alpha or choosing reconstruction paths.
+    void ApplyComputeShaderSupport(bool compute)
+    {
+        WholeScene2D.Algorithm = SupportedScaleAlgorithm(WholeScene2D.Algorithm, compute);
+        WholeScene2D.HybridAffineAlpha = SupportedAffineAlpha(WholeScene2D.HybridAffineAlpha, compute);
+        if (!compute) WholeScene2D.HybridNNEDI3PremultipliedRGB = false;
+        TextureScaling.Algorithm = SupportedScaleAlgorithm(TextureScaling.Algorithm, compute);
+        TextureScaling.Alpha = SupportedTextureAlpha(TextureScaling.Alpha, compute);
+    }
 };
 
 }

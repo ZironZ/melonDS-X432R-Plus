@@ -53,6 +53,7 @@ public:
 
     EmuInstance* getEmuInstance() { return emuInstance; }
     Config::Table& getWindowConfig() { return windowCfg; }
+    void refreshScreenPresentationSettings();
     int getWindowID() { return windowID; }
 
     bool winHasMenu() { return hasMenu; }
@@ -62,6 +63,7 @@ public:
     void toggleFullscreen();
 
     bool hasOpenGL() { return hasOGL; }
+    bool supportsComputeShaders() const;
     GL::Context* getOGLContext();
     void initOpenGL();
     void deinitOpenGL();
@@ -70,6 +72,7 @@ public:
     void releaseGL();
 
     void drawScreen();
+    bool captureFinalDisplays(std::array<QImage, 2>& images, QString* error);
 
     bool preloadROMs(QStringList file, QStringList gbafile, bool boot);
     QStringList splitArchivePath(const QString& filename, bool useMemberSyntax);
@@ -86,7 +89,7 @@ public:
     void updateMPInterface(melonDS::MPInterfaceType type);
 
     void loadRecentFilesMenu(bool loadcfg);
-    //void updateVideoSettings(bool glchange);
+    void updateVideoSettings(bool glchange) { onUpdateVideoSettings(glchange); }
 
 protected:
     void keyPressEvent(QKeyEvent* event) override;
@@ -100,6 +103,7 @@ protected:
 
 signals:
     void screenLayoutChange();
+    void screenPresentationSettingsChanged(bool filtering, int sharpening, int ghosting);
 
 private slots:
     void onOpenFile();
@@ -170,6 +174,7 @@ private slots:
     void onOpenNewWindow();
     void onChangeScreenFiltering(bool checked);
     void onChangeScreenSharpening(QAction* act);
+    void onChangeLCDGhosting(QAction* act);
     void onChangeShowOSD(bool checked);
     void onOpenWholeScene2DDebugView();
     void onOpenTextureScalingDebugView();
@@ -300,6 +305,8 @@ public:
     QAction* actScreenFiltering;
     QActionGroup* grpScreenSharpening;
     QAction* actScreenSharpening[5];
+    QActionGroup* grpLCDGhosting;
+    QAction* actLCDGhosting[screenLCDGhosting_MAX];
     QAction* actShowOSD;
     QAction* actWholeScene2DDebugView;
     QAction* actTextureScalingDebugView;

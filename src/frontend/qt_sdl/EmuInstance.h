@@ -28,6 +28,7 @@
 #include "Window.h"
 #include "Config.h"
 #include "SaveManager.h"
+#include "WideMelon.h"
 
 const int kMaxWindows = 4;
 
@@ -136,6 +137,11 @@ public:
 
     bool updateConsole() noexcept;
 
+    // UI thread: bracket a synchronous reset/boot message. The UI cannot read
+    // the shared widescreen dimensions while updateConsole replaces them.
+    void prepareConsoleRestart();
+    void finishConsoleRestart();
+
     void enableCheats(bool enable);
     melonDS::ARCodeFile* getCheatFile();
 
@@ -176,6 +182,7 @@ public:
     QMutex renderLock;
 
 private:
+    std::optional<WideMelon::Configuration> restartWidescreen;
     static int lastSep(const std::string& path);
     std::string getAssetPath(bool gba, const std::string& configpath, const std::string& ext, const std::string& file);
 
@@ -386,6 +393,7 @@ private:
 
     friend class EmuThread;
     friend class MainWindow;
+    friend class RendererTestRunner;
 };
 
 #endif //EMUINSTANCE_H

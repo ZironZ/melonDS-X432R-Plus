@@ -34,6 +34,7 @@
 #include <SDL2/SDL.h>
 
 #include "main.h"
+#include "WideMelon.h"
 
 #include "types.h"
 #include "version.h"
@@ -219,6 +220,7 @@ bool EmuThread::flushWholeSceneTimingLog(QString& filename, u64& nextFrame, QStr
 }
 
 void EmuThread::appendWholeSceneTimingLog(u32 nlines,
+                                          u32 keyMask,
                                           u64 runFrameUS,
                                           u64 drawScreenUS,
                                           u64 presentPreSwapUS,
@@ -246,7 +248,7 @@ void EmuThread::appendWholeSceneTimingLog(u32 nlines,
 
     if (!wholeSceneTimingLogHeaderWritten)
     {
-        wholeSceneTimingLogBuffer += "frame,total_us,runframe_us,drawscreen_us,present_pre_swap_us,present_swap_us,present_swap_count,nlines,touch_active,touch_press,touch_release,touch_x,touch_y,renderer_timing";
+        wholeSceneTimingLogBuffer += "frame,total_us,runframe_us,drawscreen_us,present_pre_swap_us,present_swap_us,present_swap_count,nlines,key_mask,touch_active,touch_press,touch_release,touch_x,touch_y,renderer_timing";
         wholeSceneTimingLogBuffer += "\n";
         wholeSceneTimingLogHeaderWritten = true;
     }
@@ -277,6 +279,8 @@ void EmuThread::appendWholeSceneTimingLog(u32 nlines,
     wholeSceneTimingLogBuffer += QString::number(presentSwapCount);
     wholeSceneTimingLogBuffer += ",";
     wholeSceneTimingLogBuffer += QString::number(nlines);
+    wholeSceneTimingLogBuffer += ",";
+    wholeSceneTimingLogBuffer += QString::number(keyMask & 0xFFF);
     wholeSceneTimingLogBuffer += ",";
     wholeSceneTimingLogBuffer += touchActive ? "1" : "0";
     wholeSceneTimingLogBuffer += ",";
@@ -400,6 +404,7 @@ void EmuThread::run()
 
     while (emuStatus != emuStatus_Exit)
     {
+        bool frameReady = false;
         if (emuInstance->instanceID == 0)
             MPInterface::Get().Process();
 
@@ -408,7 +413,8 @@ void EmuThread::run()
         if (emuInstance->hotkeyPressed(HK_FrameLimitToggle)) emit windowLimitFPSChange();
 
         if (emuInstance->hotkeyPressed(HK_Pause)) emuTogglePause();
-        if (emuInstance->hotkeyPressed(HK_Reset)) emuReset();
+        if (emuInstance->hotkeyPressed(HK_Reset))
+            QMetaObject::invokeMethod(emuInstance->getMainWindow(), "onReset", Qt::QueuedConnection);
         if (emuInstance->hotkeyPressed(HK_FrameStep)) emuFrameStep();
 
         if (emuInstance->hotkeyPressed(HK_FullscreenToggle)) emit windowFullscreenToggle();
@@ -501,6 +507,12 @@ void EmuThread::run()
 
             // renderer-test harness: advance the replay schedule before this
             // frame's input is applied, so scripted touches are frame-exact
+            // Shader compilation does not emulate a frame. Finish it before
+            // starting the test schedule so cold caches cannot consume input
+            // steps or shift the numbered captures.
+            if (emuInstance->rendererTest)
+                while (emuInstance->nds->GPU.GetRenderer().NeedsShaderCompile())
+                    compileShaders();
             if (emuInstance->rendererTest)
                 emuInstance->rendererTest->onEmuFrame(emuInstance);
 
@@ -585,10 +597,10 @@ void EmuThread::run()
 
             const bool timingLogActive = wholeSceneTimingLogEnabled.load();
             SetScreenPresentationTimingEnabled(timingLogActive);
+            u64 timingFrame = 0;
+            bool timingFrameValid = false;
             if (timingLogActive)
             {
-                u64 timingFrame = 0;
-                bool timingFrameValid = false;
                 {
                     QMutexLocker lock(&wholeSceneTimingLogMutex);
                     timingFrame = wholeSceneTimingLogFrame;
@@ -614,6 +626,7 @@ void EmuThread::run()
             const u32 presentSwapCount = timingLogActive ? GetScreenPresentationSwapCount() : 0;
             const u64 presentPreSwapUS = (drawScreenUS > presentSwapUS) ? (drawScreenUS - presentSwapUS) : 0;
             appendWholeSceneTimingLog(nlines,
+                                      emuInstance->inputMask,
                                       counterDeltaUS(runFrameStart, runFrameEnd),
                                       drawScreenUS,
                                       presentPreSwapUS,
@@ -625,6 +638,10 @@ void EmuThread::run()
                                       frameTouchX,
                                       frameTouchY,
                                       counterDeltaUS(frameWorkStart, drawScreenEnd));
+
+            frameReady = nlines > 1;
+            if (emuInstance->rendererTest)
+                emuInstance->rendererTest->onFramePresented(emuInstance, timingFrame, timingFrameValid);
 
 #ifdef MELONCAP
             MelonCap::Update();
@@ -725,7 +742,7 @@ void EmuThread::run()
                     winUpdateFreq = 1;
                     
                 double actualfps = (59.8261 * 263.0) / nlines;
-                snprintf(melontitle, sizeof(melontitle), "[%d/%.0f] melonDS 1.1 X432R+", fps, actualfps);
+                snprintf(melontitle, sizeof(melontitle), "[%d/%.0f] melonDS %s", fps, actualfps, MELONDS_VERSION);
                 changeWindowTitle(melontitle);
             }
         }
@@ -738,7 +755,7 @@ void EmuThread::run()
 
             emit windowUpdate();
 
-            snprintf(melontitle, sizeof(melontitle), "melonDS 1.1 X432R+");
+            snprintf(melontitle, sizeof(melontitle), "melonDS %s", MELONDS_VERSION);
             changeWindowTitle(melontitle);
 
             SDL_Delay(75);
@@ -746,7 +763,7 @@ void EmuThread::run()
             emuInstance->drawScreen();
         }
 
-        handleMessages();
+        handleMessages(frameReady);
     }
 }
 
@@ -770,13 +787,19 @@ void EmuThread::waitAllMessages()
         msgSemaphore.acquire();
 }
 
-void EmuThread::handleMessages()
+void EmuThread::handleMessages(bool frameReady)
 {
     bool glborrow = false;
 
     msgMutex.lock();
     while (!msgQueue.empty())
     {
+        // A debug frame request is queued while the preceding GL borrow is
+        // held. Compilation-only iterations must not acknowledge stale images.
+        if (msgQueue.head().type == msg_BorrowGLAfterFrame && !frameReady &&
+            (emuStatus == emuStatus_Running || emuStatus == emuStatus_FrameStep))
+            break;
+
         Message msg = msgQueue.dequeue();
         switch (msg.type)
         {
@@ -866,7 +889,12 @@ void EmuThread::handleMessages()
             break;
 
         case msg_BorrowGL:
+        case msg_BorrowGLAfterFrame:
             emuInstance->releaseGL();
+            {
+                QMutexLocker lock(&glBorrowMutex);
+                glBorrowed = true;
+            }
             glborrow = true;
             break;
 
@@ -959,13 +987,17 @@ void EmuThread::handleMessages()
         }
 
         msgSemaphore.release();
+        // Acknowledgement transfers ownership immediately. Leave any later
+        // settings/state commands queued until the UI returns the borrow.
+        if (glborrow) break;
     }
     msgMutex.unlock();
 
     if (glborrow)
     {
         glBorrowMutex.lock();
-        glBorrowCond.wait(&glBorrowMutex);
+        while (glBorrowed)
+            glBorrowCond.wait(&glBorrowMutex);
         glBorrowMutex.unlock();
     }
 }
@@ -996,8 +1028,16 @@ void EmuThread::borrowGL()
 void EmuThread::returnGL()
 {
     glBorrowMutex.lock();
+    glBorrowed = false;
     glBorrowCond.wakeAll();
     glBorrowMutex.unlock();
+}
+
+void EmuThread::borrowNextFrameGL()
+{
+    sendMessage(msg_BorrowGLAfterFrame);
+    returnGL();
+    waitMessage();
 }
 
 void EmuThread::emuRun()
@@ -1054,8 +1094,10 @@ void EmuThread::emuFrameStep()
 
 void EmuThread::emuReset()
 {
+    emuInstance->prepareConsoleRestart();
     sendMessage(msg_EmuReset);
     waitMessage();
+    emuInstance->finishConsoleRestart();
 }
 
 bool EmuThread::emuIsRunning()
@@ -1070,8 +1112,10 @@ bool EmuThread::emuIsActive()
 
 int EmuThread::bootROM(const QStringList& filename, QString& errorstr)
 {
+    emuInstance->prepareConsoleRestart();
     sendMessage({.type = msg_BootROM, .param = filename});
     waitMessage();
+    emuInstance->finishConsoleRestart();
     if (!msgResult)
     {
         errorstr = msgError;
@@ -1086,8 +1130,10 @@ int EmuThread::bootROM(const QStringList& filename, QString& errorstr)
 
 int EmuThread::bootFirmware(QString& errorstr)
 {
+    emuInstance->prepareConsoleRestart();
     sendMessage(msg_BootFirmware);
     waitMessage();
+    emuInstance->finishConsoleRestart();
     if (!msgResult)
     {
         errorstr = msgError;
@@ -1147,9 +1193,11 @@ int EmuThread::undoStateLoad()
 
 int EmuThread::importSavefile(const QString& filename)
 {
+    emuInstance->prepareConsoleRestart();
     sendMessage(msg_EmuReset);
     sendMessage({.type = msg_ImportSavefile, .param = filename});
     waitMessage(2);
+    emuInstance->finishConsoleRestart();
     return msgResult;
 }
 
@@ -1161,6 +1209,13 @@ void EmuThread::enableCheats(bool enable)
 
 void EmuThread::updateRenderer()
 {
+    auto& cfg = emuInstance->getGlobalConfig();
+    const bool computeShaders = emuInstance->getMainWindow()->supportsComputeShaders();
+    Config::ConstrainVideoSettings(cfg, computeShaders);
+    if (!computeShaders && videoRenderer == renderer3D_OpenGLCompute)
+        videoRenderer = renderer3D_OpenGL;
+    if (WideMelon::Enabled() && videoRenderer == renderer3D_Software)
+        videoRenderer = renderer3D_OpenGL;
     auto nds = emuInstance->nds;
 
     if (videoRenderer != lastVideoRenderer)
@@ -1181,7 +1236,6 @@ void EmuThread::updateRenderer()
     }
     lastVideoRenderer = videoRenderer;
 
-    auto& cfg = emuInstance->getGlobalConfig();
     auto readScaleAlgorithm = [&cfg](const char* algorithmKey, bool allowXBRZ)
     {
         auto algorithm = melonDS::RendererSettings::GetGLScaleAlgorithm(cfg.GetInt(algorithmKey));
@@ -1216,6 +1270,15 @@ void EmuThread::updateRenderer()
             .HybridNativeEffectGuard = cfg.GetBool("3D.GL.WholeScene2DScaleHybridNativeEffectGuard"),
             .HybridForeground2DBase = cfg.GetBool("3D.GL.WholeScene2DScaleHybridForeground2DBase"),
             .HybridCleanLegacyCandidate = cfg.GetBool("3D.GL.WholeScene2DScaleHybridCleanLegacyCandidate"),
+            .HybridStrictAffineHighRes = cfg.GetBool("3D.GL.WholeScene2DScaleHybridStrictAffineHighRes"),
+        .HybridAffineAlpha = melonDS::RendererSettings::GetAffineAlphaReconstruction(cfg.GetInt("3D.GL.HybridAffineAlpha")),
+        .HybridAffineSampling = melonDS::RendererSettings::GetAffineSampling(cfg.GetInt("3D.GL.HybridAffineSampling")),
+        .HybridNNEDI3PremultipliedRGB = cfg.GetBool("3D.GL.HybridNNEDI3PremultipliedRGB"),
+            .HybridStrictAffineSourceEnhancement = cfg.GetBool("3D.GL.WholeScene2DScaleHybridStrictAffineSourceEnhancement"),
+            .HybridStrictAffineConnectedSources = cfg.GetBool("3D.GL.WholeScene2DScaleHybridStrictAffineConnectedSources"),
+            .HybridStrictAffineOpaqueAssemblies = cfg.GetBool("3D.GL.WholeScene2DScaleHybridStrictAffineOpaqueAssemblies"),
+            .HybridStrictAffineTopTextBG = cfg.GetBool("3D.GL.WholeScene2DScaleHybridStrictAffineTopTextBG"),
+            .HybridStrictAffineMaskedOBJMLAA = cfg.GetBool("3D.GL.WholeScene2DScaleHybridStrictAffineMaskedOBJMLAA"),
         },
         .ReadableTextureCache = cfg.GetBool("3D.GL.ReadableTextureCache"),
         .TextureFilter = {
@@ -1237,10 +1300,12 @@ void EmuThread::updateRenderer()
             .NativeMipFloor = cfg.GetBool("3D.GL.TextureScalingNativeMipFloor"),
             .SourceMips = cfg.GetBool("3D.GL.TextureScalingSourceMips"),
             .EdgeExtendUnusedMargins = cfg.GetBool("3D.GL.TextureScalingEdgeExtendUnusedMargins"),
+            .ReconstructCompatible3D = cfg.GetBool("3D.GL.ReconstructCompatible3D"),
+            .ReconstructCompatible3DEdgeContext = cfg.GetBool("3D.GL.ReconstructCompatible3DEdgeContext"),
+            .ReconstructCompatible3DFractionalAlpha = cfg.GetBool("3D.GL.ReconstructCompatible3DFractionalAlpha"),
             .LegacyAlphaHandling = cfg.GetBool("3D.GL.TextureScalingLegacyAlphaHandling"),
             .QualityAlphaHandling = cfg.GetBool("3D.GL.TextureScalingQualityAlphaHandling"),
-            .AlphaXBRZ = cfg.GetBool("3D.GL.TextureScalingAlphaXBRZ"),
-            .Spline36Alpha = cfg.GetBool("3D.GL.TextureScalingSpline36Alpha"),
+            .Alpha = RendererSettings::GetTextureAlpha(cfg.GetInt("3D.GL.TextureScalingAlpha")),
         },
         .Threaded = cfg.GetBool("3D.Soft.Threaded"),
         .HiresCoordinates = cfg.GetBool("3D.GL.HiresCoordinates"),

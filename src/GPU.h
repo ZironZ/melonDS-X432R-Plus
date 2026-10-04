@@ -864,7 +864,7 @@ private:
 
     std::unique_ptr<Renderer> Rend = nullptr;
 
-    u16 VRAMCaptureBlockFlags[16];
+    u16 VRAMCaptureBlockFlags[16] {};
 
     u16* VRAMCBF_ABG[0x20] {};
     u16* VRAMCBF_AOBJ[0x10] {};
@@ -910,7 +910,8 @@ public:
                                            int& width,
                                            int& height,
                                            std::vector<u32>& rgba,
-                                           std::string* status = nullptr)
+                                           std::string* status = nullptr,
+                                           WholeScene2DDebugReadContext* context = nullptr)
     {
         width = 0;
         height = 0;

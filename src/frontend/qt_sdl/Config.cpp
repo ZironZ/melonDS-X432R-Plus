@@ -30,6 +30,7 @@
 #include "Config.h"
 #include "RendererSettings.h"
 #include "ScreenLayout.h"
+#include "WideMelon.h"
 #include "main.h"
 
 using namespace std::string_literals;
@@ -41,6 +42,22 @@ using namespace melonDS;
 
 
 const char* kConfigFile = "melonDS.toml";
+
+void ConstrainVideoSettings(Table& cfg, bool computeShaders)
+{
+    if (computeShaders) return;
+    using S = RendererSettings;
+    if (cfg.GetInt("3D.Renderer") == renderer3D_OpenGLCompute)
+        cfg.SetInt("3D.Renderer", renderer3D_OpenGL);
+    for (const char* key : {"3D.GL.TextureScalingAlgorithm", "3D.GL.WholeScene2DScaleAlgorithm"})
+        cfg.SetInt(key, S::GetGLScaleAlgorithmIndex(S::SupportedScaleAlgorithm(
+            S::GetGLScaleAlgorithm(cfg.GetInt(key)), false)));
+    cfg.SetInt("3D.GL.TextureScalingAlpha", static_cast<int>(S::SupportedTextureAlpha(
+        S::GetTextureAlpha(cfg.GetInt("3D.GL.TextureScalingAlpha")), false)));
+    cfg.SetInt("3D.GL.HybridAffineAlpha", static_cast<int>(S::SupportedAffineAlpha(
+        S::GetAffineAlphaReconstruction(cfg.GetInt("3D.GL.HybridAffineAlpha")), false)));
+    cfg.SetBool("3D.GL.HybridNNEDI3PremultipliedRGB", false);
+}
 
 const char* kLegacyConfigFile = "melonDS.ini";
 const char* kLegacyUniqueConfigFile = "melonDS.%d.ini";
@@ -55,12 +72,19 @@ DefaultList<int> DefaultInts =
     {"Instance*.Window*.Height", 384},
     {"Screen.VSyncInterval", 1},
     {"Screen.SharpenStrength", 0},
+    {"Instance*.Window*.ScreenLCDGhostingMode", 0},
     {"3D.Renderer", renderer3D_Software},
     {"3D.GL.ScaleFactor", 1},
+    {"3D.GL.WidescreenWidth", 256},
+    {"3D.GL.WidescreenHeight", 192},
+    {"3D.GL.WidescreenDisplay", WideMelon::Top},
     {"3D.GL.TextureAnisotropy", 1},
     {"3D.GL.TextureFilterMipDepth", RendererSettings::GetTextureFilterMipDepthIndex(RendererSettings::TextureFilterMipDepth::Min32)},
     {"3D.GL.TextureScalingAlgorithm", RendererSettings::GetGLScaleAlgorithmIndex(RendererSettings::GLScaleAlgorithm::Spline36)},
     {"3D.GL.WholeScene2DScaleMode", RendererSettings::GetWholeScene2DScaleModeIndex(RendererSettings::WholeScene2DScaleMode::ConservativeHybridUpscale)},
+    {"3D.GL.TextureScalingAlpha", 0},
+    {"3D.GL.HybridAffineAlpha", 5},
+    {"3D.GL.HybridAffineSampling", 0},
     {"3D.GL.WholeScene2DScaleAlgorithm", RendererSettings::GetGLScaleAlgorithmIndex(RendererSettings::GLScaleAlgorithm::Spline36)},
     {"3D.GL.WholeScene2DScaleFragmentationFallback", RendererSettings::GetWholeScene2DFragmentationFallbackIndex(RendererSettings::WholeScene2DFragmentationFallback::Off)},
     {"3D.GL.WholeScene2DScaleFinalUpscale3DFilter", RendererSettings::GetFinalUpscale3DDownsampleFilterIndex(RendererSettings::FinalUpscale3DDownsampleFilter::Area)},
@@ -89,11 +113,15 @@ RangeList IntRanges =
     {"3D.Renderer", {0, renderer3D_Max-1}},
     {"Screen.VSyncInterval", {1, 20}},
     {"Screen.SharpenStrength", {0, 4}},
+    {"Instance*.Window*.ScreenLCDGhostingMode", {0, 2}},
     {"3D.GL.ScaleFactor", {1, 16}},
     {"3D.GL.TextureAnisotropy", {1, 16}},
     {"3D.GL.TextureFilterMipDepth", {RendererSettings::GetTextureFilterMipDepthIndex(RendererSettings::TextureFilterMipDepth::Full), RendererSettings::GetTextureFilterMipDepthIndex(RendererSettings::TextureFilterMipDepth::Min32)}},
     {"3D.GL.TextureScalingAlgorithm", {RendererSettings::GetGLScaleAlgorithmIndex(RendererSettings::GLScaleAlgorithm::Spline36), RendererSettings::GetGLScaleAlgorithmIndex(RendererSettings::GLScaleAlgorithm::CuNNy4x32)}},
     {"3D.GL.WholeScene2DScaleMode", {RendererSettings::GetWholeScene2DScaleModeIndex(RendererSettings::WholeScene2DScaleMode::LegacyNativeUpscale), RendererSettings::GetWholeScene2DScaleModeIndex(RendererSettings::WholeScene2DScaleMode::ConservativeHybridUpscale)}},
+    {"3D.GL.TextureScalingAlpha", {0, 3}},
+    {"3D.GL.HybridAffineAlpha", {0, 5}},
+    {"3D.GL.HybridAffineSampling", {0, 1}},
     {"3D.GL.WholeScene2DScaleAlgorithm", {RendererSettings::GetGLScaleAlgorithmIndex(RendererSettings::GLScaleAlgorithm::Spline36), RendererSettings::GetGLScaleAlgorithmIndex(RendererSettings::GLScaleAlgorithm::CuNNy4x32)}},
     {"3D.GL.WholeScene2DScaleFragmentationFallback", {RendererSettings::GetWholeScene2DFragmentationFallbackIndex(RendererSettings::WholeScene2DFragmentationFallback::Off), RendererSettings::GetWholeScene2DFragmentationFallbackIndex(RendererSettings::WholeScene2DFragmentationFallback::AutoCurrentForBitmap)}},
     {"3D.GL.WholeScene2DScaleFinalUpscale3DFilter", {RendererSettings::GetFinalUpscale3DDownsampleFilterIndex(RendererSettings::FinalUpscale3DDownsampleFilter::Area), RendererSettings::GetFinalUpscale3DDownsampleFilterIndex(RendererSettings::FinalUpscale3DDownsampleFilter::Tent)}},
@@ -114,8 +142,11 @@ DefaultList<bool> DefaultBools =
 {
     {"Screen.Filter", true},
     {"Screen.Sharpen", false},
+    {"Instance*.Window*.ScreenLCDGhosting", false},
     {"3D.Soft.Threaded", true},
     {"3D.GL.AdvancedVideoSettings", false},
+    {"3D.GL.WidescreenExtendWindows", true},
+    {"3D.GL.WidescreenExpandNarrowBorders", false},
     {"3D.GL.ReadableTextureCache", false},
     {"3D.GL.TextureFilterBinaryAlphaHandling", true},
     {"3D.GL.TextureFilterMipmapPremultipliedAlphaHandling", false},
@@ -131,10 +162,11 @@ DefaultList<bool> DefaultBools =
     {"3D.GL.TextureScalingNativeMipFloor", false},
     {"3D.GL.TextureScalingSourceMips", false},
     {"3D.GL.TextureScalingEdgeExtendUnusedMargins", false},
+    {"3D.GL.ReconstructCompatible3D", false},
+    {"3D.GL.ReconstructCompatible3DEdgeContext", false},
+    {"3D.GL.ReconstructCompatible3DFractionalAlpha", false},
     {"3D.GL.TextureScalingLegacyAlphaHandling", false},
     {"3D.GL.TextureScalingQualityAlphaHandling", false},
-    {"3D.GL.TextureScalingAlphaXBRZ", false},
-    {"3D.GL.TextureScalingSpline36Alpha", false},
     {"3D.GL.WholeScene2DScale", false},
     {"3D.GL.WholeScene2DScaleSourceBoundaryGuard", false},
     {"3D.GL.WholeScene2DScaleExactFinalFallback", false},
@@ -153,6 +185,13 @@ DefaultList<bool> DefaultBools =
     {"3D.GL.WholeScene2DScaleHybridNativeEffectGuard", false},
     {"3D.GL.WholeScene2DScaleHybridForeground2DBase", true},
     {"3D.GL.WholeScene2DScaleHybridCleanLegacyCandidate", true},
+    {"3D.GL.WholeScene2DScaleHybridStrictAffineHighRes", false},
+    {"3D.GL.HybridNNEDI3PremultipliedRGB", false},
+    {"3D.GL.WholeScene2DScaleHybridStrictAffineSourceEnhancement", false},
+    {"3D.GL.WholeScene2DScaleHybridStrictAffineConnectedSources", false},
+    {"3D.GL.WholeScene2DScaleHybridStrictAffineOpaqueAssemblies", false},
+    {"3D.GL.WholeScene2DScaleHybridStrictAffineTopTextBG", false},
+    {"3D.GL.WholeScene2DScaleHybridStrictAffineMaskedOBJMLAA", false},
     {"3D.GL.HiresCoordinates", true},
     {"3D.GL.MSAA", false},
     {"LimitFPS", true},
@@ -615,12 +654,27 @@ Table Table::GetTable(const std::string& path, const std::string& defpath)
 int Table::GetInt(const std::string& path)
 {
     toml::value& tval = ResolvePath(path);
+    const std::string rngkey = GetDefaultKey(PathPrefix+path);
+    if (rngkey == "3D.GL.TextureScalingAlpha" && !tval.is_integer())
+    {
+        const auto separator = path.find_last_of('.');
+        const auto& parent = separator == std::string::npos ? Data : ResolvePath(path.substr(0, separator));
+        const auto oldFlag = [&](const char* key) {
+            const auto found = parent.as_table().find(key);
+            return found != parent.as_table().end() && found->second.is_boolean() && found->second.as_boolean();
+        };
+        const auto algorithm = parent.as_table().find("TextureScalingAlgorithm");
+        const int rgb = algorithm != parent.as_table().end() && algorithm->second.is_integer()
+            ? static_cast<int>(algorithm->second.as_integer()) : 0;
+        tval = static_cast<int>(RendererSettings::MigrateTextureAlpha(
+            oldFlag("TextureScalingAlphaXBRZ"), oldFlag("TextureScalingSpline36Alpha"),
+            RendererSettings::GetGLScaleAlgorithm(rgb)));
+    }
     if (!tval.is_integer())
         tval = FindDefault(path, 0, DefaultInts);
 
     int ret = (int)tval.as_integer();
 
-    std::string rngkey = GetDefaultKey(PathPrefix+path);
     if (IntRanges.count(rngkey) != 0)
     {
         auto& range = IntRanges[rngkey];

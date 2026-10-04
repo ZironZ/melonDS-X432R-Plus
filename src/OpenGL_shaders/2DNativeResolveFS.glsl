@@ -35,6 +35,12 @@ struct sScanline
     ivec4 WinPos;
     bvec4 BGMosaicEnable;
     ivec4 MosaicSize;
+    ivec4 BGPrio;
+    bool EnableOBJ;
+    bool Enable3D;
+    int BlendCnt;
+    int BlendEffect;
+    ivec3 BlendCoef;
 };
 
 layout(std140) uniform ubScanlineConfig
@@ -45,6 +51,12 @@ layout(std140) uniform ubScanlineConfig
 smooth in vec4 fTexcoord;
 
 out vec4 oColor;
+
+ivec4 gRowBGPrio;
+bool gRowEnable3D;
+int gRowBlendCnt;
+int gRowBlendEffect;
+ivec3 gRowBlendCoef;
 
 ivec4 QuantizeColor(vec4 color)
 {
@@ -110,6 +122,12 @@ vec4 FetchDirect3D(ivec2 coord)
 void main()
 {
     ivec2 coord = ivec2(fTexcoord.zw);
+    int line = clamp(coord.y / uScaleFactor, 0, 191);
+    gRowBGPrio = uScanline[line].BGPrio;
+    gRowEnable3D = uScanline[line].Enable3D;
+    gRowBlendCnt = uScanline[line].BlendCnt;
+    gRowBlendEffect = uScanline[line].BlendEffect;
+    gRowBlendCoef = uScanline[line].BlendCoef;
 
     if (uUseForegroundOverlay)
     {
@@ -147,8 +165,8 @@ void main()
             }
         }
 
-        int direct3DPrio = uBGPrio[0];
-        bool direct3DEnabled = uEnable3D && (direct3DPrio >= 0) && bg0Allowed;
+        int direct3DPrio = gRowBGPrio[0];
+        bool direct3DEnabled = gRowEnable3D && (direct3DPrio >= 0) && bg0Allowed;
         vec4 direct3DColor = direct3DEnabled ? FetchDirect3D(coord) : vec4(0.0);
         float direct3DAlpha = clamp(direct3DColor.a, 0.0, 1.0);
         const int direct3DMask = (1 << 0);
@@ -195,8 +213,8 @@ void main()
         return;
     }
 
-    int direct3DPrio = uBGPrio[0];
-    bool direct3DEnabled = uEnable3D && (direct3DPrio >= 0) && bg0Allowed;
+    int direct3DPrio = gRowBGPrio[0];
+    bool direct3DEnabled = gRowEnable3D && (direct3DPrio >= 0) && bg0Allowed;
 
     if (direct3DEnabled)
     {
@@ -238,9 +256,9 @@ void main()
     int effect = 0;
     int eva = 0;
     int evb = 0;
-    int evy = uBlendCoef[2];
+    int evy = gRowBlendCoef[2];
 
-    if ((specialType != 0) && ((uBlendCnt & (sourceMask2 << 8)) != 0))
+    if ((specialType != 0) && ((gRowBlendCnt & (sourceMask2 << 8)) != 0))
     {
         if (specialType == 1)
         {
@@ -251,8 +269,8 @@ void main()
         else if (specialType == 2)
         {
             effect = 1;
-            eva = uBlendCoef[0];
-            evb = uBlendCoef[1];
+            eva = gRowBlendCoef[0];
+            evb = gRowBlendCoef[1];
         }
         else
         {
@@ -261,15 +279,15 @@ void main()
             evb = 16 - eva;
         }
     }
-    else if (((uBlendCnt & sourceMask1) != 0) && blendAllowed)
+    else if (((gRowBlendCnt & sourceMask1) != 0) && blendAllowed)
     {
-        effect = uBlendEffect;
+        effect = gRowBlendEffect;
         if (effect == 1)
         {
-            if ((uBlendCnt & (sourceMask2 << 8)) != 0)
+            if ((gRowBlendCnt & (sourceMask2 << 8)) != 0)
             {
-                eva = uBlendCoef[0];
-                evb = uBlendCoef[1];
+                eva = gRowBlendCoef[0];
+                evb = gRowBlendCoef[1];
             }
             else
                 effect = 0;

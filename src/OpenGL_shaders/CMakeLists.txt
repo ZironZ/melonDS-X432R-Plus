@@ -11,6 +11,13 @@ set(OPENGL_SHADER_FILES
     2DNativeUpscaleFS.glsl
     2DNativeBoundaryGuardFS.glsl
     2DNativeResolveFS.glsl
+    2DOrdinaryOBJBandPresentationFS.glsl
+    2DOrdinaryOBJSpecialCompositeFS.glsl
+    2DResolvedOBJMergeFS.glsl
+    2DStrictAffineOrdinaryOBJCompositeFS.glsl
+    2DStrictAffineMaskedOBJMaskFS.glsl
+    2DStrictAffineMaskedOBJMLAAFS.glsl
+    2DAffineOBJPresentationCompositeFS.glsl
     2DNative3DResolveFS.glsl
     2DOverlayEndpointFS.glsl
     2DOverlayBaselineCompositeFS.glsl
@@ -23,6 +30,9 @@ set(OPENGL_SHADER_FILES
     2DArtCNN_YUVAToRGBA2xFS.glsl
     2DAlphaReplaceFS.glsl
     2DMidpointAlphaFS.glsl
+    2DReconstructionAlphaFS.glsl
+    2DTransparentRGBPadFS.glsl
+    2DOpaqueOBJAssemblyFS.glsl
     2DArtCNN_C4F16_Conv0CS.glsl
     2DArtCNN_C4F16_Conv1CS.glsl
     2DArtCNN_C4F16_Conv2CS.glsl

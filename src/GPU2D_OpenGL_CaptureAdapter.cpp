@@ -1,20 +1,5 @@
-/*
-    Copyright 2026 ZironZ
-
-    This file is part of melonDS.
-
-    melonDS is free software: you can redistribute it and/or modify it under
-    the terms of the GNU General Public License as published by the Free
-    Software Foundation, either version 3 of the License, or (at your option)
-    any later version.
-
-    melonDS is distributed in the hope that it will be useful, but WITHOUT ANY
-    WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
-    FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
-
-    You should have received a copy of the GNU General Public License along
-    with melonDS. If not, see http://www.gnu.org/licenses/.
-*/
+// Copyright 2026 ZironZ
+// SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <algorithm>
 
@@ -34,15 +19,12 @@ u32 PackedMasterBrightnessEffectState(u16 masterBrightness)
 }
 
 WholeSceneCaptureEffectOwner ConsumeEffectOwnerForCaptureRequest(
-    WholeSceneCaptureRequestKind requestKind,
-    bool sourceEngineIsSub)
+    WholeSceneCaptureRequestKind requestKind)
 {
     switch (requestKind)
     {
     case WholeSceneCaptureRequestKind::CapturedLayerConsumer:
-        return sourceEngineIsSub
-            ? WholeSceneCaptureEffectOwner::SourceA
-            : WholeSceneCaptureEffectOwner::CurrentEngine;
+        return WholeSceneCaptureEffectOwner::CurrentEngine;
     case WholeSceneCaptureRequestKind::DirectFinalConsumer:
     case WholeSceneCaptureRequestKind::MainVRAMDisplayConsumer:
         return WholeSceneCaptureEffectOwner::FinalDisplay;
@@ -116,11 +98,9 @@ bool GLRenderer2D::StoreCaptureBackedRouteProduct(const CaptureBackedRouteProduc
     product.Valid = true;
     product.Identity = write.Identity;
     product.CapturedEventSerial = 0;
+    product.CapturedEventFrameSerial = 0;
     product.StableFrames = stableFrames;
     product.PresentationClass = write.PresentationClass;
-    product.HasStoredEffectState = true;
-    product.StoredMasterBrightness =
-        GPU2D.Num ? GPU.MasterBrightnessB : GPU.MasterBrightnessA;
     RecordSourceARouteProductTrace(product);
     TryStoreCaptureBackedRouteEventProduct(write.RouteSlot);
     return true;
@@ -286,6 +266,7 @@ bool GLRenderer2D::TryStoreCaptureBackedRouteEventProduct(int slot)
     }
 
     product.CapturedEventSerial = pending.CaptureEventSerial;
+    product.CapturedEventFrameSerial = pending.CaptureEventFrameSerial;
 
     glBindFramebuffer(GL_READ_FRAMEBUFFER, WholeSceneSourceABlitFB);
     glFramebufferTexture(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, CaptureBackedRouteGL[slot].ProductTex, 0);
@@ -309,10 +290,9 @@ bool GLRenderer2D::TryStoreCaptureBackedRouteEventProduct(int slot)
     eventProduct.Valid = true;
     eventProduct.Identity = product.Identity;
     eventProduct.CapturedEventSerial = pending.CaptureEventSerial;
+    eventProduct.CapturedEventFrameSerial = pending.CaptureEventFrameSerial;
     eventProduct.StableFrames = product.StableFrames;
     eventProduct.PresentationClass = product.PresentationClass;
-    eventProduct.StoredMasterBrightness = product.StoredMasterBrightness;
-    eventProduct.HasStoredEffectState = product.HasStoredEffectState;
     RecordSourceARouteProductTrace(eventProduct.Identity,
                                    eventProduct.CapturedEventSerial,
                                    eventProduct.StableFrames,
@@ -399,6 +379,7 @@ void GLRenderer2D::NoteCaptureBackedRouteProductCaptured(int slot,
     auto& pending = CaptureBackedRoute[slot].PendingEvent;
     pending.Valid = true;
     pending.CaptureEventSerial = captureEventSerial;
+    pending.CaptureEventFrameSerial = CaptureBackedHandoff.FrameSerial;
     pending.CaptureBank = captureBank;
     pending.CapturePresentationHash = capturePresentationHash;
     pending.Source3DSerial = source3DSerial;
@@ -432,8 +413,6 @@ GLRenderer2D::CaptureBackedRouteProductLookup GLRenderer2D::FindCaptureBackedRou
         lookup.CapturedEventSerial = eventProduct.CapturedEventSerial;
         lookup.StableFrames = eventProduct.StableFrames;
         lookup.PresentationClass = eventProduct.PresentationClass;
-        lookup.StoredMasterBrightness = eventProduct.StoredMasterBrightness;
-        lookup.HasStoredEffectState = eventProduct.HasStoredEffectState;
         return lookup;
     }
 
@@ -450,8 +429,6 @@ GLRenderer2D::CaptureBackedRouteProductLookup GLRenderer2D::FindCaptureBackedRou
     lookup.CapturedEventSerial = product.CapturedEventSerial;
     lookup.StableFrames = product.StableFrames;
     lookup.PresentationClass = product.PresentationClass;
-    lookup.StoredMasterBrightness = product.StoredMasterBrightness;
-    lookup.HasStoredEffectState = product.HasStoredEffectState;
     return lookup;
 }
 
@@ -483,8 +460,6 @@ GLRenderer2D::CaptureBackedRouteProductLookup GLRenderer2D::FindCaptureBackedRou
     lookup.CapturedEventSerial = product.CapturedEventSerial;
     lookup.StableFrames = product.StableFrames;
     lookup.PresentationClass = product.PresentationClass;
-    lookup.StoredMasterBrightness = product.StoredMasterBrightness;
-    lookup.HasStoredEffectState = product.HasStoredEffectState;
     return lookup;
 }
 
@@ -518,8 +493,6 @@ GLRenderer2D::CaptureBackedRouteProductLookup GLRenderer2D::FindCaptureBackedRou
     lookup.CapturedEventSerial = product.CapturedEventSerial;
     lookup.StableFrames = product.StableFrames;
     lookup.PresentationClass = product.PresentationClass;
-    lookup.StoredMasterBrightness = product.StoredMasterBrightness;
-    lookup.HasStoredEffectState = product.HasStoredEffectState;
     return lookup;
 }
 
@@ -926,6 +899,7 @@ GLRenderer2D::SourceACaptureResolution GLRenderer2D::MakeSourceARejectedResoluti
 
 GLRenderer2D::SourceACaptureResolution GLRenderer2D::MakeSourceAFullProductResolution(
     const SourceACaptureReplacementChoice& choice,
+    SourceAFullProductPresentationProof presentationProof,
     int ystart,
     int yend)
 {
@@ -943,7 +917,8 @@ GLRenderer2D::SourceACaptureResolution GLRenderer2D::MakeSourceAFullProductResol
         choice.DirectFinalBottomConsumer
             ? WholeSceneCaptureProofKind::DirectFinalPresentationMatch
             : WholeSceneCaptureProofKind::ExactCaptureEvent);
-    if (choice.AllowExactFullProductCapturePresentation)
+    if (presentationProof ==
+        SourceAFullProductPresentationProof::ExactFullEquivalentDirectFinal)
         resolution.Request.CurrentPresentationHash = choice.CapturePresentationHash;
     return resolution;
 }
@@ -1081,8 +1056,6 @@ void GLRenderer2D::RecordSourceACaptureChoiceDebug(const SourceACaptureReplaceme
     WholeSceneTrace.SourceAFullProductEventScreenSwap = choice.FullProductEventScreenSwap;
     WholeSceneTrace.SourceAFullProductEventMainFinalBottom =
         choice.FullProductEventMainFinalBottom;
-    WholeSceneTrace.SourceAPreferExactRouteProduct =
-        choice.PreferExactRouteProduct;
     WholeSceneTrace.RouteProductLookupAttempted = choice.RouteProductLookupAttempted;
     WholeSceneTrace.RouteProductLookupSuccess = choice.RouteProductLookupSuccess;
     WholeSceneTrace.RouteProductLookupResultSource = choice.RouteProductLookupResultSource;
@@ -1139,23 +1112,17 @@ void GLRenderer2D::RecordSourceABackgroundTrace(
 }
 
 void GLRenderer2D::RecordSourceACaptureProductTrace(
-    SourceACaptureReplacementMode mode,
     u64 requestBackgroundEpochSerial,
     SourceABackgroundSource effectiveBackgroundSource,
     u64 effectiveBackgroundEpochSerial,
     u32 capturePresentationHash,
-    u32 currentPresentationHash,
-    SourceAProductChoiceReason productChoice,
-    bool fullProductKeyMatch)
+    u32 currentPresentationHash)
 {
-    WholeSceneTrace.SourceACaptureMode = mode;
     RecordSourceABackgroundTrace(requestBackgroundEpochSerial,
                                  effectiveBackgroundSource,
                                  effectiveBackgroundEpochSerial,
                                  capturePresentationHash);
     WholeSceneTrace.SourceACurrentPresentationHash = currentPresentationHash;
-    WholeSceneTrace.SourceAFullProductKeyMatch = fullProductKeyMatch;
-    WholeSceneTrace.SourceAProductChoice = productChoice;
 }
 
 void GLRenderer2D::RecordSourceARouteProductTrace(const CaptureBackedRouteProductIdentity& identity,
@@ -1207,8 +1174,6 @@ GLRenderer2D::GLCaptureProductSources GLRenderer2D::SourceACaptureProductSources
     GLCaptureProductSources sources = {};
     sources.RouteProductTex = choice.RouteProductTex;
     sources.RouteProductPresentationClass = choice.RouteProductPresentationClass;
-    sources.RouteProductStoredMasterBrightness = choice.RouteProductStoredMasterBrightness;
-    sources.RouteProductHasStoredEffectState = choice.RouteProductHasStoredEffectState;
     sources.FullProductTex = choice.FullProductTex;
     sources.BackgroundTex = choice.BackgroundTex;
     return sources;
@@ -1216,15 +1181,11 @@ GLRenderer2D::GLCaptureProductSources GLRenderer2D::SourceACaptureProductSources
 
 GLRenderer2D::GLCaptureProductSources GLRenderer2D::RouteCaptureProductSources(
     GLuint routeProductTex,
-    WholeSceneCaptureProductPresentationClass presentationClass,
-    u16 storedMasterBrightness,
-    bool hasStoredEffectState)
+    WholeSceneCaptureProductPresentationClass presentationClass)
 {
     GLCaptureProductSources sources = {};
     sources.RouteProductTex = routeProductTex;
     sources.RouteProductPresentationClass = presentationClass;
-    sources.RouteProductStoredMasterBrightness = storedMasterBrightness;
-    sources.RouteProductHasStoredEffectState = hasStoredEffectState;
     return sources;
 }
 
@@ -1237,19 +1198,15 @@ GLRenderer2D::GLCaptureProductSources GLRenderer2D::FullCaptureProductSources(
 }
 
 GLRenderer2D::GLCaptureProductSources GLRenderer2D::BackgroundCaptureProductSources(
-    GLuint backgroundTex,
-    u16 storedMasterBrightness,
-    bool hasStoredEffectState)
+    GLuint backgroundTex)
 {
     GLCaptureProductSources sources = {};
     sources.BackgroundTex = backgroundTex;
     sources.Direct3DTex = backgroundTex;
-    sources.BackgroundStoredMasterBrightness = storedMasterBrightness;
-    sources.BackgroundHasStoredEffectState = hasStoredEffectState;
     return sources;
 }
 
-GLRenderer2D::GLCaptureProductResolution GLRenderer2D::ResolveCaptureProduct(
+GLRenderer2D::GLCaptureProductResolution GLRenderer2D::AssessCaptureProduct(
     const WholeSceneCapturePolicyResult& result,
     const WholeSceneCaptureRequest& request,
     const GLCaptureProductSources& sources)
@@ -1259,9 +1216,7 @@ GLRenderer2D::GLCaptureProductResolution GLRenderer2D::ResolveCaptureProduct(
     resolved.ProductKind = result.ProductRef.Kind;
     resolved.BackgroundSource = result.ProductRef.BackgroundSource;
     resolved.RenderAction = result.RenderAction;
-    resolved.PresentationClass =
-        ::melonDS::CaptureProductPresentationClassForProduct(resolved.ProductKind,
-                                                             resolved.RenderAction);
+    resolved.PresentationClass = result.PresentationClass;
 
     switch (result.ProductRef.Kind)
     {
@@ -1287,30 +1242,6 @@ GLRenderer2D::GLCaptureProductResolution GLRenderer2D::ResolveCaptureProduct(
         break;
     }
 
-    const WholeSceneCaptureEffectOwner consumeEffectOwner =
-        ConsumeEffectOwnerForCaptureRequest(request.Kind, GPU2D.Num != 0);
-    const u16 consumeMasterBrightness =
-        consumeEffectOwner == WholeSceneCaptureEffectOwner::SourceA
-            ? GPU.MasterBrightnessA
-            : (GPU2D.Num ? GPU.MasterBrightnessB : GPU.MasterBrightnessA);
-    const bool routeProductSelected =
-        resolved.ProductKind == WholeSceneCaptureProductKind::RouteProduct ||
-        resolved.ProductKind == WholeSceneCaptureProductKind::RouteEventProduct ||
-        resolved.ProductKind == WholeSceneCaptureProductKind::RouteStateProduct;
-    const bool backgroundProductSelected =
-        resolved.ProductKind == WholeSceneCaptureProductKind::BackgroundProduct;
-    const u16 storedMasterBrightness =
-        routeProductSelected
-            ? sources.RouteProductStoredMasterBrightness
-            : (backgroundProductSelected
-                   ? sources.BackgroundStoredMasterBrightness
-                   : 0);
-    const bool hasStoredEffectState =
-        routeProductSelected
-            ? sources.RouteProductHasStoredEffectState
-            : (backgroundProductSelected &&
-               sources.BackgroundHasStoredEffectState);
-
     WholeSceneCaptureProductUseInputs useInputs = {};
     useInputs.PolicyAccepted = result.Accepted;
     useInputs.HasTexture = resolved.Tex != 0;
@@ -1321,79 +1252,16 @@ GLRenderer2D::GLCaptureProductResolution GLRenderer2D::ResolveCaptureProduct(
     useInputs.PresentationClass = resolved.PresentationClass;
     useInputs.ProductPresentationHash = request.CapturePresentationHash;
     useInputs.RequestPresentationHash = request.CurrentPresentationHash;
-    useInputs.HasStoredEffectState = hasStoredEffectState;
-    useInputs.StoredEffectActive =
-        IsMasterBrightnessEffectActive(storedMasterBrightness);
-    useInputs.ConsumeEffectActive =
-        IsMasterBrightnessEffectActive(consumeMasterBrightness);
+    useInputs.RequestYStart = request.YStart;
+    useInputs.RequestYEnd = request.YEnd;
+    useInputs.ProductYStart = sources.ValidYStart;
+    useInputs.ProductYEnd = sources.ValidYEnd;
     const WholeSceneCaptureProductUseDecision useDecision =
         CanUseWholeSceneCaptureProduct(useInputs);
     resolved.Accepted = useDecision.Accepted;
-    resolved.PresentationCompatible = useDecision.PresentationCompatible;
-    resolved.RequiresRePresentation = useDecision.RequiresRePresentation;
-
-    const bool presentationHashMatch =
-        DoesCaptureProductPresentationMatchRequest(request.CapturePresentationHash,
-                                                   request.CurrentPresentationHash);
-    const bool applySourceAEffect =
-        ShouldApplySourceAReplacementPresentationEffect(resolved.PresentationClass,
-                                                       request.Kind,
-                                                       GPU2D.Num != 0);
-    const bool applyHandoffEffect =
-        ShouldApplyHandoffPresentationEffect(resolved.PresentationClass,
-                                            request.Kind);
-    const bool applyEffectOnBlit = resolved.Accepted &&
-                                   (applySourceAEffect || applyHandoffEffect);
-
-    WholeSceneCaptureEffectAction effectAction = WholeSceneCaptureEffectAction::None;
-    if (!resolved.Accepted)
-    {
-        effectAction = result.Accepted
-            ? WholeSceneCaptureEffectAction::Reject
-            : WholeSceneCaptureEffectAction::Fallback;
-    }
-    else if (resolved.RenderAction == WholeSceneCaptureRenderAction::CompositeCurrentOverlay)
-    {
-        effectAction = WholeSceneCaptureEffectAction::CompositeCurrentOverlay;
-    }
-    else if (applyEffectOnBlit)
-    {
-        effectAction = WholeSceneCaptureEffectAction::ApplyOnBlit;
-    }
-    else if (resolved.RequiresRePresentation)
-    {
-        effectAction = WholeSceneCaptureEffectAction::NeedsRePresentation;
-    }
-    else
-    {
-        effectAction = WholeSceneCaptureEffectAction::DisplayAsIs;
-    }
-
-    WholeSceneTrace.CaptureProductUseAccepted = resolved.Accepted;
-    WholeSceneTrace.CaptureProductUsePresentationCompatible =
-        useDecision.PresentationCompatible;
-    WholeSceneTrace.CaptureProductPresentationHashMatch = presentationHashMatch;
-    WholeSceneTrace.CaptureProductStoredEffectOwner =
-        static_cast<u32>(resolved.PresentationClass ==
-                             WholeSceneCaptureProductPresentationClass::AlreadyPresented
-                         ? WholeSceneCaptureEffectOwner::CapturedPresentation
-                         : WholeSceneCaptureEffectOwner::None);
-    WholeSceneTrace.CaptureProductStoredEffectState =
-        useInputs.HasStoredEffectState
-            ? PackedMasterBrightnessEffectState(storedMasterBrightness)
-            : 0;
-    WholeSceneTrace.CaptureProductEffectPhaseIncompatible =
-        useDecision.EffectPhaseIncompatible;
-    WholeSceneTrace.CaptureProductConsumeEffectOwner =
-        static_cast<u32>(consumeEffectOwner);
-    WholeSceneTrace.CaptureProductConsumeEffectState =
-        PackedMasterBrightnessEffectState(consumeMasterBrightness);
-    WholeSceneTrace.CaptureProductEffectAction = static_cast<u32>(effectAction);
-    WholeSceneTrace.CaptureProductFinalPassEffectOwner =
-        static_cast<u32>(applyEffectOnBlit
-                         ? WholeSceneCaptureEffectOwner::None
-                         : consumeEffectOwner);
-    WholeSceneTrace.CaptureProductApplyEffectOnBlit = applyEffectOnBlit;
+    resolved.RowScopeCompatible = useDecision.RowScopeCompatible;
+    resolved.ValidYStart = sources.ValidYStart;
+    resolved.ValidYEnd = sources.ValidYEnd;
 
     return resolved;
 }
@@ -1413,6 +1281,9 @@ void GLRenderer2D::RecordChosenCaptureProductTrace(
     WholeSceneTrace.SourceAChosenProductKind = static_cast<u32>(product.ProductKind);
     WholeSceneTrace.SourceAChosenProductRenderAction = static_cast<u32>(product.RenderAction);
     WholeSceneTrace.SourceAChosenProductPresentationClass = static_cast<u32>(product.PresentationClass);
+    WholeSceneTrace.CaptureProductRowScopeCompatible = product.RowScopeCompatible;
+    WholeSceneTrace.CaptureProductValidYStart = product.ValidYStart;
+    WholeSceneTrace.CaptureProductValidYEnd = product.ValidYEnd;
 }
 
 GLRenderer2D::HandoffBackgroundChoice GLRenderer2D::MakeHandoffSnapshotBackgroundChoice(
@@ -1459,12 +1330,6 @@ GLRenderer2D::HandoffBackgroundChoice GLRenderer2D::UseActiveEpochHandoffBackgro
                                          source3DSerial,
                                          source3DSceneHash,
                                          presentationHash);
-    if (handoffSlot >= 0 && handoffSlot < 2)
-    {
-        const auto& epoch = Parent.ActiveCaptureBackgroundEpoch[handoffSlot];
-        background.StoredMasterBrightness = epoch.StoredMasterBrightness;
-        background.HasStoredEffectState = epoch.HasStoredEffectState;
-    }
     CaptureBackedHandoff.ReuseDecision = CaptureBackedHandoffReuseReason::UsedCaptureEventBackground;
     UpdateCaptureBackedRoutePresentation(handoffSlot,
                                          CaptureBackedRoutePresentationMode::BackgroundCurrentOverlay,
@@ -1475,119 +1340,111 @@ GLRenderer2D::HandoffBackgroundChoice GLRenderer2D::UseActiveEpochHandoffBackgro
     return background;
 }
 
-GLRenderer2D::GLCaptureProductResolution GLRenderer2D::RecordSourceARouteProductChoiceTrace(
+GLRenderer2D::SourceACaptureProductAssessment
+GLRenderer2D::AssessSourceACaptureProduct(
     const SourceACaptureReplacementChoice& choice,
+    const SourceACaptureSelectionDecision& selection,
+    SourceACaptureResolutionKind kind,
     int ystart,
     int yend)
 {
-    ResetWholeSceneRenderTrace();
-    RecordWholeSceneRenderTrace(WholeSceneRenderPath::SourceACaptureReplacement, ystart, yend,
-                                ScaleFactor > 1, false, false, choice.RouteProductTex);
-    RecordSourceACaptureProductTrace(SourceACaptureReplacementMode::CurrentOverlay,
-                                     choice.BackgroundEpochSerial,
-                                     SourceABackgroundSource::RouteProduct,
-                                     choice.BackgroundEpochSerial,
-                                     choice.CapturePresentationHash,
-                                     choice.CurrentPresentationHash,
-                                     choice.PreferExactRouteProduct
-                                         ? SourceAProductChoiceReason::UsedExactRouteProductSameEvent
-                                         : SourceAProductChoiceReason::ReusedPreviousRouteProduct,
-                                     choice.FullProductKeyMatch);
-    RecordSourceARouteProductTrace(choice);
-    const SourceACaptureResolution resolution =
-        MakeSourceARouteProductResolution(choice, ystart, yend);
-    RecordSourceACaptureResolution(resolution);
-    RecordSourceACaptureChoiceDebug(choice);
-    const GLCaptureProductResolution product =
-        ResolveCaptureProduct(resolution.Result,
-                              resolution.Request,
-                              SourceACaptureProductSources(choice));
-    RecordChosenCaptureProductTrace(product,
-                                    {choice.CaptureBank,
-                                     choice.RouteProductBackgroundEpochSerial,
-                                     choice.RouteProductSource3DSerial,
-                                     choice.RouteProductSource3DSceneHash,
-                                     choice.RouteProductCapturedEventSerial,
-                                     choice.RouteProductCapturePresentationHash,
-                                     choice.RouteProductCurrentPresentationHash});
-    return product;
+    SourceACaptureProductAssessment assessment = {};
+    switch (kind)
+    {
+    case SourceACaptureResolutionKind::RouteProduct:
+        assessment.Resolution =
+            MakeSourceARouteProductResolution(choice, ystart, yend);
+        assessment.TraceIdentity =
+            {choice.CaptureBank,
+             choice.RouteProductBackgroundEpochSerial,
+             choice.RouteProductSource3DSerial,
+             choice.RouteProductSource3DSceneHash,
+             choice.RouteProductCapturedEventSerial,
+             choice.RouteProductCapturePresentationHash,
+             choice.RouteProductCurrentPresentationHash};
+        break;
+    case SourceACaptureResolutionKind::BackgroundOverlay:
+        assessment.Resolution =
+            MakeSourceABackgroundOverlayResolution(choice, ystart, yend);
+        assessment.TraceIdentity =
+            {choice.CaptureBank,
+             choice.BackgroundEpochSerial,
+             choice.BackgroundSource3DSerial,
+             choice.BackgroundSource3DSceneHash,
+             choice.FullProductEventSerial,
+             choice.CapturePresentationHash,
+             choice.CurrentPresentationHash};
+        break;
+    case SourceACaptureResolutionKind::FullProduct:
+        assessment.Resolution = MakeSourceAFullProductResolution(
+            choice,
+            selection.FullProductPresentationProof,
+            ystart,
+            yend);
+        assessment.TraceIdentity =
+            {choice.FullProductCaptureBank,
+             choice.BackgroundEpochSerial,
+             choice.FullProductEventSource3DSerial,
+             choice.FullProductEventSource3DSceneHash,
+             choice.FullProductEventSerial,
+             choice.FullProductEventSourcePresentationHash,
+             assessment.Resolution.Request.CurrentPresentationHash};
+        break;
+    case SourceACaptureResolutionKind::RejectedFallback:
+    case SourceACaptureResolutionKind::None:
+        assessment.Resolution =
+            MakeSourceARejectedResolution(choice, ystart, yend);
+        break;
+    }
+
+    assessment.Product =
+        AssessCaptureProduct(assessment.Resolution.Result,
+                             assessment.Resolution.Request,
+                             SourceACaptureProductSources(choice));
+    return assessment;
 }
 
-GLRenderer2D::GLCaptureProductResolution GLRenderer2D::RecordSourceABackgroundOverlayChoiceTrace(
+void GLRenderer2D::RecordSourceACaptureProductAssessmentTrace(
     const SourceACaptureReplacementChoice& choice,
+    const SourceACaptureProductAssessment& assessment,
     int ystart,
     int yend)
 {
-    ResetWholeSceneRenderTrace();
-    RecordWholeSceneRenderTrace(WholeSceneRenderPath::SourceACaptureReplacement, ystart, yend,
-                                ScaleFactor > 1, false, ScaleFactor > 1, choice.BackgroundTex);
-    RecordSourceACaptureProductTrace(SourceACaptureReplacementMode::None,
-                                     choice.BackgroundEpochSerial,
-                                     SourceABackgroundSource::CaptureEventBackgroundTex,
-                                     choice.BackgroundEpochSerial,
-                                     choice.CapturePresentationHash,
-                                     choice.CurrentPresentationHash,
-                                     SourceAProductChoiceReason::UsedBackgroundUnderlayCurrentOverlay,
-                                     choice.FullProductKeyMatch);
-    const SourceACaptureResolution resolution =
-        MakeSourceABackgroundOverlayResolution(choice, ystart, yend);
-    RecordSourceACaptureResolution(resolution);
-    RecordSourceACaptureChoiceDebug(choice);
-    const GLCaptureProductResolution product =
-        ResolveCaptureProduct(resolution.Result,
-                              resolution.Request,
-                              SourceACaptureProductSources(choice));
-    RecordChosenCaptureProductTrace(product,
-                                    {choice.CaptureBank,
-                                     choice.BackgroundEpochSerial,
-                                     choice.BackgroundSource3DSerial,
-                                     choice.BackgroundSource3DSceneHash,
-                                     choice.FullProductEventSerial,
-                                     choice.CapturePresentationHash,
-                                     choice.CurrentPresentationHash});
-    return product;
-}
+    const WholeSceneCaptureProductKind kind =
+        assessment.Resolution.Result.ProductRef.Kind;
+    const bool backgroundOverlay =
+        kind == WholeSceneCaptureProductKind::BackgroundProduct;
+    const GLuint traceTex = assessment.Product.Tex;
+    SourceABackgroundSource backgroundSource =
+        SourceABackgroundSource::FullCaptureProduct;
+    if (backgroundOverlay)
+        backgroundSource = SourceABackgroundSource::CaptureEventBackgroundTex;
+    else if (kind == WholeSceneCaptureProductKind::RouteProduct ||
+             kind == WholeSceneCaptureProductKind::RouteEventProduct ||
+             kind == WholeSceneCaptureProductKind::RouteStateProduct)
+        backgroundSource = SourceABackgroundSource::RouteProduct;
 
-GLRenderer2D::GLCaptureProductResolution GLRenderer2D::RecordSourceAFullProductChoiceTrace(
-    const SourceACaptureReplacementChoice& choice,
-    int ystart,
-    int yend)
-{
     ResetWholeSceneRenderTrace();
-    RecordWholeSceneRenderTrace(WholeSceneRenderPath::SourceACaptureReplacement, ystart, yend,
-                                ScaleFactor > 1, false, false, choice.FullProductTex);
+    RecordWholeSceneRenderTrace(WholeSceneRenderPath::SourceACaptureReplacement,
+                                ystart,
+                                yend,
+                                ScaleFactor > 1,
+                                false,
+                                backgroundOverlay && ScaleFactor > 1,
+                                traceTex);
     RecordSourceACaptureProductTrace(
-        choice.SubEngineCapturedSourceAOnly
-            ? SourceACaptureReplacementMode::FullProductAfterOverlayFailed
-            : SourceACaptureReplacementMode::FullProduct,
         choice.BackgroundEpochSerial,
-        SourceABackgroundSource::FullCaptureProduct,
+        backgroundSource,
         choice.BackgroundEpochSerial,
-        choice.CapturePresentationHash,
-        choice.AllowExactFullProductCapturePresentation
-            ? choice.CapturePresentationHash
-            : choice.CurrentPresentationHash,
-        choice.SubEngineCapturedSourceAOnly
-            ? SourceAProductChoiceReason::UsedFullProductNoOverlayVisible
-            : SourceAProductChoiceReason::UsedFullProductKeyMatch,
-        choice.FullProductKeyMatch);
-    const SourceACaptureResolution resolution =
-        MakeSourceAFullProductResolution(choice, ystart, yend);
-    RecordSourceACaptureResolution(resolution);
+        assessment.Resolution.Request.CapturePresentationHash,
+        assessment.Resolution.Request.CurrentPresentationHash);
+    if (backgroundSource == SourceABackgroundSource::RouteProduct)
+        RecordSourceARouteProductTrace(choice);
+    RecordSourceACaptureResolution(assessment.Resolution);
     RecordSourceACaptureChoiceDebug(choice);
-    const GLCaptureProductResolution product =
-        ResolveCaptureProduct(resolution.Result,
-                              resolution.Request,
-                              SourceACaptureProductSources(choice));
-    RecordChosenCaptureProductTrace(product,
-                                    {choice.FullProductCaptureBank,
-                                     choice.BackgroundEpochSerial,
-                                     choice.FullProductEventSource3DSerial,
-                                     choice.FullProductEventSource3DSceneHash,
-                                     choice.FullProductEventSerial,
-                                     choice.FullProductEventSourcePresentationHash,
-                                     resolution.Request.CurrentPresentationHash});
-    return product;
+    WholeSceneTrace.CaptureProductUseAccepted = assessment.Product.Accepted;
+    RecordChosenCaptureProductTrace(assessment.Product,
+                                    assessment.TraceIdentity);
 }
 
 void GLRenderer2D::RecordSourceARejectedChoiceTrace(
@@ -1599,13 +1456,14 @@ void GLRenderer2D::RecordSourceARejectedChoiceTrace(
     RecordSourceACaptureChoiceDebug(choice);
 }
 
-GLRenderer2D::HandoffBackgroundResolveResult GLRenderer2D::ResolveCapturedHandoffBackgroundChoice(
+GLRenderer2D::PreparedCaptureBackedExecution
+GLRenderer2D::PrepareCapturedHandoffExecution(
     const WholeSceneCaptureRequest& request,
     int handoffSlot,
     int ystart,
     int yend)
 {
-    HandoffBackgroundResolveResult result = {};
+    HandoffBackgroundChoice background = {};
 
     if (CaptureBackedHandoff.CurrentKey.Phase == CaptureBackedHandoffPhase::CapturedBitmap)
         MarkCaptureBackedRouteCapturedPhase(handoffSlot);
@@ -1692,7 +1550,7 @@ GLRenderer2D::HandoffBackgroundResolveResult GLRenderer2D::ResolveCapturedHandof
 
         if (useRouteBackgroundOverlay)
         {
-            result.Background = UseActiveEpochHandoffBackground(handoffSlot,
+            background = UseActiveEpochHandoffBackground(handoffSlot,
                                                                 epoch.Serial,
                                                                 epoch.CaptureBank,
                                                                 epoch.Source3DSerial,
@@ -1718,71 +1576,67 @@ GLRenderer2D::HandoffBackgroundResolveResult GLRenderer2D::ResolveCapturedHandof
             const GLuint routeProductTex = routeProduct.Tex;
             if (routeProductTex)
             {
-                const GLCaptureProductResolution product =
-                    RecordHandoffRouteProductTrace(request,
-                                                   routeProduct,
-                                                   routeProductTex,
-                                                   epoch.CaptureBank,
-                                                   visibleEvent->Serial,
-                                                   epoch.Serial,
-                                                   visibleEvent->SourcePresentationHash,
-                                                   currentPresentationHash,
-                                                   ystart,
-                                                   yend);
-                if (product.Accepted)
+                const HandoffCaptureProductAssessment assessment =
+                    AssessHandoffRouteProduct(
+                        request,
+                        routeProduct,
+                        routeProductTex,
+                        epoch.CaptureBank,
+                        visibleEvent->Serial,
+                        epoch.Serial,
+                        visibleEvent->SourcePresentationHash,
+                        currentPresentationHash);
+                if (assessment.Product.Accepted)
                 {
-                    CaptureBackedHandoff.ReuseDecision =
-                        CaptureBackedHandoffReuseReason::UsedCaptureEventBackground;
-                    UpdateCaptureBackedRoutePresentation(handoffSlot,
-                                                         CaptureBackedRoutePresentationMode::BackgroundCurrentOverlay,
-                                                         epoch.Serial,
-                                                         epoch.CaptureBank,
-                                                         epoch.Source3DSceneHash,
-                                                         visibleEvent->SourcePresentationHash,
-                                                         currentPresentationHash);
-
-                    BlitWholeSceneHandoffProduct(product, ystart, yend);
-                    result.Finished = true;
-                    return result;
+                    return HandoffDirectProductExecution{
+                        assessment,
+                        handoffSlot,
+                        CaptureBackedRoutePresentationMode::
+                            BackgroundCurrentOverlay,
+                        CaptureBackedHandoffReuseReason::
+                            UsedCaptureEventBackground,
+                        epoch.Serial,
+                        epoch.CaptureBank,
+                        epoch.Source3DSceneHash,
+                        visibleEvent->SourcePresentationHash,
+                        currentPresentationHash};
                 }
             }
 
             const GLuint fullProductTex = VisibleHighResCaptureFullTex();
             if (fullProductTex)
             {
-                const GLCaptureProductResolution product =
-                    RecordHandoffFullProductTrace(request,
-                                                  fullProductTex,
-                                                  epoch.CaptureBank,
-                                                  visibleEvent->Serial,
-                                                  epoch.Serial,
-                                                  visibleEvent->SourcePresentationHash,
-                                                  currentPresentationHash,
-                                                  ystart,
-                                                  yend);
-                if (product.Accepted)
+                const HandoffCaptureProductAssessment assessment =
+                    AssessHandoffFullProduct(
+                        request,
+                        fullProductTex,
+                        epoch.CaptureBank,
+                        visibleEvent->Serial,
+                        epoch.Serial,
+                        visibleEvent->SourcePresentationHash,
+                        currentPresentationHash);
+                if (assessment.Product.Accepted)
                 {
-                    CaptureBackedHandoff.ReuseDecision =
-                        CaptureBackedHandoffReuseReason::UsedCaptureEventFullProduct;
-                    UpdateCaptureBackedRoutePresentation(handoffSlot,
-                                                         CaptureBackedRoutePresentationMode::FullProduct,
-                                                         epoch.Serial,
-                                                         epoch.CaptureBank,
-                                                         epoch.Source3DSceneHash,
-                                                         visibleEvent->SourcePresentationHash);
-
-                    BlitWholeSceneHandoffProduct(product, ystart, yend);
-                    result.Finished = true;
-                    return result;
+                    return HandoffDirectProductExecution{
+                        assessment,
+                        handoffSlot,
+                        CaptureBackedRoutePresentationMode::FullProduct,
+                        CaptureBackedHandoffReuseReason::
+                            UsedCaptureEventFullProduct,
+                        epoch.Serial,
+                        epoch.CaptureBank,
+                        epoch.Source3DSceneHash,
+                        visibleEvent->SourcePresentationHash,
+                        0};
                 }
             }
         }
 
-        if (!result.Background.Tex)
+        if (!background.Tex)
         {
             if (recentEpochForVisibleBank && !capturedBitmapUpdatedThisFrame)
             {
-                result.Background = UseActiveEpochHandoffBackground(handoffSlot,
+                background = UseActiveEpochHandoffBackground(handoffSlot,
                                                                     epoch.Serial,
                                                                     epoch.CaptureBank,
                                                                     epoch.Source3DSerial,
@@ -1792,7 +1646,7 @@ GLRenderer2D::HandoffBackgroundResolveResult GLRenderer2D::ResolveCapturedHandof
             else if (CanReuseCaptureBackedHandoffSnapshot(CaptureBackedHandoff.CurrentKey, handoffSlot, reason))
             {
                 CaptureBackedHandoff.ReuseDecision = reason;
-                result.Background =
+                background =
                     MakeHandoffSnapshotBackgroundChoice(CaptureBackedRouteGL[handoffSlot].Handoff3DTex);
                 UpdateCaptureBackedRoutePresentation(handoffSlot,
                                                      CaptureBackedRoutePresentationMode::HandoffSnapshot,
@@ -1807,19 +1661,17 @@ GLRenderer2D::HandoffBackgroundResolveResult GLRenderer2D::ResolveCapturedHandof
                 u32 presentationHash = 0;
                 if (visibleCaptureBank >= 0 && visibleCaptureBank < 4)
                     presentationHash = Parent.HighResDisplayCapture256Event[visibleCaptureBank].SourcePresentationHash;
-                result.Background =
+                background =
                     MakeCaptureEventBackgroundChoice(VisibleHighResCaptureBackgroundTex(),
                                                      SourceABackgroundSource::CaptureEventBackgroundTex,
                                                      0,
                                                      0,
                                                      0,
                                                      presentationHash);
-                if (!result.Background.Tex)
+                if (!background.Tex)
                 {
                     CaptureBackedHandoff.ReuseDecision = reason;
-                    RenderScreenWholeSceneCaptureBackedHybridFallback(ystart, yend);
-                    result.Finished = true;
-                    return result;
+                    return CaptureBackedOverlayFallbackExecution{true};
                 }
 
                 CaptureBackedHandoff.ReuseDecision = CaptureBackedHandoffReuseReason::UsedCaptureEventBackground;
@@ -1832,23 +1684,54 @@ GLRenderer2D::HandoffBackgroundResolveResult GLRenderer2D::ResolveCapturedHandof
         if (CanReuseCaptureBackedHandoffSnapshot(CaptureBackedHandoff.CurrentKey, handoffSlot, reason))
         {
             CaptureBackedHandoff.ReuseDecision = reason;
-            result.Background =
+            background =
                 MakeHandoffSnapshotBackgroundChoice(CaptureBackedRouteGL[handoffSlot].Handoff3DTex);
         }
         else
         {
             CaptureBackedHandoff.ReuseDecision = reason;
-            RenderScreenWholeSceneCaptureBackedHybridFallback(ystart, yend);
-            result.Finished = true;
-            return result;
+            return CaptureBackedOverlayFallbackExecution{true};
         }
     }
 
-    return result;
+    return PrepareHandoffBackgroundExecution(request,
+                                             handoffSlot,
+                                             background);
+}
+
+GLRenderer2D::PreparedCaptureBackedExecution
+GLRenderer2D::PrepareHandoffBackgroundExecution(
+    const WholeSceneCaptureRequest& request,
+    int handoffSlot,
+    const HandoffBackgroundChoice& background)
+{
+    if (background.Authority ==
+            WholeSceneCaptureAuthority::CaptureEventBackground &&
+        background.Tex)
+    {
+        const u32 currentPresentationHash = CapturePresentationHash();
+        HandoffCaptureProductAssessment assessment =
+            AssessHandoffBackgroundOverlayProduct(
+                request,
+                background.Source,
+                background.Authority,
+                background.Tex,
+                background.BackgroundEpochSerial,
+                background.PresentationHash,
+                currentPresentationHash);
+        if (assessment.Product.Accepted)
+        {
+            return HandoffBackgroundOverlayExecution{
+                request, background, assessment, handoffSlot};
+        }
+    }
+
+    return HandoffHybridCompositeExecution{request, background};
 }
 
 
-GLRenderer2D::GLCaptureProductResolution GLRenderer2D::RecordHandoffRouteProductTrace(
+GLRenderer2D::HandoffCaptureProductAssessment
+GLRenderer2D::AssessHandoffRouteProduct(
     const WholeSceneCaptureRequest& baseRequest,
     const CaptureBackedRouteProductLookup& routeProduct,
     GLuint routeProductTex,
@@ -1856,24 +1739,11 @@ GLRenderer2D::GLCaptureProductResolution GLRenderer2D::RecordHandoffRouteProduct
     u64 captureEventSerial,
     u64 backgroundEpochSerial,
     u32 capturePresentationHash,
-    u32 currentPresentationHash,
-    int ystart,
-    int yend)
+    u32 currentPresentationHash)
 {
-    RecordWholeSceneRenderTrace(WholeSceneRenderPath::CaptureBackedHandoff, ystart, yend,
-                                ScaleFactor > 1, false, false, routeProductTex);
-    RecordSourceACaptureProductTrace(SourceACaptureReplacementMode::CurrentOverlay,
-                                     backgroundEpochSerial,
-                                     SourceABackgroundSource::RouteProduct,
-                                     backgroundEpochSerial,
-                                     capturePresentationHash,
-                                     currentPresentationHash,
-                                     SourceAProductChoiceReason::ReusedPreviousRouteProduct);
-    RecordSourceARouteProductTrace(routeProduct.Identity,
-                                   routeProduct.CapturedEventSerial,
-                                   routeProduct.StableFrames,
-                                   routeProduct.PresentationClass);
-    const HandoffCaptureResolution resolution =
+    HandoffCaptureProductAssessment assessment = {};
+    assessment.RouteProduct = routeProduct;
+    assessment.Resolution =
         MakeHandoffRouteProductResolution(baseRequest,
                                           routeProduct,
                                           captureBank,
@@ -1881,115 +1751,125 @@ GLRenderer2D::GLCaptureProductResolution GLRenderer2D::RecordHandoffRouteProduct
                                           backgroundEpochSerial,
                                           capturePresentationHash,
                                           currentPresentationHash);
-    RecordHandoffCaptureResolution(resolution);
-    const GLCaptureProductResolution product =
-        ResolveCaptureProduct(resolution.Result,
-                              resolution.Request,
-                              RouteCaptureProductSources(routeProductTex,
-                                                         routeProduct.PresentationClass,
-                                                         routeProduct.StoredMasterBrightness,
-                                                         routeProduct.HasStoredEffectState));
-    RecordChosenCaptureProductTrace(product,
-                                    {static_cast<int>(captureBank),
-                                     routeProduct.Identity.BackgroundEpochSerial,
-                                     routeProduct.Identity.Source3DSerial,
-                                     routeProduct.Identity.Source3DSceneHash,
-                                     captureEventSerial,
-                                     capturePresentationHash,
-                                     currentPresentationHash});
-    return product;
+    assessment.Product = AssessCaptureProduct(
+        assessment.Resolution.Result,
+        assessment.Resolution.Request,
+        RouteCaptureProductSources(routeProductTex,
+                                   routeProduct.PresentationClass));
+    assessment.TraceIdentity =
+        {static_cast<int>(captureBank),
+         routeProduct.Identity.BackgroundEpochSerial,
+         routeProduct.Identity.Source3DSerial,
+         routeProduct.Identity.Source3DSceneHash,
+         captureEventSerial,
+         capturePresentationHash,
+         currentPresentationHash};
+    return assessment;
 }
 
-GLRenderer2D::GLCaptureProductResolution GLRenderer2D::RecordHandoffFullProductTrace(
+GLRenderer2D::HandoffCaptureProductAssessment
+GLRenderer2D::AssessHandoffFullProduct(
     const WholeSceneCaptureRequest& baseRequest,
     GLuint fullProductTex,
     u32 captureBank,
     u64 captureEventSerial,
     u64 backgroundEpochSerial,
     u32 capturePresentationHash,
-    u32 currentPresentationHash,
-    int ystart,
-    int yend)
+    u32 currentPresentationHash)
 {
-    RecordWholeSceneRenderTrace(WholeSceneRenderPath::CaptureBackedHandoff, ystart, yend,
-                                ScaleFactor > 1, false, false, fullProductTex);
-    RecordSourceACaptureProductTrace(SourceACaptureReplacementMode::FullProduct,
-                                     backgroundEpochSerial,
-                                     SourceABackgroundSource::FullCaptureProduct,
-                                     backgroundEpochSerial,
-                                     capturePresentationHash,
-                                     currentPresentationHash,
-                                     SourceAProductChoiceReason::UsedFullProductRouteBridge);
-    const HandoffCaptureResolution resolution =
+    HandoffCaptureProductAssessment assessment = {};
+    assessment.Resolution =
         MakeHandoffFullProductResolution(baseRequest,
                                          captureBank,
                                          captureEventSerial,
                                          backgroundEpochSerial,
                                          capturePresentationHash,
                                          currentPresentationHash);
-    RecordHandoffCaptureResolution(resolution);
-    const GLCaptureProductResolution product =
-        ResolveCaptureProduct(resolution.Result,
-                              resolution.Request,
-                              FullCaptureProductSources(fullProductTex));
-    RecordChosenCaptureProductTrace(product,
-                                    {static_cast<int>(captureBank),
-                                     backgroundEpochSerial,
-                                     0,
-                                     0,
-                                     captureEventSerial,
-                                     capturePresentationHash,
-                                     currentPresentationHash});
-    return product;
+    assessment.Product = AssessCaptureProduct(
+        assessment.Resolution.Result,
+        assessment.Resolution.Request,
+        FullCaptureProductSources(fullProductTex));
+    assessment.TraceIdentity =
+        {static_cast<int>(captureBank),
+         backgroundEpochSerial,
+         0,
+         0,
+         captureEventSerial,
+         capturePresentationHash,
+         currentPresentationHash};
+    return assessment;
 }
 
-GLRenderer2D::GLCaptureProductResolution GLRenderer2D::RecordHandoffBackgroundOverlayTrace(
+GLRenderer2D::HandoffCaptureProductAssessment
+GLRenderer2D::AssessHandoffBackgroundOverlayProduct(
     const WholeSceneCaptureRequest& baseRequest,
     SourceABackgroundSource backgroundSource,
     WholeSceneCaptureAuthority authority,
     GLuint backgroundTex,
     u64 backgroundEpochSerial,
     u32 capturePresentationHash,
-    u32 currentPresentationHash,
-    u16 storedMasterBrightness,
-    bool hasStoredEffectState,
-    int ystart,
-    int yend)
+    u32 currentPresentationHash)
 {
-    RecordWholeSceneRenderTrace(WholeSceneRenderPath::CaptureBackedHandoff, ystart, yend,
-                                ScaleFactor > 1, false, ScaleFactor > 1, backgroundTex);
-    RecordSourceACaptureProductTrace(SourceACaptureReplacementMode::CurrentOverlay,
-                                     backgroundEpochSerial,
-                                     backgroundSource,
-                                     backgroundEpochSerial,
-                                     capturePresentationHash,
-                                     currentPresentationHash,
-                                     SourceAProductChoiceReason::UsedBackgroundUnderlayCurrentOverlay);
-    const HandoffCaptureResolution resolution =
+    HandoffCaptureProductAssessment assessment = {};
+    assessment.Resolution =
         MakeHandoffBackgroundOverlayResolution(baseRequest,
                                                backgroundSource,
                                                authority,
                                                backgroundEpochSerial,
                                                capturePresentationHash,
                                                currentPresentationHash);
-    RecordHandoffCaptureResolution(resolution);
-    const GLCaptureProductResolution product =
-        ResolveCaptureProduct(resolution.Result,
-                              resolution.Request,
-                              BackgroundCaptureProductSources(backgroundTex,
-                                                             storedMasterBrightness,
-                                                             hasStoredEffectState));
-    RecordChosenCaptureProductTrace(product,
-                                    {baseRequest.CaptureBank < 4
-                                         ? static_cast<int>(baseRequest.CaptureBank)
-                                         : -1,
-                                     backgroundEpochSerial,
-                                     0,
-                                     0,
-                                     baseRequest.CaptureEventSerial,
-                                     capturePresentationHash,
-                                     currentPresentationHash});
-    return product;
+    assessment.Product = AssessCaptureProduct(
+        assessment.Resolution.Result,
+        assessment.Resolution.Request,
+        BackgroundCaptureProductSources(backgroundTex));
+    assessment.TraceIdentity =
+        {baseRequest.CaptureBank < 4
+             ? static_cast<int>(baseRequest.CaptureBank)
+             : -1,
+         backgroundEpochSerial,
+         0,
+         0,
+         baseRequest.CaptureEventSerial,
+         capturePresentationHash,
+         currentPresentationHash};
+    return assessment;
+}
+
+void GLRenderer2D::RecordHandoffCaptureProductAssessmentTrace(
+    const HandoffCaptureProductAssessment& assessment,
+    int ystart,
+    int yend)
+{
+    const auto& request = assessment.Resolution.Request;
+    const auto& result = assessment.Resolution.Result;
+    const bool backgroundOverlay =
+        result.ProductRef.Kind ==
+        WholeSceneCaptureProductKind::BackgroundProduct;
+    RecordWholeSceneRenderTrace(WholeSceneRenderPath::CaptureBackedHandoff,
+                                ystart,
+                                yend,
+                                ScaleFactor > 1,
+                                false,
+                                backgroundOverlay && ScaleFactor > 1,
+                                assessment.Product.Tex);
+    RecordSourceACaptureProductTrace(
+        request.BackgroundEpochSerial,
+        result.ProductRef.BackgroundSource,
+        request.BackgroundEpochSerial,
+        request.CapturePresentationHash,
+        request.CurrentPresentationHash);
+    if (assessment.RouteProduct.Valid)
+    {
+        RecordSourceARouteProductTrace(
+            assessment.RouteProduct.Identity,
+            assessment.RouteProduct.CapturedEventSerial,
+            assessment.RouteProduct.StableFrames,
+            assessment.RouteProduct.PresentationClass);
+    }
+    RecordHandoffCaptureResolution(assessment.Resolution);
+    WholeSceneTrace.CaptureProductUseAccepted = assessment.Product.Accepted;
+    RecordChosenCaptureProductTrace(assessment.Product,
+                                    assessment.TraceIdentity);
 }
 
 void GLRenderer2D::RecordHandoffHybridTrace(const WholeSceneCaptureRequest& baseRequest,
@@ -2018,59 +1898,23 @@ void GLRenderer2D::RecordHandoffHybridTrace(const WholeSceneCaptureRequest& base
                                     hasHighResBackground));
 }
 
-GLRenderer2D::GLCaptureProductResolution GLRenderer2D::RecordCaptureEpochOverlayTrace(
-    int routeSlot,
-    u32 captureBank,
-    SourceABackgroundSource backgroundSource,
-    GLuint backgroundTex,
-    u64 requestBackgroundEpochSerial,
-    u64 routeProductBackgroundSerial,
-    u32 routeProductPresentationHash,
-    u32 currentPresentationHash,
-    u16 storedMasterBrightness,
-    bool hasStoredEffectState,
+void GLRenderer2D::RecordCaptureEpochOverlayTrace(
+    const CaptureEpochOverlayExecutionInput& input,
     int ystart,
     int yend)
 {
     ResetWholeSceneRenderTrace();
     RecordWholeSceneRenderTrace(WholeSceneRenderPath::CaptureEpochOverlay, ystart, yend,
-                                ScaleFactor > 1, false, ScaleFactor > 1, backgroundTex);
-    RecordSourceACaptureProductTrace(SourceACaptureReplacementMode::CurrentOverlay,
-                                     requestBackgroundEpochSerial,
-                                     backgroundSource,
-                                     routeProductBackgroundSerial,
-                                     routeProductPresentationHash,
-                                     currentPresentationHash,
-                                     SourceAProductChoiceReason::UsedBackgroundUnderlayCurrentOverlay);
-    WholeSceneCaptureRequest request = ::melonDS::MakeLiveOverlayProducerCaptureRequest(
-        ystart,
-        yend,
-        routeSlot,
-        captureBank,
-        routeProductBackgroundSerial,
-        routeProductPresentationHash,
-        currentPresentationHash);
-    const WholeSceneCapturePolicyResult result =
-        ::melonDS::MakeBackgroundCapturePolicyResult(
-            backgroundSource,
-            WholeSceneCaptureRenderAction::CompositeCurrentOverlay,
-            WholeSceneCaptureAuthority::CaptureEpochBackgroundCurrentOverlay);
-    RecordWholeSceneCaptureResolution(request, result);
-    const GLCaptureProductResolution product =
-        ResolveCaptureProduct(result,
-                              request,
-                              BackgroundCaptureProductSources(backgroundTex,
-                                                             storedMasterBrightness,
-                                                             hasStoredEffectState));
-    RecordChosenCaptureProductTrace(product,
-                                    {static_cast<int>(captureBank),
-                                     routeProductBackgroundSerial,
-                                     0,
-                                     0,
-                                     0,
-                                     routeProductPresentationHash,
-                                     currentPresentationHash});
-    return product;
+                                ScaleFactor > 1, false, ScaleFactor > 1,
+                                input.Product.Tex);
+    RecordSourceACaptureProductTrace(input.Plan.BackgroundEpochSerial,
+                                     input.Plan.BackgroundSource,
+                                     input.Plan.BackgroundEpochSerial,
+                                     input.Plan.PresentationHash,
+                                     input.CurrentPresentationHash);
+    RecordWholeSceneCaptureResolution(input.Request, input.Result);
+    WholeSceneTrace.CaptureProductUseAccepted = input.Product.Accepted;
+    RecordChosenCaptureProductTrace(input.Product, input.TraceIdentity);
 }
 
 }

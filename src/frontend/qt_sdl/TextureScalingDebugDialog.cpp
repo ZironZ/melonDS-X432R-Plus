@@ -1,20 +1,5 @@
-/*
-    Copyright 2026 ZironZ
-
-    This file is part of melonDS.
-
-    melonDS is free software: you can redistribute it and/or modify it under
-    the terms of the GNU General Public License as published by the Free
-    Software Foundation, either version 3 of the License, or (at your option)
-    any later version.
-
-    melonDS is distributed in the hope that it will be useful, but WITHOUT ANY
-    WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
-    FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
-
-    You should have received a copy of the GNU General Public License along
-    with melonDS. If not, see http://www.gnu.org/licenses/.
-*/
+// Copyright 2026 ZironZ
+// SPDX-License-Identifier: GPL-3.0-or-later
 
 #include <QCheckBox>
 #include <QClipboard>
@@ -206,9 +191,9 @@ QString FormatStats(const melonDS::TextureScalingDebugStats& stats)
     const QString deferredScaling = stats.DeferredScalingEnabled ? "on" : "off";
     const QString legacyAlpha = stats.LegacyAlphaHandling ? "on" : "off";
     const QString qualityAlpha = stats.QualityAlphaHandling ? "on" : "off";
-    const QString cleanerTransparentEdges = stats.AlphaXBRZ ? "on" : "off";
+    const QString cleanerTransparentEdges = stats.AlphaAlgorithmIndex == 3 ? "on" : "off";
     const QString readableCache = stats.ReadableTextureCache ? "on" : "off";
-    const QString spline36Alpha = stats.Spline36Alpha ? "on" : "off";
+    const QString alphaAlgorithm = QStringList{"Bilinear", "Spline36", "NNEDI3", "xBRZ"}.value(stats.AlphaAlgorithmIndex, "Bilinear");
 
     return QStringLiteral(
                "Renderer: %1\n"
@@ -221,7 +206,7 @@ QString FormatStats(const melonDS::TextureScalingDebugStats& stats)
                "Quality alpha handling: %8\n"
                "Cleaner transparent edges: %9\n"
                "Readable texture cache: %10\n"
-               "Spline36 alpha: %11\n"
+               "Texture alpha: %11\n"
                "\n"
                "Cache entries: %12\n"
                "Secondary cache entries: %13 / %14\n"
@@ -245,7 +230,7 @@ QString FormatStats(const melonDS::TextureScalingDebugStats& stats)
         .arg(qualityAlpha)
         .arg(cleanerTransparentEdges)
         .arg(readableCache)
-        .arg(spline36Alpha)
+        .arg(alphaAlgorithm)
         .arg(stats.CacheEntries)
         .arg(stats.SecondaryCacheEntries)
         .arg(stats.SecondaryCacheMaxEntries)
@@ -258,7 +243,10 @@ QString FormatStats(const melonDS::TextureScalingDebugStats& stats)
         .arg(stats.TextureArrays)
         .arg(stats.FramesObserved)
         .arg(FormatFrameStats(stats.LastFrame))
-        .arg(FormatFrameStats(stats.Totals));
+        .arg(FormatFrameStats(stats.Totals)) +
+        QStringLiteral("\n\nCompatible 3D reconstruction:\nCached groups: %1\nCache hits: %2\nBuilds: %3\nBuilt output texels: %4")
+            .arg(stats.ReconstructionEntries).arg(stats.ReconstructionHits)
+            .arg(stats.ReconstructionBuilds).arg(stats.ReconstructionBuiltTexels);
 }
 
 QString FormatLastMiss(const melonDS::TextureScalingDebugLastMiss& miss)

@@ -26,6 +26,7 @@
 #include "NonStupidBitfield.h"
 #include "RendererSettings.h"
 #include "TextureScalingDebug.h"
+#include "WideTransitionPolicy.h"
 
 #include <string>
 
@@ -52,6 +53,7 @@ public:
     [[nodiscard]] bool WasLastRenderFrameSkipped() const noexcept { return LastRenderFrameSkipped; }
 
     void RenderFrame() override;
+    WideTransitionPlan TransitionPlan;
     u32* GetLine(int line) override;
     void ResetRenderFrameTiming();
     void AppendRenderFrameTimingCSVHeader(std::string& header, const char* prefix) const;
@@ -181,8 +183,8 @@ private:
     GLint ClearUniformLoc[4] {};
 
     GLint ClearBitmapULoc[2] {};
-    GLuint ClearBitmapTex[2];
-    u32* ClearBitmap[2];
+    GLuint ClearBitmapTex[2] {};
+    u32* ClearBitmap[2] {};
     u8 ClearBitmapDirty;
 
     // vertex buffer
@@ -221,6 +223,7 @@ private:
     int ScreenW {}, ScreenH {};
 
     GLuint ColorBufferTex {}, DepthBufferTex {}, AttrBufferTex {};
+    GLuint NativeCenterTex {}, NativeCenterFB {};
 
     GLuint MainFramebuffer {};
     GLuint MainMSAAFramebuffer {};
