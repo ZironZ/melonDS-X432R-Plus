@@ -1732,6 +1732,7 @@ bool GLRenderer2D::Init()
 
     int bgheight = (GPU2D.Num == 0) ? 512 : 128;
     int objheight = (GPU2D.Num == 0) ? 256 : 128;
+    UploadedOBJVRAM.assign(objheight * 1024, 0);
 
     glGenTextures(1, &VRAMTex_BG);
     glBindTexture(GL_TEXTURE_2D, VRAMTex_BG);
@@ -1761,6 +1762,7 @@ bool GLRenderer2D::Init()
 
     // generate texture to hold pre-rendered BG layers
 
+    std::fill(std::begin(NativeBGPrerenderTexture), std::end(NativeBGPrerenderTexture), 0);
     glGenTextures(22, AllBGLayerTex);
     glGenTextures(22, AllBGLayerMetaTex);
     glGenFramebuffers(22, AllBGLayerFB);
@@ -2452,24 +2454,6 @@ bool GLRenderer2D::Init()
 
     glGenFramebuffers(1, &ArtCNNOutputFB);
 
-    glGenTextures(2, CuNNyWorkTex);
-    for (int i = 0; i < 2; i++)
-    {
-        glBindTexture(GL_TEXTURE_2D, CuNNyWorkTex[i]);
-        glDefaultTexParams(GL_TEXTURE_2D);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, 1, 1, 0, GL_RGBA, GL_HALF_FLOAT, nullptr);
-        CuNNyWorkTexWidth[i] = 1;
-        CuNNyWorkTexHeight[i] = 1;
-    }
-
-    glGenTextures(1, &StrictAffineCuNNy2xTex);
-    glBindTexture(GL_TEXTURE_2D, StrictAffineCuNNy2xTex);
-    glDefaultTexParams(GL_TEXTURE_2D);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, 2, 2, 0, GL_RGBA,
-                 GL_HALF_FLOAT, nullptr);
-    StrictAffineCuNNy2xWidth = 2;
-    StrictAffineCuNNy2xHeight = 2;
-
     glGenTextures(1, &XBRZInfoTex);
     glBindTexture(GL_TEXTURE_2D, XBRZInfoTex);
     glDefaultTexParams(GL_TEXTURE_2D);
@@ -2573,7 +2557,6 @@ void GLRenderer2D::DeleteShaders()
 GLRenderer2D::~GLRenderer2D()
 {
     // Scratch textures belong to each engine; only shader programs are shared.
-    glDeleteTextures(3, ReconstructionAlphaWorkTex);
     glDeleteTextures(1, &OpaqueOBJAssemblyTex);
     glDeleteFramebuffers(1, &OpaqueOBJAssemblyFB);
     glDeleteBuffers(1, &SpritePreVtxBuffer);
@@ -2746,8 +2729,17 @@ GLRenderer2D::~GLRenderer2D()
     glDeleteTextures(1, &ArtCNNYUVA2xTex);
     glDeleteTextures(1, &ArtCNNRGBA2xTex);
     glDeleteFramebuffers(1, &ArtCNNOutputFB);
-    glDeleteTextures(2, CuNNyWorkTex);
-    glDeleteTextures(1, &StrictAffineCuNNy2xTex);
+    for (auto& index : CuNNyScratch)
+        for (auto& entry : index)
+            glDeleteTextures(1, &entry.Texture);
+    for (auto& entry : CuNNyLargeScratch)
+        glDeleteTextures(1, &entry.Texture);
+    const auto releaseScratchSet = [](ReconstructionScratchSet& set) {
+        for (auto& entry : set.Entries) glDeleteTextures(1, &entry.Texture);
+        glDeleteTextures(1, &set.Large.Texture);
+    };
+    releaseScratchSet(CuNNyResultScratch);
+    for (auto& set : AlphaScratch) releaseScratchSet(set);
     glDeleteTextures(1, &XBRZInfoTex);
     glDeleteFramebuffers(1, &XBRZInfoFB);
 
@@ -2773,6 +2765,15 @@ void GLRenderer2D::Reset()
     int objheight = (GPU2D.Num == 0) ? 256 : 128;
     LayerConfig.uVRAMMask = bgheight - 1;
     SpriteConfig.uVRAMMask = objheight - 1;
+    UploadedOBJVRAM.assign(objheight * 1024, 0);
+    std::fill(std::begin(UploadedOBJPalette), std::end(UploadedOBJPalette), 0);
+    for (auto& pixels : SpriteArtworkPixels) pixels.clear();
+    ResolvedOrdinaryOBJValid = false;
+    ResolvedOrdinaryOBJArtworkChecked = false;
+    ResolvedOrdinaryOBJArtwork.clear();
+    ResolvedOrdinaryOBJLayout.clear();
+    ++ResolvedOrdinaryOBJArtworkGeneration;
+    std::fill(std::begin(ConnectedOBJSourcePartnerPlusOne), std::end(ConnectedOBJSourcePartnerPlusOne), 0);
 
     LastLine = 0;
 
@@ -2811,10 +2812,15 @@ void GLRenderer2D::Reset()
     for (int layer = 0; layer < 4; layer++)
     {
         BGLayerSourceGeneration[layer]++;
+        BGLayerArtworkGeneration[layer]++;
+        BGArtworkCache[layer].Reset();
+        NativeBGPrerenderTexture[layer] = 0;
         EnhancedBGLayerSourceGeneration[layer] = 0;
     }
 
     memset(TempPalBuffer, 0, sizeof(TempPalBuffer));
+    memset(UploadedBGPalette, 0, sizeof(UploadedBGPalette));
+    UploadedBGPaletteValid = false;
 
     WholeSceneScaleState = WholeSceneScaleEligibility::ScreenUnavailable;
     WholeSceneTrace = {};
@@ -3338,6 +3344,7 @@ void GLRenderer2D::SetWholeSceneScaleHybridStrictAffineConnectedSources(bool ena
     {
         InvalidateEnhancedOBJSources();
         std::fill(&ConnectedOBJSourceHashes[0], &ConnectedOBJSourceHashes[128], 0);
+        std::fill(std::begin(ConnectedOBJSourcePartnerPlusOne), std::end(ConnectedOBJSourcePartnerPlusOne), 0);
         std::memset(EnhancedOBJSourceRegions, 0, sizeof(EnhancedOBJSourceRegions));
     }
     WholeSceneScaleHybridStrictAffineConnectedSources = enable;
@@ -3924,6 +3931,28 @@ bool GLRenderer2D::AreWholeSceneNativeProductsComplete() const
     return true;
 }
 
+bool GLRenderer2D::HasSupportedDeferredStrictAffineRecordedState() const
+{
+    // These differences accumulate with OR until the frame is reset. Once
+    // rejected, later scanlines cannot make the deferred executor eligible.
+    // Share this exact contract with historical-source preparation so we can
+    // avoid expensive reconstruction without predicting future row state or
+    // delaying work on frames whose historical sources may still be needed.
+    const auto& trace = WholeSceneCurrentUpdateDebugTrace;
+    constexpr u32 allowedDirtyReasons =
+        kWholeSceneDirtyLayerEnable | kWholeSceneDirtyBlend;
+    constexpr u32 allowedMiscDiffs =
+        kWholeSceneMiscBlendCnt | kWholeSceneMiscEVA |
+        kWholeSceneMiscEVB | kWholeSceneMiscEVY;
+    return (trace.StateDirtyDispCntDiff & ~0x00001F00u) == 0 &&
+        trace.StateDirtyBGCntDiff[0] == 0 &&
+        trace.StateDirtyBGCntDiff[1] == 0 &&
+        trace.StateDirtyBGCntDiff[2] == 0 &&
+        trace.StateDirtyBGCntDiff[3] == 0 &&
+        (trace.StateDirtyReasonMask & ~allowedDirtyReasons) == 0 &&
+        (trace.StateDirtyMiscDiffMask & ~allowedMiscDiffs) == 0;
+}
+
 GLRenderer2D::DeferredScanlineStrictAffinePlan
 GLRenderer2D::BuildDeferredScanlineStrictAffinePlan() const
 {
@@ -3949,24 +3978,9 @@ GLRenderer2D::BuildDeferredScanlineStrictAffinePlan() const
         Parent.GetFinalPassScreenSwapForRange(0, 192, screenSwap);
     const u32 displayMode =
         (DispCnt >> 16) & (GPU2D.Num ? 0x1u : 0x3u);
-    const auto& updateTrace = WholeSceneCurrentUpdateDebugTrace;
-    const bool layerConfigStable =
-        (updateTrace.StateDirtyDispCntDiff & ~0x00001F00u) == 0 &&
-        updateTrace.StateDirtyBGCntDiff[0] == 0 &&
-        updateTrace.StateDirtyBGCntDiff[1] == 0 &&
-        updateTrace.StateDirtyBGCntDiff[2] == 0 &&
-        updateTrace.StateDirtyBGCntDiff[3] == 0;
-    constexpr u32 allowedDirtyReasons =
-        kWholeSceneDirtyLayerEnable | kWholeSceneDirtyBlend;
-    constexpr u32 allowedMiscDiffs =
-        kWholeSceneMiscBlendCnt | kWholeSceneMiscEVA |
-        kWholeSceneMiscEVB | kWholeSceneMiscEVY;
-    const bool recordedStateSupported =
-        (updateTrace.StateDirtyReasonMask & ~allowedDirtyReasons) == 0 &&
-        (updateTrace.StateDirtyMiscDiffMask & ~allowedMiscDiffs) == 0;
     assessmentInputs.RouteAndPresentationUniform =
-        routeUniform && displayMode == 1 && layerConfigStable &&
-        recordedStateSupported &&
+        routeUniform && displayMode == 1 &&
+        HasSupportedDeferredStrictAffineRecordedState() &&
         !WholeSceneFullFrameFinalizerUnsafeFrame;
 
     bool hasAffineOBJ = false;
@@ -7931,33 +7945,31 @@ void GLRenderer2D::UploadBGVRAM(NonStupidBitField<1024>& bgDirty, int line)
 
     glBindTexture(GL_TEXTURE_2D, VRAMTex_BG);
 
-    int texlen = dirtybits >> 6;
-    for (int i = 0; i < texlen; )
+    // Keep at most the old number of GL transfers: merge consecutive dirty
+    // bitfield words, but trim unchanged rows at the two ends. Sparse writes
+    // inside a word must not turn one upload into dozens of small transfers.
+    const int words = dirtybits / 64;
+    for (int word = 0; word < words; )
     {
-        if (!bgDirty.Data[i])
+        if (!bgDirty.Data[word])
         {
-            i++;
+            ++word;
             continue;
         }
-
-        int start = i * 32;
-        for (;;)
-        {
-            i++;
-            if (i >= texlen) break;
-            if (!bgDirty.Data[i]) break;
-        }
-        int end = i * 32;
-
+        const u32 firstBlock = word * 64 + __builtin_ctzll(bgDirty.Data[word]);
+        do { ++word; } while (word < words && bgDirty.Data[word]);
+        const u32 lastBlock = (word - 1) * 64 + 64 - __builtin_clzll(bgDirty.Data[word - 1]);
+        // Dirty bits cover 512 bytes; GL texture rows cover 1024 bytes.
+        const u32 start = firstBlock / 2;
+        const u32 end = (lastBlock + 1) / 2;
         RecordWholeSceneBGUploadRange(line, start, end);
-
         glTexSubImage2D(GL_TEXTURE_2D, 0,
-                        0, start,
-                        1024, end - start,
+                        0, start, 1024, end - start,
                         GL_RED_INTEGER, GL_UNSIGNED_BYTE,
                         &vram[start * 1024]);
         BGVRAMUploadCache.RecordUpload(vram, start * 1024, (end - start) * 1024);
     }
+
 }
 
 void GLRenderer2D::UploadBGPalette(u32 paletteDirty, NonStupidBitField<64>& bgExtPalDirty)
@@ -7978,6 +7990,8 @@ void GLRenderer2D::UploadBGPalette(u32 paletteDirty, NonStupidBitField<64>& bgEx
     glBindTexture(GL_TEXTURE_2D, PalTex_BG);
     glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 256, 1+(4*16), GL_RGBA, GL_UNSIGNED_SHORT_1_5_5_5_REV,
                     TempPalBuffer);
+    std::memcpy(UploadedBGPalette, TempPalBuffer, sizeof(UploadedBGPalette));
+    UploadedBGPaletteValid = true;
 }
 
 void GLRenderer2D::PrerenderDirtyLayers(u8 layerPreDirty,
@@ -9036,8 +9050,10 @@ bool GLRenderer2D::ReadWholeSceneDebugView(WholeScene2DDebugView view,
             ? 2
             : 3;
         const auto& source = LayerConfig.uBGConfig[bg];
+        // Display the mode that produced this source. Companion text BGs can
+        // use ordinary scaling independently of the affine-source setting.
         const StrictAffineSourceEnhancementDecision sourceEnhancement =
-            WholeSceneTrace.StrictAffineSourceEnhancement;
+            static_cast<StrictAffineSourceEnhancementDecision>(EnhancedBGLayerSourceEnhancement[bg]);
         const int sourceScale = sourceEnhancement ==
                 StrictAffineSourceEnhancementDecision::Spline36Inline
             ? (ScaleFactor >= 4 ? 4 : 2)
@@ -9055,15 +9071,9 @@ bool GLRenderer2D::ReadWholeSceneDebugView(WholeScene2DDebugView view,
             (LayerEnable & (1u << bg)) != 0 &&
             source.Type <= 3 &&
             sourceScale > 1 &&
-            EnhancedBGLayerSourceGeneration[bg] == BGLayerSourceGeneration[bg] &&
-            EnhancedBGLayerAlgorithm[bg] ==
-                static_cast<u32>(WholeSceneScaleAlgorithm) &&
-            EnhancedBGLayerBackdropPrecomposed[bg] == backdropPrecomposed &&
-            EnhancedBGLayerBackdropColor[bg] == backdropColor &&
-            EnhancedBGLayerWidth[bg] ==
-                static_cast<u32>(source.Size[0] * sourceScale) &&
-            EnhancedBGLayerHeight[bg] ==
-                static_cast<u32>(source.Size[1] * sourceScale);
+            IsEnhancedBGLayerCurrent(bg, sourceScale,
+                static_cast<u32>(WholeSceneScaleAlgorithm),
+                backdropPrecomposed, backdropColor, sourceEnhancement);
         if (!valid)
         {
             if (status)
@@ -12043,6 +12053,7 @@ void GLRenderer2D::UpdateAndRender(int line)
 
         glActiveTexture(GL_TEXTURE1);
         glBindTexture(GL_TEXTURE_2D, PalTex_OBJ);
+        memcpy(UploadedOBJPalette, TempPalBuffer, sizeof(UploadedOBJPalette));
         glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 256, 1+16, GL_RGBA, GL_UNSIGNED_SHORT_1_5_5_5_REV, TempPalBuffer);
 
         PrerenderSprites();
@@ -12307,7 +12318,8 @@ void GLRenderer2D::UpdateScanlineConfig(int line)
     cfg.BlendCoef[3] = 0;
 };
 
-void GLRenderer2D::BuildWideCoverPolicies(int ystart, int yend, u32 (&policies)[192][2]) const
+void GLRenderer2D::BuildWideCoverPolicies(int ystart, int yend, u32 (&policies)[192][2],
+                                         u32 (*verticalPolicies)[2]) const
 {
     u8* vram;
     u32 mask;
@@ -12333,6 +12345,29 @@ void GLRenderer2D::BuildWideCoverPolicies(int ystart, int yend, u32 (&policies)[
             cfg.Size[0], cfg.Size[1], cfg.MapOffset, cfg.TileOffset, cfg.Type == 1};
         u32 color = 0;
         if (!source.UniformColor(color)) continue;
+        auto policyAt = [&](int x, int y, u32 verticalOBJProof = 0) -> u32
+        {
+            const auto& row = ScanlineConfig.uScanline[y];
+            if (row.BGMosaicEnable[layer] || row.BGPrio[layer] == 0xFFFFFFFFu) return 0;
+            const u32 permissions = WideWindowPermissions(row, x, row.OBJWindowEnabled != 0, verticalOBJProof);
+            if (permissions == 0x100 || !(permissions & (1u << layer))) return 0;
+            for (int other = 0; other < 4; ++other)
+                if (other != layer && (permissions & (1u << other)) &&
+                    (row.BGPrio[other] < row.BGPrio[layer] ||
+                     (row.BGPrio[other] == row.BGPrio[layer] && other < layer))) return 0;
+            // Sprite bounds are conservative, including transparent texels.
+            if (row.EnableOBJ && (permissions & (1u << 4)))
+                for (int i = 0; i < NumSprites; ++i)
+                {
+                    const auto& sprite = SpriteConfig.uOAM[i];
+                    int sx = sprite.Position[0] & 511;
+                    if (sx >= 256) sx -= 512;
+                    const int sy = (y - sprite.Position[1]) & 255;
+                    if (x >= sx && x < sx + sprite.BoundSize[0] && sy < sprite.BoundSize[1]) return 0;
+                }
+            return MakeWideWindowPolicy(row, 0, x, row.OBJWindowEnabled != 0, false, layer, color,
+                verticalOBJProof ? static_cast<int>(permissions) : -1);
+        };
         for (int y = ystart; y < yend; ++y)
         {
             const auto& row = ScanlineConfig.uScanline[y];
@@ -12343,28 +12378,24 @@ void GLRenderer2D::BuildWideCoverPolicies(int ystart, int yend, u32 (&policies)[
                 !source.OpaqueAt(row.BGOffset[layer][0] + 255, row.BGOffset[layer][1])) continue;
             for (int side = 0; side < 2; ++side)
             {
-                const int x = side ? 255 : 0;
-                const u32 permissions = WideWindowPermissions(row, x, row.OBJWindowEnabled != 0);
-                if (permissions == 0x100 || !(permissions & (1u << layer))) continue;
-                bool blocked = false;
-                for (int other = 0; other < 4; ++other)
-                    if (other != layer && (permissions & (1u << other)) &&
-                        (row.BGPrio[other] < row.BGPrio[layer] ||
-                         (row.BGPrio[other] == row.BGPrio[layer] && other < layer))) blocked = true;
-                // Do not replace a native edge occupied by a sprite. This is
-                // deliberately conservative even for transparent sprite texels.
-                if (row.EnableOBJ && (permissions & (1u << 4)))
-                    for (int i = 0; i < NumSprites; ++i)
-                    {
-                        const auto& sprite = SpriteConfig.uOAM[i];
-                        int sx = sprite.Position[0] & 511;
-                        if (sx >= 256) sx -= 512;
-                        const int sy = (y - sprite.Position[1]) & 255;
-                        if (x >= sx && x < sx + sprite.BoundSize[0] && sy < sprite.BoundSize[1]) blocked = true;
-                    }
-                if (!blocked)
-                    policies[y][side] = MakeWideWindowPolicy(row, 0, x, row.OBJWindowEnabled != 0,
-                                                            false, layer, color);
+                if (const u32 policy = policyAt(side ? 255 : 0, y)) policies[y][side] = policy;
+            }
+        }
+        if (!verticalPolicies) continue;
+        for (int x = 0; x < 256; ++x)
+        {
+            const auto& top = ScanlineConfig.uScanline[0];
+            const auto& bottom = ScanlineConfig.uScanline[191];
+            // A uniform source can contain transparent holes. Prove this
+            // column at both ends independently of the left/right row proof.
+            if (!source.OpaqueAt(top.BGOffset[layer][0] + x, top.BGOffset[layer][1]) ||
+                !source.OpaqueAt(bottom.BGOffset[layer][0] + x, bottom.BGOffset[layer][1])) continue;
+            for (int side = 0; side < 2; ++side)
+            {
+                const int y = side ? 191 : 0;
+                if (y < ystart || y >= yend) continue;
+                if (const u32 policy = policyAt(x, y, side ? WideOBJClearBottom : WideOBJClearTop))
+                    verticalPolicies[x][side] = policy;
             }
         }
     }
@@ -12967,7 +12998,12 @@ GLRenderer2D::BuildEnhancedOBJSourceKey(
         return key;
 
     const auto& source = SpriteConfig.uOAM[sprite];
-    key.SourceGeneration = SpriteSourceGeneration;
+    // A connected atlas copy contains both members. Artwork revisions come
+    // from one increasing serial, so the maximum changes for any changed member.
+    key.SourceGeneration = SpriteArtworkGeneration[sprite];
+    if (ConnectedOBJSourcePartnerPlusOne[sprite])
+        key.SourceGeneration = std::max(key.SourceGeneration,
+            SpriteArtworkGeneration[ConnectedOBJSourcePartnerPlusOne[sprite] - 1]);
     key.Type = source.Type;
     key.Width = static_cast<u32>(source.Size[0]);
     key.Height = static_cast<u32>(source.Size[1]);
@@ -12979,6 +13015,7 @@ GLRenderer2D::BuildEnhancedOBJSourceKey(
         sourceEnhancement != StrictAffineSourceEnhancementDecision::Disabled
             ? sourceEnhancement
             : CurrentStrictAffineSourceEnhancementDecision();
+    key.SourceEnhancement = static_cast<u32>(effectiveSourceEnhancement);
     key.SourceScale = static_cast<u32>(StrictAffineCachedSourceScale(
         effectiveSourceEnhancement, ScaleFactor));
     // Bump when the isolated padding, color reconstruction or presentation-
@@ -13130,6 +13167,7 @@ bool GLRenderer2D::PrepareOpaqueOBJAssemblies(u32* spriteMask, int* slots,
         for (int i:group.Members)
         {
             const auto& s=SpriteConfig.uOAM[i];
+            key.SourceGeneration = std::max(key.SourceGeneration, SpriteArtworkGeneration[i]);
             add(SpriteOAMIndex[i]); add(s.Type); add(s.PalOffset); add(s.TileOffset);
             add(s.TileStride); add(s.Size[0]); add(s.Size[1]);
         }
@@ -13345,6 +13383,7 @@ bool GLRenderer2D::PrepareStrictAffineEnhancedOBJSources(
     bool allReady = true;
 
     std::fill(&ConnectedOBJSourceHashes[0], &ConnectedOBJSourceHashes[128], 0);
+    std::fill(std::begin(ConnectedOBJSourcePartnerPlusOne), std::end(ConnectedOBJSourcePartnerPlusOne), 0);
     std::memset(EnhancedOBJSourceRegions, 0, sizeof(EnhancedOBJSourceRegions));
     std::vector<ConnectedOBJSourcePair> pairs;
     int pairIndex[128], degree[128] {};
@@ -13396,6 +13435,7 @@ bool GLRenderer2D::PrepareStrictAffineEnhancedOBJSources(
                 int index = pair.Members[m];
                 pairIndex[index] = int(p);
                 ConnectedOBJSourceHashes[index] = hash;
+                ConnectedOBJSourcePartnerPlusOne[index] = pair.Members[1 - m] + 1;
                 EnhancedOBJSourceRegions[index][0] = pair.X[m];
                 EnhancedOBJSourceRegions[index][1] = pair.Y[m];
                 EnhancedOBJSourceRegions[index][2] = pair.Width;
@@ -13624,6 +13664,7 @@ void GLRenderer2D::PreserveDeferredStrictAffineHistoricalSourceEpoch(
                           0, 0, source.Size[0], source.Size[1],
                           GL_COLOR_BUFFER_BIT, GL_NEAREST);
         epoch.NativeBGMask |= layerBit;
+        if (source.Clamp) epoch.BGClampMask |= layerBit;
     }
 
     const bool cached =
@@ -13635,22 +13676,38 @@ void GLRenderer2D::PreserveDeferredStrictAffineHistoricalSourceEpoch(
             StrictAffineSourceEnhancementDecision::NNEDI3CachedAffineSources ||
         epoch.SourceEnhancement ==
             StrictAffineSourceEnhancementDecision::XBRZCachedAffineSources;
-    if (cached && nativeReady)
+    // Native snapshots and their provenance remain intact. Copy existing
+    // scaled products at the original boundary only while a consumer remains
+    // possible. Cache misses are reconstructed from native snapshots on demand.
+    if (cached && nativeReady && HasSupportedDeferredStrictAffineRecordedState())
     {
-        const u32 companionTextMask =
-            WholeSceneScaleHybridStrictAffineTopTextBG ? dirtyMask : 0u;
-        const u32 readyMask = PrepareStrictAffineEnhancedBGSources(
-            epoch.SourceEnhancement,
-            epoch.SourceModelIndex,
-            0,
-            false,
-            0,
-            companionTextMask,
-            dirtyMask);
+        const int sourceScale = StrictAffineCachedSourceScale(epoch.SourceEnhancement, ScaleFactor);
+        // Affine BGs can own the deferred representation itself. Keep their
+        // original eager preparation (including cold sources) to preserve GPU
+        // overlap for latency-sensitive history consumers. Ordinary companion
+        // tile BGs only copy cache hits here and reconstruct misses on demand.
+        u32 affineMask = 0;
+        for (int layer = 0; layer < 4; ++layer)
+        {
+            const auto type = LayerConfig.uBGConfig[layer].Type;
+            if ((dirtyMask & (1u << layer)) && (type == 2 || type == 3))
+                affineMask |= 1u << layer;
+        }
+        if (affineMask)
+            PrepareStrictAffineEnhancedBGSources(epoch.SourceEnhancement,
+                epoch.SourceModelIndex, 0, false, 0, 0, affineMask);
         for (int layer = 0; layer < 4; layer++)
         {
             const u32 layerBit = 1u << layer;
-            if ((readyMask & dirtyMask & layerBit) == 0)
+            const auto& source = LayerConfig.uBGConfig[layer];
+            const bool supported = source.Type == 2 || source.Type == 3 ||
+                (WholeSceneScaleHybridStrictAffineTopTextBG && source.Type <= 1);
+            // Copy an already reconstructed source at its original point in
+            // the frame. A cache miss only preserves native input here; no
+            // neural/scaler work is submitted until a consumer requests it.
+            if (!(dirtyMask & layerBit) || !supported ||
+                !IsEnhancedBGLayerCurrent(layer, sourceScale,
+                    static_cast<u32>(WholeSceneScaleAlgorithm), false, 0, epoch.SourceEnhancement))
                 continue;
             const int width = EnhancedBGLayerWidth[layer];
             const int height = EnhancedBGLayerHeight[layer];
@@ -13671,6 +13728,45 @@ void GLRenderer2D::PreserveDeferredStrictAffineHistoricalSourceEpoch(
     }
 
     epoch.Valid = nativeReady && epoch.NativeBGMask == dirtyMask;
+}
+
+bool GLRenderer2D::PrepareDeferredStrictAffineHistoricalEnhancedBGs(
+    u32 requiredBGMask, StrictAffineSourceEnhancementDecision sourceEnhancement,
+    int sourceModelIndex)
+{
+    if (DeferredStrictAffineHistoricalSourceEpochOverflow ||
+        DeferredStrictAffineHistoricalSourceEpochCount == 0) return false;
+    const int sourceScale = StrictAffineCachedSourceScale(sourceEnhancement, ScaleFactor);
+    for (u32 index = 0; index < DeferredStrictAffineHistoricalSourceEpochCount; ++index)
+    {
+        auto& epoch = DeferredStrictAffineHistoricalSourceEpochs[index];
+        if (!epoch.Valid || epoch.SpriteGeneration != SpriteSourceGeneration ||
+            epoch.SourceEnhancement != sourceEnhancement ||
+            epoch.SourceModelIndex != sourceModelIndex) return false;
+        const u32 missing = requiredBGMask & epoch.NativeBGMask & ~epoch.EnhancedBGMask;
+        // Keep the same scaler support as the original eager historical
+        // publication. Do not widen eligibility for other source modes.
+        if (missing && sourceEnhancement != StrictAffineSourceEnhancementDecision::ArtCNNCachedAffineSources &&
+            sourceEnhancement != StrictAffineSourceEnhancementDecision::CuNNyCachedAffineSources &&
+            sourceEnhancement != StrictAffineSourceEnhancementDecision::NNEDI3CachedAffineSources &&
+            sourceEnhancement != StrictAffineSourceEnhancementDecision::XBRZCachedAffineSources) return false;
+        for (int layer = 0; layer < 4; ++layer)
+        {
+            const u32 bit = 1u << layer;
+            if (!(missing & bit)) continue;
+            const int width = DeferredStrictAffineHistoricalBGLayerWidth[index][layer];
+            const int height = DeferredStrictAffineHistoricalBGLayerHeight[index][layer];
+            if (!EnsureDeferredStrictAffineHistoricalEnhancedBGLayerTexture(
+                    index, layer, width * sourceScale, height * sourceScale) ||
+                !ReconstructEnhancedBGSource(
+                    DeferredStrictAffineHistoricalBGLayerFB[index][layer],
+                    DeferredStrictAffineHistoricalEnhancedBGLayerFB[index][layer],
+                    width, height, (epoch.BGClampMask & bit) != 0,
+                    sourceEnhancement, sourceModelIndex, sourceScale, false, 0)) return false;
+            epoch.EnhancedBGMask |= bit;
+        }
+    }
+    return true;
 }
 
 bool GLRenderer2D::EnsureEnhancedBGLayerTexture(int layer, int width,
@@ -13770,19 +13866,30 @@ bool GLRenderer2D::RebuildEnhancedBGLayer(
     const int sourceScale = sourceScaleOverride > 0
         ? sourceScaleOverride
         : StrictAffineCachedSourceScale(sourceEnhancement, ScaleFactor);
-    constexpr int padding = 8;
-    const int paddedWidth = width + padding * 2;
-    const int paddedHeight = height + padding * 2;
     const bool affineBG = source.Type == 2 || source.Type == 3;
     const bool textBG = allowTextBG && (source.Type == 0 || source.Type == 1);
     if ((!affineBG && !textBG) || width <= 0 || height <= 0 ||
         !EnsureEnhancedBGLayerTexture(layer,
                                       width * sourceScale,
-                                      height * sourceScale) ||
-        !EnsureEnhancedBGScratchTextures(paddedWidth,
-                                         paddedHeight,
-                                         sourceScale))
+                                      height * sourceScale))
         return false;
+
+    const bool precomposeBackdrop = (affineConstantBackdropPrecomposeMask & (1u << layer)) != 0;
+    const u32 backdropColor = layer == 2 ? WholeSceneTrace.StrictAffineBG2UnderlayBackdropColor
+                                        : WholeSceneTrace.StrictAffineBG3UnderlayBackdropColor;
+    return ReconstructEnhancedBGSource(BGLayerFB[layer], EnhancedBGLayerFB[layer],
+        width, height, source.Clamp, sourceEnhancement, sourceModelIndex,
+        sourceScale, precomposeBackdrop, backdropColor);
+}
+
+bool GLRenderer2D::ReconstructEnhancedBGSource(
+    GLuint sourceFB, GLuint targetFB, int width, int height, bool clamp,
+    StrictAffineSourceEnhancementDecision sourceEnhancement,
+    int sourceModelIndex, int sourceScale, bool precomposeBackdrop, u32 backdropColor)
+{
+    constexpr int padding = 8;
+    const int paddedWidth = width + padding * 2, paddedHeight = height + padding * 2;
+    if (!EnsureEnhancedBGScratchTextures(paddedWidth, paddedHeight, sourceScale)) return false;
 
     glDisable(GL_DEPTH_TEST);
     glDisable(GL_STENCIL_TEST);
@@ -13799,7 +13906,7 @@ bool GLRenderer2D::RebuildEnhancedBGLayer(
     auto blit = [&](int sx0, int sy0, int sx1, int sy1,
                     int dx0, int dy0, int dx1, int dy1)
     {
-        glBindFramebuffer(GL_READ_FRAMEBUFFER, BGLayerFB[layer]);
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, sourceFB);
         glReadBuffer(GL_COLOR_ATTACHMENT0);
         glBindFramebuffer(GL_DRAW_FRAMEBUFFER, EnhancedBGInputFB);
         glDrawBuffer(GL_COLOR_ATTACHMENT0);
@@ -13810,7 +13917,7 @@ bool GLRenderer2D::RebuildEnhancedBGLayer(
     blit(0, 0, width, height,
          padding, padding, padding + width, padding + height);
 
-    if (!source.Clamp)
+    if (!clamp)
     {
         blit(width - padding, 0, width, height,
              0, padding, padding, padding + height);
@@ -13835,12 +13942,6 @@ bool GLRenderer2D::RebuildEnhancedBGLayer(
              padding + width, padding + height,
              padding + width + padding, padding + height + padding);
     }
-
-    const bool precomposeBackdrop =
-        (affineConstantBackdropPrecomposeMask & (1u << layer)) != 0;
-    const u32 backdropColor = layer == 2
-        ? WholeSceneTrace.StrictAffineBG2UnderlayBackdropColor
-        : WholeSceneTrace.StrictAffineBG3UnderlayBackdropColor;
 
     // Ordinarily cached reconstruction owns RGB only and receives the same
     // guarded hidden-RGB frontier as enhanced OBJ. When the underlay proof is
@@ -13891,7 +13992,7 @@ bool GLRenderer2D::RebuildEnhancedBGLayer(
 
     glBindFramebuffer(GL_READ_FRAMEBUFFER, EnhancedBGScaledFB);
     glReadBuffer(GL_COLOR_ATTACHMENT0);
-    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, EnhancedBGLayerFB[layer]);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, targetFB);
     glDrawBuffer(GL_COLOR_ATTACHMENT0);
     glBlitFramebuffer(padding * sourceScale, padding * sourceScale,
                       (padding + width) * sourceScale,
@@ -13899,6 +14000,21 @@ bool GLRenderer2D::RebuildEnhancedBGLayer(
                       0, 0, width * sourceScale, height * sourceScale,
                       GL_COLOR_BUFFER_BIT, GL_NEAREST);
     return true;
+}
+
+bool GLRenderer2D::IsEnhancedBGLayerCurrent(int layer, int sourceScale, u32 algorithm,
+                                          bool precomposeBackdrop, u32 backdropColor,
+                                          StrictAffineSourceEnhancementDecision sourceEnhancement) const
+{
+    const auto& source = LayerConfig.uBGConfig[layer];
+    return EnhancedBGLayerSourceGeneration[layer] == BGLayerArtworkGeneration[layer] &&
+        EnhancedBGLayerSourceEnhancement[layer] == static_cast<u32>(sourceEnhancement) &&
+        EnhancedBGLayerClamp[layer] == source.Clamp &&
+        EnhancedBGLayerAlgorithm[layer] == algorithm &&
+        EnhancedBGLayerBackdropPrecomposed[layer] == precomposeBackdrop &&
+        EnhancedBGLayerBackdropColor[layer] == backdropColor &&
+        EnhancedBGLayerWidth[layer] == static_cast<u32>(source.Size[0] * sourceScale) &&
+        EnhancedBGLayerHeight[layer] == static_cast<u32>(source.Size[1] * sourceScale);
 }
 
 u32 GLRenderer2D::PrepareStrictAffineEnhancedBGSources(
@@ -13938,17 +14054,8 @@ u32 GLRenderer2D::PrepareStrictAffineEnhancedBGSources(
                 ? WholeSceneTrace.StrictAffineBG2UnderlayBackdropColor
                 : WholeSceneTrace.StrictAffineBG3UnderlayBackdropColor)
             : 0;
-        const bool valid =
-            EnhancedBGLayerSourceGeneration[layer] ==
-                BGLayerSourceGeneration[layer] &&
-            EnhancedBGLayerAlgorithm[layer] == algorithm &&
-            EnhancedBGLayerBackdropPrecomposed[layer] ==
-                precomposeBackdrop &&
-            EnhancedBGLayerBackdropColor[layer] == backdropColor &&
-            EnhancedBGLayerWidth[layer] ==
-                static_cast<u32>(source.Size[0] * sourceScale) &&
-            EnhancedBGLayerHeight[layer] ==
-                static_cast<u32>(source.Size[1] * sourceScale);
+        const bool valid = IsEnhancedBGLayerCurrent(layer, sourceScale, algorithm,
+                                                   precomposeBackdrop, backdropColor, sourceEnhancement);
         if (valid)
         {
             if (recordTrace)
@@ -13973,8 +14080,9 @@ u32 GLRenderer2D::PrepareStrictAffineEnhancedBGSources(
 
         if (recordTrace)
             WholeSceneTrace.StrictAffineEnhancedBGNeuralDispatches++;
-        EnhancedBGLayerSourceGeneration[layer] =
-            BGLayerSourceGeneration[layer];
+        EnhancedBGLayerSourceGeneration[layer] = BGLayerArtworkGeneration[layer];
+        EnhancedBGLayerSourceEnhancement[layer] = static_cast<u32>(sourceEnhancement);
+        EnhancedBGLayerClamp[layer] = source.Clamp;
         EnhancedBGLayerAlgorithm[layer] = algorithm;
         EnhancedBGLayerBackdropPrecomposed[layer] = precomposeBackdrop;
         EnhancedBGLayerBackdropColor[layer] = backdropColor;
@@ -13984,8 +14092,66 @@ u32 GLRenderer2D::PrepareStrictAffineEnhancedBGSources(
 }
 
 
+void GLRenderer2D::UpdateSpriteArtworkGenerations()
+{
+    // Mirror 2DSpritePreFS addressing and preserve all palette bits: bit 15
+    // contributes to the shader's green channel, even for transparent pixels.
+    // Compare decoded native pixels exactly, including index-zero transparency.
+    // Writes to unrelated art, identical rewrites and equivalent palette-index
+    // changes can then reuse reconstruction without weakening history checks.
+    std::vector<u32> pixels;
+    const u32 mask = (SpriteConfig.uVRAMMask << 10) | 0x3FF;
+    const bool trackArtwork = WholeSceneScaleRequested && WholeSceneScaleHybridStrictAffineHighRes && ScaleFactor > 1;
+    if (trackArtwork) pixels.reserve(64 * 64);
+    for (int i = 0; i < NumSprites; ++i)
+    {
+        const auto& source = SpriteConfig.uOAM[i];
+        const int width = source.Size[0], height = source.Size[1];
+        if (!trackArtwork || source.Rotscale == static_cast<u32>(-1) ||
+            source.Type >= 3 || width <= 0 || height <= 0 || width > 64 || height > 64 ||
+            UploadedOBJVRAM.size() != static_cast<size_t>(mask) + 1 ||
+            (source.Type == 0 && (source.PalOffset > 240 || (source.PalOffset & 15))) ||
+            (source.Type == 1 && source.PalOffset > 16) ||
+            (source.Type == 2 && ((source.TileOffset | source.TileStride) & 1)))
+        {
+            SpriteArtworkPixels[i].clear();
+            SpriteArtworkGeneration[i] = ++SpriteArtworkSerial;
+            continue;
+        }
+        pixels.resize(width * height);
+        for (int y = 0; y < height; ++y)
+        for (int x = 0; x < width; ++x)
+        {
+            u32 pixel;
+            if (source.Type == 2)
+            {
+                const u32 address = (source.TileOffset + x * 2 + y * source.TileStride) & mask;
+                pixel = UploadedOBJVRAM[address] | (UploadedOBJVRAM[(address + 1) & mask] << 8);
+            }
+            else
+            {
+                const bool eightBit = source.Type == 1;
+                const u32 address = source.TileOffset + (x >> 3) * (eightBit ? 64 : 32) +
+                    (y >> 3) * source.TileStride + (y & 7) * (eightBit ? 8 : 4) +
+                    (eightBit ? (x & 7) : ((x & 7) >> 1));
+                u32 index = UploadedOBJVRAM[address & mask];
+                if (!eightBit) index = (index >> ((x & 1) * 4)) & 15;
+                const u32 paletteIndex = eightBit ? source.PalOffset * 256 + index : source.PalOffset + index;
+                pixel = UploadedOBJPalette[paletteIndex] | (index ? 1u << 16 : 0u);
+            }
+            pixels[y * width + x] = pixel;
+        }
+        if (pixels != SpriteArtworkPixels[i])
+        {
+            SpriteArtworkPixels[i] = pixels;
+            SpriteArtworkGeneration[i] = ++SpriteArtworkSerial;
+        }
+    }
+}
+
 void GLRenderer2D::PrerenderSprites()
 {
+    UpdateSpriteArtworkGenerations();
     u16* vtxbuf = SpritePreVtxData;
     int vtxnum = 0;
 
@@ -14027,26 +14193,46 @@ void GLRenderer2D::PrerenderSprites()
     glDrawArrays(GL_TRIANGLES, 0, vtxnum);
 }
 
-void GLRenderer2D::PrerenderLayer(int layer)
+void GLRenderer2D::PrerenderLayer(int layer, bool partial)
 {
     auto& cfg = LayerConfig.uBGConfig[layer];
-
     if (cfg.Type >= 6)
+        return;
+
+    // Preserve native history boundaries even if the exact decoded source is
+    // unchanged. The existing dependency snapshot covers color AND metadata.
+    BGLayerSourceGeneration[layer]++;
+    const GLBGArtworkCache::Config source{cfg.Size[0], cfg.Size[1], cfg.Type,
+        cfg.PalOffset, cfg.TileOffset, cfg.MapOffset, cfg.Clamp};
+    bool artworkChanged = true;
+    if (!WholeSceneScaleRequested || !WholeSceneScaleHybridStrictAffineHighRes || ScaleFactor <= 1 ||
+        !UploadedBGPaletteValid)
+        BGArtworkCache[layer].Reset();
+    else
+        artworkChanged = BGArtworkCache[layer].Update(source, BGVRAMUploadCache,
+            UploadedBGPalette, std::size(UploadedBGPalette));
+    if (artworkChanged)
+        BGLayerArtworkGeneration[layer]++;
+    const bool reuse = !partial && !artworkChanged && BGLayerTex[layer] != 0 &&
+        NativeBGPrerenderTexture[layer] == BGLayerTex[layer];
+    if (reuse)
         return;
 
     glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, BGLayerFB[layer]);
-
     glUniform1i(LayerPreCurBGULoc, layer);
-
-    // set layer size
     glViewport(0, 0, cfg.Size[0], cfg.Size[1]);
-
     glBindBuffer(GL_ARRAY_BUFFER, Parent.RectVtxBuffer);
     glBindVertexArray(Parent.RectVtxArray);
     glDrawArrays(GL_TRIANGLES, 0, 2*3);
-    BGLayerSourceGeneration[layer]++;
+
+    // Some BG types/sizes share backing storage. A different layer writing
+    // that texture invalidates its previous owner's native reuse proof.
+    for (auto& texture : NativeBGPrerenderTexture)
+        if (texture == BGLayerTex[layer]) texture = 0;
+    NativeBGPrerenderTexture[layer] = !partial && cfg.Type <= 3 ? BGLayerTex[layer] : 0;
 }
+
 
 void GLRenderer2D::PrerenderLayerRows(int layer, int firstRow, int lastRow)
 {
@@ -14065,7 +14251,7 @@ void GLRenderer2D::PrerenderLayerRows(int layer, int firstRow, int lastRow)
 
     glEnable(GL_SCISSOR_TEST);
     glScissor(0, firstRow, cfg.Size[0], lastRow - firstRow);
-    PrerenderLayer(layer);
+    PrerenderLayer(layer, true);
     glDisable(GL_SCISSOR_TEST);
 }
 
@@ -14512,6 +14698,7 @@ void GLRenderer2D::UpdateSemanticAffineOBJRoleContinuity()
         // role jump reconstruction domains.
         roleKey.SourceGeneration = 0;
         roleKey.Algorithm = 0;
+        roleKey.SourceEnhancement = 0;
         roleKey.SourceScale = 0;
         roleKey.EnhancementVersion = 0;
         const int word = oamIndex >> 6;
@@ -14906,6 +15093,62 @@ bool GLRenderer2D::RenderOrdinaryOBJBandProducts(
     return true;
 }
 
+u64 GLRenderer2D::UpdateResolvedOrdinaryOBJArtwork(const u32* includedSprites, u64 oamHash)
+{
+    const bool sameLayout = ResolvedOrdinaryOBJLayoutWork == ResolvedOrdinaryOBJLayout;
+    if (ResolvedOrdinaryOBJArtworkChecked && sameLayout &&
+        ResolvedOrdinaryOBJCheckedGeneration == SpriteSourceGeneration &&
+        ResolvedOrdinaryOBJCheckedOAMHash == oamHash)
+        return ResolvedOrdinaryOBJArtworkGeneration;
+
+    auto& pixels = ResolvedOrdinaryOBJArtworkWork;
+    pixels.clear();
+    const u32 mask = (SpriteConfig.uVRAMMask << 10) | 0x3FF;
+    const auto untracked = [&]() {
+        // Unsupported CPU inputs still use the existing GPU producer, but
+        // cannot reuse an earlier presentation product.
+        ResolvedOrdinaryOBJArtworkChecked = false;
+        return ++ResolvedOrdinaryOBJArtworkGeneration;
+    };
+    if (UploadedOBJVRAM.size() != static_cast<size_t>(mask) + 1)
+        return untracked();
+    for (int i = 0; i < NumSprites; ++i)
+    {
+        if (!(includedSprites[i >> 5] & (1u << (i & 31)))) continue;
+        const auto& source = SpriteConfig.uOAM[i];
+        const int width = source.Size[0], height = source.Size[1];
+        if (width <= 0 || height <= 0 || width > 64 || height > 64 || source.Type >= 2 ||
+            (source.Type == 0 && (source.PalOffset > 240 || (source.PalOffset & 15))) ||
+            (source.Type == 1 && source.PalOffset > 16))
+            return untracked();
+        for (int y = 0; y < height; ++y)
+        for (int x = 0; x < width; ++x)
+        {
+            // Same native inputs as SpritePreShader, including transparent
+            // RGB and the palette's high green bit. Native history remains
+            // keyed by SpriteSourceGeneration, never this artwork revision.
+            const bool eightBit = source.Type == 1;
+            const u32 address = source.TileOffset + (x >> 3) * (eightBit ? 64 : 32) +
+                (y >> 3) * source.TileStride + (y & 7) * (eightBit ? 8 : 4) +
+                (eightBit ? (x & 7) : ((x & 7) >> 1));
+            u32 index = UploadedOBJVRAM[address & mask];
+            if (!eightBit) index = (index >> ((x & 1) * 4)) & 15;
+            const u32 paletteIndex = eightBit ? source.PalOffset * 256 + index : source.PalOffset + index;
+            pixels.push_back(UploadedOBJPalette[paletteIndex] | (index ? 1u << 16 : 0u));
+        }
+    }
+    if (!ResolvedOrdinaryOBJArtworkChecked || !sameLayout || pixels != ResolvedOrdinaryOBJArtwork)
+    {
+        ResolvedOrdinaryOBJArtwork = pixels;
+        ResolvedOrdinaryOBJLayout = ResolvedOrdinaryOBJLayoutWork;
+        ++ResolvedOrdinaryOBJArtworkGeneration;
+    }
+    ResolvedOrdinaryOBJArtworkChecked = true;
+    ResolvedOrdinaryOBJCheckedGeneration = SpriteSourceGeneration;
+    ResolvedOrdinaryOBJCheckedOAMHash = oamHash;
+    return ResolvedOrdinaryOBJArtworkGeneration;
+}
+
 bool GLRenderer2D::RenderResolvedOrdinaryOBJProduct(
     int ystart,
     int yend,
@@ -14922,8 +15165,10 @@ bool GLRenderer2D::RenderResolvedOrdinaryOBJProduct(
     u32 includedSpriteMask[4] {};
     int includedCount = 0;
     u64 ordinaryOAMHash = 1469598103934665603ull;
-    auto hashValue = [](u64& hash, u64 value)
+    ResolvedOrdinaryOBJLayoutWork.clear();
+    auto hashValue = [this](u64& hash, u64 value)
     {
+        ResolvedOrdinaryOBJLayoutWork.push_back(static_cast<u32>(value));
         constexpr u64 kFNVPrime = 1099511628211ull;
         for (int byte = 0; byte < 8; byte++)
         {
@@ -14996,7 +15241,7 @@ bool GLRenderer2D::RenderResolvedOrdinaryOBJProduct(
     const int scaledWidth = ScreenW;
     const int scaledHeight = ScreenH;
     ResolvedOrdinaryOBJProductKey productKey;
-    productKey.SourceGeneration = SpriteSourceGeneration;
+    productKey.SourceGeneration = UpdateResolvedOrdinaryOBJArtwork(includedSpriteMask, ordinaryOAMHash);
     productKey.OrdinaryOAMHash = ordinaryOAMHash;
     productKey.SourceEnhancement = static_cast<u32>(sourceEnhancement);
     productKey.SourceModelIndex = sourceModelIndex;
@@ -17454,31 +17699,43 @@ fail:
 
 bool GLRenderer2D::EnsureCuNNyWorkTexture(int index, int width, int height)
 {
-    if (index < 0 || index >= 2 || width <= 0 || height <= 0)
-        return false;
-
-    if (CuNNyWorkTex[index] == 0)
-        glGenTextures(1, &CuNNyWorkTex[index]);
-
-    glBindTexture(GL_TEXTURE_2D, CuNNyWorkTex[index]);
-    if (CuNNyWorkTexWidth[index] != (u32)width || CuNNyWorkTexHeight[index] != (u32)height)
-    {
-        glDefaultTexParams(GL_TEXTURE_2D);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, width, height, 0, GL_RGBA, GL_HALF_FLOAT, nullptr);
-        CuNNyWorkTexWidth[index] = width;
-        CuNNyWorkTexHeight[index] = height;
-    }
-
-    return true;
+    if (index < 0 || index >= 2) return false;
+    return EnsureReconstructionScratch(CuNNyScratch[index], CuNNyLargeScratch[index],
+        CuNNyScratchClock, CuNNyWorkTex[index], width, height, ReconstructionScratchBudget);
 }
 
-bool GLRenderer2D::EnsureStrictAffineCuNNy2xTexture(int width, int height)
+bool GLRenderer2D::EnsureReconstructionScratch(ReconstructionScratch (&entries)[ReconstructionScratchEntries], ReconstructionScratch& large,
+                                                u64& clock, GLuint& selected, int width, int height, u64 budget)
 {
     if (width <= 0 || height <= 0)
         return false;
-    if (StrictAffineCuNNy2xWidth == static_cast<u32>(width) &&
-        StrictAffineCuNNy2xHeight == static_cast<u32>(height))
+
+    const auto select = [&](ReconstructionScratch& entry) {
+        entry.LastUse = ++clock;
+        selected = entry.Texture;
+        glBindTexture(GL_TEXTURE_2D, entry.Texture);
+    };
+    const auto release = [&](ReconstructionScratch& entry) {
+        if (!entry.Texture) return;
+        if (selected == entry.Texture)
+            selected = 0;
+        glDeleteTextures(1, &entry.Texture);
+        entry = {};
+    };
+    const u64 bytes = u64(width) * height * 8;
+    if (bytes <= budget)
     {
+        release(large);
+        for (auto& entry : entries)
+            if (entry.Texture && entry.Width == u32(width) && entry.Height == u32(height))
+            {
+                select(entry);
+                return true;
+            }
+    }
+    else if (large.Texture && large.Width == u32(width) && large.Height == u32(height))
+    {
+        select(large);
         return true;
     }
 
@@ -17487,14 +17744,58 @@ bool GLRenderer2D::EnsureStrictAffineCuNNy2xTexture(int width, int height)
     if (width > maxTextureSize || height > maxTextureSize)
         return false;
 
-    glBindTexture(GL_TEXTURE_2D, StrictAffineCuNNy2xTex);
+    ReconstructionScratch* target = &large;
+    if (bytes <= budget)
+    {
+        // Each role owns its LRU. Outputs cannot evict another role's input;
+        // GL preserves queued uses of an evicted texture.
+        for (;;)
+        {
+            u64 retained = 0;
+            ReconstructionScratch* oldest = nullptr;
+            target = nullptr;
+            for (auto& entry : entries)
+            {
+                retained += entry.Bytes();
+                if (!entry.Texture) target = &entry;
+                else if (!oldest || entry.LastUse < oldest->LastUse) oldest = &entry;
+            }
+            if (target && retained + bytes <= budget) break;
+            release(*oldest);
+        }
+    }
+    else
+    {
+        release(large);
+        for (auto& entry : entries) release(entry);
+    }
+
+    glGenTextures(1, &target->Texture);
+    if (!target->Texture) return false;
+    glBindTexture(GL_TEXTURE_2D, target->Texture);
     glDefaultTexParams(GL_TEXTURE_2D);
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, width, height, 0,
-                 GL_RGBA, GL_HALF_FLOAT, nullptr);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, width, height, 0, GL_RGBA, GL_HALF_FLOAT, nullptr);
+    if (glGetError() != GL_NO_ERROR)
+    {
+        release(*target);
+        return false;
+    }
+    target->Width = width;
+    target->Height = height;
+    select(*target);
+    return true;
+}
+
+bool GLRenderer2D::EnsureStrictAffineCuNNy2xTexture(int width, int height)
+{
+    auto& set = CuNNyResultScratch;
+    if (!EnsureReconstructionScratch(set.Entries, set.Large, set.Clock,
+            StrictAffineCuNNy2xTex, width, height, ReconstructionResultBudget)) return false;
     StrictAffineCuNNy2xWidth = width;
     StrictAffineCuNNy2xHeight = height;
     return true;
 }
+
 
 void GLRenderer2D::RenderCuNNyComputePass(GLuint shader, GLuint sourceTex, GLuint baseTex, GLuint targetTex,
                                           int sourceWidth, int sourceHeight,
@@ -17761,24 +18062,25 @@ bool GLRenderer2D::RenderNNEDI3RGBAtScale(GLuint sourceTex, GLuint targetTex,
     return true;
 }
 
-void GLRenderer2D::EnsureReconstructionAlphaTextures(int width, int height, int scale)
+bool GLRenderer2D::EnsureReconstructionAlphaTextures(int width, int height, int scale)
 {
-    if (!ReconstructionAlphaWorkTex[0]) glGenTextures(3, ReconstructionAlphaWorkTex);
-    if (width != ReconstructionAlphaWidth || height != ReconstructionAlphaHeight || scale != ReconstructionAlphaScale)
+    if (width <= 0 || height <= 0 || (scale != 2 && scale != 4)) return false;
+    GLint maximum = 0; glGetIntegerv(GL_MAX_TEXTURE_SIZE, &maximum);
+    if (width > maximum / scale || height > maximum / scale) return false;
+    for (int i = 0; i < 3; ++i)
     {
-        for (int i = 0; i < 3; ++i)
-        {
-            glBindTexture(GL_TEXTURE_2D, ReconstructionAlphaWorkTex[i]);
-            glDefaultTexParams(GL_TEXTURE_2D);
-            int factor = i == 0 ? 1 : scale;
-            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA16F, width * factor, height * factor,
-                         0, GL_RGBA, GL_HALF_FLOAT, nullptr);
-        }
-        ReconstructionAlphaWidth = width;
-        ReconstructionAlphaHeight = height;
-        ReconstructionAlphaScale = scale;
+        auto& set = AlphaScratch[i];
+        const int factor = i == 0 ? 1 : scale;
+        if (!EnsureReconstructionScratch(set.Entries, set.Large, set.Clock,
+                ReconstructionAlphaWorkTex[i], width * factor, height * factor,
+                ReconstructionResultBudget)) return false;
     }
+    ReconstructionAlphaWidth = width;
+    ReconstructionAlphaHeight = height;
+    ReconstructionAlphaScale = scale;
+    return true;
 }
+
 
 bool GLRenderer2D::ReconstructAffineAlpha(GLuint source, GLuint rgb, GLuint target,
                                           int width, int height, int scale,
@@ -17802,7 +18104,7 @@ bool GLRenderer2D::ReconstructAffineAlpha(GLuint source, GLuint rgb, GLuint targ
         return true;
     }
 
-    EnsureReconstructionAlphaTextures(width, height, scale);
+    if (!EnsureReconstructionAlphaTextures(width, height, scale)) return false;
     const GLuint mask = ReconstructionAlphaWorkTex[0];
     const GLuint alpha = reuseAlpha ? rgb : ReconstructionAlphaWorkTex[1];
     if (!reuseAlpha)
@@ -17870,7 +18172,7 @@ bool GLRenderer2D::RenderStrictAffineCachedRGB(
         {
             // Keep the original half-float mask conversion. Filter it beside
             // RGB with the same weights, rather than running Spline36 twice.
-            EnsureReconstructionAlphaTextures(sourceWidth, sourceHeight, sourceScale);
+            if (!EnsureReconstructionAlphaTextures(sourceWidth, sourceHeight, sourceScale)) return false;
             coverage = ReconstructionAlphaWorkTex[0];
             glUseProgram(ReconstructionAlphaShader);
             SetUniform1iIfPresent(ReconstructionAlphaShader, "uBilinear", false);
@@ -23069,6 +23371,16 @@ bool GLRenderer2D::RenderDeferredScanlineStrictAffine(
         deferredPlan.Assessment.HistoricalSourceUsed;
     if (historicalSourceUsed)
     {
+        // Eligibility is now authoritative and current-source preparation
+        // identified the exact enhanced operands. Finish any missing historical
+        // operands from their frozen native textures before drawing this frame.
+        // Existing cache hits were already copied at the original boundary.
+        if (cached && !PrepareDeferredStrictAffineHistoricalEnhancedBGs(
+                compositorEnhancedBGMask, sourceEnhancement, sourceModelIndex)) return false;
+        WholeSceneTrace.DeferredStrictAffineHistoricalEnhancedBGMask = 0;
+        for (u32 i = 0; i < DeferredStrictAffineHistoricalSourceEpochCount; ++i)
+            WholeSceneTrace.DeferredStrictAffineHistoricalEnhancedBGMask |=
+                DeferredStrictAffineHistoricalSourceEpochs[i].EnhancedBGMask;
         if (DeferredStrictAffineHistoricalSourceEpochOverflow ||
             deferredPlan.Assessment.HistoricalSourceEpochCount !=
                 DeferredStrictAffineHistoricalSourceEpochCount)
@@ -24770,6 +25082,8 @@ void GLRenderer2D::DrawSprites(u32 line)
                         1024, end - start,
                         GL_RED_INTEGER, GL_UNSIGNED_BYTE,
                         &vram[start * 1024]);
+        memcpy(UploadedOBJVRAM.data() + start * 1024, vram + start * 1024,
+               (end - start) * 1024);
         dirty = true;
         sourceArtDirty = true;
     }

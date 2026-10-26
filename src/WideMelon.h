@@ -36,6 +36,37 @@ constexpr int ValidateHeight(int height)
 {
     return height >= 192 && height <= 768 && height % 2 == 0 ? height : 192;
 }
+struct ViewExtent
+{
+    int Width = 256;
+    int Height = 192;
+    bool Valid = false;
+};
+// The smallest requested-aspect rectangle containing the native view is 100%.
+// Expansion grows both axes without changing native scene/HUD pixel scale.
+// Quantize each extent upward to an even pixel; reject unsupported sizes rather
+// than clamping one axis and silently changing the requested aspect.
+constexpr ViewExtent ResolveCustomView(int aspectWidth, int aspectHeight, int fovPercent)
+{
+    if (aspectWidth < 1 || aspectWidth > 32 || aspectHeight < 1 || aspectHeight > 32 ||
+        fovPercent < 100 || fovPercent > 300) return {};
+    auto even = [](int64_t numerator, int64_t denominator) {
+        return int(2 * ((numerator + 2 * denominator - 1) / (2 * denominator)));
+    };
+    ViewExtent result;
+    if (192 * aspectWidth >= 256 * aspectHeight)
+    {
+        result.Width = even(int64_t(192) * aspectWidth * fovPercent, int64_t(aspectHeight) * 100);
+        result.Height = even(int64_t(192) * fovPercent, 100);
+    }
+    else
+    {
+        result.Width = even(int64_t(256) * fovPercent, 100);
+        result.Height = even(int64_t(256) * aspectHeight * fovPercent, int64_t(aspectWidth) * 100);
+    }
+    result.Valid = result.Width <= 768 && result.Height <= 768;
+    return result;
+}
 struct Configuration
 {
     int Width = 256;
@@ -57,9 +88,16 @@ inline Configuration CurrentConfiguration()
     return {ViewWidth, ViewHeight, Target, ExtendWindows, ExpandNarrowBorders};
 }
 inline Configuration ResolveConfiguration(int configuredWidth, int displayTarget = Top, int configuredHeight = 192,
-                                          bool extendWindows = true, bool expandNarrowBorders = false)
+                                          bool extendWindows = true, bool expandNarrowBorders = false,
+                                          bool custom = false, int aspectWidth = 4, int aspectHeight = 3, int fovPercent = 100)
 {
     Configuration result;
+    if (custom)
+    {
+        const auto extent = ResolveCustomView(aspectWidth, aspectHeight, fovPercent);
+        configuredWidth = extent.Valid ? extent.Width : 256;
+        configuredHeight = extent.Valid ? extent.Height : 192;
+    }
     const char* env = std::getenv("WIDEMELON_VIEW_WIDTH");
     result.Width = env ? ParseWidth(env) : ValidateWidth(configuredWidth);
     result.Height = ValidateHeight(configuredHeight);
@@ -71,7 +109,6 @@ inline Configuration ResolveConfiguration(int configuredWidth, int displayTarget
         result.Height = end != height && *end == '\0' && parsed >= 192 && parsed <= 768
             ? ValidateHeight(static_cast<int>(parsed)) : 192;
     }
-    if (result.Height > 192) result.Width = 256;
     result.Target = ValidateDisplayTarget(displayTarget);
     result.ExtendWindows = extendWindows;
     result.ExpandNarrowBorders = expandNarrowBorders;
@@ -86,14 +123,17 @@ inline void ApplyConfiguration(const Configuration& config)
     ExpandNarrowBorders = config.ExpandNarrowBorders;
 }
 inline void Configure(int configuredWidth, int displayTarget = Top, int configuredHeight = 192,
-                      bool extendWindows = true, bool expandNarrowBorders = false)
+                      bool extendWindows = true, bool expandNarrowBorders = false,
+                      bool custom = false, int aspectWidth = 4, int aspectHeight = 3, int fovPercent = 100)
 {
     ApplyConfiguration(ResolveConfiguration(configuredWidth, displayTarget, configuredHeight,
-                                            extendWindows, expandNarrowBorders));
+                                            extendWindows, expandNarrowBorders,
+                                            custom, aspectWidth, aspectHeight, fovPercent));
 }
 inline int Width() { return ViewWidth; }
 inline int Height() { return ViewHeight; }
 inline bool Vertical() { return Height() > 192; }
+inline bool Rectangular() { return Width() > 256 && Height() > 192; }
 inline bool Enabled() { return Width() > 256 || ViewHeight > 192; }
 // Retain real scene pixels beneath a narrow native mask and its filter fringe.
 // Configuration is fixed before any capture textures are allocated.

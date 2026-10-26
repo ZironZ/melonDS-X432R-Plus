@@ -26,13 +26,14 @@ static void Compile(QOpenGLShaderProgram& shader, const std::string& source)
     if (!ok) std::fprintf(stderr, "%s\n", shader.log().toUtf8().constData());
     Check(ok, "production Compute shader compilation");
 }
-static std::string Defines(int width, int storage, int height, int native, int tile=8)
+static std::string Defines(int width, int storage, int height, int native, int tile=8,
+                           int outputHeight=0, int nativeHeight=0)
 {
     return "#version 430 core\n#define OutputWidth " + std::to_string(width)
         + "\n#define ScreenWidth " + std::to_string(storage)
         + "\n#define ScreenHeight " + std::to_string(height)
-        + "\n#define OutputHeight " + std::to_string(height)
-        + "\n#define NativeHeight " + std::to_string(height)
+        + "\n#define OutputHeight " + std::to_string(outputHeight ? outputHeight : height)
+        + "\n#define NativeHeight " + std::to_string(nativeHeight ? nativeHeight : height)
         + "\n#define NativeWidth " + std::to_string(native)
         + "\n#define TileSize " + std::to_string(tile)
         + "\n#define CoarseTileCountY 4\n#define ClearCoarseBinMaskLocalSize 64\n"
@@ -48,14 +49,20 @@ int main(int argc, char** argv)
     Check(context.makeCurrent(&surface), "GL surface");
     auto* gl=context.extraFunctions(); gl->initializeOpenGLFunctions();
     const bool brokenCenter=app.arguments().contains("--broken-center");
+    const bool brokenCenterY=app.arguments().contains("--broken-center-y");
     const bool brokenPadding=app.arguments().contains("--broken-padding");
     GLuint resultBuffer, metaBuffer, fb;
     gl->glGenBuffers(1,&resultBuffer); gl->glGenBuffers(1,&metaBuffer); gl->glGenFramebuffers(1,&fb);
     gl->glBindFramebuffer(GL_FRAMEBUFFER,fb);
     int cases=0;
-    for (int baseWidth : {256,308,342,448,682,768}) for (int scale : {1,3,5,16})
+    for (const auto size : {std::array<int,2>{256,4},{308,4},{342,4},{448,4},{682,4},{768,4},
+                            {384,288},{512,288},{384,512},{344,258}}) for (int scale : {1,3,5,16})
     {
-        const int width=baseWidth*scale, native=256*scale, storage=(width+255)/256*256, height=4, stride=storage*height;
+        const bool rectangular=size[1]>4;
+        if (rectangular && scale>3) continue;
+        const int width=size[0]*scale, native=256*scale, storage=(width+255)/256*256;
+        const int height=rectangular?size[1]*scale:4, nativeHeight=rectangular?192*scale:4;
+        const int storageHeight=rectangular?(height+31)/32*32:height, stride=storage*storageHeight;
         for (bool edges : {false,true})
         {
             std::vector<uint32_t> data(stride*6,0);
@@ -68,7 +75,7 @@ int main(int argc, char** argv)
             for (int y=0;y<height;y++) for(int x=0;x<storage;x++)
             {
                 const int i=y*storage+x;
-                data[i]=uint32_t((x%63)|((y+1)<<8)|(((x+y)%63)<<16)|(31<<24));
+                data[i]=uint32_t((x%63)|((y%63+1)<<8)|(((x+y)%63)<<16)|(31<<24));
                 data[i+2*stride]=100;
                 data[i+4*stride]=(1U<<24)|(edges?1U:0U);
             }
@@ -82,29 +89,32 @@ int main(int argc, char** argv)
             for(int i=0;i<2;i++)
             {
                 gl->glBindTexture(GL_TEXTURE_2D,textures[i]);
-                gl->glTexStorage2D(GL_TEXTURE_2D,1,GL_RGBA8,i?native:width,height);
+                gl->glTexStorage2D(GL_TEXTURE_2D,1,GL_RGBA8,i?native:width,i?nativeHeight:height);
                 gl->glBindImageTexture(i,textures[i],0,GL_FALSE,0,GL_WRITE_ONLY,GL_RGBA8);
             }
-            std::string source=Defines(width,storage,height,native)+"#define Widescreen\n"+(edges?"#define EdgeMarking\n":"")+S::Common+S::FinalPass;
+            std::string source=Defines(width,storage,storageHeight,native,8,height,nativeHeight)+"#define Widescreen\n"+(edges?"#define EdgeMarking\n":"")+S::Common+S::FinalPass;
             const std::string centerOffset="(OutputWidth - NativeWidth) / 2";
             if(brokenCenter) source.replace(source.find(centerOffset),centerOffset.size(),"0");
+            const std::string centerOffsetY="(OutputHeight - NativeHeight) / 2";
+            if(brokenCenterY) source.replace(source.find(centerOffsetY),centerOffsetY.size(),"0");
             QOpenGLShaderProgram shader; Compile(shader,source);
-            gl->glDispatchCompute(storage/32,height,1);
+            gl->glDispatchCompute(storage/32,storageHeight,1);
             gl->glMemoryBarrier(GL_FRAMEBUFFER_BARRIER_BIT);
-            std::vector<unsigned char> full(width*height*4),center(native*height*4);
+            std::vector<unsigned char> full(width*height*4),center(native*nativeHeight*4);
             for(int i=0;i<2;i++)
             {
                 gl->glFramebufferTexture2D(GL_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,textures[i],0);
                 Check(gl->glCheckFramebufferStatus(GL_FRAMEBUFFER)==GL_FRAMEBUFFER_COMPLETE,"output framebuffer");
-                gl->glReadPixels(0,0,i?native:width,height,GL_RGBA,GL_UNSIGNED_BYTE,i?center.data():full.data());
+                gl->glReadPixels(0,0,i?native:width,i?nativeHeight:height,GL_RGBA,GL_UNSIGNED_BYTE,i?center.data():full.data());
             }
             for(int y=0;y<height;y++) for(int x=0;x<width;x++)
             {
                 const bool edge=edges&&(x==0||x==width-1||y==0||y==height-1);
-                std::array<int,4> expected{edge?63:x%63,edge?0:y+1,edge?0:(x+y)%63,63};
+                std::array<int,4> expected{edge?63:x%63,edge?0:y%63+1,edge?0:(x+y)%63,63};
                 for(int c=0;c<4;c++) Check(std::abs(int(full[(y*width+x)*4+c])-int(std::lround(expected[c]*255.0/63.0)))<=1,"visible width/stride/edge pixel");
             }
-            for(int y=0;y<height;y++) Check(std::memcmp(center.data()+y*native*4,full.data()+(y*width+(width-native)/2)*4,native*4)==0,"native center is exact");
+            for(int y=0;y<nativeHeight;y++) Check(std::memcmp(center.data()+y*native*4,
+                full.data()+((y+(height-nativeHeight)/2)*width+(width-native)/2)*4,native*4)==0,"native center is exact on both axes");
             Check(gl->glGetError()==GL_NO_ERROR,"final pass GL error");
             gl->glDeleteTextures(2,textures); cases++;
         }

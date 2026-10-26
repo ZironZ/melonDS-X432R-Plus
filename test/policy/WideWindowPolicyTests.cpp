@@ -66,7 +66,34 @@ POLICY_TEST(WideNarrowBorderOptInUsesInteriorVisibilityAndEffects)
     CHECK(!CanExpandWideNarrowBorder(row, false));
     WideMelon::ViewWidth = 342;
     WideMelon::ViewHeight = 342;
-    CHECK(!CanExpandWideNarrowBorder(row, false));
+    CHECK(CanExpandWideNarrowBorder(row, false));
+}
+
+POLICY_TEST(RectangularNarrowBorderCombinesBothAxesWithoutChangingEdgeEffects)
+{
+    NarrowBorderSettings settings;
+    WideMelon::ViewWidth = 384; WideMelon::ViewHeight = 288;
+    std::array<WindowRow,192> rows;
+    for (int y = 0; y < 192; ++y)
+    {
+        auto& row=rows[y];row.WinRegs=0x3FFFFF00;
+        if(y>0&&y<191){row.WinMask=2;row.WinPos[0]=1;row.WinPos[1]=255;}
+    }
+    CHECK(CanExpandVerticalNarrowBorder(rows.data()));
+    CHECK_EQ(WideMelon::CaptureOverlap(),2); CHECK_EQ(WideMelon::VerticalCaptureOverlap(),2);
+    for (int y : {0,96,191}) for(int x : {0,128,255})
+    {
+        rows[y].BlendCnt=(3<<6)|1; rows[y].BlendCoef[2]=12;
+        const u32 policy=MakeRectangularWindowPolicy(rows.data(),0,x,y,true);
+        CHECK_EQ(policy&3,WideEdgeVisible);
+        CHECK_EQ((policy>>2)&3,3u); CHECK_EQ((policy>>4)&31,12u);
+        const bool border=x==0||x==255||y==0||y==191;
+        CHECK_EQ(bool(policy&WideNarrowBorder),border);
+        CHECK_EQ(MakeRectangularWindowPolicy(rows.data(),0,x,y,true,true)&WideNarrowBorder,0u);
+    }
+    CHECK_EQ(rows[0].WinMask,0u); CHECK_EQ(rows[96].WinPos[0],1);
+    WideMelon::ExpandNarrowBorders=false;
+    CHECK_EQ(MakeRectangularWindowPolicy(rows.data(),0,0,0,false)&3,1u);
 }
 
 POLICY_TEST(WideNarrowBorderFillingRequiresVisibleSourceAndDestination)
@@ -156,6 +183,66 @@ POLICY_TEST(RotatedNarrowBorderPreservesEdgeEffectsAndOtherAxisClipping)
     CHECK(!CanExpandVerticalNarrowBorder(rows.data()));
 }
 
+POLICY_TEST(VerticalNarrowBorderAcceptsOnlyOneRowGuardsOnEitherEdge)
+{
+    NarrowBorderSettings settings;
+    WideMelon::ViewWidth = 384; WideMelon::ViewHeight = 288;
+    for (int window : {0, 1}) for (unsigned excluded : {1u, 2u, 3u})
+    {
+        std::array<WindowRow, 192> rows;
+        WindowRow inside;
+        inside.WinRegs = window ? 0xFF3FFF00 : 0x3FFFFF00;
+        inside.WinMask = 2u << (window * 3);
+        inside.WinPos[window * 2] = 1;
+        inside.WinPos[window * 2 + 1] = 255;
+        rows.fill(inside);
+        for (int side : {0, 1}) if (excluded & (1u << side))
+        {
+            auto& edge = rows[side ? 191 : 0];
+            edge.WinMask = 0;
+            std::fill(std::begin(edge.WinPos), std::end(edge.WinPos), 256);
+        }
+        CHECK(CanExpandVerticalNarrowBorder(rows.data()));
+        const auto valid = rows;
+        for (int side : {0, 1})
+        {
+            const int y = side ? 191 : 0;
+            rows[y].BlendCnt = (3 << 6) | 1;
+            rows[y].BlendCoef[2] = 7;
+            for (int x : {0, 128, 255})
+            {
+                const u32 policy = MakeRectangularWindowPolicy(rows.data(), 0, x, y, true);
+                CHECK_EQ(policy & 3, WideEdgeVisible);
+                CHECK_EQ((policy >> 2) & 3, 3u);
+                CHECK_EQ((policy >> 4) & 31, 7u);
+                CHECK_EQ(bool(policy & WideNarrowBorder), x != 128 || bool(excluded & (1u << side)));
+            }
+            const u32 vertical = MakeVerticalWindowPolicy(rows.data(), 0, 128, side, true);
+            CHECK_EQ(vertical & 3, WideEdgeVisible);
+            CHECK_EQ(bool(vertical & WideNarrowBorder), bool(excluded & (1u << side)));
+            CHECK_EQ(rows[y].WinMask, valid[y].WinMask); // Native permissions stay unchanged.
+        }
+        rows = valid;
+        rows[(excluded & 1) ? 1 : 190].WinMask = 0; // Two excluded rows are not a guard.
+        CHECK(!CanExpandVerticalNarrowBorder(rows.data()));
+        rows = valid; rows[96].WinMask = 0;
+        CHECK(!CanExpandVerticalNarrowBorder(rows.data()));
+        rows = valid; rows[96].WinPos[window * 2]++;
+        CHECK(!CanExpandVerticalNarrowBorder(rows.data()));
+        rows = valid; rows[0].WinRegs ^= 1;
+        CHECK(!CanExpandVerticalNarrowBorder(rows.data()));
+        rows = valid; rows[191].OBJWindowEnabled = 1;
+        CHECK(!CanExpandVerticalNarrowBorder(rows.data()));
+        rows = valid; WideMelon::ExpandNarrowBorders = false;
+        CHECK(!CanExpandVerticalNarrowBorder(rows.data()));
+        WideMelon::ExpandNarrowBorders = true; WideMelon::ExtendWindows = false;
+        CHECK(!CanExpandVerticalNarrowBorder(rows.data()));
+        WideMelon::ExtendWindows = true;
+        rows.fill(inside); // No excluded edge: do not claim a border repair.
+        CHECK(!CanExpandVerticalNarrowBorder(rows.data()));
+    }
+}
+
 POLICY_TEST(WideNarrowBorderRejectsAmbiguousAndIntentionalRegions)
 {
     NarrowBorderSettings settings;
@@ -235,7 +322,7 @@ POLICY_TEST(WideWindowInteriorSpriteMasksLeaveOnlyProvenEdgesClear)
     WindowRow row;
     row.WinRegs = 0x3F3F322F;
     row.OBJWindowEnabled = 1 | WideOBJWindowProof(oam);
-    CHECK_EQ(row.OBJWindowEnabled, 13u);
+    CHECK_EQ(row.OBJWindowEnabled & 15u, 13u);
     CHECK_EQ(WideWindowPermissions(row, 0, true), 0x2Fu);
     CHECK_EQ(WideWindowPermissions(row, 255, true), 0x2Fu);
     CHECK_EQ(WideWindowPermissions(row, 5, true), 0x100u);
@@ -261,22 +348,130 @@ POLICY_TEST(WideWindowBoundsProofRespectsShapesAffineSizeAndSignedX)
                 const int width = widths[shape][size] * (type == 3 ? 2 : 1);
                 oam[0] = (shape << 14) | (2 << 10) | (type << 8) | 240;
                 oam[1] = (size << 14) | (255 - width);
-                CHECK_EQ(WideOBJWindowProof(oam), 12u); // Stops just before x=255.
+                CHECK_EQ(WideOBJWindowProof(oam) & 15u, 12u); // Stops just before x=255.
                 ++oam[1];
-                CHECK_EQ(WideOBJWindowProof(oam), 4u); // Right edge may be masked.
+                CHECK_EQ(WideOBJWindowProof(oam) & 15u, 4u); // Right edge may be masked.
                 oam[1] = size << 14;
-                CHECK_EQ(WideOBJWindowProof(oam), 8u); // Left edge may be masked.
+                CHECK_EQ(WideOBJWindowProof(oam) & 15u, 8u); // Left edge may be masked.
                 oam[1] |= 511;
-                CHECK_EQ(WideOBJWindowProof(oam), 8u); // x=-1, not x=511.
+                CHECK_EQ(WideOBJWindowProof(oam) & 15u, 8u); // x=-1, not x=511.
             }
     // Union all masks, including the last OAM slot; no stale proof after a move.
     oam[0] = 2 << 10; oam[1] = 5;
     oam[508] = 2 << 10; oam[509] = 250;
-    CHECK_EQ(WideOBJWindowProof(oam), 4u);
+    CHECK_EQ(WideOBJWindowProof(oam) & 15u, 4u);
     oam[1] = 0;
-    CHECK_EQ(WideOBJWindowProof(oam), 0u);
+    CHECK_EQ(WideOBJWindowProof(oam) & 15u, 0u);
     oam[0] |= 3 << 14;
     CHECK_EQ(WideOBJWindowProof(oam), 0u);
+}
+
+POLICY_TEST(WideWindowInteriorOBJMaskLeavesTopAndBottomMarginsVisible)
+{
+    NarrowBorderSettings settings;
+    WideMelon::ViewWidth = 384; WideMelon::ViewHeight = 288;
+    u16 oam[512] = {};
+    oam[0] = (2 << 10) | 5;
+    oam[1] = (1 << 14) | 5;
+    std::array<WindowRow,192> rows;
+    for (auto& row : rows)
+    {
+        row.WinRegs = 0x3F3F322F;
+        row.WinMask = 16;
+        row.WinPos[2] = 64; row.WinPos[3] = 255;
+        row.OBJWindowEnabled = 1 | WideOBJWindowProof(oam);
+        row.BlendCnt = (3 << 6) | 1;
+        row.BlendCoef[2] = 7;
+    }
+    CHECK(rows[0].OBJWindowEnabled & WideOBJClearTop);
+    CHECK(rows[191].OBJWindowEnabled & WideOBJClearBottom);
+    // Reproduce the native x=1..63 unknown-policy strip above the HUD.
+    for (int x : {1,16,32,63})
+    {
+        CHECK_EQ(WideWindowPermissions(rows[0],x,true),0x100u);
+        for (int side : {0,1})
+        {
+            const auto policy = MakeVerticalWindowPolicy(rows.data(),0,x,side,false);
+            CHECK_EQ(policy & 3,WideEdgeVisible);
+            CHECK_EQ((policy >> 2) & 3,3u);
+            CHECK_EQ((policy >> 4) & 31,7u);
+            CHECK_EQ(policy & WideNarrowBorder,0u);
+            CHECK_EQ(MakeRectangularWindowPolicy(rows.data(),0,x,side ? 191 : 0,false),policy);
+        }
+        CHECK_EQ(MakeRectangularWindowPolicy(rows.data(),0,x,96,false),0u);
+    }
+    // Restoring just the old horizontal proofs reproduces the black box.
+    for (auto& row : rows) row.OBJWindowEnabled &= 15u;
+    CHECK_EQ(MakeVerticalWindowPolicy(rows.data(),0,16,0,false),0u);
+    CHECK_EQ(MakeRectangularWindowPolicy(rows.data(),0,16,0,false),0u);
+}
+
+POLICY_TEST(WideWindowVerticalOBJProofRespectsBoundsWrapAndAffineSize)
+{
+    u16 oam[512] = {};
+    constexpr int heights[3][4] = {{8,16,32,64},{8,8,16,32},{16,32,32,64}};
+    for (int shape=0;shape<3;++shape)
+        for (int size=0;size<4;++size)
+            for (int type=0;type<4;++type)
+                for (int y : {0,1,64,127,128,180,191,192,200,240,255})
+                {
+                    const int height=heights[shape][size]*(type==3 ? 2 : 1);
+                    oam[0]=(shape<<14)|(2<<10)|(type<<8)|y;
+                    oam[1]=(size<<14)|32;
+                    const u32 proof=WideOBJWindowProof(oam);
+                    if (proof & WideOBJClearTop) CHECK(((256-y)&255)>=height);
+                    if (proof & WideOBJClearBottom) CHECK(((191-y)&255)>=height);
+                    if (y==0) CHECK_EQ(proof & WideOBJClearTop,0u);
+                    if (y==191) CHECK_EQ(proof & WideOBJClearBottom,0u);
+                    if (y==1 && height<=128) CHECK(proof & WideOBJClearTop);
+                    if (y+height>256) CHECK_EQ(proof & WideOBJClearTop,0u);
+                }
+    // Disabled/unknown masks retain conservative bounds, including slot 127.
+    oam[0]=0;
+    CHECK_EQ(WideOBJWindowProof(oam),62u);
+    oam[508]=(2<<10)|(1<<9);
+    oam[509]=32;
+    CHECK_EQ(WideOBJWindowProof(oam) & WideOBJClearTop,0u);
+    oam[508]=(2<<10)|(3<<8)|180;
+    oam[509]=(3<<14)|32;
+    CHECK_EQ(WideOBJWindowProof(oam) & (WideOBJClearTop|WideOBJClearBottom),0u);
+    oam[508] |= 3<<14;
+    CHECK_EQ(WideOBJWindowProof(oam),0u);
+}
+
+POLICY_TEST(WideWindowVerticalOBJProofUsesBoundarySnapshotAndKeepsRealMasks)
+{
+    NarrowBorderSettings settings;
+    WideMelon::ViewWidth=384; WideMelon::ViewHeight=288;
+    std::array<WindowRow,192> rows;
+    for (auto& row : rows)
+    {
+        row.WinRegs=0x3F3F322F;
+        row.OBJWindowEnabled=1;
+    }
+    rows[0].OBJWindowEnabled |= WideOBJClearTop;
+    rows[191].OBJWindowEnabled |= WideOBJClearBottom;
+    CHECK_EQ(MakeVerticalWindowPolicy(rows.data(),0,16,0,false)&3,WideEdgeVisible);
+    CHECK_EQ(MakeVerticalWindowPolicy(rows.data(),0,16,1,false)&3,WideEdgeVisible);
+    // The same boundary proof must preserve a known opaque covering BG,
+    // rather than expose the 3D layer underneath it.
+    rows[0].BGPrio[0]=2; rows[0].BGPrio[1]=1;
+    const auto permissions=WideWindowPermissions(rows[0],16,true,WideOBJClearTop);
+    const auto cover=MakeWideWindowPolicy(rows[0],0,16,true,false,1,0x1234,permissions);
+    CHECK_EQ(cover & 3,1u);
+    CHECK_EQ((cover >> 9) & 0xFFFF,0x1234u);
+    rows[0].OBJWindowEnabled=1|WideOBJClearBottom;
+    rows[191].OBJWindowEnabled=1|WideOBJClearTop;
+    CHECK_EQ(MakeVerticalWindowPolicy(rows.data(),0,16,0,false),0u);
+    CHECK_EQ(MakeRectangularWindowPolicy(rows.data(),0,16,191,false),0u);
+    // Rectangular windows retain priority over absence proofs and effects.
+    auto& top=rows[0];
+    top.OBJWindowEnabled |= WideOBJClearTop;
+    top.WinRegs=0x303F322F; top.WinMask=2;
+    top.WinPos[0]=0; top.WinPos[1]=64;
+    CHECK_EQ(MakeVerticalWindowPolicy(rows.data(),0,16,0,false)&3,1u);
+    WideMelon::ExtendWindows=false;
+    CHECK_EQ(MakeVerticalWindowPolicy(rows.data(),0,100,0,false),0u);
 }
 
 POLICY_TEST(WideWindow3DBlendRequiresKnownBackdropOperand)

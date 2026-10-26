@@ -27,6 +27,7 @@
 #include "OpenGLSupport.h"
 #include "GPU2D.h"
 #include "GLBGVRAMUploadCache.h"
+#include "GLBGArtworkCache.h"
 #include "RendererDebug.h"
 #include "RendererSettings.h"
 #include "WholeSceneOutputPlan.h"
@@ -300,7 +301,14 @@ private:
     u32 EnhancedBGLayerWidth[4] {};
     u32 EnhancedBGLayerHeight[4] {};
     u64 BGLayerSourceGeneration[4] {1, 1, 1, 1};
+    u64 BGLayerArtworkGeneration[4] {1, 1, 1, 1};
+    GLBGArtworkCache BGArtworkCache[4];
+    GLuint NativeBGPrerenderTexture[4] {};
+    u16 UploadedBGPalette[256 * 65] {};
+    bool UploadedBGPaletteValid = false;
     u64 EnhancedBGLayerSourceGeneration[4] {};
+    u32 EnhancedBGLayerSourceEnhancement[4] {};
+    u32 EnhancedBGLayerClamp[4] {};
     u32 EnhancedBGLayerAlgorithm[4] {};
     bool EnhancedBGLayerBackdropPrecomposed[4] {};
     u32 EnhancedBGLayerBackdropColor[4] {};
@@ -425,6 +433,12 @@ private:
     };
     ResolvedOrdinaryOBJProductKey ResolvedOrdinaryOBJKey {};
     bool ResolvedOrdinaryOBJValid = false;
+    // Exact decoded inputs for this presentation surface, not native history.
+    std::vector<u32> ResolvedOrdinaryOBJArtwork, ResolvedOrdinaryOBJArtworkWork;
+    std::vector<u32> ResolvedOrdinaryOBJLayout, ResolvedOrdinaryOBJLayoutWork;
+    u64 ResolvedOrdinaryOBJArtworkGeneration = 0;
+    u64 ResolvedOrdinaryOBJCheckedGeneration = 0, ResolvedOrdinaryOBJCheckedOAMHash = 0;
+    bool ResolvedOrdinaryOBJArtworkChecked = false;
 
     GLuint NativeOutputFB {};
     GLuint NativeOutputTex {};
@@ -508,10 +522,37 @@ private:
     GLuint XBRZInfoFB {};
     u32 XBRZInfoWidth = 0;
     u32 XBRZInfoHeight = 0;
-    GLuint CuNNyWorkTex[2] {};
-    u32 CuNNyWorkTexWidth[2] {};
-    u32 CuNNyWorkTexHeight[2] {};
-    GLuint StrictAffineCuNNy2xTex = 0;
+    struct ReconstructionScratch
+    {
+        GLuint Texture = 0;
+        u32 Width = 0, Height = 0;
+        u64 LastUse = 0;
+        u64 Bytes() const { return u64(Width) * Height * 8; } // RGBA16F
+    };
+    // Each ping-pong index owns its own LRU: replacing an output can never
+    // evict the other index, which may still be the input of the next pass.
+    static constexpr u64 ReconstructionScratchBudget = 16 * 1024 * 1024;
+    static constexpr int ReconstructionScratchEntries = 4;
+    struct ReconstructionScratchSet
+    {
+        ReconstructionScratch Entries[ReconstructionScratchEntries] {};
+        ReconstructionScratch Large {};
+        u64 Clock = 0;
+    };
+    // Result and alpha roles cannot evict one another's live inputs. Each
+    // retains at most 8 MiB / four exact sizes, or one oversized working
+    // allocation. This bounds retention, not the largest supported image.
+    static constexpr u64 ReconstructionResultBudget = 8 * 1024 * 1024;
+    ReconstructionScratchSet CuNNyResultScratch, AlphaScratch[3];
+    ReconstructionScratch CuNNyScratch[2][ReconstructionScratchEntries] {};
+    // Requests exceeding the retained-storage budget keep the old renderer's
+    // one working allocation per index. These are released on returning to
+    // ordinary sizes; large backgrounds remain supported without an unbounded
+    // collection of oversized textures.
+    ReconstructionScratch CuNNyLargeScratch[2] {};
+    u64 CuNNyScratchClock = 0;
+    GLuint CuNNyWorkTex[2] {}; // Borrowed selections, never deleted directly.
+    GLuint StrictAffineCuNNy2xTex = 0; // Borrowed from CuNNyResultScratch.
     u32 StrictAffineCuNNy2xWidth = 0;
     u32 StrictAffineCuNNy2xHeight = 0;
 
@@ -555,7 +596,7 @@ private:
     RendererSettings::AffineAlphaReconstruction AffineAlpha = RendererSettings::AffineAlphaReconstruction::Bilinear;
     RendererSettings::AffineSampling AffineSampleGrid = RendererSettings::AffineSampling::OutputGrid;
     bool NNEDI3PremultipliedRGB = false;
-    void EnsureReconstructionAlphaTextures(int width, int height, int scale);
+    bool EnsureReconstructionAlphaTextures(int width, int height, int scale);
     bool ReconstructAffineAlpha(GLuint source, GLuint rgb, GLuint target,
                                 int width, int height, int scale,
                                 StrictAffineSourceEnhancementDecision rgbEnhancement);
@@ -882,6 +923,7 @@ private:
         int YEnd = 0;
         u32 NativeBGMask = 0;
         u32 EnhancedBGMask = 0;
+        u32 BGClampMask = 0;
         u64 SourceGeneration = 0;
         u64 SpriteGeneration = 0;
         u64 BGLayerGeneration[4] {};
@@ -1095,6 +1137,7 @@ private:
         u32 TileOffset = 0;
         u32 TileStride = 0;
         u32 Algorithm = 0;
+        u32 SourceEnhancement = 0;
         u32 SourceScale = 0;
         u32 EnhancementVersion = 0;
         u64 ConnectedSourceHash = 0;
@@ -1107,6 +1150,7 @@ private:
                    TileOffset == other.TileOffset &&
                    TileStride == other.TileStride &&
                    Algorithm == other.Algorithm &&
+                   SourceEnhancement == other.SourceEnhancement &&
                    SourceScale == other.SourceScale &&
                     EnhancementVersion == other.EnhancementVersion &&
                     ConnectedSourceHash == other.ConnectedSourceHash;
@@ -1118,6 +1162,7 @@ private:
     bool OpaqueOBJAssemblyValid[128] {};
     std::string OpaqueOBJAssemblyDescription;
     u64 ConnectedOBJSourceHashes[128] {};
+    u8 ConnectedOBJSourcePartnerPlusOne[128] {};
     s32 EnhancedOBJSourceRegions[128][4] {};
     u64 EnhancedOBJSourceValidMask[2] {};
     EnhancedOBJSourceKey SemanticAffineOBJRoleKeys[128] {};
@@ -1125,6 +1170,14 @@ private:
     u8 SemanticAffineOBJIdentityGrace[128] {};
     u64 SemanticAffineOBJRoleMask[2] {};
     u64 SpriteSourceGeneration = 1;
+    // Exact input to SpritePreShader, tracked separately from the global
+    // generation used by scanline/history ownership. No GPU readback or hash
+    // collision can authorize reuse of changed artwork.
+    std::vector<u8> UploadedOBJVRAM;
+    u16 UploadedOBJPalette[256 * 17] {};
+    std::vector<u32> SpriteArtworkPixels[128];
+    u64 SpriteArtworkGeneration[128] {};
+    u64 SpriteArtworkSerial = 0;
     int SpriteOAMIndex[128] {};
     int NumSprites;
     bool SpriteUseMosaic;
@@ -1138,7 +1191,7 @@ private:
             u32 BackColor;          // 96
             u32 WinRegs;            // 100
             u32 WinMask;            // 104
-            u32 OBJWindowEnabled; // bit 0: enabled; bit 1: no masks; bits 2/3: clear left/right edge
+            u32 OBJWindowEnabled; // bit 0: enabled; bit 1: no masks; bits 2/3/4/5: clear left/right/top/bottom
             s32 WinPos[4];
             u32 BGMosaicEnable[4];
             s32 MosaicSize[4];
@@ -1314,7 +1367,8 @@ private:
     void RecordWholeSceneVisibleBitmapDirtyRows(int layer, int line, int firstRow, int lastRow);
     void UpdateCachedRegistersAndLayerConfig(u8 layerPreDirty);
     void UploadBGVRAM(NonStupidBitField<1024>& bgDirty, int line);
-    void BuildWideCoverPolicies(int ystart, int yend, u32 (&policies)[192][2]) const;
+    void BuildWideCoverPolicies(int ystart, int yend, u32 (&policies)[192][2],
+                                u32 (*verticalPolicies)[2] = nullptr) const;
     void UploadBGPalette(u32 paletteDirty, NonStupidBitField<64>& bgExtPalDirty);
     void PrerenderDirtyLayers(u8 layerPreDirty,
                               u8 rowLimitedBitmapMask,
@@ -1338,6 +1392,7 @@ private:
     bool AreWholeSceneNativeProductsComplete() const;
     DeferredScanlineStrictAffinePlan
         BuildDeferredScanlineStrictAffinePlan() const;
+    bool HasSupportedDeferredStrictAffineRecordedState() const;
     WholeSceneOutputPlan BuildDeferredScanlineStrictAffineOutputPlan(
         const DeferredScanlineStrictAffinePlan& deferredPlan) const;
     bool RenderDeferredScanlineStrictAffine(
@@ -1593,7 +1648,9 @@ private:
     void UpdateCompositorConfig(int ystart = -1, int yend = -1);
 
     void PrerenderSprites();
-    void PrerenderLayer(int layer);
+    void UpdateSpriteArtworkGenerations();
+    u64 UpdateResolvedOrdinaryOBJArtwork(const u32* includedSprites, u64 oamHash);
+    void PrerenderLayer(int layer, bool partial = false);
     void PrerenderLayerRows(int layer, int firstRow, int lastRow);
 
     void DoRenderSprites(int line);
@@ -1728,6 +1785,12 @@ private:
         u8 vramLayerPreDirty,
         u8 paletteLayerPreDirty,
         u8 deferredLayerPreDirty);
+    bool PrepareDeferredStrictAffineHistoricalEnhancedBGs(
+        u32 requiredBGMask, StrictAffineSourceEnhancementDecision sourceEnhancement,
+        int sourceModelIndex);
+    bool IsEnhancedBGLayerCurrent(int layer, int sourceScale, u32 algorithm,
+                                  bool precomposeBackdrop, u32 backdropColor,
+                                  StrictAffineSourceEnhancementDecision sourceEnhancement) const;
     bool EnsureEnhancedBGScratchTextures(int width, int height,
                                          int sourceScale);
     bool RebuildEnhancedBGLayer(
@@ -1737,6 +1800,11 @@ private:
         int sourceScaleOverride = 0,
         u32 affineConstantBackdropPrecomposeMask = 0,
         bool allowTextBG = false);
+    bool ReconstructEnhancedBGSource(
+        GLuint sourceFB, GLuint targetFB, int width, int height, bool clamp,
+        StrictAffineSourceEnhancementDecision sourceEnhancement,
+        int sourceModelIndex, int sourceScale, bool precomposeBackdrop,
+        u32 backdropColor);
     u32 PrepareStrictAffineEnhancedBGSources(
         StrictAffineSourceEnhancementDecision sourceEnhancement,
         int sourceModelIndex,
@@ -1896,6 +1964,8 @@ private:
     bool EnsureArtCNNWorkTextures(int nativeWidth, int nativeHeight);
     bool EnsureNNEDI3ComputePrograms();
     bool EnsureCuNNyWorkTexture(int index, int width, int height);
+    bool EnsureReconstructionScratch(ReconstructionScratch (&entries)[ReconstructionScratchEntries], ReconstructionScratch& large,
+                                      u64& clock, GLuint& selected, int width, int height, u64 budget);
     void CopyCuNNyProgramsFrom(const GLRenderer2D& other);
     void CopyArtCNNProgramsFrom(const GLRenderer2D& other);
     void CopyNNEDI3ComputeProgramsFrom(const GLRenderer2D& other);

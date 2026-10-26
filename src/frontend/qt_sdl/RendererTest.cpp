@@ -8,6 +8,7 @@
 #include <utility>
 
 #include <QDateTime>
+#include <QCryptographicHash>
 #include <QElapsedTimer>
 #include <QDir>
 #include <QFile>
@@ -19,6 +20,7 @@
 #include <QMetaObject>
 #include <QSet>
 #include <QTimer>
+#include <QTimeZone>
 
 #include "RendererTest.h"
 #include "RendererTestAssertions.h"
@@ -223,6 +225,13 @@ RendererTestRunner* RendererTestRunner::fromManifest(const QString& manifestPath
     if (!runner->savestate.isEmpty() && !QFileInfo::exists(runner->savestate))
     {
         errorstr = QString("Savestate %1 does not exist.").arg(runner->savestate);
+        delete runner;
+        return nullptr;
+    }
+
+    if (!RendererTestEnvironment::parse(root, !runner->savestate.isEmpty(), runner->environment, errorstr))
+    {
+        errorstr = QString("Manifest %1: %2").arg(manifestPath, errorstr);
         delete runner;
         return nullptr;
     }
@@ -587,6 +596,9 @@ void RendererTestRunner::onFramePresented(EmuInstance* inst,
                                           qulonglong timingFrame,
                                           bool timingFrameValid)
 {
+    if (armed.load(std::memory_order_acquire) && !scheduleDone.load() &&
+        !validateFrameEnvironment(inst))
+        return;
     RendererTestFrameCapture* capture = captureForFrame(timingFrame);
     if (!capture || capture->frameObserved)
         return;
@@ -769,6 +781,62 @@ void RendererTestRunner::onEmuStart()
         }
         printf("[renderer-test] savestate loaded: %s\n", savestate.toUtf8().constData());
     }
+
+    // This pause spans state loading, RTC policy, probe policy, and arming.
+    // No host-clock overwrite or unscheduled frame can intervene.
+    auto* nds = emuInstance->getNDS();
+    if (environment.rtcMode == "fixed")
+    {
+        const QDate date = environment.fixedDateTime.date();
+        const QTime time = environment.fixedDateTime.time();
+        nds->RTC.SetDateTime(date.year(), date.month(), date.day(), time.hour(), time.minute(), time.second());
+    }
+    auto& renderer = nds->GPU.GetRenderer();
+    if (!renderer.SetCaptureLumaProbeEnabled(environment.captureLumaProbe))
+    {
+        fail("The requested capture-luma probe is unavailable for this renderer.");
+        finishRun();
+        return;
+    }
+    initialProbeReadbacks = renderer.GetCaptureLumaProbeReadbackCount();
+    environmentStarted = true;
+    environmentRecord = environment.toJson();
+    environmentRecord["captureLumaProbeReadbacksBeforeRun"] = static_cast<qint64>(initialProbeReadbacks);
+    environmentRecord["configuredHostRtcSync"] = emuInstance->getLocalConfig().GetBool("RTC.SyncToHost");
+    environmentRecord["configuredRtcOffsetSeconds"] = QString::number(emuInstance->getLocalConfig().GetInt64("RTC.Offset"));
+    int year, month, day, hour, minute, second;
+    nds->RTC.GetDateTime(year, month, day, hour, minute, second);
+    environmentRecord["initialRtcDateTime"] = QDateTime(QDate(year, month, day), QTime(hour, minute, second), QTimeZone("UTC"))
+        .toString("yyyy-MM-ddTHH:mm:ss");
+    melonDS::RTC::StateData rtcState;
+    nds->RTC.GetState(rtcState);
+    environmentRecord["initialRtcRegisters"] = QString::fromLatin1(
+        QByteArray(reinterpret_cast<const char*>(rtcState.DateTime), 7).toHex());
+    environmentRecord["initialRtcStatus1"] = rtcState.StatusReg1;
+    environmentRecord["initialRtcStatus2"] = rtcState.StatusReg2;
+    if (!savestate.isEmpty())
+    {
+        QFile stateFile(savestate);
+        QCryptographicHash hash(QCryptographicHash::Sha256);
+        if (!stateFile.open(QIODevice::ReadOnly) || !hash.addData(&stateFile))
+        {
+            fail("Could not fingerprint the replay savestate.");
+            finishRun();
+            return;
+        }
+        environmentRecord["savestateSha256"] = QString::fromLatin1(hash.result().toHex());
+    }
+    const QString environmentError = checkEnvironment(emuInstance);
+    if (!environmentError.isEmpty())
+    {
+        fail(environmentError);
+        finishRun();
+        return;
+    }
+    printf("[renderer-test] environment: purpose=%s rtc=%s host-sync=%s capture-luma-probe=%s\n",
+           environment.purpose.toUtf8().constData(), environment.rtcMode.toUtf8().constData(),
+           environment.deterministicRTC() ? "suppressed" : "configured",
+           environment.captureLumaProbe ? "enabled (diagnostic)" : "disabled");
 
     if (captureWholeSceneCsv)
     {
@@ -1101,6 +1169,33 @@ void RendererTestRunner::fail(const QString& reason)
     printf("[renderer-test] FAIL: %s\n", reason.toUtf8().constData());
 }
 
+QString RendererTestRunner::checkEnvironment(EmuInstance* inst)
+{
+    if (!inst || !inst->getNDS())
+        return "Replay environment lost its emulator instance.";
+    auto& renderer = inst->getNDS()->GPU.GetRenderer();
+    const auto count = renderer.GetCaptureLumaProbeReadbackCount();
+    if (count < initialProbeReadbacks)
+        return "The renderer/probe counter changed during the replay; results are not comparable.";
+    observedProbeReadbacks.store(count - initialProbeReadbacks, std::memory_order_relaxed);
+    return environment.validateObserved(renderer.IsCaptureLumaProbeEnabled(), count - initialProbeReadbacks,
+                                        hostRTCWrites.load(std::memory_order_relaxed));
+}
+
+bool RendererTestRunner::validateFrameEnvironment(EmuInstance* inst)
+{
+    environmentFramesChecked.fetch_add(1, std::memory_order_relaxed);
+    const QString error = checkEnvironment(inst);
+    if (error.isEmpty())
+        return true;
+    if (!environmentViolation.exchange(true))
+    {
+        scheduleDone.store(true, std::memory_order_release);
+        QMetaObject::invokeMethod(this, [this, error]() { fail(error); finishRun(); }, Qt::QueuedConnection);
+    }
+    return false;
+}
+
 void RendererTestRunner::finishRun()
 {
     if (finished)
@@ -1108,8 +1203,33 @@ void RendererTestRunner::finishRun()
     finished = true;
 
     EmuThread* emuThread = emuInstance ? emuInstance->getEmuThread() : nullptr;
+    if (emuThread && emuThread->emuIsRunning())
+        emuThread->emuPause(false);
     if (emuThread && emuThread->wholeSceneTimingLogActive())
         emuThread->stopWholeSceneTimingLog();
+
+    if (environmentStarted)
+    {
+        const QString error = checkEnvironment(emuInstance);
+        if (!error.isEmpty())
+        {
+            environmentViolation.store(true);
+            fail(error);
+        }
+        environmentRecord["captureLumaProbeEnabled"] = emuInstance->getNDS()->GPU.GetRenderer().IsCaptureLumaProbeEnabled();
+        environmentRecord["captureLumaProbeReadbacks"] = static_cast<qint64>(observedProbeReadbacks.load());
+        environmentRecord["hostRtcWrites"] = static_cast<qint64>(hostRTCWrites.load());
+        environmentRecord["framesChecked"] = static_cast<qint64>(environmentFramesChecked.load());
+        int year, month, day, hour, minute, second;
+        emuInstance->getNDS()->RTC.GetDateTime(year, month, day, hour, minute, second);
+        environmentRecord["finalRtcDateTime"] = QDateTime(QDate(year, month, day), QTime(hour, minute, second), QTimeZone("UTC"))
+            .toString("yyyy-MM-ddTHH:mm:ss");
+        environmentRecord["safeguardsPassed"] = !environmentViolation.load();
+        const bool comparable = !environmentViolation.load() && !environment.diagnostic();
+        environmentRecord["imageComparisonEligible"] = comparable;
+        environmentRecord["performanceComparisonEligible"] = comparable && !environment.imageReadbacks;
+        emuInstance->getNDS()->GPU.GetRenderer().SetCaptureLumaProbeEnabled(false);
+    }
 
     writeExactFrameCaptures();
 
@@ -1152,6 +1272,14 @@ void RendererTestRunner::writeVerdict()
     verdict["framesRun"] = static_cast<qint64>(framesRun.load());
     verdict["warmupFrames"] = warmupFrames;
     verdict["steps"] = static_cast<int>(steps.size());
+    if (!environmentStarted)
+    {
+        environmentRecord = environment.toJson();
+        environmentRecord["safeguardsPassed"] = false;
+        environmentRecord["imageComparisonEligible"] = false;
+        environmentRecord["performanceComparisonEligible"] = false;
+    }
+    verdict["environment"] = environmentRecord;
     verdict["wholeSceneCsv"] = captureWholeSceneCsv ? timingCsvPath : QString();
     verdict["rollingDumpRequested"] = rollingDumpAtEnd;
     verdict["debugFrameHandoffTestRequested"] = testDebugFrameHandoff;

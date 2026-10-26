@@ -35,6 +35,7 @@
 #include "ArchiveUtil.h"
 #endif
 #include "EmuInstance.h"
+#include "RendererTest.h"
 #include "WideMelon.h"
 #include "Config.h"
 #include "Platform.h"
@@ -388,7 +389,11 @@ void EmuInstance::prepareConsoleRestart()
         globalCfg.GetInt("3D.GL.WidescreenDisplay"),
         globalCfg.GetInt("3D.GL.WidescreenHeight"),
         globalCfg.GetBool("3D.GL.WidescreenExtendWindows"),
-        globalCfg.GetBool("3D.GL.WidescreenExpandNarrowBorders"));
+        globalCfg.GetBool("3D.GL.WidescreenExpandNarrowBorders"),
+        globalCfg.GetBool("3D.GL.WidescreenCustom"),
+        globalCfg.GetInt("3D.GL.WidescreenAspectWidth"),
+        globalCfg.GetInt("3D.GL.WidescreenAspectHeight"),
+        globalCfg.GetInt("3D.GL.WidescreenFOVPercent"));
     if (requested == WideMelon::CurrentConfiguration()) return;
 
     // Dimensions are process-wide. Never invalidate another instance's live
@@ -1245,8 +1250,15 @@ void EmuInstance::saveRTCData()
 
 void EmuInstance::setDateTime()
 {
-    QDateTime hosttime = QDateTime::currentDateTime();
-    QDateTime time = hosttime.addSecs(localCfg.GetInt64("RTC.Offset"));
+    QDateTime time;
+    if (rendererTest && rendererTest->deterministicRTC())
+        time = rendererTest->bootRTCSeed();
+    else
+    {
+        time = QDateTime::currentDateTime().addSecs(localCfg.GetInt64("RTC.Offset"));
+        if (rendererTest)
+            rendererTest->recordHostRTCWrite();
+    }
 
     nds->RTC.SetDateTime(time.date().year(), time.date().month(), time.date().day(),
                          time.time().hour(), time.time().minute(), time.time().second());
@@ -1254,6 +1266,10 @@ void EmuInstance::setDateTime()
 
 void EmuInstance::syncRTC()
 {
+    // A replay's clock advances with emulated time. Preserve a loaded state's
+    // RTC and ignore host sync without changing the user's configuration.
+    if (rendererTest && rendererTest->deterministicRTC())
+        return;
     if (!localCfg.GetBool("RTC.SyncToHost"))
         return;
 

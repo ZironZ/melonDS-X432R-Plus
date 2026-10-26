@@ -3,7 +3,47 @@
 #include "PolicyTestHarness.h"
 #include "GPU3D_TexcacheMip.h"
 
+#include <cstring>
+#include <limits>
+
 using namespace melonDS;
+
+POLICY_TEST(TextureMipChannelRoundingMatchesHalfwayBoundaries)
+{
+    for (int halfSteps = 0; halfSteps <= 510; halfSteps++)
+    {
+        const float value = halfSteps * 0.5f;
+        for (float sample : {value,
+                             std::nextafter(value, -std::numeric_limits<float>::infinity()),
+                             std::nextafter(value, std::numeric_limits<float>::infinity())})
+        {
+            if (sample >= 0.0f && sample <= 255.0f)
+                CHECK_EQ(TextureMipRoundChannel(sample), std::lround(sample));
+        }
+    }
+    CHECK_EQ(TextureMipRoundChannel(-0.0f), 0u);
+}
+
+POLICY_TEST(TextureMipChannelRoundingMatchesFiniteFloatSamples)
+{
+    // Fine-spaced samples exercise every channel range, while deterministic
+    // float bit patterns include small magnitudes and subnormal values.
+    for (u32 value = 0; value <= 255 * 256; value++)
+    {
+        const float sample = value / 256.0f;
+        CHECK_EQ(TextureMipRoundChannel(sample), std::lround(sample));
+    }
+    u32 random = 0xBADC0DE;
+    for (u32 i = 0; i < 65536; i++)
+    {
+        random = random * 1664525u + 1013904223u;
+        const u32 bits = random & 0x7FFFFFFFu;
+        float sample;
+        std::memcpy(&sample, &bits, sizeof(sample));
+        if (std::isfinite(sample) && sample <= 255.0f)
+            CHECK_EQ(TextureMipRoundChannel(sample), std::lround(sample));
+    }
+}
 
 POLICY_TEST(TexturePaddingUsesOnlyOriginalNontransparentNeighbors)
 {
@@ -71,4 +111,86 @@ POLICY_TEST(TextureMipRetainsUnroundedAlphaForFinalCoverageThreshold)
     TextureMipBuildBinaryAlphaLevel(2, 2, src, nullptr, 1, 1, dst, nullptr, false, false);
     CHECK_EQ(dst.size(), 1u);
     CHECK_EQ(dst[0], 0x000000FFu);
+}
+
+POLICY_TEST(TexturePaddingMatchesBoundedNeighborhoodReference)
+{
+    u32 random = 0xBADC0DE;
+    for (u32 width : {1u, 2u, 3u, 7u, 16u})
+    for (u32 height : {1u, 2u, 3u, 7u, 16u})
+    for (u32 pattern = 0; pattern < 8; pattern++)
+    {
+        std::vector<u32> source(width * height);
+        for (u32& color : source)
+        {
+            random = random * 1664525u + 1013904223u;
+            color = random;
+            if (pattern == 0 || (pattern > 1 && (random & 3) == 0))
+                color &= 0x00FFFFFF;
+        }
+        auto expected = source;
+        // Read only the original source, so traversal order cannot hide
+        // accidental propagation through already-padded transparent pixels.
+        for (u32 y = 0; y < height; y++)
+        for (u32 x = 0; x < width; x++)
+        {
+            if (source[y * width + x] >> 24)
+                continue;
+            u32 sum[3] = {}, count = 0;
+            for (int dy = -1; dy <= 1; dy++)
+            for (int dx = -1; dx <= 1; dx++)
+            {
+                int nx = static_cast<int>(x) + dx;
+                int ny = static_cast<int>(y) + dy;
+                if (nx < 0 || ny < 0 || nx >= static_cast<int>(width) || ny >= static_cast<int>(height))
+                    continue;
+                u32 color = source[ny * width + nx];
+                if (!(color >> 24))
+                    continue;
+                for (u32 channel = 0; channel < 3; channel++)
+                    sum[channel] += (color >> (channel * 8)) & 255;
+                count++;
+            }
+            if (count)
+                expected[y * width + x] = (sum[0] / count) |
+                    ((sum[1] / count) << 8) | ((sum[2] / count) << 16);
+        }
+        for (u32 iterations : {1u, 6u})
+        {
+            auto actual = source;
+            PadTransparentTextureRGBIterations(width, height, actual.data(), iterations);
+            CHECK(actual == expected);
+        }
+    }
+}
+
+POLICY_TEST(TextureMipWeightedRGBMatchesFloatReference)
+{
+    u32 random = 0xBADC0DE;
+    for (u32 alpha = 0; alpha < 256; alpha++)
+    for (u32 pattern = 0; pattern < 32; pattern++)
+    {
+        std::vector<u32> source(4);
+        float weighted[3] = {}, fallback[3] = {}, weight = 0.0f;
+        for (u32 i = 0; i < 4; i++)
+        {
+            random = random * 1664525u + 1013904223u;
+            const u32 a = pattern == 0 ? 0 : (alpha + i * pattern) & 255;
+            source[i] = (random & 0x00FFFFFF) | (a << 24);
+            weight += static_cast<float>(a);
+            for (u32 channel = 0; channel < 3; channel++)
+            {
+                float value = static_cast<float>((source[i] >> (channel * 8)) & 255);
+                fallback[channel] += value;
+                weighted[channel] += value * static_cast<float>(a);
+            }
+        }
+        u32 expectedRGB = 0;
+        for (u32 channel = 0; channel < 3; channel++)
+            expectedRGB |= static_cast<u32>(std::lround(weight > 0.0f ?
+                weighted[channel] / weight : fallback[channel] / 4.0f)) << (channel * 8);
+        std::vector<u32> actual;
+        TextureMipBuildBinaryAlphaLevel(2, 2, source, nullptr, 1, 1, actual, nullptr, false, false);
+        CHECK_EQ(actual[0] & 0x00FFFFFF, expectedRGB);
+    }
 }

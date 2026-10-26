@@ -30,6 +30,7 @@
 #include "WideWindowPolicy.h"
 #include "WideDisplayPolicy.h"
 #include "OpenGL_shaders/WideVertical.h"
+#include "OpenGL_shaders/WideRectangular.h"
 #include "OpenGL_shaders/WideCapture.h"
 
 namespace melonDS
@@ -163,7 +164,14 @@ bool GLRenderer::Init()
             return false;
         glUniformBlockBinding(WideShader, glGetUniformBlockIndex(WideShader, "ubFinalPassConfig"), 30);
         glUniformBlockBinding(WideShader, glGetUniformBlockIndex(WideShader, "ubWideWindows"), 29);
-        if (WideMelon::Vertical())
+        if (WideMelon::Rectangular())
+        {
+            if (!OpenGL::CompileVertexFragmentProgram(WideRectangularShader, kFinalPassVS, kWideRectangularFS,
+                "WideRectangular", {{"vPosition", 0}}, {{"oTopColor", 0}, {"oBottomColor", 1}})) return false;
+            glUniformBlockBinding(WideRectangularShader, glGetUniformBlockIndex(WideRectangularShader, "ubFinalPassConfig"), 30);
+            glUniformBlockBinding(WideRectangularShader, glGetUniformBlockIndex(WideRectangularShader, "ubWideWindows"), 29);
+        }
+        else if (WideMelon::Vertical())
         {
             if (!OpenGL::CompileVertexFragmentProgram(WideVerticalShader, kFinalPassVS, kWideVerticalFS,
                 "WideVertical", {{"vPosition", 0}}, {{"oTopColor", 0}, {"oBottomColor", 1}})) return false;
@@ -179,7 +187,7 @@ bool GLRenderer::Init()
         glGenBuffers(1, &WideWindowUBO);
         glBindBuffer(GL_UNIFORM_BUFFER, WideWindowUBO);
         static_assert(sizeof(WideWindowRow) == 32);
-        glBufferData(GL_UNIFORM_BUFFER, 256 * sizeof(WideWindowRow), nullptr, GL_STREAM_DRAW);
+        glBufferData(GL_UNIFORM_BUFFER, (WideMelon::Rectangular() ? 448 : 256) * sizeof(WideWindowRow), nullptr, GL_STREAM_DRAW);
         glGenTextures(2, WideOutputTex);
         glGenFramebuffers(2, WideOutputFB);
     }
@@ -425,6 +433,7 @@ GLRenderer::~GLRenderer()
     glDeleteProgram(FPShader);
     glDeleteProgram(WideShader);
     glDeleteProgram(WideVerticalShader);
+    glDeleteProgram(WideRectangularShader);
     glDeleteProgram(WideCaptureShader);
     glDeleteTextures(1, &WideScratchTex);
     glDeleteFramebuffers(1, &WideScratchFB);
@@ -548,8 +557,6 @@ void GLRenderer::ResetWholeSceneFrameTiming()
 {
     WholeSceneFrameTiming = {};
     LastCaptureNativeLumaDebug = {};
-    if (WholeSceneTimingCSVActiveFrames > 0)
-        WholeSceneTimingCSVActiveFrames--;
     MainVRAMDisplayEpochInvalidationDebug = {};
     VRAMDisplayWriteDebug = {};
     VRAMDisplayWriteDebug.DisplayBank = 0xFFFFFFFFu;
@@ -1881,6 +1888,262 @@ void GLRenderer::RenderScreen(int ystart, int yend)
     AddWholeScenePhaseTiming(WholeSceneFrameTiming.RenderScreen, ElapsedUS(phaseStart));
 }
 
+void GLRenderer::BuildRectangularWindows(const GLRenderer2D& renderer, int layer, int engine,
+                                         bool raw, int ystart, int yend, WideWindowRow (&windows)[448])
+{
+    const auto* rows = renderer.ScanlineConfig.uScanline;
+    const bool expandVertical = ystart == 0 && yend == 192 && CanExpandVerticalNarrowBorder(rows);
+    u32 covers[192][2] = {}, verticalCovers[256][2] = {};
+    if (!raw && layer == 0 && WideMelon::ExtendWindows)
+        renderer.BuildWideCoverPolicies(ystart, yend, covers, verticalCovers);
+    auto set = [&](int index, int side, int x, int y, u32 cover)
+    {
+        const auto& row = rows[y];
+        // A translated/mosaic live BG0 has no rectangular identity proof.
+        // Captured BG/OBJ consumers already pass FindWideCapture's proof.
+        if (!raw && layer == 0 && row.Enable3D &&
+            (row.BGOffset[0][0] != 0 || row.BGOffset[0][1] != y || row.BGMosaicEnable[0])) return;
+        const int slot = engine * 2 + side;
+        windows[index].Current[slot] = raw ? WideEdgeVisible : cover ? cover :
+            MakeRectangularWindowPolicy(rows, layer, x, y, expandVertical);
+        windows[index].Captured[slot] = MakeRectangularWindowPolicy(rows, layer, x, y, expandVertical, true);
+    };
+    for (int y = ystart; y < yend; ++y)
+        for (int side = 0; side < 2; ++side)
+            set(y, side, side ? 255 : 0, y, covers[y][side]);
+    for (int side = 0; side < 2; ++side)
+    {
+        const int y = side ? 191 : 0;
+        if (y < ystart || y >= yend) continue;
+        for (int x = 0; x < 256; ++x)
+            set(192 + x, side, x, y, verticalCovers[x][side]);
+    }
+}
+
+void GLRenderer::StoreRectangularCapture(const sLastDisplayCaptureDebug& capture,
+                                         const sHighResDisplayCaptureEvent& event)
+{
+    const u32 bank = capture.DstBlock;
+    const auto previous = WideCapture[bank];
+    const u64 feedbackSerial = WideFeedbackSerial[bank];
+    WideFeedbackSerial[bank] = 0;
+    WideCapture[bank] = {};
+    if (!WideRectangularShader || !WideOutputTex3D || !event.Valid || !event.Serial ||
+        capture.CapSize != 3 || capture.DstOffset || capture.YStart != 0 || capture.YEnd < 192 ||
+        capture.FinalNativeSourceA) return;
+    for (int y = 0; y < 192; ++y)
+        if (CaptureConfig.uSrcAOffset[y] != 0) return;
+    int mode = CaptureConfig.uDstMode;
+    GLuint sourceB = 0;
+    bool restartFeedback = false;
+    if (mode != 0 && capture.UsesSrcB)
+    {
+        if (capture.SrcB || capture.SrcBOffset || capture.SrcBBlock >= 4) return;
+        const bool self = capture.SrcBBlock == bank;
+        const u64 previous = self ? feedbackSerial : WideCapture[capture.SrcBBlock].Serial;
+        if (capture.SrcBUsesTrackedCapture && previous &&
+            (self || previous == HighResDisplayCapture256Event[capture.SrcBBlock].Serial))
+            sourceB = WideCaptureTex[capture.SrcBBlock];
+        if (!sourceB)
+        {
+            restartFeedback = mode == 2 && self && !capture.SrcA && capture.EVA != 0;
+            if (!restartFeedback) return;
+        }
+    }
+    WideWindowRow windows[448] = {};
+    const auto& renderer = *static_cast<GLRenderer2D*>(Rend2D_A.get());
+    BuildRectangularWindows(renderer, 0, 0, capture.SrcA != 0, 0, 192, windows);
+    for (const auto& row : windows)
+        for (int side = 0; side < 2; ++side)
+        {
+            if (mode != 1 && !row.Current[side]) return;
+            if (restartFeedback && (!IsWidePolicyFullyDark(row.Current[side]) ||
+                !IsWidePolicyFullyDark(row.Captured[side]))) return;
+        }
+    if (restartFeedback) mode = 0;
+
+    // The full auxiliary canvas retains real scene pixels beneath relaxed
+    // native borders. Propagate that provenance through A/B feedback too.
+    const auto& sourceBState = sourceB ? (capture.SrcBBlock == bank ? previous : WideCapture[capture.SrcBBlock]) : previous;
+    for (int index = 0; index < 448; ++index)
+        for (int side = 0; side < 2; ++side)
+        {
+            u8 bits = mode != 1 && (mode == 0 || capture.EVA) &&
+                (windows[index].Current[side] & WideNarrowBorder) ? 1u << side : 0;
+            if (sourceB && (mode == 1 || capture.EVB))
+                bits |= (index < 192 ? sourceBState.HorizontalBorders[index] :
+                    sourceBState.VerticalBorders[index - 192]) & (1u << side);
+            if (index < 192) WideCapture[bank].HorizontalBorders[index] |= bits;
+            else WideCapture[bank].VerticalBorders[index - 192] |= bits;
+        }
+
+    GLint oldRead, oldDraw, oldProgram, oldViewport[4];
+    glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &oldRead);
+    glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &oldDraw);
+    glGetIntegerv(GL_CURRENT_PROGRAM, &oldProgram);
+    glGetIntegerv(GL_VIEWPORT, oldViewport);
+    const GLboolean scissor = glIsEnabled(GL_SCISSOR_TEST);
+    if (!WideScratchTex)
+    {
+        glGenTextures(1, &WideScratchTex);
+        glBindTexture(GL_TEXTURE_2D, WideScratchTex);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, WideMelon::Width() * WideSourceScale,
+            WideMelon::Height() * WideSourceScale, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+    }
+    if (!WideScratchFB) glGenFramebuffers(1, &WideScratchFB);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, WideScratchFB);
+    glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, WideScratchTex, 0);
+    glDrawBuffer(GL_COLOR_ATTACHMENT0);
+    glViewport(0, 0, WideMelon::Width() * WideSourceScale, WideMelon::Height() * WideSourceScale);
+    glDisable(GL_SCISSOR_TEST);
+    glDisable(GL_BLEND);
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_STENCIL_TEST);
+    glColorMaski(0, GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glUseProgram(WideRectangularShader);
+    glUniform1i(glGetUniformLocation(WideRectangularShader, "uOperation"), mode + 1);
+    glUniform1i(glGetUniformLocation(WideRectangularShader, "uRaw3D"), capture.SrcA != 0);
+    glUniform2i(glGetUniformLocation(WideRectangularShader, "uBlend"), capture.EVA, capture.EVB);
+    glUniform2i(glGetUniformLocation(WideRectangularShader, "uSize"), WideMelon::Width(), WideMelon::Height());
+    glUniform2i(glGetUniformLocation(WideRectangularShader, "uOverlap"), WideMelon::CaptureOverlap(), WideMelon::VerticalCaptureOverlap());
+    glUniform1i(glGetUniformLocation(WideRectangularShader, "InputA"), 0);
+    glUniform1i(glGetUniformLocation(WideRectangularShader, "InputB"), 1);
+    glBindBuffer(GL_UNIFORM_BUFFER, WideWindowUBO);
+    glBufferSubData(GL_UNIFORM_BUFFER, 0, sizeof(windows), windows);
+    glBindBufferBase(GL_UNIFORM_BUFFER, 29, WideWindowUBO);
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, sourceB);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, WideOutputTex3D);
+    glBindVertexArray(FPVertexArrayID);
+    glDrawArrays(GL_TRIANGLES, 0, 6);
+    std::swap(WideScratchTex, WideCaptureTex[bank]);
+    WideCapture[bank].Serial = event.Serial;
+    WideCapture[bank].FullWidth = true;
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, oldRead);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, oldDraw);
+    glUseProgram(oldProgram);
+    glViewport(oldViewport[0], oldViewport[1], oldViewport[2], oldViewport[3]);
+    if (scissor) glEnable(GL_SCISSOR_TEST);
+}
+
+void GLRenderer::RenderRectangularWings(int ystart, int yend)
+{
+    GLuint textures[2] = {};
+    int modes[2] = {};
+    int captureBanks[2] = {-1,-1};
+    WideWindowRow windows[448] = {};
+    for (int engine = 0; engine < 2; ++engine)
+    {
+        const auto& renderer = *static_cast<GLRenderer2D*>(engine ? Rend2D_B.get() : Rend2D_A.get());
+        const u32 disp = engine ? DispCntB : DispCntA;
+        if (!GPU.ScreensEnabled || !renderer.GPU2D.Enabled || renderer.GPU2D.ForcedBlank) continue;
+        int layer = 0, bank = -1;
+        if (engine == 0 && ((disp >> 16) & 3) == 2)
+        {
+            bank = FindWideVRAMDisplay(disp);
+            if (bank < 0) continue;
+            modes[engine] = 3;
+        }
+        else if (((disp >> 16) & 3) == 1)
+        {
+            if (engine == 0 && (disp & 0x108) == 0x108)
+            {
+                textures[engine] = WideOutputTex3D;
+                modes[engine] = 1;
+            }
+            else
+            {
+                bank = FindWideCapture(renderer, ystart, yend, layer);
+                if (bank < 0) continue;
+                modes[engine] = 2;
+            }
+        }
+        if (bank >= 0) textures[engine] = WideCaptureTex[bank];
+        captureBanks[engine] = bank;
+        if (modes[engine]) BuildRectangularWindows(renderer, layer, engine, modes[engine] == 3,
+                                                  ystart, yend, windows);
+    }
+    for (int engine = 0; engine < 2; ++engine)
+    {
+        const int bank = captureBanks[engine];
+        auto fill = [&](int index, int side, u8 capturedBorders) {
+            const u32 captured = bank < 0 ? 0 : WideEdgeVisible |
+                ((capturedBorders & (1u << side)) ? WideNarrowBorder : 0);
+            return modes[engine] && ShouldFillWideNarrowBorder(windows[index].Current[engine*2+side],
+                captured, bank >= 0);
+        };
+        for (int y = ystart; y < yend; ++y)
+        {
+            const int screen = FinalPassConfig.uScreenSwap[y] ? engine : 1-engine;
+            WideNarrowBorderRows[y][screen] = 0;
+            if (WideMelon::WidenDisplay(screen))
+                for (int side = 0; side < 2; ++side)
+                    if (fill(y, side, bank < 0 ? 0 : WideCapture[bank].HorizontalBorders[y]))
+                        WideNarrowBorderRows[y][screen] |= 1u << side;
+        }
+        for (int side = 0; side < 2; ++side)
+        {
+            const int y = side ? 191 : 0;
+            if (y < ystart || y >= yend) continue;
+            const int screen = FinalPassConfig.uScreenSwap[y] ? engine : 1-engine;
+            for (int x = 0; x < 256; ++x)
+            {
+                WideNarrowBorderColumns[x][screen] &= ~(1u << side);
+                if (WideMelon::WidenDisplay(screen) &&
+                    fill(192+x, side, bank < 0 ? 0 : WideCapture[bank].VerticalBorders[x]))
+                    WideNarrowBorderColumns[x][screen] |= 1u << side;
+            }
+        }
+    }
+    const int margin = (WideMelon::Height() - 192) / 2;
+    const int y0 = ystart == 0 ? 0 : ystart + margin;
+    const int y1 = yend == 192 ? WideMelon::Height() : yend + margin;
+    const GLenum outputs[] = {GL_COLOR_ATTACHMENT0, GL_COLOR_ATTACHMENT1};
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, WideOutputFB[BackBuffer]);
+    glDrawBuffers(2, outputs);
+    glViewport(0, 0, WideMelon::Width() * ScaleFactor, WideMelon::Height() * ScaleFactor);
+    glEnable(GL_SCISSOR_TEST);
+    glScissor(0, y0 * ScaleFactor, WideMelon::Width() * ScaleFactor, (y1 - y0) * ScaleFactor);
+    glDisable(GL_BLEND);
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_STENCIL_TEST);
+    glColorMaski(0, GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glColorMaski(1, GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glUseProgram(WideRectangularShader);
+    glUniform1i(glGetUniformLocation(WideRectangularShader, "uOperation"), 0);
+    glUniform2i(glGetUniformLocation(WideRectangularShader, "uSize"), WideMelon::Width(), WideMelon::Height());
+    glUniform2i(glGetUniformLocation(WideRectangularShader, "uOverlap"), WideMelon::CaptureOverlap(), WideMelon::VerticalCaptureOverlap());
+    glUniform2iv(glGetUniformLocation(WideRectangularShader, "uModes"), 1, modes);
+    glUniform2i(glGetUniformLocation(WideRectangularShader, "uDisplays"), WideMelon::WidenDisplay(0), WideMelon::WidenDisplay(1));
+    for (int engine = 0; engine < 2; ++engine)
+    {
+        const auto& renderer = *static_cast<GLRenderer2D*>(engine ? Rend2D_B.get() : Rend2D_A.get());
+        const auto presentation = WideDisplayPresentation(GPU.ScreensEnabled,
+            renderer.GPU2D.Enabled, renderer.GPU2D.ForcedBlank, engine,
+            engine ? DispCntB : DispCntA, engine ? MasterBrightnessB : MasterBrightnessA);
+        glUniform3iv(glGetUniformLocation(WideRectangularShader,
+            engine ? "uPresentation[1]" : "uPresentation[0]"), 1, presentation.data());
+    }
+    glUniform1i(glGetUniformLocation(WideRectangularShader, "InputA"), 0);
+    glUniform1i(glGetUniformLocation(WideRectangularShader, "InputB"), 1);
+    glBindBuffer(GL_UNIFORM_BUFFER, WideWindowUBO);
+    glBufferSubData(GL_UNIFORM_BUFFER, 0, sizeof(windows), windows);
+    glBindBufferBase(GL_UNIFORM_BUFFER, 29, WideWindowUBO);
+    glBindBuffer(GL_UNIFORM_BUFFER, FPConfigUBO);
+    glBufferSubData(GL_UNIFORM_BUFFER, 0, sizeof(FinalPassConfig), &FinalPassConfig);
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, textures[1]);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, textures[0]);
+    glBindVertexArray(FPVertexArrayID);
+    glDrawArrays(GL_TRIANGLES, 0, 6);
+}
+
 void GLRenderer::StoreVerticalCapture(const sLastDisplayCaptureDebug& capture,
                                       const sHighResDisplayCaptureEvent& event)
 {
@@ -2236,6 +2499,7 @@ void GLRenderer::StoreWideCapture(const sLastDisplayCaptureDebug& capture,
 {
     if (!WideMelon::Enabled() || capture.DstBlock >= 4) return;
     const u32 bank = capture.DstBlock;
+    if (WideMelon::Rectangular()) { StoreRectangularCapture(capture, event); return; }
     if (WideMelon::Vertical()) { StoreVerticalCapture(capture, event); return; }
     if (capture.UsesSrcB) { StoreWideFeedbackCapture(capture, event); return; }
     WideFeedbackSerial[bank] = 0;
@@ -2467,6 +2731,7 @@ int GLRenderer::FindWideCapture(const GLRenderer2D& renderer,
 
 void GLRenderer::RenderWideWings(int ystart, int yend)
 {
+    if (WideMelon::Rectangular()) { RenderRectangularWings(ystart, yend); return; }
     if (WideMelon::Vertical()) { RenderVerticalWings(ystart, yend); return; }
     if (!WideMelon::Enabled()) return;
     GLuint textures[2] = {0, 0};
@@ -2585,6 +2850,33 @@ void GLRenderer::CopyWideCenter()
     {
         glReadBuffer(GL_COLOR_ATTACHMENT0 + i);
         glDrawBuffer(GL_COLOR_ATTACHMENT0 + i);
+        if (WideMelon::Rectangular())
+        {
+            const int overlapX = WideMelon::CaptureOverlap();
+            const int overlapY = WideMelon::VerticalCaptureOverlap();
+            auto band = [&](int y) { return y < overlapY ? 1 : y >= 192-overlapY ? 2 : 0; };
+            for (int y = 0; y < 192; )
+            {
+                const int first = y++;
+                const u8 sides = WideNarrowBorderRows[first][i];
+                const int verticalSide = band(first);
+                while (y < 192 && WideNarrowBorderRows[y][i] == sides && band(y) == verticalSide) ++y;
+                const int firstX = sides & 1 ? overlapX : 0;
+                const int lastX = 256 - (sides & 2 ? overlapX : 0);
+                for (int x = firstX; x < lastX; )
+                {
+                    const int start = x++;
+                    const bool preserve = (WideNarrowBorderColumns[start][i] & verticalSide) != 0;
+                    while (x < lastX && ((WideNarrowBorderColumns[x][i] & verticalSide) != 0) == preserve) ++x;
+                    if (preserve) continue;
+                    const int x0 = start*ScaleFactor, x1 = x*ScaleFactor;
+                    const int y0 = first*ScaleFactor, y1 = y*ScaleFactor;
+                    glBlitFramebuffer(x0,y0,x1,y1,left+x0,top+y0,left+x1,top+y1,
+                        GL_COLOR_BUFFER_BIT,GL_NEAREST);
+                }
+            }
+            continue;
+        }
         const int verticalOverlap = WideMelon::VerticalCaptureOverlap() * ScaleFactor;
         if (verticalOverlap)
         {
@@ -3044,7 +3336,7 @@ void GLRenderer::DoCapture(int ystart, int yend)
             CaptureOutput256Valid[dstblock] = true;
     }
 
-    if (WholeSceneTimingCSVActiveFrames > 0 && yend >= dstheight)
+    if (CaptureLumaProbeEnabled && yend >= dstheight)
     {
         MeasureCaptureNativeLumaDebug(capcnt, dstblock, capture.DstOffset,
                                       dstwidth, dstheight, capsize,
@@ -3105,6 +3397,7 @@ void GLRenderer::MeasureCaptureNativeLumaDebug(u32 capcnt, u32 dstblock, u32 dst
                                                int dstwidth, int dstheight, u32 capsize,
                                                GLuint captureFB)
 {
+    ++CaptureLumaProbeReadbacks;
     const int bufferwidth = (capsize == 0) ? 128 : 256;
     const int bufferheight = (capsize == 0) ? 128 : 256;
 
@@ -5699,6 +5992,8 @@ void GLRenderer::AppendWholeSceneFrameTimingCSVHeader(std::string& header)
     add("last_capture_eva");
     add("last_capture_evb");
     add("last_capture_native_luma_valid");
+    add("capture_luma_probe_enabled");
+    add("capture_luma_probe_readbacks");
     add("last_capture_native_luma_x1000");
     add("last_capture_native_luma_dst_block");
     add("capture256_valid_mask");
@@ -5968,6 +6263,8 @@ void GLRenderer::AppendWholeSceneFrameTimingCSVRow(std::string& row) const
     addInt(LastDisplayCaptureDebug.EVA);
     addInt(LastDisplayCaptureDebug.EVB);
     addInt(LastCaptureNativeLumaDebug.Valid);
+    addInt(CaptureLumaProbeEnabled);
+    addU64(CaptureLumaProbeReadbacks);
     addInt(LastCaptureNativeLumaDebug.LumaX1000);
     addInt(LastCaptureNativeLumaDebug.DstBlock);
     addInt(DisplayCapture256ValidMask());
@@ -6381,9 +6678,6 @@ bool GLRenderer::ReadWholeScene2DTimingCSV(std::string& header,
 
     header.clear();
     row.clear();
-    // Arm the capture-content luma probe for the next few frames; it stays off
-    // outside logging so normal rendering never pays the readback.
-    WholeSceneTimingCSVActiveFrames = 8;
     AppendWholeSceneFrameTimingCSVHeader(header);
     AppendWholeSceneFrameTimingCSVRow(row);
 

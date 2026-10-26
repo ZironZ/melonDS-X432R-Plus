@@ -27,6 +27,7 @@
 #include "RendererSettings.h"
 #include "TextureScalingDebug.h"
 #include "WideTransitionPolicy.h"
+#include "WideTransitionMask.h"
 
 #include <string>
 
@@ -54,6 +55,7 @@ public:
 
     void RenderFrame() override;
     WideTransitionPlan TransitionPlan;
+    std::unordered_map<const Polygon*, WideTransitionMask> TransitionMasks;
     u32* GetLine(int line) override;
     void ResetRenderFrameTiming();
     void AppendRenderFrameTimingCSVHeader(std::string& header, const char* prefix) const;
@@ -66,6 +68,8 @@ public:
     bool SetTextureScalingDebugFrameCaptureEnabled(bool enabled, std::string* status = nullptr);
 
 private:
+    friend struct GLRendererLifetimeTestAccess;
+    void UploadShaderConfig();
     GLRenderer& Parent;
     bool LastRenderFrameSkipped = false;
 

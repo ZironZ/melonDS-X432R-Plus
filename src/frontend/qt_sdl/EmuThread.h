@@ -189,7 +189,8 @@ private:
                                    bool touchRelease,
                                    int touchX,
                                    int touchY,
-                                   melonDS::u64 totalUS);
+                                   melonDS::u64 totalUS,
+                                   melonDS::u64 presentEndCounter);
 
     enum EmuStatusKind
     {
@@ -235,6 +236,7 @@ private:
     QFile wholeSceneRendererLogFile;
     QString wholeSceneRendererLogBuffer;
     melonDS::u64 wholeSceneTimingLogFrame;
+    melonDS::u64 wholeSceneTimingLastPresentCounter = 0;
     bool wholeSceneTimingLogHeaderWritten;
     bool wholeSceneRendererLogHeaderWritten;
     bool wholeSceneTimingLastTouching;

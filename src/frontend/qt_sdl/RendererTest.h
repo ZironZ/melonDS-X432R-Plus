@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "RendererDebug.h"
+#include "RendererTestEnvironment.h"
 
 class EmuInstance;
 
@@ -79,6 +80,10 @@ struct RendererTestFrameCapture
 // {
 //   "rom": "path/to/game.nds",               (required)
 //   "savestate": "path/to/state.mln",        (optional)
+//   "purpose": "comparison",                 (default; also performance/diagnostic)
+//   "rtc": { "mode": "savestate" },          (default with a state; otherwise fixed)
+//     For fixed time: { "mode": "fixed", "dateTime": "2000-01-01T12:00:00" }
+//     Host time requires purpose=diagnostic. Replay clocks advance in emulated time.
 //   "warmupFrames": 30,                       (optional, default 0)
 //   "steps": [                                (optional)
 //     { "frames": 12 },
@@ -89,6 +94,7 @@ struct RendererTestFrameCapture
 //   ],
 //   "captures": {
 //     "wholeSceneCsv": true,                  (default true)
+//     "captureLumaProbe": false,              (default false; true requires diagnostic)
 //     "testDebugProductValidity": false,      (optional; full-frame diagnostic lifecycle tests)
 //     "testDebugFrameHandoff": false,         (optional; GL ownership/full dump tests)
 //     "profileDebugReads": false,             (optional; extra reads/timings)
@@ -116,6 +122,9 @@ public:
 
     QString romPath() const { return rom; }
     bool failed() const { return runFailed; }
+    bool deterministicRTC() const { return environment.deterministicRTC(); }
+    QDateTime bootRTCSeed() const { return environment.fixedDateTime; }
+    void recordHostRTCWrite() { hostRTCWrites.fetch_add(1, std::memory_order_relaxed); }
 
     // UI thread, after the emu instance exists and the ROM boot was requested.
     void begin(EmuInstance* inst);
@@ -145,11 +154,21 @@ private:
     void fail(const QString& reason);
     void finishRun();
     void writeVerdict();
+    QString checkEnvironment(EmuInstance* inst);
+    bool validateFrameEnvironment(EmuInstance* inst);
 
     QString manifestPath;
     QString rom;
     QString savestate;
     QString outputDir;
+    RendererTestEnvironment environment;
+    QJsonObject environmentRecord;
+    bool environmentStarted = false;
+    melonDS::u64 initialProbeReadbacks = 0;
+    std::atomic<melonDS::u64> hostRTCWrites { 0 };
+    std::atomic<melonDS::u64> observedProbeReadbacks { 0 };
+    std::atomic<melonDS::u64> environmentFramesChecked { 0 };
+    std::atomic_bool environmentViolation { false };
     int warmupFrames = 0;
     bool captureWholeSceneCsv = true;
     bool rollingDumpAtEnd = false;

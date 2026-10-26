@@ -25,6 +25,8 @@
 #include <QLayout>
 #include <QPushButton>
 #include <QSignalBlocker>
+#include <QSpinBox>
+#include <QFormLayout>
 #include <QStandardItemModel>
 #include <QVBoxLayout>
 #include <QWhatsThis>
@@ -695,6 +697,7 @@ VideoSettingsDialog::VideoSettingsDialog(QWidget* parent) : QDialog(parent), ui(
     auto* wideGroup = new QGroupBox(tr("Widescreen"), this);
     auto* wideLayout = new QVBoxLayout(wideGroup);
     widescreenCombo = new QComboBox(wideGroup);
+    widescreenCombo->setObjectName("widescreenMode");
     widescreenCombo->addItem(tr("Off (native 4:3)"), 256);
     widescreenCombo->addItem(tr("16:10"), 308);
     widescreenCombo->addItem(tr("16:9"), 342);
@@ -702,14 +705,52 @@ VideoSettingsDialog::VideoSettingsDialog(QWidget* parent) : QDialog(parent), ui(
     widescreenCombo->addItem(tr("32:9"), 682);
     widescreenCombo->addItem(tr("3:4 (rotated games)"), -342);
     widescreenCombo->addItem(tr("9:16 (rotated games)"), -456);
+    widescreenCombo->addItem(tr("Custom"), 0);
     const int wideHeight = WideMelon::ValidateHeight(cfg.GetInt("3D.GL.WidescreenHeight"));
-    widescreenCombo->setCurrentIndex(std::max(0, widescreenCombo->findData(wideHeight > 192 ? -wideHeight : cfg.GetInt("3D.GL.WidescreenWidth"))));
+    widescreenCombo->setCurrentIndex(std::max(0, widescreenCombo->findData(cfg.GetBool("3D.GL.WidescreenCustom") ? 0 :
+        wideHeight > 192 ? -wideHeight : cfg.GetInt("3D.GL.WidescreenWidth"))));
     widescreenCombo->setWhatsThis(tr("Reveals additional 3D scenery at the sides in compatible games. "
         "Works with Classic OpenGL or Compute and keeps 2D content centered on the selected displays. "
         "Some games hide off-screen objects or use effects that cannot extend beyond the original screen. "
         "The 3:4 and 9:16 options extend the scene vertically for rotated games. After a 90-degree screen rotation, these appear as 4:3 and 16:9. "
+        "Custom lets you choose an aspect ratio and expand the field of view on both axes. "
         "Set screen rotation separately. Reset or reopen the game to apply changes. Off restores normal renderer selection."));
     wideLayout->addWidget(widescreenCombo);
+    widescreenCustomControls = new QWidget(wideGroup);
+    auto* customLayout = new QFormLayout(widescreenCustomControls);
+    customLayout->setContentsMargins(0, 0, 0, 0);
+    auto* ratioRow = new QHBoxLayout;
+    widescreenAspectWidth = new QSpinBox(widescreenCustomControls);
+    widescreenAspectHeight = new QSpinBox(widescreenCustomControls);
+    widescreenAspectWidth->setObjectName("widescreenAspectWidth");
+    widescreenAspectHeight->setObjectName("widescreenAspectHeight");
+    widescreenAspectWidth->setRange(1, 32);
+    widescreenAspectHeight->setRange(1, 32);
+    widescreenAspectWidth->setValue(cfg.GetInt("3D.GL.WidescreenAspectWidth"));
+    widescreenAspectHeight->setValue(cfg.GetInt("3D.GL.WidescreenAspectHeight"));
+    ratioRow->addWidget(widescreenAspectWidth);
+    ratioRow->addWidget(new QLabel(tr(":"), widescreenCustomControls));
+    ratioRow->addWidget(widescreenAspectHeight);
+    ratioRow->addStretch();
+    customLayout->addRow(tr("Aspect ratio:"), ratioRow);
+    widescreenAspectWidth->setToolTip(tr("Shape of the expanded view before screen rotation, for example 4:3 or 16:9."));
+    widescreenAspectHeight->setToolTip(widescreenAspectWidth->toolTip());
+    widescreenFOVPercent = new QSpinBox(widescreenCustomControls);
+    widescreenFOVPercent->setObjectName("widescreenFOVPercent");
+    widescreenFOVPercent->setRange(100, 300);
+    widescreenFOVPercent->setSingleStep(5);
+    widescreenFOVPercent->setSuffix(tr("%"));
+    widescreenFOVPercent->setValue(cfg.GetInt("3D.GL.WidescreenFOVPercent"));
+    widescreenFOVPercent->setToolTip(tr("100% uses the smallest view of this shape that contains the original picture. "
+        "Higher values reveal more scenery on both axes while preserving the native center. "
+        "This is view expansion, not an angle in degrees: 4:3 at 150% gives 384 × 288. "
+        "Games can still hide objects or effects outside their original view."));
+    customLayout->addRow(tr("FOV expansion:"), widescreenFOVPercent);
+    widescreenCustomPreview = new QLabel(widescreenCustomControls);
+    widescreenCustomPreview->setObjectName("widescreenCustomPreview");
+    widescreenCustomPreview->setWordWrap(true);
+    customLayout->addRow(widescreenCustomPreview);
+    wideLayout->addWidget(widescreenCustomControls);
     auto* displayRow = new QHBoxLayout;
     auto* displayLabel = new QLabel(tr("Display:"), wideGroup);
     widescreenDisplayCombo = new QComboBox(wideGroup);
@@ -734,26 +775,20 @@ VideoSettingsDialog::VideoSettingsDialog(QWidget* parent) : QDialog(parent), ui(
         "Reset or reopen the game to apply changes."));
     wideLayout->addWidget(widescreenExtendWindows);
     widescreenExpandNarrowBorders = new QCheckBox(tr("Expand scenes behind narrow borders"), wideGroup);
+    widescreenExpandNarrowBorders->setObjectName("widescreenExpandNarrowBorders");
     widescreenExpandNarrowBorders->setChecked(cfg.GetBool("3D.GL.WidescreenExpandNarrowBorders"));
     widescreenExpandNarrowBorders->setWhatsThis(tr("Try this when a 3D scene stays inside black side borders with widescreen enabled. "
         "Reveals scenery behind some thin borders without stretching logos or other 2D artwork. "
         "May reveal unintended scenery or effects outside the original picture. "
         "Turn it off if borders or transitions look wrong. Requires Extend screen masks and transitions, "
-        "and works with regular and rotated-game aspect ratios. Reset or reopen the game to apply changes."));
+        "and works with regular, rotated-game and Custom aspect ratios. "
+        "Reset or reopen the game to apply changes."));
     wideLayout->addWidget(widescreenExpandNarrowBorders);
-    auto updateNarrowBorders = [this] {
-        widescreenExpandNarrowBorders->setEnabled(widescreenCombo->currentData().toInt() != 256 &&
-            widescreenExtendWindows->isChecked());
-    };
-    updateNarrowBorders();
-    connect(widescreenExtendWindows, &QCheckBox::toggled, this, updateNarrowBorders);
-    connect(widescreenCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this, updateNarrowBorders);
-    widescreenExtendWindows->setEnabled(widescreenCombo->currentData().toInt() != 256);
-    widescreenDisplayCombo->setEnabled(widescreenCombo->currentData().toInt() != 256);
-    connect(widescreenCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int) {
-        widescreenDisplayCombo->setEnabled(widescreenCombo->currentData().toInt() != 256);
-        widescreenExtendWindows->setEnabled(widescreenCombo->currentData().toInt() != 256);
-    });
+    connect(widescreenExtendWindows, &QCheckBox::toggled, this, &VideoSettingsDialog::updateWidescreenControls);
+    connect(widescreenCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this, &VideoSettingsDialog::updateWidescreenControls);
+    for (auto* spin : {widescreenAspectWidth, widescreenAspectHeight, widescreenFOVPercent})
+        connect(spin, QOverload<int>::of(&QSpinBox::valueChanged), this, &VideoSettingsDialog::updateWidescreenControls);
+    updateWidescreenControls();
     auto* wideRestartHelp = new QLabel(tr("Reset or reopen the game to apply changes. Supports Classic OpenGL and Compute."), wideGroup);
     wideRestartHelp->setWordWrap(true);
     wideRestartHelp->setToolTip(tr("With multiple emulator instances open, close the other instances before resetting to apply widescreen changes."));
@@ -1018,11 +1053,33 @@ VideoSettingsDialog::~VideoSettingsDialog()
     delete ui;
 }
 
+void VideoSettingsDialog::updateWidescreenControls()
+{
+    const int choice = widescreenCombo->currentData().toInt();
+    const bool custom = choice == 0;
+    const auto extent = WideMelon::ResolveCustomView(widescreenAspectWidth->value(), widescreenAspectHeight->value(), widescreenFOVPercent->value());
+    widescreenCustomControls->setVisible(custom);
+    widescreenCustomPreview->setText(extent.Valid ?
+        tr("%1 × %2 view; original 256 × 192 picture stays centered.").arg(extent.Width).arg(extent.Height) :
+        tr("This combination exceeds the supported 768 × 768 view. Reduce the FOV expansion or choose a less extreme aspect ratio."));
+    ui->buttonBox->button(QDialogButtonBox::Ok)->setEnabled(!custom || extent.Valid);
+    const bool enabled = custom ? extent.Valid && (extent.Width > 256 || extent.Height > 192) : choice != 256;
+    widescreenDisplayCombo->setEnabled(enabled);
+    widescreenExtendWindows->setEnabled(enabled);
+    widescreenExpandNarrowBorders->setEnabled(enabled && widescreenExtendWindows->isChecked());
+}
+
 void VideoSettingsDialog::on_VideoSettingsDialog_accepted()
 {
     const int wideChoice = widescreenCombo->currentData().toInt();
-    emuInstance->getGlobalConfig().SetInt("3D.GL.WidescreenWidth", wideChoice < 0 ? 256 : wideChoice);
-    emuInstance->getGlobalConfig().SetInt("3D.GL.WidescreenHeight", wideChoice < 0 ? -wideChoice : 192);
+    const auto extent = WideMelon::ResolveCustomView(widescreenAspectWidth->value(), widescreenAspectHeight->value(), widescreenFOVPercent->value());
+    if (wideChoice == 0 && !extent.Valid) return;
+    emuInstance->getGlobalConfig().SetBool("3D.GL.WidescreenCustom", wideChoice == 0);
+    emuInstance->getGlobalConfig().SetInt("3D.GL.WidescreenAspectWidth", widescreenAspectWidth->value());
+    emuInstance->getGlobalConfig().SetInt("3D.GL.WidescreenAspectHeight", widescreenAspectHeight->value());
+    emuInstance->getGlobalConfig().SetInt("3D.GL.WidescreenFOVPercent", widescreenFOVPercent->value());
+    emuInstance->getGlobalConfig().SetInt("3D.GL.WidescreenWidth", wideChoice == 0 ? extent.Width : wideChoice < 0 ? 256 : wideChoice);
+    emuInstance->getGlobalConfig().SetInt("3D.GL.WidescreenHeight", wideChoice == 0 ? extent.Height : wideChoice < 0 ? -wideChoice : 192);
     emuInstance->getGlobalConfig().SetInt("3D.GL.WidescreenDisplay", widescreenDisplayCombo->currentData().toInt());
     emuInstance->getGlobalConfig().SetBool("3D.GL.WidescreenExtendWindows", widescreenExtendWindows->isChecked());
     emuInstance->getGlobalConfig().SetBool("3D.GL.WidescreenExpandNarrowBorders", widescreenExpandNarrowBorders->isChecked());

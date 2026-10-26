@@ -129,6 +129,27 @@ inline bool TextureHasBinaryAlpha(u32 width, u32 height, const u32* src, u8 alph
     return true;
 }
 
+struct TexturePaddingRGBAccumulator
+{
+    u32 R = 0, G = 0, B = 0, Count = 0;
+
+    void Add(u32 color)
+    {
+        if ((color >> 24) == 0)
+            return;
+        R += color & 0xFF;
+        G += (color >> 8) & 0xFF;
+        B += (color >> 16) & 0xFF;
+        Count++;
+    }
+
+    void Apply(u32& color) const
+    {
+        if (Count != 0)
+            color = (R / Count) | ((G / Count) << 8) | ((B / Count) << 16);
+    }
+};
+
 inline void PadTransparentTextureRGBIterations(u32 width, u32 height, u32* src, u32 maxIterations)
 {
     size_t pixels = static_cast<size_t>(width) * static_cast<size_t>(height);
@@ -138,32 +159,60 @@ inline void PadTransparentTextureRGBIterations(u32 width, u32 height, u32* src, 
     // Only nontransparent pixels contribute, and their color and alpha never
     // change. Repeating this pass cannot propagate padding any further. Writes
     // to transparent pixels are safe in place for the same reason.
-    for (u32 y = 0; y < height; y++)
+    auto padEdge = [&](u32 x, u32 y)
     {
-        for (u32 x = 0; x < width; x++)
+        size_t index = static_cast<size_t>(y) * width + x;
+        if ((src[index] >> 24) != 0)
+            return;
+        TexturePaddingRGBAccumulator accum;
+        for (s32 ny = std::max<s32>(0, static_cast<s32>(y) - 1);
+             ny <= std::min<s32>(static_cast<s32>(height) - 1, static_cast<s32>(y) + 1); ny++)
         {
-            size_t index = static_cast<size_t>(y) * width + x;
-            if ((src[index] >> 24) != 0)
-                continue;
-
-            u32 r = 0, g = 0, b = 0, count = 0;
-            for (s32 ny = std::max<s32>(0, static_cast<s32>(y) - 1);
-                 ny <= std::min<s32>(static_cast<s32>(height) - 1, static_cast<s32>(y) + 1); ny++)
+            for (s32 nx = std::max<s32>(0, static_cast<s32>(x) - 1);
+                 nx <= std::min<s32>(static_cast<s32>(width) - 1, static_cast<s32>(x) + 1); nx++)
             {
-                for (s32 nx = std::max<s32>(0, static_cast<s32>(x) - 1);
-                     nx <= std::min<s32>(static_cast<s32>(width) - 1, static_cast<s32>(x) + 1); nx++)
-                {
-                    u32 neighbor = src[static_cast<size_t>(ny) * width + nx];
-                    if ((neighbor >> 24) == 0)
-                        continue;
-                    r += neighbor & 0xFF;
-                    g += (neighbor >> 8) & 0xFF;
-                    b += (neighbor >> 16) & 0xFF;
-                    count++;
-                }
+                accum.Add(src[static_cast<size_t>(ny) * width + nx]);
             }
-            if (count != 0)
-                src[index] = (r / count) | ((g / count) << 8) | ((b / count) << 16);
+        }
+        accum.Apply(src[index]);
+    };
+
+    if (width <= 2 || height <= 2)
+    {
+        for (u32 y = 0; y < height; y++)
+            for (u32 x = 0; x < width; x++)
+                padEdge(x, y);
+        return;
+    }
+
+    for (u32 x = 0; x < width; x++)
+    {
+        padEdge(x, 0);
+        padEdge(x, height - 1);
+    }
+    for (u32 y = 1; y < height - 1; y++)
+    {
+        padEdge(0, y);
+        padEdge(width - 1, y);
+        u32* row = src + static_cast<size_t>(y) * width;
+        const u32* above = row - width;
+        const u32* below = row + width;
+        for (u32 x = 1; x < width - 1; x++)
+        {
+            if ((row[x] >> 24) != 0)
+                continue;
+            // The transparent center cannot contribute. Interior pixels have
+            // exactly eight neighbors; no variable-length sample loop is needed.
+            TexturePaddingRGBAccumulator accum;
+            accum.Add(above[x - 1]);
+            accum.Add(above[x]);
+            accum.Add(above[x + 1]);
+            accum.Add(row[x - 1]);
+            accum.Add(row[x + 1]);
+            accum.Add(below[x - 1]);
+            accum.Add(below[x]);
+            accum.Add(below[x + 1]);
+            accum.Apply(row[x]);
         }
     }
 }
@@ -372,10 +421,12 @@ inline void ConvertOutputBufferToPreviewRGBA8(u32 width, u32 height, const u32* 
             u32 b = (color >> 16) & 0xFF;
             u32 a = (color >> 24) & 0xFF;
 
-            r = static_cast<u32>(std::lround((static_cast<float>(r) * 255.0f) / 63.0f));
-            g = static_cast<u32>(std::lround((static_cast<float>(g) * 255.0f) / 63.0f));
-            b = static_cast<u32>(std::lround((static_cast<float>(b) * 255.0f) / 63.0f));
-            a = static_cast<u32>(std::lround((static_cast<float>(a) * 255.0f) / 31.0f));
+            // Odd denominators have no halfway cases, so integer expansion
+            // exactly preserves the previous floating-point rounding.
+            r = (r * 255u + 31u) / 63u;
+            g = (g * 255u + 31u) / 63u;
+            b = (b * 255u + 31u) / 63u;
+            a = (a * 255u + 15u) / 31u;
 
             dst[i] = r | (g << 8) | (b << 16) | (a << 24);
         }

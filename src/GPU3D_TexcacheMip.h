@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cassert>
 #include <cmath>
 #include <vector>
 
@@ -432,6 +433,15 @@ inline void TextureMipApplyIslandAwareFringe(u32 width,
     level.swap(updated);
 }
 
+// Mip channel averages are finite and within [0, 255]. In this domain,
+// truncating value + 0.5 matches lround without its general-purpose cost.
+// Add in double precision so floats just below a halfway boundary stay below.
+inline u32 TextureMipRoundChannel(float value)
+{
+    assert(std::isfinite(value) && value >= 0.0f && value <= 255.0f);
+    return static_cast<u32>(static_cast<double>(value) + 0.5);
+}
+
 inline void TextureMipBuildBinaryAlphaLevel(u32 srcWidth,
                                             u32 srcHeight,
                                             const std::vector<u32>& srcLevel,
@@ -456,13 +466,16 @@ inline void TextureMipBuildBinaryAlphaLevel(u32 srcWidth,
     {
         for (u32 x = 0; x < dstWidth; x++)
         {
-            float accumAlpha = 0.0f;
-            float accumR = 0.0f;
-            float accumG = 0.0f;
-            float accumB = 0.0f;
-            float fallbackR = 0.0f;
-            float fallbackG = 0.0f;
-            float fallbackB = 0.0f;
+            // Four byte-valued samples sum to at most 1020, or 260100 for
+            // alpha-weighted RGB. These integers were also exact in float;
+            // defer conversion until division without changing the averages.
+            u32 accumAlpha = 0;
+            u32 accumR = 0;
+            u32 accumG = 0;
+            u32 accumB = 0;
+            u32 fallbackR = 0;
+            u32 fallbackG = 0;
+            u32 fallbackB = 0;
             u32 sampleCount = 0;
             int labelIds[4];
             float labelWeights[4] = {};
@@ -481,14 +494,14 @@ inline void TextureMipBuildBinaryAlphaLevel(u32 srcWidth,
                     u32 sx = std::min(srcWidth - 1, x * 2 + ox);
                     size_t srcIndex = static_cast<size_t>(sy) * static_cast<size_t>(srcWidth) + static_cast<size_t>(sx);
                     u32 color = srcLevel[srcIndex];
-                    float a = static_cast<float>((color >> 24) & 0xFF);
-                    float r = static_cast<float>(color & 0xFF);
-                    float g = static_cast<float>((color >> 8) & 0xFF);
-                    float b = static_cast<float>((color >> 16) & 0xFF);
+                    u32 a = (color >> 24) & 0xFF;
+                    u32 r = color & 0xFF;
+                    u32 g = (color >> 8) & 0xFF;
+                    u32 b = (color >> 16) & 0xFF;
                     accumAlpha += a;
                     if (useImprovedMipColors)
                     {
-                        if (a > 0.0f && srcLabels)
+                        if (a > 0 && srcLabels)
                         {
                             int label = (*srcLabels)[srcIndex];
                             if (label >= 0)
@@ -522,12 +535,9 @@ inline void TextureMipBuildBinaryAlphaLevel(u32 srcWidth,
                         fallbackR += r;
                         fallbackG += g;
                         fallbackB += b;
-                        if (a > 0.0f)
-                        {
-                            accumR += r * a;
-                            accumG += g * a;
-                            accumB += b * a;
-                        }
+                        accumR += r * a;
+                        accumG += g * a;
+                        accumB += b * a;
                     }
                     sampleCount++;
                 }
@@ -579,10 +589,10 @@ inline void TextureMipBuildBinaryAlphaLevel(u32 srcWidth,
             if (!dominantLabels.empty())
                 dominantLabels[dstIndex] = dominantLabel;
             dstLevel[dstIndex] =
-                (static_cast<u32>(std::clamp(std::lround(avgAlpha[dstIndex]), 0l, 255l)) << 24) |
-                (static_cast<u32>(std::clamp(std::lround(outR), 0l, 255l)) & 0xFF) |
-                ((static_cast<u32>(std::clamp(std::lround(outG), 0l, 255l)) & 0xFF) << 8) |
-                ((static_cast<u32>(std::clamp(std::lround(outB), 0l, 255l)) & 0xFF) << 16);
+                (TextureMipRoundChannel(avgAlpha[dstIndex]) << 24) |
+                TextureMipRoundChannel(outR) |
+                (TextureMipRoundChannel(outG) << 8) |
+                (TextureMipRoundChannel(outB) << 16);
             alphaHistogram[dstLevel[dstIndex] >> 24]++;
         }
     }

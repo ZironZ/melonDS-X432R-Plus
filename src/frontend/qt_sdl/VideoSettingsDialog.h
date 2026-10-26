@@ -30,6 +30,8 @@ class QCheckBox;
 class QGroupBox;
 class QGridLayout;
 class QTabWidget;
+class QSpinBox;
+class QLabel;
 
 class VideoSettingsDialog : public QDialog
 {
@@ -139,6 +141,12 @@ private:
     QComboBox* widescreenDisplayCombo = nullptr;
     QCheckBox* widescreenExtendWindows = nullptr;
     QCheckBox* widescreenExpandNarrowBorders = nullptr;
+    QWidget* widescreenCustomControls = nullptr;
+    QSpinBox* widescreenAspectWidth = nullptr;
+    QSpinBox* widescreenAspectHeight = nullptr;
+    QSpinBox* widescreenFOVPercent = nullptr;
+    QLabel* widescreenCustomPreview = nullptr;
+    void updateWidescreenControls();
     void setVsyncControlEnable(bool hasOGL);
     void setEnabled();
     void applyTexture2DAtlasProtection(bool enabled);

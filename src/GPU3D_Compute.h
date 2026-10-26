@@ -171,6 +171,9 @@ private:
         float TextureInsetV0;
         float TextureInsetU1;
         float TextureInsetV1;
+        u32 TransitionMaskMode;
+        float TransitionMaskBounds[4];
+        float TransitionMaskUVScale[2];
     };
 
     int TileSize;

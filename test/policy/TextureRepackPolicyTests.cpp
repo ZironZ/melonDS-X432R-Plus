@@ -36,6 +36,48 @@ POLICY_TEST(RGB6RepackPreservesEveryExpandedRGB6Value)
     }
 }
 
+POLICY_TEST(PackedTextureExpansionPreservesReferenceRounding)
+{
+    std::vector<u32> source;
+    for (u32 alpha = 0; alpha < 256; alpha++)
+        for (u32 value = 0; value < 256; value++)
+            source.push_back((alpha << 24) | (((value * 73) & 255) << 16) |
+                             ((255 - value) << 8) | value);
+
+    // Include every channel byte, even outside the usual RGB6/A5 range,
+    // and mixed colours to catch channel-order and packing changes.
+    u32 random = 0xBADC0DE;
+    for (u32 i = 0; i < 256 * 256; i++)
+    {
+        random = random * 1664525u + 1013904223u;
+        source.push_back(random);
+    }
+    std::vector<u32> reference;
+    reference.reserve(source.size());
+    for (u32 color : source)
+    {
+        // Keep the original float conversion as an independent reference.
+        u32 expanded = 0;
+        for (u32 channel = 0; channel < 4; channel++)
+        {
+            const float value = static_cast<float>((color >> (channel * 8)) & 255);
+            const float maximum = channel == 3 ? 31.0f : 63.0f;
+            expanded |= static_cast<u32>(std::lround(value * 255.0f / maximum)) << (channel * 8);
+        }
+        reference.push_back(expanded);
+    }
+
+    std::vector<u32> actual(source.size());
+    ConvertOutputBufferToPreviewRGBA8<outputFmt_RGB6A5>(
+        source.size(), 1, source.data(), actual.data());
+    CHECK(actual == reference);
+    actual = source;
+    ConvertOutputBufferToPreviewRGBA8<outputFmt_RGB6A5>(
+        actual.size(), 1, actual.data(), actual.data());
+    CHECK(actual == reference);
+    ConvertOutputBufferToPreviewRGBA8<outputFmt_RGB6A5>(0, 0, nullptr, nullptr);
+}
+
 POLICY_TEST(RGB6NativeExpansionPreservesEveryRGB5Anchor)
 {
     for (int value5 = 0; value5 <= 31; value5++)

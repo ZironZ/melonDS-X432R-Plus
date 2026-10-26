@@ -20,6 +20,12 @@ public:
 
     void Reset() { Valid.Clear(); }
 
+    const std::vector<u8>& UploadedBytes() const { return Bytes; }
+    bool IsUploaded(u32 address) const
+    {
+        return address < Bytes.size() && Valid[address / BlockSize];
+    }
+
     void FilterUnchanged(const u8* source, u32 byteSize, NonStupidBitField<1024>& dirty)
     {
         assert(byteSize == 128 * 1024 || byteSize == 512 * 1024);

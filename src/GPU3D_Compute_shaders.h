@@ -300,6 +300,9 @@ struct Polygon
     float TextureInsetV0;
     float TextureInsetU1;
     float TextureInsetV1;
+    uint TransitionMaskMode;
+    float TransitionMaskLeft, TransitionMaskTop, TransitionMaskRight, TransitionMaskBottom;
+    float TransitionMaskUScale, TransitionMaskVScale;
 };
 
 layout (std430, binding = 0) readonly buffer PolygonBuffer
@@ -1314,7 +1317,12 @@ void main()
     int tileOffset = int(bitfieldExtract(workDesc.y, 11, 21)) * TileSize * TileSize + TileSize * int(gl_LocalInvocationID.y) + int(gl_LocalInvocationID.x);
 
     uint color = 0U;
-    if (position.y >= polygon.YTop && position.y < polygon.YBot)
+    ivec2 nativeOrigin = ivec2((OutputWidth-NativeWidth)/2, (OutputHeight-NativeHeight)/2);
+    bool nativeMaskPixel = all(greaterThanEqual(position, nativeOrigin)) &&
+        all(lessThan(position, nativeOrigin+ivec2(NativeWidth,NativeHeight)));
+    bool maskVisible = polygon.TransitionMaskMode == 0U ||
+        (nativeMaskPixel != (polygon.TransitionMaskMode == 2U));
+    if (maskVisible && position.y >= polygon.YTop && position.y < polygon.YBot)
     {
         XSpanSetup xspan = XSpanSetups[polygon.FirstXSpan + (position.y - polygon.YTop)];
 
@@ -1482,9 +1490,22 @@ void main()
             }
             else
             {
-                uvf = ApplyTextureInset(polygon, uvf);
+                if (polygon.TransitionMaskMode == 2U)
+                {
+                    vec2 p = vec2(clamp(position-nativeOrigin, ivec2(0), ivec2(NativeWidth-1,NativeHeight-1)));
+                    p = (p+vec2(0.5)) * (256.0/float(NativeWidth));
+                    vec2 lo = vec2(polygon.TransitionMaskLeft,polygon.TransitionMaskTop);
+                    vec2 hi = vec2(polygon.TransitionMaskRight,polygon.TransitionMaskBottom);
+                    vec2 uv = (p-lo)/(hi-lo);
+                    uvf = any(lessThan(uv,vec2(0))) || any(greaterThanEqual(uv,vec2(1))) ? vec2(0) : uv;
+                    uvf *= vec2(polygon.TransitionMaskUScale,polygon.TransitionMaskVScale);
+                }
+                else uvf = ApplyTextureInset(polygon, uvf);
 #ifdef FILTERABLE_TEXTURE_CACHE
-                texcolorf = SampleCurrentTextureFiltered(polygon, position, xspan, uvf);
+                // The margin uses a clamped native pixel centre, not the
+                // synthetic fullscreen quad's interpolation/derivatives.
+                texcolorf = polygon.TransitionMaskMode == 2U ? SampleCurrentTextureAtLod(polygon,uvf,0.0) :
+                    SampleCurrentTextureFiltered(polygon, position, xspan, uvf);
                 if (uBinaryAlphaTexture != 0)
                 {
                     texcolorf.a = texcolorf.a >= 0.5 ? 1.0 : 0.0;

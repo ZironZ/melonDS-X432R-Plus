@@ -29,7 +29,7 @@ some of the features and things will look noticeably better.
 - `Postprocessing Upscale`, the other major mode, which scales the 2D and 3D
   together as one image. This is less likely to have weird scaling issues than
   the Hybrid mode, but the 3D usually looks softer.
-- A widescreen option.
+- Widescreen and FOV options.
 - `3D anti-aliasing` for Classic OpenGL and Compute.
 - A screen sharpening filter for blurry output.
 - Debug tools for whole-scene 2D, texture-scaling inspection, timings, 
@@ -180,6 +180,22 @@ In the same section, `LCD ghosting` blends frames to mimic how the original
 DS screen softens changes from one image to the next. It helps with flickering
 effects in games such as Hotel Dusk, though `Natural blur` can also leave trails
 when things move.
+
+### Widescreen and FOV
+
+`Widescreen` reveals more of the 3D scene. Choose a preset, or use `Custom` to
+set your own aspect ratio and FOV. Increasing FOV above 100% reveals more scenery
+above and below the original picture as well as to the sides. Some games hide
+objects outside their original view, so you may see missing scenery.
+
+Touch controls stay in the original center area. Reset or reopen the game to
+apply widescreen changes.
+
+If fades or transitions look wrong, try `Extend screen masks and transitions`
+in `Advanced settings`. If thin borders keep the scene boxed in, try
+`Expand scenes behind narrow borders` too. It requires the transitions option.
+Both can help, but can also cause visual problems in some games, so turn them
+off if they make things worse.
 
 ## Known Limits
 

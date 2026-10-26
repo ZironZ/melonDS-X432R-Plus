@@ -19,6 +19,7 @@
 #include "GPU_OpenGL.h"
 #include "WideMelon.h"
 #include "WideTransitionPolicy.h"
+#include "WideTransitionMask.h"
 #include "GPU3D_Texture2DPolicy.h"
 
 #include <assert.h>
@@ -1107,7 +1108,21 @@ void ComputeRenderer3D::RenderFrame()
 
     Texcache.BeginRenderFrame();
     const auto transitionPlan = BuildWideTransitionPlan(GPU3D.RenderPolygonRAM.data(), GPU3D.RenderNumPolygons,
-        WideMelon::Width() > 256 && WideMelon::ExtendWindows);
+        WideMelon::Enabled() && WideMelon::ExtendWindows, WideMelon::ExpandNarrowBorders);
+
+    auto transitionScene = BuildWideTransitionMaskScene(GPU3D.RenderPolygonRAM.data(), GPU3D.RenderNumPolygons,
+        WideMelon::Enabled() && WideMelon::ExtendWindows && (GPU3D.RenderDispCnt & 1),
+        WideMelon::Width(), WideMelon::Height(), [&](const Polygon& p, std::vector<u32>& pixels) {
+            pixels.resize(TextureWidth(p.TexParam)*TextureHeight(p.TexParam));
+            const u32 format = (p.TexParam >> 26) & 7;
+            const u32 palette = (p.TexPalette*16 >> (format == 2 ? 1 : 0)) & 0x1FFFF;
+            TextureScaleDecodeSourceRGBA8(format, TextureWidth(p.TexParam), TextureHeight(p.TexParam),
+                pixels.data(), (p.TexParam & 0xFFFF)*8, 0, palette, (p.TexParam & (1u<<29)) != 0,
+                {GPU.VRAMFlat_Texture, GPU.VRAMFlat_TexPal});
+            return true;
+        });
+    const auto& framePolygons = transitionScene.Polygons;
+    const u32 framePolygonCount = framePolygons.size();
 
     // figure out which chunks of texture memory contain display captures
     int captureinfo[16];
@@ -1181,7 +1196,7 @@ void ComputeRenderer3D::RenderFrame()
     std::vector<u32> reconstructedVariants;
     if (TextureScaling.ReconstructCompatible3D && TextureScaling.Enabled && ScaleFactor > 1 && enableTextureMaps)
     {
-        std::vector<Polygon*> inputs(GPU3D.RenderPolygonRAM.begin(), GPU3D.RenderPolygonRAM.begin() + GPU3D.RenderNumPolygons);
+        std::vector<Polygon*> inputs(framePolygons.begin(), framePolygons.begin() + framePolygonCount);
         reconstructionPlan = &Texcache.GetTextureReconstructionPlan(inputs,
             TextureScaling.ReconstructCompatible3DEdgeContext, TextureScaling.ReconstructCompatible3DFractionalAlpha);
         Texcache.BeginTextureReconstruction();
@@ -1197,9 +1212,9 @@ void ComputeRenderer3D::RenderFrame()
     TextureFrameEdgeExtendCandidateMap edgeExtendCandidateMap;
     if (TextureScaling.EdgeExtendUnusedMargins && TextureScaling.Enabled && ScaleFactor > 1)
     {
-        edgeExtendCandidates.reserve(GPU3D.RenderNumPolygons);
-        edgeExtendCandidateMap.reserve(GPU3D.RenderNumPolygons);
-        AccumulateTextureFrameEdgeExtendCandidates(GPU3D.RenderPolygonRAM.data(), GPU3D.RenderNumPolygons,
+        edgeExtendCandidates.reserve(framePolygonCount);
+        edgeExtendCandidateMap.reserve(framePolygonCount);
+        AccumulateTextureFrameEdgeExtendCandidates(framePolygons.data(), framePolygonCount,
                                                    enableTextureMaps, edgeExtendCandidates, edgeExtendCandidateMap);
     }
 
@@ -1247,10 +1262,11 @@ void ComputeRenderer3D::RenderFrame()
     int previousGroup = -1;
     bool previousNativeTexture = false, previousForceNearestTexture = false;
     TextureSamplingBounds previousSamplingBounds;
-    for (int i = 0; i < GPU3D.RenderNumPolygons; i++)
+    for (int i = 0; i < framePolygonCount; i++)
     {
-        Polygon* polygon = GPU3D.RenderPolygonRAM[i];
+        Polygon* polygon = framePolygons[i];
         int groupIndex = reconstruction.Membership.empty() ? -1 : reconstruction.Membership[i];
+        if (transitionScene.Masks.count(polygon)) groupIndex = -1;
         if (groupIndex >= 0 && !reconstructedTextures[groupIndex]) groupIndex = -1;
         Polygon reconstructedPolygon;
         std::array<Vertex,4> reconstructedVertices;
@@ -1262,7 +1278,9 @@ void ComputeRenderer3D::RenderFrame()
         TextureSamplingBounds samplingBounds;
         u32 polygonTextype = (polygon->TexParam >> 26) & 0x7;
         const bool nativeTexture = groupIndex < 0 && useNativeTexture(polygon);
-        if (groupIndex < 0) buildSamplingBounds(polygon, nativeTexture, samplingBounds);
+        const auto transitionMask = transitionScene.Masks.find(polygon);
+        const bool marginMask = transitionMask != transitionScene.Masks.end() && transitionMask->second.Margin;
+        if (groupIndex < 0 && !marginMask) buildSamplingBounds(polygon, nativeTexture, samplingBounds);
         const bool currentForceNearestTexture = groupIndex < 0 && shouldForceNearestTexture(polygon, nativeTexture, samplingBounds);
 
         u32 nverts = polygon->NumVertices;
@@ -1270,13 +1288,19 @@ void ComputeRenderer3D::RenderFrame()
 
         RenderPolygons[i].FirstXSpan = numSetupIndices;
         RenderPolygons[i].Attr = polygon->Attr;
+        const auto mask = transitionScene.Masks.find(polygon);
+        RenderPolygons[i].TransitionMaskMode = mask == transitionScene.Masks.end() ? 0 : (mask->second.Margin ? 2 : 1);
+        for (unsigned c = 0; c < 4; ++c)
+            RenderPolygons[i].TransitionMaskBounds[c] = mask == transitionScene.Masks.end() ? 0.0f : mask->second.Bounds[c]/16.0f;
+        for (unsigned c = 0; c < 2; ++c)
+            RenderPolygons[i].TransitionMaskUVScale[c] = mask == transitionScene.Masks.end() ? 1.0f : mask->second.UVScale[c];
 
         bool foundVariant = false;
         if (i > 0)
         {
             // if the whole texture attribute matches
             // the texture layer will also match
-            Polygon* prevPolygon = GPU3D.RenderPolygonRAM[i - 1];
+            Polygon* prevPolygon = framePolygons[i - 1];
             foundVariant = prevPolygon->TexParam == polygon->TexParam
                 && prevPolygon->TexPalette == polygon->TexPalette
                 && (prevPolygon->Attr & 0x30) == (polygon->Attr & 0x30)
@@ -1484,6 +1508,8 @@ void ComputeRenderer3D::RenderFrame()
             }
             scaledPositions[i][0] = WideTransitionX(transitionPlan, polygon, polygon->Vertices[i],
                 scaledPositions[i][0], OutputWidth);
+            scaledPositions[i][1] = WideTransitionY(transitionPlan, polygon, polygon->Vertices[i],
+                scaledPositions[i][1], OutputHeight);
             ytop = std::min(scaledPositions[i][1], ytop);
             ybot = std::max(scaledPositions[i][1], ybot);
         }
@@ -1645,7 +1671,7 @@ void ComputeRenderer3D::RenderFrame()
         glBufferSubData(GL_TEXTURE_BUFFER, 0, numSetupIndices*4*2, YSpanIndices.data());
 
         glBindBuffer(GL_SHADER_STORAGE_BUFFER, RenderPolygonMemory);
-        glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, GPU3D.RenderNumPolygons*sizeof(RenderPolygon), RenderPolygons);
+        glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, framePolygonCount*sizeof(RenderPolygon), RenderPolygons);
         // we haven't accessed image data yet, so we don't need to invalidate anything
     }
 
@@ -1663,7 +1689,7 @@ void ComputeRenderer3D::RenderFrame()
 
     MetaUniform meta;
     meta.DispCnt = GPU3D.RenderDispCnt;
-    meta.NumPolygons = GPU3D.RenderNumPolygons;
+    meta.NumPolygons = framePolygonCount;
     meta.NumVariants = numVariants;
     meta.AlphaRef = GPU3D.RenderAlphaRef;
     {
@@ -1728,7 +1754,7 @@ void ComputeRenderer3D::RenderFrame()
     bool wbuffer = false;
     if (numYSpans > 0)
     {
-        wbuffer = GPU3D.RenderPolygonRAM[0]->WBuffer;
+        wbuffer = framePolygons[0]->WBuffer;
 
         glUseProgram(ShaderClearIndirectWorkCount);
         glDispatchCompute((numVariants+31)/32, 1, 1);
@@ -1745,7 +1771,7 @@ void ComputeRenderer3D::RenderFrame()
 
         // bin polygons
         glUseProgram(ShaderBinCombined);
-        glDispatchCompute(((GPU3D.RenderNumPolygons + 31) / 32), ScreenWidth/CoarseTileW, ScreenHeight/CoarseTileH);
+        glDispatchCompute(((framePolygonCount + 31) / 32), ScreenWidth/CoarseTileW, ScreenHeight/CoarseTileH);
         glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_COMMAND_BARRIER_BIT);
 
         // calculate list offsets

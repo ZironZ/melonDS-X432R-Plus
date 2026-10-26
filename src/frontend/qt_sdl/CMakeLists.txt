@@ -65,6 +65,8 @@ set(SOURCES_QT_SDL
 
     RendererTest.h
     RendererTest.cpp
+    RendererTestEnvironment.h
+    RendererTestEnvironment.cpp
     RendererTestAssertions.h
     RendererTestAssertions.cpp
 
@@ -293,6 +295,15 @@ endif()
 
 option(BUILD_DEBUG_EXPORT_TESTS "Build debug export writer tests" OFF)
 option(BUILD_RENDERER_SHADER_TESTS "Build OpenGL 4.3 coverage shader tests (requires GPU context)" OFF)
+if (BUILD_DEBUG_EXPORT_TESTS OR BUILD_RENDERER_SHADER_TESTS)
+    add_executable(renderer-test-environment-tests
+        "${CMAKE_SOURCE_DIR}/test/renderer/RendererTestEnvironmentTests.cpp"
+        RendererTestEnvironment.cpp)
+    target_include_directories(renderer-test-environment-tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+    target_link_libraries(renderer-test-environment-tests PRIVATE ${QT_LINK_LIBS})
+    enable_testing()
+    add_test(NAME renderer-test-environment-tests COMMAND renderer-test-environment-tests)
+endif()
 if (BUILD_RENDERER_SHADER_TESTS)
     if (ENABLE_OGLRENDERER)
         target_sources(melonDS PRIVATE "${CMAKE_SOURCE_DIR}/test/renderer/GLRendererLifetimeTests.cpp")
@@ -305,6 +316,16 @@ if (BUILD_RENDERER_SHADER_TESTS)
         "${CMAKE_SOURCE_DIR}/src" "${CMAKE_SOURCE_DIR}/src/frontend")
     target_link_libraries(widescreen-capture-tests PRIVATE ${QT_LINK_LIBS})
     add_test(NAME widescreen-capture-tests COMMAND widescreen-capture-tests)
+    add_executable(rectangular-widescreen-tests
+        "${CMAKE_SOURCE_DIR}/test/renderer/RectangularWidescreenTests.cpp" ../glad/glad.c)
+    target_include_directories(rectangular-widescreen-tests PRIVATE
+        "${CMAKE_SOURCE_DIR}/src" "${CMAKE_SOURCE_DIR}/src/frontend")
+    target_link_libraries(rectangular-widescreen-tests PRIVATE ${QT_LINK_LIBS})
+    add_test(NAME rectangular-widescreen-tests COMMAND rectangular-widescreen-tests)
+    add_test(NAME rectangular-corner-negative-control COMMAND rectangular-widescreen-tests --broken-corner)
+    set_tests_properties(rectangular-corner-negative-control PROPERTIES WILL_FAIL TRUE)
+    add_test(NAME rectangular-repair-metadata-negative-control COMMAND rectangular-widescreen-tests --broken-repair-metadata)
+    set_tests_properties(rectangular-repair-metadata-negative-control PROPERTIES WILL_FAIL TRUE)
     add_executable(screen-capture-tests
         "${CMAKE_SOURCE_DIR}/test/renderer/ScreenCaptureTests.cpp"
         ScreenCapture.cpp ../glad/glad.c)
@@ -321,8 +342,9 @@ if (BUILD_RENDERER_SHADER_TESTS)
     target_link_libraries(compute-widescreen-tests PRIVATE ${QT_LINK_LIBS})
     add_test(NAME compute-widescreen-tests COMMAND compute-widescreen-tests)
     add_test(NAME compute-wide-center-negative-control COMMAND compute-widescreen-tests --broken-center)
+    add_test(NAME compute-wide-center-y-negative-control COMMAND compute-widescreen-tests --broken-center-y)
     add_test(NAME compute-wide-padding-negative-control COMMAND compute-widescreen-tests --broken-padding)
-    set_tests_properties(compute-wide-center-negative-control compute-wide-padding-negative-control PROPERTIES WILL_FAIL TRUE)
+    set_tests_properties(compute-wide-center-negative-control compute-wide-center-y-negative-control compute-wide-padding-negative-control PROPERTIES WILL_FAIL TRUE)
     add_executable(nnedi3-coverage-tests
         "${CMAKE_SOURCE_DIR}/test/renderer/NNEDI3CoverageTests.cpp"
         "${CMAKE_SOURCE_DIR}/test/renderer/NNEDI3CompositionDiagnostic.cpp"

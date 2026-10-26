@@ -7,6 +7,89 @@
 #include "frontend/ScreenLayout.h"
 #include <cmath>
 #include <limits>
+#include <array>
+
+POLICY_TEST(CustomAspectAndFOVAreIndependent)
+{
+    for (const auto example : {std::array<int,5>{4,3,100,256,192}, {4,3,150,384,288},
+                              {16,9,100,342,192}, {16,9,150,512,288},
+                              {3,4,100,256,342}, {3,4,150,384,512}, {4,3,300,768,576}})
+    {
+        const auto view = WideMelon::ResolveCustomView(example[0], example[1], example[2]);
+        CHECK(view.Valid);
+        CHECK_EQ(view.Width, example[3]); CHECK_EQ(view.Height, example[4]);
+    }
+    for (const auto invalid : {std::array<int,3>{0,3,150}, {33,3,150}, {4,0,150},
+                              {4,33,150}, {4,3,99}, {4,3,301}, {16,9,300}, {1,32,100}})
+        CHECK(!WideMelon::ResolveCustomView(invalid[0], invalid[1], invalid[2]).Valid);
+    for (int a = 1; a <= 32; ++a) for (int b = 1; b <= 32; ++b)
+    for (int fov : {100,125,150,200,300})
+    {
+        const auto view = WideMelon::ResolveCustomView(a,b,fov);
+        if (!view.Valid) continue;
+        CHECK(view.Width >= 256 && view.Height >= 192);
+        CHECK_EQ(view.Width % 2, 0); CHECK_EQ(view.Height % 2, 0);
+        // Each axis rounds upward by less than two pixels.
+        CHECK(std::abs(double(view.Width)*b-double(view.Height)*a) < 2.0*(a+b));
+    }
+}
+
+POLICY_TEST(CustomTouchStaysInNativeCenterOnBothAxes)
+{
+    for (const auto size : {std::array<int,2>{384,288}, {512,288}, {384,512}})
+    for (int rotation = 0; rotation < 4; ++rotation) for (int kind = 0; kind < 4; ++kind)
+    for (bool swap : {false,true})
+    {
+        const int width = size[0], height = size[1];
+        ScreenLayout layout;
+        layout.Setup(2000,1600,ScreenLayoutType(kind),ScreenRotation(rotation),
+            screenSizing_Even,8,false,swap,1.f,width/256.f,true,1.f,height/192.f);
+        float matrices[kMaxScreenTransforms*6]; int screens[kMaxScreenTransforms];
+        const int count = layout.GetScreenTransforms(matrices,screens);
+        for (int i = 0; i < count; ++i)
+        {
+            if (screens[i] != 1) continue;
+            const float* m = matrices+i*6;
+            auto host = [&](float x, float y, int& hx, int& hy) {
+                const float sx = (x-128)*256/width+128, sy = (y-96)*192/height+96;
+                hx = int(std::lround(sx*m[0]+sy*m[2]+m[4]));
+                hy = int(std::lround(sx*m[1]+sy*m[3]+m[5]));
+            };
+            for (int px : {10,128,244}) for (int py : {10,96,180})
+            {
+                int x,y; host(px+0.5f,py+0.5f,x,y);
+                CHECK(layout.GetTouchCoords(x,y,false,width,height));
+                CHECK(std::abs(x-px)<=1); CHECK(std::abs(y-py)<=1);
+            }
+            for (const auto p : {std::array<int,2>{-8,96}, {264,96}, {128,-8}, {128,200}})
+            {
+                int x,y; host(p[0],p[1],x,y);
+                CHECK(!layout.GetTouchCoords(x,y,false,width,height));
+            }
+        }
+    }
+}
+
+POLICY_TEST(CustomDisplayCroppingAndBorderOverlapUseBothAxes)
+{
+    const auto saved = WideMelon::CurrentConfiguration();
+    for (int target : {WideMelon::Top,WideMelon::Bottom,WideMelon::Both})
+    {
+        WideMelon::ApplyConfiguration({384,288,target,true,true});
+        CHECK(WideMelon::Rectangular());
+        CHECK_EQ(WideMelon::CaptureOverlap(),2);
+        CHECK_EQ(WideMelon::VerticalCaptureOverlap(),2);
+        for (int screen : {0,1})
+        {
+            const bool expanded=target==WideMelon::Both||target==screen;
+            CHECK_EQ(WideMelon::DisplayWidth(screen),expanded?384:256);
+            CHECK_EQ(WideMelon::DisplayHeight(screen),expanded?288:192);
+            CHECK(std::abs(WideMelon::ContentWidth(screen)*384-(expanded?384:256))<0.001f);
+            CHECK(std::abs(WideMelon::ContentHeight(screen)*288-(expanded?288:192))<0.001f);
+        }
+    }
+    WideMelon::ApplyConfiguration(saved);
+}
 
 POLICY_TEST(RotatedWidescreenKeepsWorldScaleAndCenter)
 {

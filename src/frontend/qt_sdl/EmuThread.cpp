@@ -135,6 +135,7 @@ bool EmuThread::startWholeSceneTimingLog(const QString& filename, QString& error
     wholeSceneTimingLogBuffer.clear();
     wholeSceneRendererLogBuffer.clear();
     wholeSceneTimingLogFrame = 0;
+    wholeSceneTimingLastPresentCounter = 0;
     wholeSceneTimingLogHeaderWritten = false;
     wholeSceneRendererLogHeaderWritten = false;
     wholeSceneTimingLastTouching = emuInstance && emuInstance->isTouching;
@@ -231,7 +232,8 @@ void EmuThread::appendWholeSceneTimingLog(u32 nlines,
                                           bool touchRelease,
                                           int touchX,
                                           int touchY,
-                                          u64 totalUS)
+                                          u64 totalUS,
+                                          u64 presentEndCounter)
 {
     if (!wholeSceneTimingLogEnabled.load())
         return;
@@ -248,7 +250,7 @@ void EmuThread::appendWholeSceneTimingLog(u32 nlines,
 
     if (!wholeSceneTimingLogHeaderWritten)
     {
-        wholeSceneTimingLogBuffer += "frame,total_us,runframe_us,drawscreen_us,present_pre_swap_us,present_swap_us,present_swap_count,nlines,key_mask,touch_active,touch_press,touch_release,touch_x,touch_y,renderer_timing";
+        wholeSceneTimingLogBuffer += "frame,total_us,runframe_us,drawscreen_us,present_pre_swap_us,present_swap_us,present_swap_count,nlines,key_mask,touch_active,touch_press,touch_release,touch_x,touch_y,renderer_timing,present_interval_us";
         wholeSceneTimingLogBuffer += "\n";
         wholeSceneTimingLogHeaderWritten = true;
     }
@@ -293,6 +295,15 @@ void EmuThread::appendWholeSceneTimingLog(u32 nlines,
     wholeSceneTimingLogBuffer += QString::number(touchY);
     wholeSceneTimingLogBuffer += ",";
     wholeSceneTimingLogBuffer += rendererTimingAvailable ? "1" : "0";
+    // Measure cadence across the whole loop, including work outside RunFrame
+    // and drawScreen. A removed implicit GPU wait can move into SwapBuffers
+    // without making successive presentation returns farther apart.
+    const u64 presentIntervalUS = wholeSceneTimingLastPresentCounter
+        ? static_cast<u64>((presentEndCounter - wholeSceneTimingLastPresentCounter) *
+                          1000000.0 / SDL_GetPerformanceFrequency() + 0.5) : 0;
+    wholeSceneTimingLastPresentCounter = presentEndCounter;
+    wholeSceneTimingLogBuffer += ",";
+    wholeSceneTimingLogBuffer += QString::number(presentIntervalUS);
     if (wholeSceneRendererLogHeaderWritten)
     {
         wholeSceneRendererLogBuffer += QString::number(timingFrame);
@@ -637,7 +648,8 @@ void EmuThread::run()
                                       frameTouchRelease,
                                       frameTouchX,
                                       frameTouchY,
-                                      counterDeltaUS(frameWorkStart, drawScreenEnd));
+                                      counterDeltaUS(frameWorkStart, drawScreenEnd),
+                                      drawScreenEnd);
 
             frameReady = nlines > 1;
             if (emuInstance->rendererTest)

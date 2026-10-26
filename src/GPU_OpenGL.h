@@ -75,6 +75,10 @@ public:
                                          std::string* status = nullptr) override;
     bool ReadWholeScene2DTimingCSV(std::string& header,
                                    std::string& row) override;
+    bool SetCaptureLumaProbeEnabled(bool enabled) override
+    { CaptureLumaProbeEnabled = enabled; return true; }
+    bool IsCaptureLumaProbeEnabled() const override { return CaptureLumaProbeEnabled; }
+    u64 GetCaptureLumaProbeReadbackCount() const override { return CaptureLumaProbeReadbacks; }
     void SetWholeScene2DTimingFrame(u64 frame, bool valid) override;
     bool SetWholeScene2DRollingDebugCapture(bool enabled,
                                             int frameCount,
@@ -119,6 +123,7 @@ private:
     GLuint WideOutputTex3D = 0;
     GLuint WideShader = 0;
     GLuint WideVerticalShader = 0;
+    GLuint WideRectangularShader = 0;
     GLuint WideCaptureShader = 0;
     GLuint WideScratchTex = 0, WideScratchFB = 0;
     u64 WideFeedbackSerial[4] = {};
@@ -146,9 +151,13 @@ private:
         std::array<std::array<u32, 2>, 192> BackdropPolicy = {};
         bool NeedsComposition = false;
         std::array<u8, 256> VerticalBorders = {};
+        std::array<u8, 192> HorizontalBorders = {};
     } WideCapture[4];
     void RenderWideWings(int ystart, int yend);
     void RenderVerticalWings(int ystart, int yend);
+    void RenderRectangularWings(int ystart, int yend);
+    void BuildRectangularWindows(const GLRenderer2D& renderer, int layer, int engine,
+                                 bool raw, int ystart, int yend, WideWindowRow (&windows)[448]);
     int FindWideCapture(const GLRenderer2D& renderer, int ystart, int yend, int& layer) const;
     int FindWideVRAMDisplay(u32 dispCnt) const;
     void CopyWideCenter();
@@ -458,7 +467,8 @@ private:
     // touched while the whole-scene timing CSV is being read.
     GLuint CaptureLumaProbeFB {};
     GLuint CaptureLumaProbeTex {};
-    int WholeSceneTimingCSVActiveFrames = 0;
+    bool CaptureLumaProbeEnabled = false;
+    u64 CaptureLumaProbeReadbacks = 0;
 
     u16* AuxInputBuffer[2] {};
     u8 AuxUsageMask;
@@ -649,6 +659,7 @@ private:
                                            const sHighResDisplayCaptureEvent& event,
                                            bool fullDisplay);
     void StoreVerticalCapture(const sLastDisplayCaptureDebug& capture, const sHighResDisplayCaptureEvent& event);
+    void StoreRectangularCapture(const sLastDisplayCaptureDebug& capture, const sHighResDisplayCaptureEvent& event);
     void StoreWideFeedbackCapture(const sLastDisplayCaptureDebug& capture, const sHighResDisplayCaptureEvent& event);
     void StoreWideCapture(const sLastDisplayCaptureDebug& capture,
                           const sHighResDisplayCaptureEvent& event);

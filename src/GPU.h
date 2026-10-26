@@ -936,6 +936,10 @@ public:
             *status = "Whole-scene 2D debug view controls are unavailable for this renderer.";
         return false;
     }
+    // Content probes are explicit diagnostics; timing collection must not arm them.
+    virtual bool SetCaptureLumaProbeEnabled(bool enabled) { return !enabled; }
+    virtual bool IsCaptureLumaProbeEnabled() const { return false; }
+    virtual u64 GetCaptureLumaProbeReadbackCount() const { return 0; }
     virtual bool ReadWholeScene2DTimingCSV(std::string& header, std::string& row)
     {
         header.clear();

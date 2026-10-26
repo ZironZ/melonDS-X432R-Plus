@@ -9,6 +9,7 @@ uniform sampler2DArray Capture128Texture;
 uniform sampler2DArray Capture256Texture;
 uniform vec4 uTextureNormalize;
 uniform int uBinaryAlphaTexture;
+uniform float uWideMaskScale;
 
 layout(std140) uniform uConfig
 {
@@ -21,6 +22,11 @@ layout(std140) uniform uConfig
     int uFogOffset;
     int uFogShift;
 };
+
+vec2 WideMaskPoint()
+{
+    return gl_FragCoord.xy / uWideMaskScale - (uScreenSize / uWideMaskScale - vec2(256,192)) * 0.5;
+}
 
 uniform int uRenderMode; // 0=opaque 1=translucent 2=shadowmask
 
@@ -174,7 +180,17 @@ vec4 FinalColor()
     else
     {
         vec2 texcoordXY = fTexcoord;
-        if (fTexcoordInsetBounds.z > fTexcoordInsetBounds.x &&
+        if ((fPolygonAttr.x & (1 << 12)) != 0)
+        {
+            // Continue only the transition layer. Scenery retains its expanded
+            // coordinates, and the original mask keeps its native raster path.
+            vec2 halfPixel = vec2(0.5 / uWideMaskScale);
+            vec2 p = clamp(WideMaskPoint(), halfPixel, vec2(256,192)-halfPixel);
+            vec2 uv = (p-fTexcoordInsetBounds.xy) / (fTexcoordInsetBounds.zw-fTexcoordInsetBounds.xy);
+            texcoordXY = any(lessThan(uv, vec2(0))) || any(greaterThanEqual(uv, vec2(1))) ? vec2(0) : uv;
+            texcoordXY *= vec2(1 << (fPolygonAttr.x & 3), 1 << ((fPolygonAttr.x >> 2) & 3));
+        }
+        else if (fTexcoordInsetBounds.z > fTexcoordInsetBounds.x &&
             fTexcoordInsetBounds.w > fTexcoordInsetBounds.y)
         {
             texcoordXY = clamp(texcoordXY, fTexcoordInsetBounds.xy, fTexcoordInsetBounds.zw);
@@ -223,6 +239,12 @@ vec4 FinalColor()
 
 void main()
 {
+    if ((fPolygonAttr.x & ((1 << 10) | (1 << 12))) != 0)
+    {
+        vec2 p = WideMaskPoint();
+        bool native = all(greaterThanEqual(p, vec2(0))) && all(lessThan(p, vec2(256,192)));
+        if (native == ((fPolygonAttr.x & (1 << 12)) != 0)) discard;
+    }
     if (uRenderMode == 2)
     {
         oColor = vec4(0,0,0,1);

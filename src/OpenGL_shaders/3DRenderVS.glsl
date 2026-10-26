@@ -69,6 +69,8 @@ void main()
     fTexcoordInsetBounds = vec4(
         (vec2(vTexcoordInsetBounds.xy) * (1.0 / 16.0) + vec2(0.5)) / texsize,
         (vec2(vTexcoordInsetBounds.zw) * (1.0 / 16.0) - vec2(0.5)) / texsize);
+    if ((attr & (1 << 12)) != 0)
+        fTexcoordInsetBounds = vec4(ivec4(vTexcoordInsetBounds << 16) >> 16) * (1.0 / 16.0);
     fPolygonAttr = ivec3(vPolygonAttr.x, vPolygonAttr.y & 0xFFFF, attrz);
 
     gl_Position = fpos;

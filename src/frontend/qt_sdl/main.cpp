@@ -384,7 +384,11 @@ int main(int argc, char** argv)
         Config::GetGlobalTable().GetInt("3D.GL.WidescreenDisplay"),
         Config::GetGlobalTable().GetInt("3D.GL.WidescreenHeight"),
         Config::GetGlobalTable().GetBool("3D.GL.WidescreenExtendWindows"),
-        Config::GetGlobalTable().GetBool("3D.GL.WidescreenExpandNarrowBorders"));
+        Config::GetGlobalTable().GetBool("3D.GL.WidescreenExpandNarrowBorders"),
+        Config::GetGlobalTable().GetBool("3D.GL.WidescreenCustom"),
+        Config::GetGlobalTable().GetInt("3D.GL.WidescreenAspectWidth"),
+        Config::GetGlobalTable().GetInt("3D.GL.WidescreenAspectHeight"),
+        Config::GetGlobalTable().GetInt("3D.GL.WidescreenFOVPercent"));
 
     camStarted[0] = false;
     camStarted[1] = false;

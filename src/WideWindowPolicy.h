@@ -17,6 +17,8 @@ namespace melonDS
 constexpr u32 WideEdgeVisible = 3;
 constexpr u32 WideBlend3DBackdrop = 1u << 25;
 constexpr u32 WideNarrowBorder = 1u << 28;
+constexpr u32 WideOBJClearTop = 1u << 4;
+constexpr u32 WideOBJClearBottom = 1u << 5;
 
 inline bool IsWidePolicyFullyDark(u32 policy)
 {
@@ -40,7 +42,7 @@ template <typename Row>
 bool CanExpandWideNarrowBorder(const Row& row, bool objWindowEnabled)
 {
     if (!WideMelon::ExpandNarrowBorders || !WideMelon::ExtendWindows ||
-        WideMelon::Width() <= 256 || WideMelon::Vertical()) return false;
+        WideMelon::Width() <= 256) return false;
     if (!(row.OBJWindowEnabled & 2) &&
         (objWindowEnabled || ((row.WinRegs >> 8) & 255) != 255)) return false;
     for (int window = 0; window < 2; ++window)
@@ -57,12 +59,13 @@ bool CanExpandWideNarrowBorder(const Row& row, bool objWindowEnabled)
 
 // Cache only geometric absence proofs when OAM changes. Include disabled and
 // vertically offscreen masks, and the complete affine double-size bounds.
-// Bits match the scanline OBJWindowEnabled field: no masks, clear left edge,
-// clear right edge. Texture transparency is deliberately not part of the proof.
+// Bits match the scanline OBJWindowEnabled field: no masks, clear left/right
+// edges, clear top/bottom edges. Texture transparency is not part of the proof.
 inline u32 WideOBJWindowProof(const u16* oam)
 {
-    u32 proof = 2 | 4 | 8;
+    u32 proof = 2 | 4 | 8 | WideOBJClearTop | WideOBJClearBottom;
     constexpr int widths[3][4] = {{8, 16, 32, 64}, {16, 32, 32, 64}, {8, 8, 16, 32}};
+    constexpr int heights[3][4] = {{8, 16, 32, 64}, {8, 8, 16, 32}, {16, 32, 32, 64}};
     for (int i = 0; i < 128; ++i)
     {
         const u16 attr0 = oam[i * 4], attr1 = oam[i * 4 + 1];
@@ -72,14 +75,21 @@ inline u32 WideOBJWindowProof(const u16* oam)
         if (shape == 3) return 0; // Undefined shape: retain the conservative fallback.
         const int x = (attr1 & 511) >= 256 ? (attr1 & 511) - 512 : attr1 & 511;
         int width = widths[shape][attr1 >> 14];
-        if (((attr0 >> 8) & 3) == 3) width *= 2;
+        int height = heights[shape][attr1 >> 14];
+        if (((attr0 >> 8) & 3) == 3) { width *= 2; height *= 2; }
         if (x <= 0) proof &= ~4u;
         if (x + width > 255) proof &= ~8u;
+        const int rawY = attr0 & 255;
+        const int y = rawY >= 192 ? rawY - 256 : rawY;
+        // OBJ Y wraps modulo 256, including tall double-size sprites that
+        // start on-screen and wrap past 255 back onto the top edge.
+        if (y <= 0 || rawY + height > 256) proof &= ~WideOBJClearTop;
+        if (y + height > 191) proof &= ~WideOBJClearBottom;
     }
     return proof;
 }
 
-// The rotated counterpart is a rectangle excluding just rows 0 and 191.
+// The rotated counterpart excludes one native row at the top, bottom, or both.
 // Prove its bounds from the recorded scanlines, including vertical activity,
 // rather than using end-of-frame registers that may have changed mid-frame.
 template <typename Row>
@@ -93,15 +103,16 @@ bool CanExpandVerticalNarrowBorder(const Row* rows)
     const u32 permissions = (inside.WinRegs >> (24 - window * 8)) & 0x3F;
     const u32 outside = inside.WinRegs & 0x3F;
     if (permissions == outside || (permissions & outside) != outside) return false;
+    bool excludedEdge = false;
     for (int y = 0; y < 192; ++y)
     {
         const auto& row = rows[y];
         if (row.WinRegs != inside.WinRegs ||
             (!(row.OBJWindowEnabled & 2) &&
              (row.OBJWindowEnabled || ((row.WinRegs >> 8) & 255) != 255))) return false;
-        if (y == 0 || y == 191)
+        if ((y == 0 || y == 191) && row.WinMask == 0)
         {
-            if (row.WinMask != 0) return false;
+            excludedEdge = true;
         }
         else
         {
@@ -110,11 +121,11 @@ bool CanExpandVerticalNarrowBorder(const Row* rows)
                 if (row.WinPos[i] != inside.WinPos[i]) return false;
         }
     }
-    return true;
+    return excludedEdge;
 }
 
 template <typename Row>
-u32 WideWindowPermissions(const Row& row, int x, bool objWindowEnabled)
+u32 WideWindowPermissions(const Row& row, int x, bool objWindowEnabled, u32 verticalOBJProof = 0)
 {
     auto inside = [&](int window)
     {
@@ -125,7 +136,7 @@ u32 WideWindowPermissions(const Row& row, int x, bool objWindowEnabled)
     u32 permissions = row.WinRegs;
     if (inside(0)) permissions >>= 24;
     else if (inside(1)) permissions >>= 16;
-    else if (!(row.OBJWindowEnabled & (2u | (x == 0 ? 4u : x == 255 ? 8u : 0u))) &&
+    else if (!(row.OBJWindowEnabled & (2u | (x == 0 ? 4u : x == 255 ? 8u : 0u) | verticalOBJProof)) &&
              (objWindowEnabled || ((row.WinRegs >> 8) & 255) != 255))
         return 0x100; // No proof of OBJ-window coverage outside the native image.
 
@@ -195,11 +206,33 @@ u32 MakeVerticalWindowPolicy(const Row* rows, int layer, int x, int side,
                             bool expandBorder, bool backdropOnly = false)
 {
     const auto& row = rows[side ? 191 : 0];
-    const u32 original = WideWindowPermissions(row, x, row.OBJWindowEnabled != 0);
-    const u32 permissions = expandBorder ? WideWindowPermissions(rows[1], x, rows[1].OBJWindowEnabled != 0) : original;
+    const u32 objProof = side ? WideOBJClearBottom : WideOBJClearTop;
+    const u32 original = WideWindowPermissions(row, x, row.OBJWindowEnabled != 0, objProof);
+    const u32 permissions = expandBorder ? WideWindowPermissions(rows[1], x, rows[1].OBJWindowEnabled != 0, objProof) : original;
     u32 policy = MakeWideWindowPolicy(row, layer, x, row.OBJWindowEnabled != 0, backdropOnly, -1, 0, permissions);
     if (expandBorder && (policy & 3) == WideEdgeVisible &&
         original != permissions) policy |= WideNarrowBorder;
+    return policy;
+}
+
+// Combine the independent one-pixel rectangle proofs while retaining effects
+// from the actual boundary scanline. This never changes emulated window state.
+template <typename Row>
+u32 MakeRectangularWindowPolicy(const Row* rows, int layer, int x, int y,
+                                bool expandVertical, bool backdropOnly = false)
+{
+    const auto& row = rows[y];
+    const bool vertical = expandVertical && (y == 0 || y == 191);
+    const auto& permissionRow = vertical ? rows[1] : row;
+    const bool horizontal = (x == 0 || x == 255) &&
+        CanExpandWideNarrowBorder(permissionRow, permissionRow.OBJWindowEnabled != 0);
+    const int sampleX = horizontal ? (x == 0 ? 1 : 254) : x;
+    const u32 objProof = y == 0 ? WideOBJClearTop : y == 191 ? WideOBJClearBottom : 0u;
+    const u32 permissions = WideWindowPermissions(permissionRow, sampleX, permissionRow.OBJWindowEnabled != 0, objProof);
+    u32 policy = MakeWideWindowPolicy(row, layer, x, row.OBJWindowEnabled != 0,
+        backdropOnly, -1, 0, permissions);
+    if ((policy & 3) == WideEdgeVisible &&
+        permissions != WideWindowPermissions(row, x, row.OBJWindowEnabled != 0, objProof)) policy |= WideNarrowBorder;
     return policy;
 }
 }

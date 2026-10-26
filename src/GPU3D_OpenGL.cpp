@@ -487,6 +487,7 @@ void GLRenderer3D::UseRenderShader(bool wbuffer)
     CurShaderID = flags;
 
     RenderModeULoc = glGetUniformLocation(RenderShader[flags], "uRenderMode");
+    glUniform1f(glGetUniformLocation(RenderShader[flags], "uWideMaskScale"), ScaleFactor);
 }
 
 void SetupDefaultTexParams(GLuint tex)
@@ -986,6 +987,16 @@ u32* GLRenderer3D::SetupVertex(const Polygon* poly, int vid, const Vertex* vtx, 
             : (static_cast<uint64_t>(vtx->HiresPosition[1]) * ScaleFactor * WideMelon::Height()) / (16 * 192);
     }
     x = WideTransitionX(TransitionPlan, poly, vtx, x, ScreenW);
+    y = WideTransitionY(TransitionPlan, poly, vtx, y, ScreenH);
+    const auto mask = TransitionMasks.find(poly);
+    if (mask != TransitionMasks.end())
+    {
+        vtxattr |= mask->second.Margin ? (1u << 12) : (1u << 10);
+        if (mask->second.Margin)
+            for (unsigned axis = 0; axis < 2; ++axis)
+                for (unsigned scale = mask->second.UVScale[axis]; scale > 1; scale >>= 1)
+                    vtxattr += 1u << (axis*2);
+    }
     *vptr++ = x | (y << 16);
     *vptr++ = z | (w << 16);
 
@@ -999,7 +1010,13 @@ u32* GLRenderer3D::SetupVertex(const Polygon* poly, int vid, const Vertex* vtx, 
     *vptr++ = vtxattr | (zshift << 16);
     *vptr++ = texlayer;
     *vptr++ = PackTextureSizeRepeatAndForceNearest(texwidth, texheight, (poly->TexParam >> 16) & 0xF, forceNearestTexture);
-    if (spriteUVInsetBounds.Valid)
+    if (mask != TransitionMasks.end() && mask->second.Margin)
+    {
+        const auto& b = mask->second.Bounds;
+        *vptr++ = u16(b[0]) | (u32(u16(b[1])) << 16);
+        *vptr++ = u16(b[2]) | (u32(u16(b[3])) << 16);
+    }
+    else if (spriteUVInsetBounds.Valid)
     {
         *vptr++ = spriteUVInsetBounds.U0 | (static_cast<u32>(spriteUVInsetBounds.V0) << 16);
         *vptr++ = spriteUVInsetBounds.U1 | (static_cast<u32>(spriteUVInsetBounds.V1) << 16);
@@ -1065,7 +1082,10 @@ void GLRenderer3D::BuildPolygons(GLRenderer3D::RendererPolygon* polygons, int np
     {
         RendererPolygon* rp = &polygons[i];
         Polygon* poly = rp->PolyData;
+        const auto transitionMask = TransitionMasks.find(poly);
+        const bool marginMask = transitionMask != TransitionMasks.end() && transitionMask->second.Margin;
         int groupIndex = reconstruction.Membership.empty() ? -1 : reconstruction.Membership[i];
+        if (TransitionMasks.count(poly)) groupIndex = -1;
         if (groupIndex >= 0 && !reconstructedTextures[groupIndex]) groupIndex = -1;
         Polygon reconstructedPolygon;
         std::array<Vertex,4> reconstructedVertices;
@@ -1087,7 +1107,7 @@ void GLRenderer3D::BuildPolygons(GLRenderer3D::RendererPolygon* polygons, int np
             TextureFilter.Smart2DFiltering && IsStretchedTexture2DStrip(*poly);
         TextureSamplingBounds samplingBounds;
         const u32 textypeForBounds = (texparam >> 26) & 0x7;
-        if (TexEnable && textypeForBounds && groupIndex < 0 && !nativeTexture)
+        if (TexEnable && textypeForBounds && groupIndex < 0 && !nativeTexture && !marginMask)
         {
             const u32 texWidth = TextureWidth(texparam);
             const u32 texHeight = TextureHeight(texparam);
@@ -2151,6 +2171,23 @@ void GLRenderer3D::AppendRenderFrameTimingCSVRow(std::string& row) const
     row += std::to_string(Texcache.GetReconstructionBuiltTexels());
 }
 
+void GLRenderer3D::UploadShaderConfig()
+{
+    glBindBuffer(GL_UNIFORM_BUFFER, ShaderConfigUBO);
+    // Every byte is replaced. Invalidation lets the driver give this frame
+    // fresh storage instead of waiting for earlier draws using the old data.
+    void* data = glMapBufferRange(GL_UNIFORM_BUFFER, 0, sizeof(ShaderConfig),
+                                  GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT);
+    if (data)
+    {
+        memcpy(data, &ShaderConfig, sizeof(ShaderConfig));
+        if (glUnmapBuffer(GL_UNIFORM_BUFFER) == GL_TRUE)
+            return;
+    }
+    // A failed map or corrupted mapping must never leave stale uniforms.
+    glBufferData(GL_UNIFORM_BUFFER, sizeof(ShaderConfig), &ShaderConfig, GL_STREAM_DRAW);
+}
+
 void GLRenderer3D::RenderFrame()
 {
     LastRenderFrameSkipped = false;
@@ -2168,7 +2205,19 @@ void GLRenderer3D::RenderFrame()
 
     Texcache.BeginRenderFrame();
     TransitionPlan = BuildWideTransitionPlan(GPU3D.RenderPolygonRAM.data(), GPU3D.RenderNumPolygons,
-        WideMelon::Width() > 256 && WideMelon::ExtendWindows);
+        WideMelon::Enabled() && WideMelon::ExtendWindows, WideMelon::ExpandNarrowBorders);
+    auto transitionScene = BuildWideTransitionMaskScene(GPU3D.RenderPolygonRAM.data(), GPU3D.RenderNumPolygons,
+        WideMelon::Enabled() && WideMelon::ExtendWindows && (GPU3D.RenderDispCnt & 1),
+        WideMelon::Width(), WideMelon::Height(), [&](const Polygon& p, std::vector<u32>& pixels) {
+            pixels.resize(TextureWidth(p.TexParam)*TextureHeight(p.TexParam));
+            const u32 format = (p.TexParam >> 26) & 7;
+            const u32 palette = (p.TexPalette*16 >> (format == 2 ? 1 : 0)) & 0x1FFFF;
+            TextureScaleDecodeSourceRGBA8(format, TextureWidth(p.TexParam), TextureHeight(p.TexParam),
+                pixels.data(), (p.TexParam & 0xFFFF)*8, 0, palette, (p.TexParam & (1u<<29)) != 0,
+                {GPU.VRAMFlat_Texture, GPU.VRAMFlat_TexPal});
+            return true;
+        });
+    TransitionMasks = std::move(transitionScene.Masks);
 
     // figure out which chunks of texture memory contain display captures
     int captureinfo[16];
@@ -2277,10 +2326,7 @@ void GLRenderer3D::RenderFrame()
     ShaderConfig.uFogOffset = GPU3D.RenderFogOffset;
     ShaderConfig.uFogShift = GPU3D.RenderFogShift;
 
-    glBindBuffer(GL_UNIFORM_BUFFER, ShaderConfigUBO);
-    void* unibuf = glMapBuffer(GL_UNIFORM_BUFFER, GL_WRITE_ONLY);
-    if (unibuf) memcpy(unibuf, &ShaderConfig, sizeof(ShaderConfig));
-    glUnmapBuffer(GL_UNIFORM_BUFFER);
+    UploadShaderConfig();
 
     glDisable(GL_SCISSOR_TEST);
     glEnable(GL_DEPTH_TEST);
@@ -2357,12 +2403,12 @@ void GLRenderer3D::RenderFrame()
         phaseStart = std::chrono::steady_clock::now();
         int npolys = 0;
         int firsttrans = -1;
-        for (u32 i = 0; i < GPU3D.RenderNumPolygons; i++)
+        for (auto* polygon : transitionScene.Polygons)
         {
-            if (GPU3D.RenderPolygonRAM[i]->Degenerate) continue;
+            if (polygon->Degenerate) continue;
 
-            SetupPolygon(&PolygonList[npolys], GPU3D.RenderPolygonRAM[i]);
-            if (firsttrans < 0 && GPU3D.RenderPolygonRAM[i]->Translucent)
+            SetupPolygon(&PolygonList[npolys], polygon);
+            if (firsttrans < 0 && polygon->Translucent)
                 firsttrans = npolys;
 
             npolys++;

@@ -1158,6 +1158,9 @@ void MainWindow::onFocusOut()
 
 void MainWindow::onAppStateChanged(Qt::ApplicationState state)
 {
+    // Closing a window can emit this signal after closeEvent detached the
+    // emulator instance, just like the late focusOutEvent handled above.
+    if (!emuInstance) return;
     if (state == Qt::ApplicationInactive)
     {
         emuInstance->keyReleaseAll();

@@ -4,6 +4,7 @@ add_executable(policy-tests
     AffineReconstructionSettingsTests.cpp
     TextureAlphaSettingsTests.cpp
     BGVRAMUploadCacheTests.cpp
+    BGArtworkCacheTests.cpp
     CapturePolicyTests.cpp
     CleanLegacyEligibilityTests.cpp
     CompositorInputPolicyTests.cpp

@@ -65,6 +65,59 @@ auto RealCompileShader = glad_glCompileShader;
 auto RealLinkProgram = glad_glLinkProgram;
 int FailCompileAt = 0, CompileCalls = 0;
 bool FailLink = false, FailCreateShader = false, FailCreateProgram = false;
+auto RealDrawArrays = glad_glDrawArrays;
+size_t DrawArraysCalls = 0;
+void APIENTRY DrawArrays(GLenum mode, GLint first, GLsizei count)
+{
+    ++DrawArraysCalls;
+    RealDrawArrays(mode, first, count);
+}
+
+auto RealTexSubImage2D = glad_glTexSubImage2D;
+struct UploadRectangle { GLint Y; GLsizei Width, Height; };
+bool CollectVRAMUploads = false;
+std::vector<UploadRectangle> VRAMUploads;
+void APIENTRY TexSubImage2D(GLenum target, GLint level, GLint x, GLint y,
+                           GLsizei width, GLsizei height, GLenum format,
+                           GLenum type, const void* data)
+{
+    if (CollectVRAMUploads)
+    {
+        Check(target == GL_TEXTURE_2D && format == GL_RED_INTEGER && type == GL_UNSIGNED_BYTE,
+              "BG upload format");
+        VRAMUploads.push_back({y,width,height});
+    }
+    RealTexSubImage2D(target,level,x,y,width,height,format,type,data);
+}
+
+auto RealTexImage2D = glad_glTexImage2D;
+bool FailScratchAllocation = false;
+size_t TextureStorageCalls = 0;
+auto RealMapBufferRange = glad_glMapBufferRange;
+auto RealUnmapBuffer = glad_glUnmapBuffer;
+bool FailUniformMap = false, FailUniformUnmap = false;
+size_t UniformUnmaps = 0;
+GLbitfield UniformMapFlags = 0;
+void* APIENTRY MapBufferRange(GLenum target, GLintptr offset, GLsizeiptr size, GLbitfield flags)
+{
+    UniformMapFlags = flags;
+    return FailUniformMap ? nullptr : RealMapBufferRange(target, offset, size, flags);
+}
+GLboolean APIENTRY UnmapBuffer(GLenum target)
+{
+    ++UniformUnmaps;
+    const auto result = RealUnmapBuffer(target);
+    return FailUniformUnmap ? GL_FALSE : result;
+}
+void APIENTRY TexImage2D(GLenum target, GLint level, GLint format, GLsizei width,
+                        GLsizei height, GLint border, GLenum inputFormat,
+                        GLenum type, const void* data)
+{
+    ++TextureStorageCalls;
+    // Produce a real GL allocation error, then verify production cleans up.
+    RealTexImage2D(target, level, format, FailScratchAllocation ? -1 : width,
+                   height, border, inputFormat, type, data);
+}
 
 GLuint APIENTRY CreateShader(GLenum type)
 {
@@ -114,6 +167,7 @@ void InstallHooks()
     HOOK(CreateShader); HOOK(DeleteShader);
     HOOK(CreateProgram); HOOK(DeleteProgram);
     HOOK(CompileShader); HOOK(LinkProgram);
+    HOOK(TexImage2D); HOOK(MapBufferRange); HOOK(UnmapBuffer); HOOK(DrawArrays); HOOK(TexSubImage2D);
 #undef HOOK
 }
 
@@ -185,6 +239,1008 @@ namespace melonDS
 // frontend API. It exercises production lazy publication and per-engine scratch.
 struct GLRendererLifetimeTestAccess
 {
+    static void RectangularBorders(GLRenderer& renderer)
+    {
+        const int scale=renderer.ScaleFactor,w=WideMelon::Width()*scale,h=WideMelon::Height()*scale;
+        const int left=(w-256*scale)/2,top=(h-192*scale)/2;
+        const bool savedExpand=WideMelon::ExpandNarrowBorders;
+        glDisable(GL_SCISSOR_TEST); glDisable(GL_DITHER);
+        const GLfloat scenery[]={20.f/255,40.f/255,60.f/255,1};
+        const GLfloat native[]={220.f/255,80.f/255,100.f/255,1};
+        const GLenum outputs[]={GL_COLOR_ATTACHMENT0,GL_COLOR_ATTACHMENT1};
+        for(int mode=0;mode<3;++mode)
+        {
+            WideMelon::ExpandNarrowBorders=mode!=2;
+            for(int y=0;y<192;++y) for(int screen=0;screen<2;++screen)
+                renderer.WideNarrowBorderRows[y][screen]=mode==1?0:(y/(screen?11:7))%4;
+            for(int x=0;x<256;++x) for(int screen=0;screen<2;++screen)
+                renderer.WideNarrowBorderColumns[x][screen]=mode==1?0:(x/(screen?17:13))%4;
+            glBindFramebuffer(GL_DRAW_FRAMEBUFFER,renderer.WideOutputFB[renderer.BackBuffer]);
+            glDrawBuffers(2,outputs);
+            glBindFramebuffer(GL_READ_FRAMEBUFFER,renderer.FPOutputFB[renderer.BackBuffer]);
+            for(int screen=0;screen<2;++screen)
+            {
+                glColorMaski(screen,GL_TRUE,GL_TRUE,GL_TRUE,GL_TRUE);
+                glClearBufferfv(GL_COLOR,screen,scenery);
+            }
+            glBindFramebuffer(GL_DRAW_FRAMEBUFFER,renderer.FPOutputFB[renderer.BackBuffer]);
+            glDrawBuffers(2,outputs);
+            for(int screen=0;screen<2;++screen) glClearBufferfv(GL_COLOR,screen,native);
+            renderer.CopyWideCenter();
+            glBindFramebuffer(GL_READ_FRAMEBUFFER,renderer.WideOutputFB[renderer.BackBuffer]);
+            for(int screen=0;screen<2;++screen)
+            {
+                glReadBuffer(outputs[screen]);
+                std::vector<u8> pixels(w*h*4);glReadPixels(0,0,w,h,GL_RGBA,GL_UNSIGNED_BYTE,pixels.data());
+                for(int y=0;y<h;++y) for(int x=0;x<w;++x)
+                {
+                    const int nx=(x-left)/scale,ny=(y-top)/scale;
+                    const bool inside=x>=left&&x<left+256*scale&&y>=top&&y<top+192*scale;
+                    const u8 rows=inside?renderer.WideNarrowBorderRows[ny][screen]:0;
+                    const u8 cols=inside?renderer.WideNarrowBorderColumns[nx][screen]:0;
+                    const bool border=mode!=2&&inside&&((nx<2&&(rows&1))||(nx>=254&&(rows&2))||
+                        (ny<2&&(cols&1))||(ny>=190&&(cols&2)));
+                    const std::array<u8,4> expected=inside&&!border?std::array<u8,4>{220,80,100,255}:
+                        std::array<u8,4>{20,40,60,255};
+                    Check(std::memcmp(pixels.data()+(y*w+x)*4,expected.data(),4)==0,
+                        "rectangular native center preserves only proved border overlap on all four sides");
+                }
+            }
+        }
+        WideMelon::ExpandNarrowBorders=savedExpand;
+        Check(glGetError()==GL_NO_ERROR,"rectangular four-side center copy GL state");
+        std::puts("[GL lifetime] rectangular four-side center copy, corners, disabled option passed");
+    }
+    static void CaptureProbeIsolation(GLRenderer& renderer)
+    {
+        renderer.Reset(); // CSV diagnostics consume initialized OAM/engine state.
+        std::string header, row;
+        const auto originalCapture = renderer.CaptureCnt;
+        renderer.CaptureCnt = 0; // Complete 128x128 source-A display capture.
+        Check(!renderer.IsCaptureLumaProbeEnabled(), "content probe defaults off");
+        for (int i = 0; i < 10; ++i)
+        {
+            renderer.ReadWholeScene2DTimingCSV(header, row);
+            renderer.ResetWholeSceneFrameTiming();
+            renderer.DoCapture(0, 128);
+        }
+        Check(renderer.GetCaptureLumaProbeReadbackCount() == 0 && !renderer.LastCaptureNativeLumaDebug.Valid,
+              "CSV logging must never arm the content probe");
+        renderer.SetCaptureLumaProbeEnabled(true);
+        renderer.DoCapture(0, 64);
+        Check(renderer.GetCaptureLumaProbeReadbackCount() == 0, "partial capture does not read back luma");
+        renderer.DoCapture(64, 128);
+        Check(renderer.GetCaptureLumaProbeReadbackCount() == 1 && renderer.LastCaptureNativeLumaDebug.Valid,
+              "explicit diagnostic probe reads the completed capture");
+        renderer.SetCaptureLumaProbeEnabled(false);
+        renderer.ResetWholeSceneFrameTiming();
+        renderer.ReadWholeScene2DTimingCSV(header, row);
+        renderer.DoCapture(0, 128);
+        Check(renderer.GetCaptureLumaProbeReadbackCount() == 1 && !renderer.LastCaptureNativeLumaDebug.Valid,
+              "disabling the probe takes effect immediately, including while logging");
+        renderer.CaptureCnt = originalCapture;
+    }
+    static void PoisonScratchAfterEviction(GLRenderer2D& engine)
+    {
+        // Evict all previous sizes, and leave visible garbage in every retained
+        // allocation. Forced reconstruction must still reproduce current art.
+        glActiveTexture(GL_TEXTURE0);
+        for (int index = 0; index < 2; ++index)
+            for (int i = 0; i <= engine.ReconstructionScratchEntries; ++i)
+            {
+                Check(engine.EnsureCuNNyWorkTexture(index,13+i,17), "scratch eviction before reconstruction");
+                std::vector<float> poison((13+i)*17*4,1.0f);
+                glTexSubImage2D(GL_TEXTURE_2D,0,0,0,13+i,17,GL_RGBA,GL_FLOAT,poison.data());
+            }
+        for (int i = 0; i <= engine.ReconstructionScratchEntries; ++i)
+        {
+            const int w = 13+i, h = 17;
+            Check(engine.EnsureStrictAffineCuNNy2xTexture(w*2,h*2) &&
+                  engine.EnsureReconstructionAlphaTextures(w,h,4), "result/alpha eviction before reconstruction");
+            for (int role = 0; role < 4; ++role)
+            {
+                const GLuint texture = role == 0 ? engine.StrictAffineCuNNy2xTex : engine.ReconstructionAlphaWorkTex[role-1];
+                const int scale = role == 0 ? 2 : role == 1 ? 1 : 4;
+                std::vector<float> poison(w*h*scale*scale*4,1.0f);
+                glBindTexture(GL_TEXTURE_2D,texture);
+                glTexSubImage2D(GL_TEXTURE_2D,0,0,0,w*scale,h*scale,GL_RGBA,GL_FLOAT,poison.data());
+            }
+        }
+    }
+
+    static void UniformUploads(GLRenderer& renderer)
+    {
+        auto& classic = static_cast<GLRenderer3D&>(*renderer.Rend3D);
+        const auto saved = classic.ShaderConfig;
+        for (int failure = 0; failure < 3; ++failure)
+        {
+            std::memset(&classic.ShaderConfig, 0x31 + failure, sizeof(classic.ShaderConfig));
+            FailUniformMap = failure == 1;
+            FailUniformUnmap = failure == 2;
+            const auto unmaps = UniformUnmaps;
+            classic.UploadShaderConfig();
+            FailUniformMap = FailUniformUnmap = false;
+            std::array<unsigned char, sizeof(classic.ShaderConfig)> actual{};
+            glGetBufferSubData(GL_UNIFORM_BUFFER, 0, actual.size(), actual.data());
+            Check(std::memcmp(actual.data(), &classic.ShaderConfig, actual.size()) == 0,
+                  "uniform upload and fallback publish the complete current payload");
+            Check(UniformMapFlags == (GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT),
+                  "uniform upload permits replacement storage without unsynchronized writes");
+            Check(UniformUnmaps - unmaps == (failure == 1 ? 0 : 1),
+                  "failed uniform mapping must not unmap an unmapped buffer");
+        }
+        classic.ShaderConfig = saved;
+        classic.UploadShaderConfig();
+        Check(glGetError() == GL_NO_ERROR, "uniform upload failure recovery");
+        std::puts("[GL lifetime] Classic uniform payload, map/unmap failure recovery passed");
+    }
+
+    static void ResultAlphaScratchStorage(GLRenderer& renderer, bool engineB)
+    {
+        auto& engine = static_cast<GLRenderer2D&>(*(engineB ? renderer.Rend2D_B : renderer.Rend2D_A));
+        const auto acquire = [&](int w, int h) {
+            glActiveTexture(GL_TEXTURE0);
+            Check(engine.EnsureStrictAffineCuNNy2xTexture(w*2,h*2) &&
+                  engine.EnsureReconstructionAlphaTextures(w,h,4), "result/alpha scratch allocation");
+            std::array<GLuint,4> names{engine.StrictAffineCuNNy2xTex,
+                engine.ReconstructionAlphaWorkTex[0],engine.ReconstructionAlphaWorkTex[1],engine.ReconstructionAlphaWorkTex[2]};
+            for (int role = 0; role < 4; ++role)
+            {
+                glBindTexture(GL_TEXTURE_2D,names[role]);
+                GLint actualW = 0, actualH = 0;
+                glGetTexLevelParameteriv(GL_TEXTURE_2D,0,GL_TEXTURE_WIDTH,&actualW);
+                glGetTexLevelParameteriv(GL_TEXTURE_2D,0,GL_TEXTURE_HEIGHT,&actualH);
+                const int scale = role == 0 ? 2 : role == 1 ? 1 : 4;
+                Check(actualW == w*scale && actualH == h*scale, "each scratch role preserves exact dimensions");
+            }
+            return names;
+        };
+        const int sizes[][2] = {{64,64},{256,192},{32,64}};
+        std::array<GLuint,4> warm[3];
+        for (int i = 0; i < 3; ++i) warm[i] = acquire(sizes[i][0],sizes[i][1]);
+        const auto created = Textures.Created, storage = TextureStorageCalls;
+        for (int repeat = 0; repeat < 3; ++repeat)
+            for (int i = 0; i < 3; ++i)
+                Check(acquire(sizes[i][0],sizes[i][1]) == warm[i], "warm result and alpha texture names persist");
+        Check(Textures.Created == created && TextureStorageCalls == storage,
+              "alternating sprite/background sizes perform no warm result/alpha allocation");
+        Check(engine.EnsureStrictAffineCuNNy2xTexture(8,8), "result input allocation");
+        const auto input = engine.StrictAffineCuNNy2xTex;
+        std::array<float,8*8*4> pattern{}, actual{};
+        for (size_t i = 0; i < pattern.size(); ++i) pattern[i] = float(i%16)/16;
+        glTexSubImage2D(GL_TEXTURE_2D,0,0,0,8,8,GL_RGBA,GL_FLOAT,pattern.data());
+        for (int i = 0; i < 6; ++i)
+            Check(engine.EnsureReconstructionAlphaTextures(13+i,17,4), "alpha eviction pressure");
+        glBindTexture(GL_TEXTURE_2D,input);
+        glGetTexImage(GL_TEXTURE_2D,0,GL_RGBA,GL_FLOAT,actual.data());
+        Check(actual == pattern, "alpha allocation cannot evict a live RGB input");
+        for (auto* set : {&engine.CuNNyResultScratch,&engine.AlphaScratch[0],&engine.AlphaScratch[1],&engine.AlphaScratch[2]})
+        {
+            u64 bytes = 0; int count = 0;
+            for (auto& entry : set->Entries) { bytes += entry.Bytes(); count += entry.Texture != 0; }
+            Check(bytes <= engine.ReconstructionResultBudget && count <= engine.ReconstructionScratchEntries,
+                  "each result/alpha role obeys retention limits");
+        }
+        Check(engine.EnsureStrictAffineCuNNy2xTexture(1024,1025), "oversized result working texture");
+        const auto large = engine.StrictAffineCuNNy2xTex;
+        const auto largeStorage = TextureStorageCalls;
+        Check(engine.EnsureStrictAffineCuNNy2xTexture(1024,1025) && engine.StrictAffineCuNNy2xTex == large &&
+              TextureStorageCalls == largeStorage, "oversized result reused");
+        for (auto& entry : engine.CuNNyResultScratch.Entries) Check(!entry.Texture, "oversized result drops retained small entries");
+        Check(engine.EnsureStrictAffineCuNNy2xTexture(8,8) && !engine.CuNNyResultScratch.Large.Texture,
+              "return to ordinary dimensions releases oversized result");
+        const auto normal = engine.StrictAffineCuNNy2xTex;
+        engine.ResolvedOrdinaryOBJValid = engine.ResolvedOrdinaryOBJArtworkChecked = true;
+        engine.Reset();
+        Check(!engine.ResolvedOrdinaryOBJValid && !engine.ResolvedOrdinaryOBJArtworkChecked,
+              "reset invalidates ordinary output and dependency signature");
+        engine.SetScaleFactor(3); engine.SetScaleFactor(2);
+        Check(engine.EnsureStrictAffineCuNNy2xTexture(8,8) && engine.StrictAffineCuNNy2xTex == normal,
+              "dimension-keyed result storage survives reset and scale changes");
+        const auto beforeInvalid = Textures.Created;
+        GLint maximum = 0; glGetIntegerv(GL_MAX_TEXTURE_SIZE,&maximum);
+        Check(!engine.EnsureReconstructionAlphaTextures(0,8,4) &&
+              !engine.EnsureReconstructionAlphaTextures(8,8,3) &&
+              !engine.EnsureReconstructionAlphaTextures(maximum,8,4) &&
+              !engine.EnsureStrictAffineCuNNy2xTexture(maximum+1,8), "invalid result/alpha sizes rejected");
+        Check(Textures.Created == beforeInvalid, "invalid result/alpha requests allocate nothing");
+        const auto live = Textures.Live.size();
+        FailScratchAllocation = true;
+        const bool ok = engine.EnsureReconstructionAlphaTextures(63,61,4);
+        FailScratchAllocation = false;
+        Check(!ok && Textures.Live.size() <= live, "failed alpha allocation releases its name");
+        Check(engine.EnsureReconstructionAlphaTextures(63,61,4), "alpha recovers after storage allocation failure");
+        Check(glGetError() == GL_NO_ERROR, "result/alpha scratch GL operations");
+        std::printf("[GL lifetime] bounded result/alpha scratch engine %c passed\n",engineB?'B':'A');
+    }
+
+    static void OrdinarySpriteSurface(GLRenderer& renderer, bool engineB,
+                                      RendererSettings::GLScaleAlgorithm algorithm)
+    {
+        auto& engine = static_cast<GLRenderer2D&>(*(engineB ? renderer.Rend2D_B : renderer.Rend2D_A));
+        engine.SetScaleFactor(2);
+        engine.WholeSceneScaleRequested = true;
+        engine.WholeSceneScaleHybridStrictAffineHighRes = true;
+        engine.WholeSceneScaleHybridStrictAffineSourceEnhancement = true;
+        engine.SetWholeSceneScaleHybridStrictAffineConnectedSources(false);
+        engine.WholeSceneScaleAlgorithm = algorithm;
+        engine.AffineAlpha = RendererSettings::ResolveAffineAlphaReconstruction(
+            RendererSettings::AffineAlphaReconstruction::Automatic,algorithm);
+        const auto enhancement = engine.CurrentStrictAffineSourceEnhancementDecision(true);
+        const int model = RendererSettings::IsGLArtCNNAlgorithm(algorithm)
+            ? RendererSettings::GetGLArtCNNModelIndex(algorithm)
+            : RendererSettings::IsGLCuNNyAlgorithm(algorithm) ? RendererSettings::GetGLCuNNyModelIndex(algorithm) : -1;
+        engine.NumSprites = 3;
+        engine.SpriteUseMosaic = false;
+        engine.SpriteConfig.uVRAMMask = engineB ? 127 : 255;
+        const u32 mask = (engine.SpriteConfig.uVRAMMask<<10)|1023;
+        engine.UploadedOBJVRAM.resize(mask+1);
+        engine.SpriteConfig.uRotscale[0][0] = engine.SpriteConfig.uRotscale[0][3] = 256;
+        engine.SpriteConfig.uRotscale[0][1] = engine.SpriteConfig.uRotscale[0][2] = 0;
+        const auto upload = [&](bool bumpGeneration = true) {
+            if (bumpGeneration) ++engine.SpriteSourceGeneration;
+            glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D,engine.VRAMTex_OBJ);
+            glTexSubImage2D(GL_TEXTURE_2D,0,0,0,1024,engine.SpriteConfig.uVRAMMask+1,
+                GL_RED_INTEGER,GL_UNSIGNED_BYTE,engine.UploadedOBJVRAM.data());
+            glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D,engine.PalTex_OBJ);
+            glTexSubImage2D(GL_TEXTURE_2D,0,0,0,256,17,GL_RGBA,GL_UNSIGNED_SHORT_1_5_5_5_REV,engine.UploadedOBJPalette);
+            glBindBuffer(GL_UNIFORM_BUFFER,engine.SpriteConfigUBO);
+            glBufferSubData(GL_UNIFORM_BUFFER,0,sizeof(engine.SpriteConfig),&engine.SpriteConfig);
+            engine.PrerenderSprites();
+        };
+        const auto prepare = [&](bool reused) {
+            engine.WholeSceneTrace = {};
+            Check(engine.RenderResolvedOrdinaryOBJProduct(0,192,enhancement,model), "ordinary surface reconstruction");
+            Check(engine.WholeSceneTrace.StrictAffineResolvedOBJOrdinaryProductReused == reused,
+                  "ordinary surface invalidates exactly when its dependencies change");
+        };
+        const auto read = [&] {
+            std::vector<unsigned char> pixels(engine.ScreenW*engine.ScreenH*4);
+            glBindFramebuffer(GL_READ_FRAMEBUFFER,engine.ResolvedOrdinaryOBJFB);
+            glReadBuffer(GL_COLOR_ATTACHMENT0);
+            glReadPixels(0,0,engine.ScreenW,engine.ScreenH,GL_RGBA,GL_UNSIGNED_BYTE,pixels.data());
+            // Ownership/material metadata must survive hits too, not only RGBA.
+            std::vector<unsigned char> metadata(256*192*4*3);
+            glBindFramebuffer(GL_READ_FRAMEBUFFER,engine.ResolvedOrdinaryOBJNativeLayerFB);
+            for (int layer = 0; layer < 3; ++layer)
+            {
+                glReadBuffer(GL_COLOR_ATTACHMENT0+layer);
+                glReadPixels(0,0,256,192,GL_RGBA,GL_UNSIGNED_BYTE,metadata.data()+layer*256*192*4);
+            }
+            pixels.insert(pixels.end(),metadata.begin(),metadata.end());
+            return pixels;
+        };
+        const auto forced = [&] {
+            const auto cached = read();
+            engine.ResolvedOrdinaryOBJValid = false;
+            PoisonScratchAfterEviction(engine);
+            prepare(false);
+            Check(read() == cached, "ordinary surface cache equals forced current reconstruction after poisoned scratch");
+        };
+        for (int variant = 0; variant < 4; ++variant)
+        {
+            const bool eightBit = variant != 0;
+            const u32 palette = !eightBit ? 32 : variant == 1 ? 0 : variant == 2 ? 1 : 16;
+            std::fill(engine.UploadedOBJVRAM.begin(),engine.UploadedOBJVRAM.end(),eightBit?1:0x11);
+            for (int p = 0; p < 17*256; ++p) engine.UploadedOBJPalette[p] = (p*71)&0xFFFF;
+            for (int i = 0; i < 3; ++i)
+            {
+                auto& source = engine.SpriteConfig.uOAM[i]; source = {};
+                source.Rotscale = i == 2 ? 0 : u32(-1);
+                source.Type = eightBit ? 1 : 0; source.PalOffset = palette;
+                source.Size[0] = source.Size[1] = source.BoundSize[0] = source.BoundSize[1] = 16;
+                source.Position[0] = i*20;
+                source.TileOffset = i == 0 ? mask-31 : i*4096;
+                source.TileStride = eightBit ? 256 : 128;
+                engine.SpriteOAMIndex[i] = i;
+            }
+            engine.ResolvedOrdinaryOBJValid = false;
+            upload(); prepare(false); prepare(true); forced();
+            const auto original = read();
+            bool visible = false;
+            for (size_t p = 3; p < size_t(engine.ScreenW*engine.ScreenH*4); p += 4) visible |= original[p] != 0;
+            Check(visible, "ordinary surface fixture contains visible reconstructed artwork");
+            upload(); prepare(true);
+            engine.UploadedOBJVRAM[40000] ^= 255;
+            engine.UploadedOBJVRAM[8192] ^= 255; // affine-only sprite
+            engine.UploadedOBJPalette[1000] ^= 0xFFFF;
+            upload(); prepare(true);
+            Check(read() == original, "unrelated and affine-only writes preserve ordinary output");
+            const u32 referenced = eightBit ? palette*256+1 : palette+1;
+            engine.UploadedOBJPalette[referenced] ^= 0x8000;
+            upload(); prepare(false); forced();
+            engine.UploadedOBJPalette[referenced] ^= 0x1F;
+            upload(); prepare(false);
+            Check(read() != original, "ordinary palette animation reaches the output immediately");
+            forced();
+            // Different indices with identical RGB and opacity have identical
+            // reconstruction inputs; do not lose this reuse opportunity.
+            engine.UploadedOBJPalette[referenced+1] = engine.UploadedOBJPalette[referenced];
+            upload(); prepare(true);
+            engine.UploadedOBJVRAM[4096] = eightBit ? 2 : 0x22;
+            upload(); prepare(true); forced();
+            engine.UploadedOBJVRAM[4096] = 0;
+            upload(); prepare(false); forced();
+            const u32 transparent = eightBit ? palette*256 : palette;
+            engine.UploadedOBJPalette[transparent] ^= 0x4210;
+            upload(); prepare(false); forced();
+            engine.SpriteConfig.uOAM[1].Position[0] += 3;
+            upload(false); prepare(false); forced();
+            engine.SpriteConfig.uOAM[1].Flip[0] = 1;
+            upload(false); prepare(false); forced();
+            engine.SpriteConfig.uOAM[1].BGPrio = 2;
+            upload(false); prepare(false); forced();
+            engine.SpriteConfig.uOAM[1].OBJMode = 1;
+            upload(false); prepare(false); forced();
+            engine.SpriteConfig.uOAM[1].Rotscale = 0;
+            upload(false); prepare(false); forced();
+            engine.SpriteConfig.uOAM[1].Rotscale = u32(-1);
+            upload(false); prepare(false);
+            engine.SpriteConfig.uOAM[1].Mosaic = 1;
+            Check(!engine.RenderResolvedOrdinaryOBJProduct(0,192,enhancement,model), "unsupported ordinary material remains rejected");
+            engine.SpriteConfig.uOAM[1].Mosaic = 0;
+        }
+        Check(glGetError() == GL_NO_ERROR, "ordinary surface cache GL operations");
+        std::printf("[GL lifetime] ordinary surface engine %c algorithm %d passed\n",engineB?'B':'A',int(algorithm));
+    }
+
+    static void ReconstructionScratchStorage(GLRenderer& renderer, bool engineB)
+    {
+        auto& engine = static_cast<GLRenderer2D&>(*(engineB ? renderer.Rend2D_B : renderer.Rend2D_A));
+        glActiveTexture(GL_TEXTURE0);
+        const auto acquire = [&](int index, int w, int h) {
+            Check(engine.EnsureCuNNyWorkTexture(index,w,h), "scratch allocation");
+            GLint actualW = 0, actualH = 0;
+            glGetTexLevelParameteriv(GL_TEXTURE_2D,0,GL_TEXTURE_WIDTH,&actualW);
+            glGetTexLevelParameteriv(GL_TEXTURE_2D,0,GL_TEXTURE_HEIGHT,&actualH);
+            Check(actualW == w && actualH == h, "scratch preserves exact sampling dimensions");
+            return engine.CuNNyWorkTex[index];
+        };
+        // Animal Crossing: two CuNNy textures, then four NNEDI3 sizes. Once
+        // warm, the whole sequence must allocate nothing and reuse every name.
+        const int sizes[][3] = {{0,256,128},{1,256,128},{0,64,128},
+                                {1,128,128},{0,128,256},{1,256,256}};
+        GLuint warm[6]{};
+        for (int i = 0; i < 6; ++i) warm[i] = acquire(sizes[i][0],sizes[i][1],sizes[i][2]);
+        const auto created = Textures.Created;
+        const auto storageCalls = TextureStorageCalls;
+        for (int repeat = 0; repeat < 3; ++repeat)
+            for (int i = 0; i < 6; ++i)
+                Check(acquire(sizes[i][0],sizes[i][1],sizes[i][2]) == warm[i], "warm scratch reused");
+        Check(Textures.Created == created, "warm reconstruction allocates no textures");
+        Check(TextureStorageCalls == storageCalls, "warm reconstruction does not redefine texture storage");
+
+        const GLuint input = acquire(1,8,8);
+        std::array<float,8*8*4> pattern{}, read{};
+        for (size_t i = 0; i < pattern.size(); ++i) pattern[i] = float(i%16)/16;
+        glTexSubImage2D(GL_TEXTURE_2D,0,0,0,8,8,GL_RGBA,GL_FLOAT,pattern.data());
+        const auto bounded = [&] {
+            for (auto& index : engine.CuNNyScratch)
+            {
+                u64 bytes = 0; int count = 0;
+                for (auto& entry : index) { bytes += entry.Bytes(); count += entry.Texture != 0; }
+                Check(bytes <= engine.ReconstructionScratchBudget, "retained scratch byte limit");
+                Check(count <= engine.ReconstructionScratchEntries, "retained scratch entry limit");
+            }
+            Check(glIsTexture(input), "output eviction preserves other ping-pong input");
+        };
+        // Entry pressure, then byte pressure (two allocations cannot coexist).
+        for (int i = 0; i < 12; ++i) { acquire(0,16+i,16); bounded(); }
+        acquire(0,1024,1024); bounded();
+        acquire(0,1024,1025); bounded();
+        const GLuint recent = acquire(0,32,32);
+        acquire(0,33,32); acquire(0,34,32); acquire(0,35,32);
+        acquire(0,32,32); acquire(0,36,32);
+        Check(acquire(0,32,32) == recent, "scratch eviction respects recency");
+        bounded();
+
+        const GLuint large = acquire(0,2048,1025);
+        Check(acquire(0,2048,1025) == large, "oversized working allocation reused");
+        for (auto& entry : engine.CuNNyScratch[0])
+            Check(!entry.Texture, "oversized request releases ordinary pool for its index");
+        bounded();
+        acquire(0,2048,1026); bounded();
+        acquire(0,8,8);
+        Check(!engine.CuNNyLargeScratch[0].Texture, "oversized scratch released at ordinary sizes");
+        glBindTexture(GL_TEXTURE_2D,input);
+        glGetTexImage(GL_TEXTURE_2D,0,GL_RGBA,GL_FLOAT,read.data());
+        Check(read == pattern, "eviction preserves input texels");
+        engine.Reset();
+        engine.SetScaleFactor(3); engine.SetScaleFactor(2);
+        Check(acquire(1,8,8) == input, "reset and scale changes retain dimension-keyed scratch");
+
+        const auto beforeInvalid = Textures.Created;
+        Check(!engine.EnsureCuNNyWorkTexture(-1,8,8) &&
+              !engine.EnsureCuNNyWorkTexture(2,8,8) &&
+              !engine.EnsureCuNNyWorkTexture(0,0,8) &&
+              !engine.EnsureCuNNyWorkTexture(0,8,-1), "invalid scratch requests rejected");
+        GLint maximum = 0; glGetIntegerv(GL_MAX_TEXTURE_SIZE,&maximum);
+        Check(!engine.EnsureCuNNyWorkTexture(0,maximum+1,8), "unsupported scratch dimensions rejected");
+        Check(Textures.Created == beforeInvalid, "invalid requests do not allocate");
+        const auto live = Textures.Live.size();
+        FailScratchAllocation = true;
+        const bool allocated = engine.EnsureCuNNyWorkTexture(0,63,61);
+        FailScratchAllocation = false;
+        Check(!allocated && Textures.Live.size() == live, "failed scratch allocation releases its name");
+        acquire(0,63,61);
+        Check(glGetError() == GL_NO_ERROR, "scratch storage GL operations");
+        std::printf("[GL lifetime] bounded scratch engine %c: reuse, eviction, dimensions, reset, failure passed\n",engineB?'B':'A');
+    }
+
+    static void BackgroundArtworkCache(GLRenderer& renderer, bool engineB,
+                                       RendererSettings::GLScaleAlgorithm algorithm)
+    {
+        auto& engine = static_cast<GLRenderer2D&>(*(engineB ? renderer.Rend2D_B : renderer.Rend2D_A));
+        engine.SetWholeSceneDebugViewsActive(true);
+        engine.WholeSceneScaleRequested = true;
+        engine.WholeSceneScaleHybridStrictAffineHighRes = true;
+        engine.WholeSceneScaleAlgorithm = algorithm;
+        engine.AffineAlpha = RendererSettings::ResolveAffineAlphaReconstruction(
+            RendererSettings::AffineAlphaReconstruction::Automatic, algorithm);
+        engine.WholeSceneScaleHybridStrictAffineSourceEnhancement = true;
+        const auto enhancement = engine.CurrentStrictAffineSourceEnhancementDecision(true);
+        const int model = RendererSettings::IsGLArtCNNAlgorithm(algorithm)
+            ? RendererSettings::GetGLArtCNNModelIndex(algorithm)
+            : RendererSettings::IsGLCuNNyAlgorithm(algorithm)
+                ? RendererSettings::GetGLCuNNyModelIndex(algorithm) : -1;
+        engine.LayerEnable = 4;
+        engine.LayerConfig.uVRAMMask = engineB ? 127 : 511;
+        std::vector<u8> vram((engine.LayerConfig.uVRAMMask+1)*1024);
+        auto& bg = engine.LayerConfig.uBGConfig[2];
+        const auto upload = [&] {
+            NonStupidBitField<1024> dirty(0,1024);
+            engine.BGVRAMUploadCache.FilterUnchanged(vram.data(),vram.size(),dirty);
+            engine.BGVRAMUploadCache.RecordUpload(vram.data(),0,vram.size());
+            glActiveTexture(GL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_2D,engine.VRAMTex_BG);
+            glTexSubImage2D(GL_TEXTURE_2D,0,0,0,1024,engine.LayerConfig.uVRAMMask+1,
+                GL_RED_INTEGER,GL_UNSIGNED_BYTE,vram.data());
+            glActiveTexture(GL_TEXTURE1);
+            glBindTexture(GL_TEXTURE_2D,engine.PalTex_BG);
+            glTexSubImage2D(GL_TEXTURE_2D,0,0,0,256,65,GL_RGBA,
+                GL_UNSIGNED_SHORT_1_5_5_5_REV,engine.UploadedBGPalette);
+            engine.UploadedBGPaletteValid = true;
+            glBindBuffer(GL_UNIFORM_BUFFER,engine.LayerConfigUBO);
+            glBufferSubData(GL_UNIFORM_BUFFER,0,sizeof(engine.LayerConfig),&engine.LayerConfig);
+            const int rows[4]{};
+            engine.PrerenderDirtyLayers(4,0,rows,rows,0);
+        };
+        const auto readNative = [&] {
+            std::vector<u8> pixels(bg.Size[0]*bg.Size[1]*4*2);
+            glBindFramebuffer(GL_READ_FRAMEBUFFER,engine.BGLayerFB[2]);
+            for (int channel = 0; channel < 2; ++channel)
+            {
+                glReadBuffer(GL_COLOR_ATTACHMENT0+channel);
+                glReadPixels(0,0,bg.Size[0],bg.Size[1],GL_RGBA,GL_UNSIGNED_BYTE,
+                    pixels.data()+channel*bg.Size[0]*bg.Size[1]*4);
+            }
+            return pixels;
+        };
+        const auto forcedNative = [&] {
+            const auto exact = readNative();
+            engine.NativeBGPrerenderTexture[2] = 0;
+            const auto before = DrawArraysCalls;
+            upload();
+            Check(DrawArraysCalls == before+1, "lost native texture proof forces prerender");
+            Check(readNative() == exact, "reused native BG color and metadata equal forced rendering");
+        };
+        const auto prepare = [&](StrictAffineSourceEnhancementDecision mode) {
+            engine.WholeSceneTrace = {};
+            Check(engine.PrepareStrictAffineEnhancedBGSources(mode,model,0,true,0,4,4) == 4,
+                  "prepare enhanced tiled background");
+        };
+        const auto read = [&] {
+            std::vector<u8> pixels(engine.EnhancedBGLayerWidth[2]*engine.EnhancedBGLayerHeight[2]*4);
+            glBindFramebuffer(GL_READ_FRAMEBUFFER,engine.EnhancedBGLayerFB[2]);
+            glReadBuffer(GL_COLOR_ATTACHMENT0);
+            glReadPixels(0,0,engine.EnhancedBGLayerWidth[2],engine.EnhancedBGLayerHeight[2],
+                GL_RGBA,GL_UNSIGNED_BYTE,pixels.data());
+            return pixels;
+        };
+        const auto forced = [&](StrictAffineSourceEnhancementDecision mode) {
+            const auto cached = read();
+            engine.EnhancedBGLayerSourceGeneration[2] = 0;
+            PoisonScratchAfterEviction(engine);
+            prepare(mode);
+            Check(read() == cached,"cached background equals forced reconstruction byte for byte");
+        };
+        for (u32 type : {0u,1u,2u,3u})
+        {
+            bg = {}; bg.Type = type; bg.Size[0] = bg.Size[1] = 16;
+            bg.TileOffset = vram.size()-32; bg.MapOffset = 8192;
+            bg.PalOffset = type == 1 || type == 3 ? 49 : 0;
+            std::fill(vram.begin(),vram.end(),0);
+            std::fill(vram.end()-32,vram.end(),0x11);
+            std::fill(vram.begin(),vram.begin()+128,0x11);
+            if (type != 2)
+                for (u32 y = 0; y < 2; ++y) for (u32 x = 0; x < 2; ++x)
+                    vram[8193 + (y*(type <= 1 ? 32 : 2)+x)*2] = 0xF0;
+            for (u32 i = 0; i < 256*65; ++i) engine.UploadedBGPalette[i] = i*71;
+            engine.BGArtworkCache[2].Reset();
+            upload(); prepare(enhancement); forced(enhancement);
+            if (type <= 1)
+            {
+                engine.WholeSceneTrace.StrictAffineCandidateValid = true;
+                engine.WholeSceneTrace.StrictAffineSourceEnhancement =
+                    StrictAffineSourceEnhancementDecision::NativeCachedAffineSources;
+                int width = 0, height = 0; std::vector<u32> debug;
+                Check(engine.ReadWholeSceneDebugView(WholeScene2DDebugView::StrictAffineEnhancedBG2Source,
+                      width,height,debug),
+                      "text BG debug product retains its own reconstruction mode independently of affine sources");
+            }
+            const auto generation = engine.BGLayerArtworkGeneration[2];
+            const auto native = engine.BGLayerSourceGeneration[2];
+            vram[32768] ^= 1;
+            engine.UploadedBGPalette[250] ^= 0x8000;
+            const auto beforeReuse = DrawArraysCalls;
+            upload();
+            Check(DrawArraysCalls == beforeReuse, "unrelated writes skip native tile prerender");
+            forcedNative();
+            prepare(enhancement);
+            Check(engine.BGLayerSourceGeneration[2] > native &&
+                  engine.BGLayerArtworkGeneration[2] == generation &&
+                  engine.WholeSceneTrace.StrictAffineEnhancedBGCacheHits == 1,
+                  "unrelated uploaded writes reuse artwork while retaining native provenance");
+            forced(enhancement);
+            const u32 index = type == 0 ? 241 : type == 2 ? 17 : 64*256+17;
+            engine.UploadedBGPalette[index] ^= 0x8000;
+            const auto beforePalette = DrawArraysCalls;
+            upload();
+            Check(DrawArraysCalls == beforePalette+1, "referenced palette change redraws native tile immediately");
+            forcedNative();
+            prepare(enhancement);
+            Check(engine.WholeSceneTrace.StrictAffineEnhancedBGCacheMisses == 1,
+                  "referenced palette high bit invalidates the enhanced background");
+            forced(enhancement);
+            vram.back() ^= 0x11; // includes transparency and wrap across end of VRAM
+            const auto beforeTile = DrawArraysCalls;
+            upload();
+            Check(DrawArraysCalls == beforeTile+1, "referenced tile change redraws native layer immediately");
+            forcedNative();
+            prepare(enhancement);
+            Check(engine.WholeSceneTrace.StrictAffineEnhancedBGCacheMisses == 1,
+                  "referenced tile animation invalidates immediately");
+            forced(enhancement);
+            vram[8192] = 1; if (type != 2) vram[8193] ^= 0x0C;
+            upload(); prepare(enhancement);
+            Check(engine.WholeSceneTrace.StrictAffineEnhancedBGCacheMisses == 1,
+                  "tile selection and flips invalidate immediately");
+            forced(enhancement);
+            // Clamp can change without a native color change or prerender.
+            bg.Clamp ^= 1; prepare(enhancement);
+            Check(engine.WholeSceneTrace.StrictAffineEnhancedBGCacheMisses == 1,
+                  "padding wrap/clamp is part of the reconstruction contract");
+            forced(enhancement);
+            prepare(StrictAffineSourceEnhancementDecision::NativeCachedAffineSources);
+            Check(engine.WholeSceneTrace.StrictAffineEnhancedBGCacheMisses == 1,
+                  "native RGB cache cannot alias a neural source at the same dimensions");
+            forced(StrictAffineSourceEnhancementDecision::NativeCachedAffineSources);
+            prepare(enhancement); forced(enhancement);
+
+            // Reuse requires ownership of the backing texture, not just equal
+            // source bytes. Another layer may select the same native storage.
+            const auto exactNative = readNative();
+            const auto otherBG = engine.LayerConfig.uBGConfig[3];
+            const auto otherTex = engine.BGLayerTex[3];
+            const auto otherMeta = engine.BGLayerMetaTex[3];
+            const auto otherFB = engine.BGLayerFB[3];
+            engine.LayerConfig.uBGConfig[3] = bg;
+            engine.LayerConfig.uBGConfig[3].TileOffset += 32;
+            engine.BGLayerTex[3] = engine.BGLayerTex[2];
+            engine.BGLayerMetaTex[3] = engine.BGLayerMetaTex[2];
+            engine.BGLayerFB[3] = engine.BGLayerFB[2];
+            engine.BGArtworkCache[3].Reset();
+            glBindBuffer(GL_UNIFORM_BUFFER,engine.LayerConfigUBO);
+            glBufferSubData(GL_UNIFORM_BUFFER,0,sizeof(engine.LayerConfig),&engine.LayerConfig);
+            const int rows[4]{};
+            engine.PrerenderDirtyLayers(8,0,rows,rows,0);
+            Check(!engine.NativeBGPrerenderTexture[2], "another BG invalidates shared backing ownership");
+            const auto beforeAlias = DrawArraysCalls;
+            upload();
+            Check(DrawArraysCalls == beforeAlias+1 && readNative() == exactNative,
+                  "shared backing overwrite forces exact native restoration");
+            engine.LayerConfig.uBGConfig[3] = otherBG;
+            engine.BGLayerTex[3] = otherTex;
+            engine.BGLayerMetaTex[3] = otherMeta;
+            engine.BGLayerFB[3] = otherFB;
+            engine.BGArtworkCache[3].Reset();
+            engine.NativeBGPrerenderTexture[3] = 0;
+
+            // A partial update must never publish a full native product.
+            glUseProgram(engine.LayerPreShader);
+            glBindBufferBase(GL_UNIFORM_BUFFER,20,engine.LayerConfigUBO);
+            glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D,engine.VRAMTex_BG);
+            glActiveTexture(GL_TEXTURE1); glBindTexture(GL_TEXTURE_2D,engine.PalTex_BG);
+            engine.PrerenderLayerRows(2,2,5);
+            Check(!engine.NativeBGPrerenderTexture[2], "partial draw cannot publish full native reuse");
+            const auto beforeFull = DrawArraysCalls;
+            upload();
+            Check(DrawArraysCalls == beforeFull+1 && readNative() == exactNative,
+                  "full draw after partial update restores complete native product");
+        }
+        engine.SetWholeSceneDebugViewsActive(false);
+    }
+    static void SpriteArtworkCache(GLRenderer& renderer, bool engineB,
+                                    RendererSettings::GLScaleAlgorithm algorithm)
+    {
+        auto& engine = static_cast<GLRenderer2D&>(*(engineB ? renderer.Rend2D_B : renderer.Rend2D_A));
+        engine.WholeSceneScaleRequested = true;
+        engine.WholeSceneScaleHybridStrictAffineHighRes = true;
+        engine.WholeSceneScaleAlgorithm = algorithm;
+        engine.AffineAlpha = RendererSettings::ResolveAffineAlphaReconstruction(
+            RendererSettings::AffineAlphaReconstruction::Automatic, algorithm);
+        engine.WholeSceneScaleHybridStrictAffineSourceEnhancement = true;
+        engine.WholeScenePlan.SelectedPath = WholeSceneRenderPath::StrictAffineHighRes;
+        const auto enhancement = engine.CurrentStrictAffineSourceEnhancementDecision(true);
+        const int model = RendererSettings::IsGLArtCNNAlgorithm(algorithm)
+            ? RendererSettings::GetGLArtCNNModelIndex(algorithm)
+            : RendererSettings::IsGLCuNNyAlgorithm(algorithm)
+                ? RendererSettings::GetGLCuNNyModelIndex(algorithm) : -1;
+        engine.NumSprites = 2;
+        engine.SpriteConfig.uVRAMMask = engineB ? 127 : 255;
+        engine.UploadedOBJVRAM.resize((engine.SpriteConfig.uVRAMMask+1)*1024);
+        engine.SpriteConfig.uRotscale[0][0] = engine.SpriteConfig.uRotscale[0][3] = 256;
+        engine.SpriteConfig.uRotscale[0][1] = engine.SpriteConfig.uRotscale[0][2] = 0;
+        const auto upload = [&] {
+            ++engine.SpriteSourceGeneration;
+            glActiveTexture(GL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_2D, engine.VRAMTex_OBJ);
+            glTexSubImage2D(GL_TEXTURE_2D,0,0,0,1024,engine.SpriteConfig.uVRAMMask+1,
+                GL_RED_INTEGER,GL_UNSIGNED_BYTE,engine.UploadedOBJVRAM.data());
+            glActiveTexture(GL_TEXTURE1);
+            glBindTexture(GL_TEXTURE_2D, engine.PalTex_OBJ);
+            glTexSubImage2D(GL_TEXTURE_2D,0,0,0,256,17,GL_RGBA,
+                GL_UNSIGNED_SHORT_1_5_5_5_REV,engine.UploadedOBJPalette);
+            glBindBuffer(GL_UNIFORM_BUFFER,engine.SpriteConfigUBO);
+            glBufferSubData(GL_UNIFORM_BUFFER,0,sizeof(engine.SpriteConfig),&engine.SpriteConfig);
+            engine.PrerenderSprites();
+            glBindFramebuffer(GL_READ_FRAMEBUFFER,engine.SpriteFB);
+            glReadBuffer(GL_COLOR_ATTACHMENT0);
+            for (int slot = 0; slot < 2; ++slot)
+            {
+                const auto& source = engine.SpriteConfig.uOAM[slot];
+                const auto& native = engine.SpriteArtworkPixels[slot];
+                std::vector<unsigned char> pixels(source.Size[0]*source.Size[1]*4);
+                glReadPixels(slot*64,0,source.Size[0],source.Size[1],GL_RGBA,GL_UNSIGNED_BYTE,pixels.data());
+                Check(native.size()*4 == pixels.size(), "native sprite dependency image has the shader's dimensions");
+                // Recover the exact DS 6-bit channel codes. The driver's
+                // RGB5_A1 fetch and RGBA8 store can quantize the intermediate
+                // float differently from a CPU float-to-byte calculation.
+                const auto channel = [](u32 value) { return (value*63+127)/255; };
+                for (size_t p = 0; p < native.size(); ++p)
+                {
+                    const u32 color = native[p];
+                    const u32 r = (color&31)*2;
+                    const u32 g = ((color>>5)&31)*2 + (source.Type == 2 ? 0 : (color>>15)&1);
+                    const u32 b = ((color>>10)&31)*2;
+                    const bool matches = channel(pixels[p*4]) == r && channel(pixels[p*4+1]) == g && channel(pixels[p*4+2]) == b &&
+                          pixels[p*4+3] == ((source.Type == 2 ? color&(1u<<15) : color&(1u<<16)) ? 255 : 0);
+                    Check(matches,
+                          "exact dependency pixels match native SpritePreShader output, including transparency and green high bit");
+                }
+            }
+        };
+        const auto prepare = [&] {
+            engine.WholeSceneTrace = {};
+            Check(engine.PrepareStrictAffineEnhancedOBJSources(enhancement,model), "prepare enhanced sprite sources");
+        };
+        const auto read = [&] {
+            std::array<unsigned char,2*64*32*4> pixels{};
+            glBindFramebuffer(GL_READ_FRAMEBUFFER,engine.EnhancedSpriteFB);
+            glReadBuffer(GL_COLOR_ATTACHMENT0);
+            for (int slot = 0; slot < 2; ++slot)
+            {
+                const int width = engine.EnhancedOBJSourceRegions[slot][2] ? 64 : 32;
+                glReadPixels(slot*128,0,width,32,GL_RGBA,GL_UNSIGNED_BYTE,pixels.data()+slot*64*32*4);
+            }
+            return pixels;
+        };
+        const auto checkForcedRebuild = [&] {
+            const auto reused = read();
+            engine.InvalidateEnhancedOBJSources();
+            PoisonScratchAfterEviction(engine);
+            prepare();
+            Check(read() == reused, "reused sprite pixels exactly match forced reconstruction of current artwork");
+        };
+        for (int variant = 0; variant < 5; ++variant)
+        {
+            const u32 type = variant == 0 ? 0 : variant == 4 ? 2 : 1;
+            const u32 palette = type == 0 ? 32 : variant == 1 ? 0 : variant == 2 ? 1 : 16;
+            engine.SetWholeSceneScaleHybridStrictAffineConnectedSources(false);
+            std::fill(engine.UploadedOBJVRAM.begin(),engine.UploadedOBJVRAM.end(),type == 2 ? 0x91 : 0x11);
+            for (int p = 0; p < 256*17; ++p) engine.UploadedOBJPalette[p] = (p*71) & 0xFFFF;
+            const u32 mask = (engine.SpriteConfig.uVRAMMask<<10)|1023;
+            for (int slot = 0; slot < 2; ++slot)
+            {
+                auto& source = engine.SpriteConfig.uOAM[slot];
+                source = {};
+                source.Type = type; source.Size[0] = source.Size[1] = 16;
+                source.BoundSize[0] = source.BoundSize[1] = 16;
+                source.TileStride = type == 0 ? 128 : 256;
+                source.TileOffset = slot ? 8192 : type == 2 ? mask-31 : 0;
+                source.PalOffset = palette;
+                source.Position[0] = slot*16;
+                engine.SpriteOAMIndex[slot] = slot;
+            }
+            upload(); prepare();
+            const auto original = read();
+            engine.WholeSceneTrace = {};
+            Check(engine.PrepareStrictAffineEnhancedOBJSources(
+                    StrictAffineSourceEnhancementDecision::NativeCachedAffineSources,-1) &&
+                  engine.WholeSceneTrace.StrictAffineEnhancedOBJCacheMisses == 2,
+                  "native RGB mode cannot reuse a neural/scaler reconstruction of the same artwork");
+            prepare();
+            Check(engine.WholeSceneTrace.StrictAffineEnhancedOBJCacheMisses == 2 && read() == original,
+                  "restoring the scaler rebuilds its own source mode with exact original pixels");
+            const auto key0 = engine.BuildEnhancedOBJSourceKey(0,enhancement);
+            const auto key1 = engine.BuildEnhancedOBJSourceKey(1,enhancement);
+            engine.UploadedOBJVRAM[mask/2] ^= 0xFF;
+            engine.UploadedOBJPalette[type == 1 ? palette*256+200 : 47] ^= 0xFFFF;
+            upload(); prepare();
+            Check(engine.BuildEnhancedOBJSourceKey(0,enhancement) == key0 &&
+                  engine.BuildEnhancedOBJSourceKey(1,enhancement) == key1 &&
+                  engine.WholeSceneTrace.StrictAffineEnhancedOBJCacheHits == 2,
+                  "unrelated writes and unused palette colours retain exact artwork cache hits");
+            Check(read() == original, "unrelated writes preserve displayed sprite pixels");
+            engine.UploadedOBJVRAM[engine.SpriteConfig.uOAM[0].TileOffset] ^= 0xFF;
+            upload(); prepare();
+            Check(!(engine.BuildEnhancedOBJSourceKey(0,enhancement) == key0) &&
+                  engine.BuildEnhancedOBJSourceKey(1,enhancement) == key1 &&
+                  engine.WholeSceneTrace.StrictAffineEnhancedOBJCacheMisses == 1,
+                  "changed source bytes invalidate their own sprite, including VRAM wrap");
+            Check(read() != original, "visible source animation changes the enhanced pixels immediately");
+            checkForcedRebuild();
+            const auto beforePalette = engine.BuildEnhancedOBJSourceKey(1,enhancement);
+            const u32 paletteIndex = type == 0 ? 33 : palette*256+0x11;
+            engine.UploadedOBJPalette[paletteIndex] ^= 0x8000;
+            upload(); prepare();
+            Check((engine.BuildEnhancedOBJSourceKey(1,enhancement) == beforePalette) == (type == 2),
+                  "referenced palette changes invalidate indexed art; bitmap art ignores palettes");
+            checkForcedRebuild();
+            const auto beforeMotion = engine.BuildEnhancedOBJSourceKey(1,enhancement);
+            engine.SpriteConfig.uOAM[1].Position[0] += 3;
+            engine.SpriteConfig.uRotscale[0][0] = 251;
+            upload(); prepare();
+            Check(engine.BuildEnhancedOBJSourceKey(1,enhancement) == beforeMotion &&
+                  engine.WholeSceneTrace.StrictAffineEnhancedOBJCacheHits == 2,
+                  "position and affine matrix changes reuse source reconstruction");
+            checkForcedRebuild();
+        }
+        engine.SpriteConfig.uRotscale[0][0] = 256;
+        for (int slot = 0; slot < 2; ++slot)
+        {
+            auto& source = engine.SpriteConfig.uOAM[slot];
+            source.Type = 0; source.TileOffset = slot*64; source.TileStride = 128;
+            source.PalOffset = 0; source.Position[0] = slot*16;
+        }
+        engine.SetWholeSceneScaleHybridStrictAffineConnectedSources(true);
+        upload(); prepare();
+        Check(engine.ConnectedOBJSourceHashes[0] != 0, "test exercises a connected sprite pair");
+        const auto pairKey = engine.BuildEnhancedOBJSourceKey(0,enhancement);
+        engine.UploadedOBJVRAM[64] ^= 0xFF;
+        upload();
+        Check(!(engine.BuildEnhancedOBJSourceKey(0,enhancement) == pairKey),
+              "connected key notices changed partner before pair preparation runs again");
+        prepare();
+        Check(!(engine.BuildEnhancedOBJSourceKey(0,enhancement) == pairKey) &&
+              engine.WholeSceneTrace.StrictAffineEnhancedOBJNeuralDispatches == 1 &&
+              engine.WholeSceneTrace.StrictAffineEnhancedOBJCacheMisses == 2,
+              "non-root artwork change invalidates the connected pair atomically");
+        checkForcedRebuild();
+        engine.SetWholeSceneScaleHybridStrictAffineConnectedSources(false);
+        // Concentric assemblies cache a union: every member's artwork must
+        // participate, not just the root whose metadata supplies the key.
+        engine.DispCnt = 0;
+        engine.CompositorConfig.uBlendEffect = 0;
+        for (auto& row : engine.ScanlineConfig.uScanline)
+        { row.WinRegs = 0xFFFFFFFFu; row.BlendEffect = 0; }
+        engine.SpriteConfig.uOAM[1].Position[0] = 0;
+        upload(); prepare();
+        const auto assemble = [&] {
+            u32 mask[4] = {~0u,~0u,~0u,~0u};
+            int assemblySlots[128];
+            engine.WholeSceneExecutionTrace.OrderedOpaqueAssemblyRebuildCount = 0;
+            Check(engine.PrepareOpaqueOBJAssemblies(mask,assemblySlots,0,192) && assemblySlots[1] == 0,
+                  "test exercises a concentric assembly with sprite 1 as root");
+            std::array<unsigned char,32*32*4> pixels{};
+            glBindFramebuffer(GL_READ_FRAMEBUFFER,engine.OpaqueOBJAssemblyFB);
+            glReadBuffer(GL_COLOR_ATTACHMENT0);
+            glReadPixels(0,0,32,32,GL_RGBA,GL_UNSIGNED_BYTE,pixels.data());
+            return pixels;
+        };
+        const auto assemblyPixels = assemble();
+        const auto assemblyKey = engine.OpaqueOBJAssemblyKeys[0];
+        const auto rootGeneration = engine.SpriteArtworkGeneration[1];
+        engine.UploadedOBJVRAM[0] ^= 0xFF;
+        upload(); prepare();
+        const auto changedAssemblyPixels = assemble();
+        Check(engine.SpriteArtworkGeneration[1] == rootGeneration &&
+              !(engine.OpaqueOBJAssemblyKeys[0] == assemblyKey) &&
+              engine.WholeSceneExecutionTrace.OrderedOpaqueAssemblyRebuildCount == 1,
+              "non-root artwork change invalidates its assembly without changing root artwork");
+        Check(changedAssemblyPixels != assemblyPixels, "assembly animation updates visible artwork immediately");
+        engine.OpaqueOBJAssemblyValid[0] = false;
+        Check(assemble() == changedAssemblyPixels, "assembly cache matches a forced reconstruction");
+        // Compare native decoding against the actual shader with varied bytes,
+        // transparency, all legal extents and tile/bitmap address wrap.
+        for (size_t p = 0; p < engine.UploadedOBJVRAM.size(); ++p)
+            engine.UploadedOBJVRAM[p] = (p*73+(p>>3)) & 255;
+        for (u32 type : {0u,1u,2u}) for (int extent : {8,16,32,64})
+        {
+            for (int slot = 0; slot < 2; ++slot)
+            {
+                auto& source = engine.SpriteConfig.uOAM[slot];
+                source.Type = type; source.Size[0] = source.Size[1] = extent;
+                source.TileOffset = slot ? 8192 : (engine.SpriteConfig.uVRAMMask<<10)+992;
+                source.TileStride = type == 2 ? 256 : 1024;
+                source.PalOffset = type == 0 ? 240 : 16;
+            }
+            upload(); // verifies every native pixel against SpritePreShader
+        }
+        const auto beforeDisabled = engine.BuildEnhancedOBJSourceKey(0,enhancement);
+        engine.WholeSceneScaleRequested = false;
+        engine.UpdateSpriteArtworkGenerations();
+        Check(engine.SpriteArtworkPixels[0].empty() &&
+              !(engine.BuildEnhancedOBJSourceKey(0,enhancement) == beforeDisabled),
+              "disabled artwork enhancement skips pixel comparison and fails closed for old cache entries");
+        engine.WholeSceneScaleRequested = true;
+    }
+    static void HistoricalBGPreparation(GLRenderer& renderer, bool engineB,
+                                        RendererSettings::GLScaleAlgorithm algorithm)
+    {
+        auto& engine = static_cast<GLRenderer2D&>(*(engineB ? renderer.Rend2D_B : renderer.Rend2D_A));
+        engine.WholeSceneScaleHybridStrictAffineHighRes = true;
+        engine.WholeSceneScaleMode = RendererSettings::WholeScene2DScaleMode::ConservativeHybridUpscale;
+        engine.WholeSceneScaleAlgorithm = algorithm;
+        engine.AffineAlpha = RendererSettings::ResolveAffineAlphaReconstruction(
+            RendererSettings::AffineAlphaReconstruction::Automatic, algorithm);
+        engine.WholeSceneScaleHybridStrictAffineSourceEnhancement = true;
+        engine.WholeSceneScaleHybridStrictAffineTopTextBG = true;
+        const auto enhancement = engine.CurrentStrictAffineSourceEnhancementDecision(true);
+        const int model = RendererSettings::IsGLArtCNNAlgorithm(algorithm)
+            ? RendererSettings::GetGLArtCNNModelIndex(algorithm)
+            : RendererSettings::IsGLCuNNyAlgorithm(algorithm)
+                ? RendererSettings::GetGLCuNNyModelIndex(algorithm) : -1;
+        engine.LayerEnable = 4;
+        auto& bg = engine.LayerConfig.uBGConfig[2];
+        bg.Type = 0; bg.Size[0] = bg.Size[1] = 16; bg.Clamp = 1;
+        for (auto& row : engine.ScanlineConfig.uScanline)
+        {
+            for (auto& priority : row.BGPrio) priority = 0xFFFFFFFFu;
+            row.BGPrio[2] = 0;
+        }
+        const GLfloat red[] = {1,0,0,1}, green[] = {0,1,0,1}, blue[] = {0,0,1,1};
+        std::array<unsigned char,32*32*4> referenceEnhanced{};
+        const auto fill = [&](const GLfloat* color, const GLfloat* meta) {
+            glDisable(GL_SCISSOR_TEST);
+            glColorMask(GL_TRUE,GL_TRUE,GL_TRUE,GL_TRUE);
+            glBindFramebuffer(GL_DRAW_FRAMEBUFFER,engine.BGLayerFB[2]);
+            const GLenum outputs[] = {GL_COLOR_ATTACHMENT0,GL_COLOR_ATTACHMENT1};
+            glDrawBuffers(2,outputs);
+            glClearBufferfv(GL_COLOR,0,color); glClearBufferfv(GL_COLOR,1,meta);
+        };
+        // Exercise rejected and still-supported frames on the actual GL path.
+        // A stale enhanced copy from the preceding frame must never look ready.
+        for (int scenario = 0; scenario < 9; ++scenario)
+        {
+            engine.ResetWholeSceneNativeProductTracking();
+            engine.WholeSceneCurrentUpdateDebugTrace = {};
+            auto& trace = engine.WholeSceneCurrentUpdateDebugTrace;
+            switch (scenario)
+            {
+            case 0: trace.StateDirtyReasonMask = 1u<<8; break; // parent partial render (Joker)
+            case 1: trace.StateDirtyMiscDiffMask = 1u<<6; break;
+            case 2: trace.StateDirtyDispCntDiff = 1u<<3; break;
+            case 3: trace.StateDirtyBGCntDiff[2] = 1; break;
+            case 4: trace.StateDirtyReasonMask = 1u<<31; break; // unknown changes fail closed
+            case 5: break; // next clean frame can still need historical data
+            case 6: // allowed layer-enable and blend transitions
+                trace.StateDirtyDispCntDiff = 0x1F00;
+                trace.StateDirtyReasonMask = (1u<<2)|(1u<<7);
+                trace.StateDirtyMiscDiffMask = 0x3C;
+                break;
+            case 7: // allowed changes cannot undo an accumulated rejection
+                trace.StateDirtyReasonMask = (1u<<8)|(1u<<2)|(1u<<7);
+                break;
+            case 8: bg.Type = 2; break; // cold owning affine BGs retain eager preparation
+            }
+            fill(red,green);
+            ++engine.BGLayerSourceGeneration[2];
+            ++engine.BGLayerArtworkGeneration[2];
+            if (scenario == 5)
+                Check(engine.PrepareStrictAffineEnhancedBGSources(
+                    enhancement,model,0,false,0,4,4) == 4, "prepare a reusable enhanced source");
+            const auto oldEnhancedGeneration = engine.EnhancedBGLayerSourceGeneration[2];
+            engine.PreserveDeferredStrictAffineHistoricalSourceEpoch(64,4,0,0,4,0);
+            const auto& epoch = engine.DeferredStrictAffineHistoricalSourceEpochs[0];
+            Check(epoch.Valid && epoch.NativeBGMask == 4 && epoch.YEnd == 64,
+                  "historical native source/provenance survives early enhancement rejection");
+            Check(epoch.EnhancedBGMask == (scenario == 5 || scenario == 8 ? 4u : 0u),
+                  "tile cache hits and owning affine sources are prepared at the historical boundary");
+            Check(scenario == 8 ? engine.EnhancedBGLayerSourceGeneration[2] == engine.BGLayerArtworkGeneration[2]
+                                : engine.EnhancedBGLayerSourceGeneration[2] == oldEnhancedGeneration,
+                  "only an owning affine source may eagerly reconstruct a cache miss");
+            fill(blue,red); // later palette/source contents must not replace the snapshot
+            if (scenario == 6)
+            {
+                Check(engine.PrepareDeferredStrictAffineHistoricalEnhancedBGs(
+                    4,enhancement,model),
+                    "selected historical source is reconstructed on demand");
+                Check(epoch.EnhancedBGMask == 4 &&
+                      engine.EnhancedBGLayerSourceGeneration[2] == oldEnhancedGeneration,
+                      "on-demand reconstruction publishes only the historical product");
+            }
+            if (scenario == 5 || scenario == 6 || scenario == 8)
+            {
+                std::array<unsigned char,32*32*4> pixels{};
+                glBindFramebuffer(GL_READ_FRAMEBUFFER,engine.DeferredStrictAffineHistoricalEnhancedBGLayerFB[0][2]);
+                glReadBuffer(GL_COLOR_ATTACHMENT0);
+                glReadPixels(0,0,32,32,GL_RGBA,GL_UNSIGNED_BYTE,pixels.data());
+                if (scenario == 5) referenceEnhanced = pixels;
+                else Check(pixels == referenceEnhanced,
+                    "late reconstruction uses frozen red pixels, not the new blue source, with exact cached-image parity");
+            }
+            glBindFramebuffer(GL_READ_FRAMEBUFFER,engine.DeferredStrictAffineHistoricalBGLayerFB[0][2]);
+            for (int attachment = 0; attachment < 2; ++attachment)
+            {
+                std::array<unsigned char,16*16*4> pixels{};
+                glReadBuffer(GL_COLOR_ATTACHMENT0+attachment);
+                glReadPixels(0,0,16,16,GL_RGBA,GL_UNSIGNED_BYTE,pixels.data());
+                for (int p = 0; p < 16*16; ++p)
+                    Check(pixels[p*4] == (attachment ? 0 : 255) &&
+                          pixels[p*4+1] == (attachment ? 255 : 0) &&
+                          pixels[p*4+2] == 0 && pixels[p*4+3] == 255,
+                          "historical colors and ownership metadata remain frozen after a source mutation");
+            }
+        }
+    }
+    static void TightBGUploads(GLRenderer& renderer, bool engineB)
+    {
+        auto& engine = static_cast<GLRenderer2D&>(*(engineB ? renderer.Rend2D_B : renderer.Rend2D_A));
+        u8* vram = nullptr; u32 mask = 0;
+        engine.GPU2D.GetBGVRAM(vram,mask);
+        const u32 size = mask+1, blocks = size/512;
+        for (u32 i = 0; i < size; ++i) vram[i] = static_cast<u8>(i*71+(i>>9));
+        engine.BGVRAMUploadCache.Reset();
+        NonStupidBitField<1024> all(0,1024);
+        engine.BGVRAMUploadCache.FilterUnchanged(vram,size,all);
+        glActiveTexture(GL_TEXTURE0);
+        engine.UploadBGVRAM(all,0);
+        const auto readExact = [&] {
+            std::vector<u8> gpu(size);
+            glBindTexture(GL_TEXTURE_2D,engine.VRAMTex_BG);
+            glGetTexImage(GL_TEXTURE_2D,0,GL_RED_INTEGER,GL_UNSIGNED_BYTE,gpu.data());
+            Check(std::memcmp(gpu.data(),vram,size) == 0, "tight BG uploads preserve every VRAM byte");
+            Check(engine.BGVRAMUploadCache.UploadedBytes() == gpu, "uploaded byte mirror matches real GL texture");
+        };
+        readExact();
+        const auto update = [&](std::initializer_list<u32> changed,
+                                std::initializer_list<UploadRectangle> expected) {
+            NonStupidBitField<1024> dirty;
+            for (u32 bit : changed) { vram[bit*512+17] ^= 0x55; dirty[bit] = true; }
+            VRAMUploads.clear(); CollectVRAMUploads = true;
+            engine.UploadBGVRAM(dirty,13);
+            CollectVRAMUploads = false;
+            Check(VRAMUploads.size() == expected.size(), "tight BG upload run count");
+            size_t index = 0;
+            for (const auto& rectangle : expected)
+            {
+                const auto& actual = VRAMUploads[index++];
+                Check(actual.Y == rectangle.Y && actual.Width == rectangle.Width && actual.Height == rectangle.Height,
+                      "tight BG upload rectangle");
+            }
+            readExact();
+        };
+        update({3},{{1,1024,1}});                     // Odd half of a row.
+        update({0,1},{{0,1024,1}});                   // Both halves share a transfer.
+        update({62,63,64,65},{{31,1024,2}});          // Cross old 32 KiB boundary.
+        update({0,80,blocks-1},{{0,1024,41},{static_cast<GLint>(blocks/2-1),1024,1}});
+        // Sparse dirty rows retain one transfer per old contiguous-word run.
+        update({0,4,8,12,16,20,24,28,32,36,40,44,48,52,56,60},{{0,1024,31}});
+        update({},{});
+        Check(glGetError() == GL_NO_ERROR, "tight BG upload GL state");
+    }
+
     static void ExtendedBGPaletteSlots(GLRenderer& renderer, bool engineB)
     {
         auto& engine = static_cast<GLRenderer2D&>(*(engineB ? renderer.Rend2D_B : renderer.Rend2D_A));
@@ -310,8 +1366,29 @@ int RunGLRendererLifetimeTests()
                 RendererSettings settings{};
                 settings.ScaleFactor = 2;
                 renderer.SetRenderSettings(settings);
+                GLRendererLifetimeTestAccess::CaptureProbeIsolation(renderer);
+                if (!compute) GLRendererLifetimeTestAccess::UniformUploads(renderer);
+                GLRendererLifetimeTestAccess::ResultAlphaScratchStorage(renderer, false);
+                GLRendererLifetimeTestAccess::ResultAlphaScratchStorage(renderer, true);
+                GLRendererLifetimeTestAccess::ReconstructionScratchStorage(renderer, false);
+                GLRendererLifetimeTestAccess::ReconstructionScratchStorage(renderer, true);
+                GLRendererLifetimeTestAccess::TightBGUploads(renderer, false);
+                GLRendererLifetimeTestAccess::TightBGUploads(renderer, true);
                 GLRendererLifetimeTestAccess::ExtendedBGPaletteSlots(renderer, false);
                 GLRendererLifetimeTestAccess::ExtendedBGPaletteSlots(renderer, true);
+                for (auto algorithm : {RendererSettings::GLScaleAlgorithm::CuNNy4x32,
+                    RendererSettings::GLScaleAlgorithm::ArtCNN, RendererSettings::GLScaleAlgorithm::NNEDI3,
+                    RendererSettings::GLScaleAlgorithm::XBRZ})
+                {
+                    GLRendererLifetimeTestAccess::OrdinarySpriteSurface(renderer, false, algorithm);
+                    GLRendererLifetimeTestAccess::OrdinarySpriteSurface(renderer, true, algorithm);
+                    GLRendererLifetimeTestAccess::HistoricalBGPreparation(renderer, false, algorithm);
+                    GLRendererLifetimeTestAccess::HistoricalBGPreparation(renderer, true, algorithm);
+                    GLRendererLifetimeTestAccess::SpriteArtworkCache(renderer, false, algorithm);
+                    GLRendererLifetimeTestAccess::SpriteArtworkCache(renderer, true, algorithm);
+                    GLRendererLifetimeTestAccess::BackgroundArtworkCache(renderer, false, algorithm);
+                    GLRendererLifetimeTestAccess::BackgroundArtworkCache(renderer, true, algorithm);
+                }
             }
             CheckReleased("normal initialization");
             nds->GPU.Reset();
@@ -377,6 +1454,9 @@ int RunGLRendererLifetimeTests()
             WideMelon::Configuration{682, 192, 2, true, true},
             WideMelon::Configuration{256, 342, 1, true, true},
             WideMelon::Configuration{256, 342, 2, false, false},
+            WideMelon::Configuration{384, 288, 2, true, true},
+            WideMelon::Configuration{512, 288, 0, false, false},
+            WideMelon::Configuration{384, 512, 1, true, false},
             WideMelon::Configuration{256, 192, 0, true, false}})
         {
             WideMelon::ApplyConfiguration(config);
@@ -399,6 +1479,8 @@ int RunGLRendererLifetimeTests()
             glGetTexLevelParameteriv(GL_TEXTURE_2D_ARRAY, 0, GL_TEXTURE_HEIGHT, &height);
             Check(width == config.Width * 2 && height == config.Height * 2,
                   "widescreen restart allocates the requested output dimensions");
+            if (config.Width==384 && config.Height==288)
+                GLRendererLifetimeTestAccess::RectangularBorders(*renderer);
             nds.reset();
             CheckReleased("widescreen restart");
         }

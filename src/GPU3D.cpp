@@ -1084,20 +1084,20 @@ void GPU3D::SubmitPolygon() noexcept
     // their off-screen origin. Native rasterization continues to use only
     // the clipped vertices below.
     Polygon::UnclippedQuadSource sourceQuad {};
-    bool flatQuad = nverts == 4;
+    bool flatGeometry = nverts == 4 || (nverts == 3 && polytype == 1);
     bool needsClip = false;
-    for (int i = 0; i < nverts && flatQuad; i++)
+    for (int i = 0; i < nverts && flatGeometry; i++)
     {
         const auto& v = clippedvertices[i];
         const auto& first = clippedvertices[0];
-        flatQuad = !v.Clipped && v.Position[3] > 0 && v.Position[3] <= 0xFFFFFF &&
+        flatGeometry = !v.Clipped && v.Position[3] > 0 && v.Position[3] <= 0xFFFFFF &&
             v.Position[3] == first.Position[3] && v.Position[2] == first.Position[2];
-        if (WideMelon::Enabled()) flatQuad &= v.NativeSourceValid;
-        for (int c = 0; c < 3; c++) flatQuad &= v.Color[c] == first.Color[c];
+        if (WideMelon::Enabled()) flatGeometry &= v.NativeSourceValid;
+        for (int c = 0; c < 3; c++) flatGeometry &= v.Color[c] == first.Color[c];
         for (int c = 0; c < 3; c++)
             needsClip |= s64(v.Position[c]) < -s64(v.Position[3]) || v.Position[c] > v.Position[3];
     }
-    if (flatQuad && (needsClip || WideMelon::Enabled()))
+    if (nverts == 4 && flatGeometry && (needsClip || WideMelon::Enabled()))
     {
         sourceQuad.Valid = true;
         for (int i = 0; i < 4; i++)
@@ -1260,7 +1260,7 @@ void GPU3D::SubmitPolygon() noexcept
 
     Polygon* poly = &CurPolygonRAM[NumPolygons++];
     poly->UnclippedSource = sourceQuad;
-    poly->WideOrthographic = WideMelon::Enabled() && flatQuad &&
+    poly->WideOrthographic = WideMelon::Enabled() && flatGeometry &&
         ProjMatrix[3] == 0 && ProjMatrix[7] == 0 && ProjMatrix[11] == 0 && ProjMatrix[15] != 0;
     poly->NumVertices = 0;
 
