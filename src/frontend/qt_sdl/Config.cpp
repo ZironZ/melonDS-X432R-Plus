@@ -76,6 +76,9 @@ DefaultList<int> DefaultInts =
     {"3D.Renderer", renderer3D_Software},
     {"3D.GL.ScaleFactor", 1},
     {"3D.GL.WidescreenWidth", 256},
+    {"3D.GL.WidescreenMethod", WideMelon::Renderer},
+    {"3D.GL.WidescreenPatchAspectWidth", 16},
+    {"3D.GL.WidescreenPatchAspectHeight", 10},
     {"3D.GL.WidescreenHeight", 192},
     {"3D.GL.WidescreenAspectWidth", 4},
     {"3D.GL.WidescreenAspectHeight", 3},
@@ -102,6 +105,7 @@ DefaultList<int> DefaultInts =
     {"Instance*.Audio.Volume", 256},
     {"Mic.InputType", 1},
     {"Mouse.HideSeconds", 5},
+    {"SpeedUpLowPass", 48000},
     {"Instance*.DSi.Battery.Level", 0xF},
 #ifdef GDBSTUB_ENABLED
     {"Instance*.Gdb.ARM7.Port", 3334},
@@ -138,6 +142,7 @@ RangeList IntRanges =
     {"Instance*.Window*.ScreenAspectTop", {0, AspectRatiosNum-1}},
     {"Instance*.Window*.ScreenAspectBot", {0, AspectRatiosNum-1}},
     {"MP.AudioMode", {0, 2}},
+    {"SpeedUpLowPass", {1000, 48000}},
     {"LAN.HostNumPlayers", {2, 16}},
 };
 
@@ -151,6 +156,7 @@ DefaultList<bool> DefaultBools =
     {"3D.GL.WidescreenExtendWindows", true},
     {"3D.GL.WidescreenCustom", false},
     {"3D.GL.WidescreenExpandNarrowBorders", false},
+    {"3D.GL.WidescreenGameFixes", false},
     {"3D.GL.ReadableTextureCache", false},
     {"3D.GL.TextureFilterBinaryAlphaHandling", true},
     {"3D.GL.TextureFilterMipmapPremultipliedAlphaHandling", false},
@@ -211,6 +217,8 @@ DefaultList<bool> DefaultBools =
 #endif
 #endif
     {"DSi.DSP.HLE", true},
+    {"SpeedUpTimeStretch", true},
+    {"SpeedUpLowPassEnable", true},
     {"Instance*.RTC.SyncToHost", true},
 };
 

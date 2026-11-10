@@ -1517,6 +1517,10 @@ void ComputeRenderer3D::RenderFrame()
         RenderPolygons[i].YBot = ybot;
         RenderPolygons[i].XMin = ScreenWidth;
         RenderPolygons[i].XMax = 0;
+        // Degenerate edge polygons may never update one of the X extrema.
+        // Keep its Y value in this polygon rather than a reused record.
+        RenderPolygons[i].XMinY = ytop;
+        RenderPolygons[i].XMaxY = ytop;
 
         // Tall views can exceed the initial scanline estimate. Grow both CPU
         // and GPU span storage together, retaining the capacity across frames.

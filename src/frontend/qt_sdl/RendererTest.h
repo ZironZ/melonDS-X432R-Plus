@@ -31,6 +31,7 @@ struct RendererTestStep
     bool hasKeys = false;
     melonDS::u32 keyMask = 0xFFF;
     bool releaseKeys = false;
+    QString checkpoint;
 };
 
 struct RendererTestCapturedDebugView
@@ -92,6 +93,8 @@ struct RendererTestFrameCapture
 //     { "keys": ["Start"], "frames": 1 },
 //     { "releaseKeys": true, "frames": 90 }
 //   ],
+//   Steps may also contain "checkpoint": "save" or "load". They use a private
+//   replay-checkpoint.state in outputDir; a load must follow a save.
 //   "captures": {
 //     "wholeSceneCsv": true,                  (default true)
 //     "captureLumaProbe": false,              (default false; true requires diagnostic)

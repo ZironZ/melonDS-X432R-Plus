@@ -26,8 +26,10 @@
 #include <vector>
 #include "GPU_OpenGL.h"
 #include "GPU2D_OpenGL.h"
+#include "GLBitmapRowStaging.h"
 #include "WholeSceneOpaqueAssemblyPolicy.h"
 #include "WideWindowPolicy.h"
+#include "WideMelon.h"
 #include "WideCoverPolicy.h"
 #include "GPU.h"
 #include "GPU3D.h"
@@ -2556,6 +2558,9 @@ void GLRenderer2D::DeleteShaders()
 
 GLRenderer2D::~GLRenderer2D()
 {
+    glDeleteTextures(1, &BitmapRowVRAMTex);
+    glDeleteTextures(1, &BitmapRowColorTex);
+    glDeleteFramebuffers(1, &BitmapRowFB);
     // Scratch textures belong to each engine; only shader programs are shared.
     glDeleteTextures(1, &OpaqueOBJAssemblyTex);
     glDeleteFramebuffers(1, &OpaqueOBJAssemblyFB);
@@ -2673,6 +2678,8 @@ GLRenderer2D::~GLRenderer2D()
     glDeleteTextures(1, &NativeOverlayWhite3DTex);
     glDeleteTextures(1, &NativeOverlayBlackCapture128Tex);
     glDeleteTextures(1, &NativeOverlayWhiteCapture128Tex);
+    glDeleteTextures(2, CopiedBitmapEndpointTex);
+    glDeleteTextures(1, &CopiedBitmapNativePresentationTex);
     glDeleteTextures(1, &NativeOverlayBlackCapture256Tex);
     glDeleteTextures(1, &NativeOverlayWhiteCapture256Tex);
     glDeleteTextures(1, &NativeOverlayTrueFinalTex);
@@ -2750,6 +2757,14 @@ GLRenderer2D::~GLRenderer2D()
 
 void GLRenderer2D::Reset()
 {
+    CopiedBitmapProof = {};
+    CopiedBitmapLayer = -1;
+    CopiedBitmapAppliedGeneration = CopiedBitmapAppliedEvent = 0;
+    CopiedBitmapNativePresentationValid = false;
+    CopiedBitmapAppliedBank = -1;
+    BitmapRowCandidate = BitmapRowDeferred = BitmapRowRendering = false;
+    BitmapRowLayer = -1;
+    BitmapRowEnd = 0;
     WholeSceneDebugProducts = {};
     memset(BGLayerFB, 0, sizeof(BGLayerFB));
     memset(BGLayerTex, 0, sizeof(BGLayerTex));
@@ -6124,6 +6139,11 @@ void GLRenderer2D::AppendWholeSceneTimingCSVHeader(std::string& header, const ch
     add("prev_bg2_visible_bitmap_row_limited_last_row");
     add("prev_bg3_visible_bitmap_row_limited_first_row");
     add("prev_bg3_visible_bitmap_row_limited_last_row");
+    add("copied_capture_generation");
+    add("copied_capture_event");
+    add("copied_capture_bank");
+    add("copied_capture_rows");
+    add("copied_capture_rejected");
     AppendWholeSceneUpdateTimingCSVHeader(header, prefix);
 }
 
@@ -6640,6 +6660,11 @@ void GLRenderer2D::AppendWholeSceneTimingCSVRow(std::string& row) const
     addInt(WholeScenePreviousUpdateDebugTrace.LayerPrerenderBitmapMask);
     addStateDebugTrace(WholeScenePreviousUpdateDebugTrace);
     addBitmapDebugTrace(WholeScenePreviousUpdateDebugTrace);
+    addU64(CopiedBitmapAppliedGeneration);
+    addU64(CopiedBitmapAppliedEvent);
+    addInt(CopiedBitmapAppliedBank);
+    addInt(CopiedBitmapProof.Rows);
+    addInt(CopiedBitmapProof.Rejected);
     AppendWholeSceneUpdateTimingCSVRow(row);
 }
 
@@ -7530,14 +7555,8 @@ u8 GLRenderer2D::CoveredByOpaqueBitmapBGLayerMask(int ystart, int yend, const u8
     if ((DispCnt & 0xE000) || ((BlendCnt >> 6) & 0x3))
         return 0;
 
+    bool testedCover[4] = {};
     bool opaqueCover[4] = {};
-    for (int layer = 0; layer < 4; layer++)
-    {
-        if ((LayerEnable & (1 << layer)) &&
-            DirectColorBitmapLayerCoversRange(layer, ystart, yend, bgvram, bgvrammask))
-            opaqueCover[layer] = true;
-    }
-
     u8 covered = 0;
     for (int layer = 0; layer < 4; layer++)
     {
@@ -7547,9 +7566,19 @@ u8 GLRenderer2D::CoveredByOpaqueBitmapBGLayerMask(int ystart, int yend, const u8
         const int prio = BGCnt[layer] & 0x3;
         for (int upper = 0; upper < 4; upper++)
         {
-            if (upper == layer || !opaqueCover[upper])
+            if (upper == layer || !(LayerEnable & (1 << upper)) ||
+                (BGCnt[upper] & 0x3) >= prio)
                 continue;
-            if ((BGCnt[upper] & 0x3) < prio)
+            // Prove opacity only when a lower-priority bitmap could be hidden.
+            // A lone streaming bitmap otherwise rescans an ever-growing range
+            // of retained rows without having any layer to suppress.
+            if (!testedCover[upper])
+            {
+                testedCover[upper] = true;
+                opaqueCover[upper] = DirectColorBitmapLayerCoversRange(
+                    upper, ystart, yend, bgvram, bgvrammask);
+            }
+            if (opaqueCover[upper])
             {
                 covered |= (1 << layer);
                 break;
@@ -10820,7 +10849,7 @@ bool GLRenderer2D::ReadWholeSceneDebugView(WholeScene2DDebugView view,
 }
 
 
-bool GLRenderer2D::IsScreenOn()
+bool GLRenderer2D::IsScreenOn() const
 {
     if (!GPU.ScreensEnabled) return false;
     if (!GPU2D.Enabled) return false;
@@ -11565,6 +11594,13 @@ int GLRenderer2D::WholeSceneArtCNNModelIndex() const
 
 void GLRenderer2D::UpdateAndRender(int line)
 {
+    FlushBitmapRowsBeforeGap(line);
+    if (line == 0)
+    {
+        BitmapRowCandidate = BitmapRowDeferred = BitmapRowRendering = false;
+        BitmapRowLayer = -1;
+        BitmapRowEnd = 0;
+    }
     u32 palmask = 1 << (GPU2D.Num * 2);
 
     // check if any 'critical' registers were modified
@@ -11948,6 +11984,33 @@ void GLRenderer2D::UpdateAndRender(int line)
     }
     AddWholeSceneUpdateTiming(WholeSceneUpdateTiming.Classify, ElapsedUS(phaseStart));
 
+    bool batchBitmapRow = false;
+    if (BitmapRowCandidate && line > 0)
+    {
+        const bool realStreamChange = comp_dirty &&
+            (vram_layer_pre_dirty & (1u << BitmapRowLayer));
+        const bool canBatch = (BitmapRowDeferred || realStreamChange) && BitmapRowEnd == line &&
+            state_dirty_reason_mask == 0 && !LayerConfigDirty && !SpriteConfigDirty && !SpriteDirty &&
+            !(GPU.PaletteDirty & (palmask | (palmask << 1))) &&
+            !bgExtPalDirty.CheckRange(0, 64) && !objExtPalDirty.CheckRange(0, 16) &&
+            CanContinueBitmapRows(bgvram, bgvrammask);
+        if (canBatch && (BitmapRowDeferred || EnsureBitmapRowTargets()))
+        {
+            batchBitmapRow = true;
+            BitmapRowDeferred = true;
+            comp_dirty = false;
+        }
+        else
+        {
+            if (BitmapRowDeferred)
+            {
+                PrepareBitmapRowRender(line);
+                comp_dirty = true;
+            }
+            BitmapRowCandidate = false;
+        }
+    }
+
     // if needed, render sprites
 
     if ((comp_dirty || SpriteDirty) && (line > 0))
@@ -11973,11 +12036,17 @@ void GLRenderer2D::UpdateAndRender(int line)
         AddWholeSceneUpdateTiming(WholeSceneUpdateTiming.PartialComposite, ElapsedUS(phaseStart));
     }
 
+    if (BitmapRowRendering)
+    {
+        BitmapRowRendering = false;
+        UploadCompositorScanlines(0, line);
+    }
+
     // The rows above this boundary have already consumed the current BG
     // source. Preserve that representation before palette upload and layer
     // prerender replace it, so the deferred strict compositor can reconstruct
     // the same two source epochs without reverting those rows to path 6.
-    PreserveDeferredStrictAffineHistoricalSourceEpoch(
+    if (!batchBitmapRow) PreserveDeferredStrictAffineHistoricalSourceEpoch(
         line,
         layer_pre_dirty,
         register_layer_pre_dirty,
@@ -12014,7 +12083,17 @@ void GLRenderer2D::UpdateAndRender(int line)
     if (layer_pre_dirty)
     {
         phaseStart = std::chrono::steady_clock::now();
-        PrerenderDirtyLayers(layer_pre_dirty,
+        u8 renderDirty = layer_pre_dirty;
+        if (batchBitmapRow && (renderDirty & (1u << BitmapRowLayer)))
+        {
+            // Retain logical source epochs even though this source is decoded
+            // from its immutable row atlas at the next real composition barrier.
+            ++BGLayerSourceGeneration[BitmapRowLayer];
+            ++BGLayerArtworkGeneration[BitmapRowLayer];
+            NativeBGPrerenderTexture[BitmapRowLayer] = 0;
+            renderDirty &= ~(1u << BitmapRowLayer);
+        }
+        PrerenderDirtyLayers(renderDirty,
                              row_limited_bitmap_prerender,
                              row_limited_bitmap_first,
                              row_limited_bitmap_last,
@@ -12065,8 +12144,362 @@ void GLRenderer2D::UpdateAndRender(int line)
 
     LayerConfigDirty = false;
     SpriteDirty = false;
+    CaptureBitmapRow(line, bgvram, bgvrammask);
+    ObserveCopiedCaptureRow(line, bgvram, bgvrammask);
 }
 
+
+std::array<u32, 12> GLRenderer2D::CopiedBitmapPresentationState() const
+{
+    return {DispCnt, LayerEnable, OBJEnable, BlendCnt, EVA, EVB, EVY,
+            GPU2D.Num ? GPU.MasterBrightnessB : GPU.MasterBrightnessA,
+            BGCnt[0], BGCnt[1], BGCnt[2], BGCnt[3]};
+}
+
+void GLRenderer2D::ObserveCopiedCaptureRow(int line, const u8* vram, u32 mask)
+{
+    if (line == 0)
+    {
+        CopiedBitmapProof = {};
+        CopiedBitmapLayer = -1;
+        CopiedBitmapAppliedGeneration = CopiedBitmapAppliedEvent = 0;
+        CopiedBitmapNativePresentationValid = false;
+        CopiedBitmapAppliedBank = -1;
+        CopiedBitmapPresentation = CopiedBitmapPresentationState();
+        std::copy(std::begin(BGLayerArtworkGeneration), std::end(BGLayerArtworkGeneration), CopiedBitmapOtherSources);
+    }
+    if (line >= 192 || CopiedBitmapProof.Rejected) return;
+    if (!vram || (ScaleFactor <= 1 && !WideMelon::Enabled()) ||
+        !GPU.ScreensEnabled || !IsScreenOn() || ((DispCnt >> 16) & (GPU2D.Num ? 1u : 3u)) != 1 ||
+        (!GPU2D.Num && ((DispCnt & (1u << 3)) || GPU.CaptureEnable)) ||
+        (DispCnt & 0xE000) || (BlendCnt & 0xC0) || NumSprites != 0 ||
+        CopiedBitmapPresentationState() != CopiedBitmapPresentation)
+    { CopiedBitmapProof.Rejected = true; return; }
+
+    const u32 base = GPU2D.Num ? 0x06200000u : 0x06000000u;
+    std::optional<CaptureCopyTracker::Row> row;
+    for (int layer = 2; layer < 4; ++layer)
+    {
+        if (CopiedBitmapLayer >= 0 && CopiedBitmapLayer != layer) continue;
+        if (LayerConfig.uBGConfig[layer].Type != 5) continue;
+        const int address = BitmapRowSource(layer, line);
+        if (address < 0 || static_cast<u32>(address) + CaptureCopyTracker::RowBytes > mask + 1) continue;
+        row = Parent.CopiedCaptures.Match(base + address, vram + address);
+        if (row)
+        {
+            if (CopiedBitmapLayer < 0) CopiedBitmapLayer = layer;
+            break;
+        }
+    }
+    for (int layer = 0; layer < 4; ++layer)
+    {
+        if (layer == CopiedBitmapLayer || !(LayerEnable & (1u << layer))) continue;
+        // Replaying the native overlay is safe only with unchanged text artwork.
+        // Coordinates remain the authoritative per-scanline coordinates.
+        if (LayerConfig.uBGConfig[layer].Type > 1 || NativeBGPrerenderTexture[layer] != BGLayerTex[layer] ||
+            BGLayerArtworkGeneration[layer] != CopiedBitmapOtherSources[layer])
+        { CopiedBitmapProof.Rejected = true; return; }
+    }
+    CopiedBitmapProof.Observe(line, row);
+}
+
+bool GLRenderer2D::RenderCopiedCaptureOverlay()
+{
+    if (!CopiedBitmapProof.Consume() || CopiedBitmapLayer < 0 || Parent.LastLine != 0 ||
+        !GPU.ScreensEnabled || !IsScreenOn()) return false;
+    const auto presentation = CopiedBitmapPresentationFor(WholeSceneTrace.Path);
+    if (presentation == CopiedBitmapPresentation::Unsupported) return false;
+    const bool compositor = presentation == CopiedBitmapPresentation::Compositor;
+    const bool physicalNative = presentation == CopiedBitmapPresentation::PhysicalNative;
+    const int endpointScale = compositor ? ScaleFactor : 1;
+    if (CopiedBitmapEndpointScale != endpointScale)
+    {
+        glDeleteTextures(2, CopiedBitmapEndpointTex);
+        std::fill(std::begin(CopiedBitmapEndpointTex), std::end(CopiedBitmapEndpointTex), 0);
+        CopiedBitmapEndpointScale = endpointScale;
+    }
+    const auto& record = Parent.CopiedCaptures.Get(CopiedBitmapProof.Slot);
+    const auto& product = Parent.CopiedCaptureProducts[CopiedBitmapProof.Slot];
+    bool screenSwap;
+    if (record.Generation != CopiedBitmapProof.Generation || !product.Texture ||
+        !Parent.GetFinalPassScreenSwapForRange(0, 192, screenSwap) ||
+        CopiedBitmapPresentation != CopiedBitmapPresentationState()) return false;
+    for (int layer = 0; layer < 4; ++layer)
+        if (layer != CopiedBitmapLayer && (LayerEnable & (1u << layer)) &&
+            BGLayerArtworkGeneration[layer] != CopiedBitmapOtherSources[layer]) return false;
+
+    if (ScaleFactor == 1)
+    {
+        // Native pixels need no replacement, but the same row proof can select
+        // their retained expanded scenery during the final presentation pass.
+        CopiedBitmapAppliedGeneration = record.Generation;
+        CopiedBitmapAppliedEvent = product.EventSerial;
+        CopiedBitmapAppliedBank = product.Bank;
+        return true;
+    }
+
+    const auto allocate = [](GLuint& texture, int scale) {
+        if (texture) return true;
+        glGenTextures(1, &texture);
+        glBindTexture(GL_TEXTURE_2D, texture);
+        glDefaultTexParams(GL_TEXTURE_2D);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 256 * scale, 192 * scale,
+                     0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+        GLint width = 0;
+        glGetTexLevelParameteriv(GL_TEXTURE_2D, 0, GL_TEXTURE_WIDTH, &width);
+        if (width == 256 * scale) return true;
+        glDeleteTextures(1, &texture);
+        texture = 0;
+        return false;
+    };
+    for (auto& texture : CopiedBitmapEndpointTex)
+        if (!allocate(texture, endpointScale)) return false;
+    if (physicalNative && !allocate(CopiedBitmapNativePresentationTex, 1)) return false;
+    // Only the private endpoint passes see a capture layer. Native pixels,
+    // VRAM contents, current UI, and the real layer configuration stay intact.
+    auto config = LayerConfig;
+    config.uBGConfig[CopiedBitmapLayer].Type = 8;
+    config.uBGConfig[CopiedBitmapLayer].TileOffset = 0;
+    config.uBGConfig[CopiedBitmapLayer].MapOffset = 0;
+    glBindBuffer(GL_UNIFORM_BUFFER, LayerConfigUBO);
+    glBufferSubData(GL_UNIFORM_BUFFER, 0, sizeof(config), &config);
+    const GLuint capture128[] = {NativeOverlayBlackCapture128Tex, NativeOverlayWhiteCapture128Tex};
+    const GLuint capture256[] = {NativeOverlayBlackCapture256Tex, NativeOverlayWhiteCapture256Tex};
+    for (int endpoint = 0; endpoint < 2; ++endpoint)
+    {
+        if (compositor)
+        {
+            glBindFramebuffer(GL_FRAMEBUFFER, NativeExactFinalFB);
+            glFramebufferTexture(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, CopiedBitmapEndpointTex[endpoint], 0);
+            glDrawBuffer(GL_COLOR_ATTACHMENT0);
+            RenderCompositorPass(NativeExactFinalFB, OBJLayerTex, ScreenW, ScreenH, 0, 192,
+                ScaleFactor, WholeSceneHighResLayerFilterMode(), WholeSceneHighResLayerFilterNoWrap(),
+                false, false, 0, 0, false, false, capture128[endpoint], capture256[endpoint]);
+            glBindFramebuffer(GL_FRAMEBUFFER, NativeExactFinalFB);
+            glFramebufferTexture(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, NativeExactFinalTex, 0);
+        }
+        else
+            RenderNativeExactFinalToTexture(CopiedBitmapEndpointTex[endpoint], 0, 192, false, 0, 0, false,
+                                            capture128[endpoint], capture256[endpoint]);
+    }
+    GLuint black = CopiedBitmapEndpointTex[0], white = CopiedBitmapEndpointTex[1];
+    if (presentation == CopiedBitmapPresentation::UpscaledNative)
+    {
+        RenderNativeFinalUpscaleToTexture(black, UpscaledExactFinalTex);
+        RenderNativeFinalUpscaleToTexture(white, UpscaledCoverageTex);
+        black = UpscaledExactFinalTex;
+        white = UpscaledCoverageTex;
+    }
+    // Physical postprocessing consumes this private native presentation once.
+    // Other modes retain the captured 3D resolution beneath their normal 2D UI.
+    RenderOverlayComposite(black, white, product.Texture,
+                            false, 0, 0, 0, 0, false, 0,
+                            physicalNative ? CopiedBitmapNativePresentationTex : OutputTex, false,
+                            0, 0, 192, true, false, 0, 0, 0, false,
+                            physicalNative ? 1 : ScaleFactor, WholeSceneScaleRequested);
+    CopiedBitmapNativePresentationValid = physicalNative;
+    glBindBuffer(GL_UNIFORM_BUFFER, LayerConfigUBO);
+    glBufferSubData(GL_UNIFORM_BUFFER, 0, sizeof(LayerConfig), &LayerConfig);
+    CopiedBitmapAppliedGeneration = record.Generation;
+    CopiedBitmapAppliedEvent = product.EventSerial;
+    CopiedBitmapAppliedBank = product.Bank;
+    if (presentation == CopiedBitmapPresentation::UpscaledNative &&
+        WholeSceneDebugViewsActive.load(std::memory_order_relaxed))
+    {
+        // The copy overlay uses the shared upscale scratch, not native authority.
+        // Restore native-reference previews for later debug consumers.
+        RenderNativeFinalUpscaleToTexture(NativeExactFinalTex, UpscaledExactFinalTex);
+        RenderNativeFinalUpscaleToTexture(NativeOutputTex, UpscaledCoverageTex);
+    }
+
+    return true;
+}
+
+
+bool GLRenderer2D::EnsureBitmapRowTargets()
+{
+    if (BitmapRowFB) return true;
+    if (!BitmapRowScanlines) BitmapRowScanlines = std::make_unique<sScanlineConfig>();
+    glGenTextures(1, &BitmapRowVRAMTex);
+    glBindTexture(GL_TEXTURE_2D, BitmapRowVRAMTex);
+    glDefaultTexParams(GL_TEXTURE_2D);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_R8UI, 1024, 128, 0, GL_RED_INTEGER, GL_UNSIGNED_BYTE, nullptr);
+    glGenTextures(1, &BitmapRowColorTex);
+    glBindTexture(GL_TEXTURE_2D, BitmapRowColorTex);
+    glDefaultTexParams(GL_TEXTURE_2D);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 256, 256, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+    glGenFramebuffers(1, &BitmapRowFB);
+    glBindFramebuffer(GL_FRAMEBUFFER, BitmapRowFB);
+    glFramebufferTexture(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, BitmapRowColorTex, 0);
+    glDrawBuffer(GL_COLOR_ATTACHMENT0);
+    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE)
+        return true;
+    glDeleteFramebuffers(1, &BitmapRowFB); BitmapRowFB = 0;
+    glDeleteTextures(1, &BitmapRowVRAMTex); BitmapRowVRAMTex = 0;
+    glDeleteTextures(1, &BitmapRowColorTex); BitmapRowColorTex = 0;
+    return false;
+}
+
+int GLRenderer2D::BitmapRowSource(int layer, int line) const
+{
+    if (layer < 2 || layer > 3 || line < 0 || line >= 192 ||
+        !GPU.ScreensEnabled || !IsScreenOn() ||
+        !(GPU2D.LayerEnable & (1u << layer))) return -1;
+    const auto& cfg = LayerConfig.uBGConfig[layer];
+    if (cfg.PalOffset) return -1;
+    const int rot = layer - 2;
+    const BitmapRowSampling sampling{cfg.Type, cfg.Size[0], cfg.Size[1], cfg.MapOffset,
+        GPU2D.BGXRefInternal[rot], GPU2D.BGYRefInternal[rot],
+        GPU2D.BGRotA[rot], GPU2D.BGRotB[rot], GPU2D.BGRotC[rot], GPU2D.BGRotD[rot],
+        (GPU2D.BGCnt[layer] & (1u << 6)) != 0};
+    return BitmapRowSourceAddress(sampling, GPU2D.Num ? 128 * 1024 : 512 * 1024);
+}
+
+bool GLRenderer2D::CanContinueBitmapRows(const u8* vram, u32 mask) const
+{
+    const int sourceAddress = BitmapRowSource(BitmapRowLayer, BitmapRowEnd);
+    const u32 stride = BitmapRowLayer >= 0 && LayerConfig.uBGConfig[BitmapRowLayer].Type == 5 ? 512 : 256;
+    const u32* mapping = GPU2D.Num ? GPU.VRAMMap_BBG : GPU.VRAMMap_ABG;
+    const size_t mappingSize = GPU2D.Num ? sizeof(GPU.VRAMMap_BBG) : sizeof(GPU.VRAMMap_ABG);
+    if (!vram || sourceAddress < 0 || static_cast<u32>(sourceAddress) + stride > mask + 1 ||
+        std::memcmp(BitmapRowMapping, mapping, mappingSize) || Parent.NeedPartialRender ||
+        (GPU2D.Num == 0 && GPU.CaptureEnable)) return false;
+    for (int layer = 0; layer < 4; ++layer)
+    {
+        if (layer == BitmapRowLayer || !(LayerEnable & (1u << layer))) continue;
+        const auto& cfg = LayerConfig.uBGConfig[layer];
+        // Live 3D is stable until Start/Restart3DRendering, which flushes any
+        // retained rows before replacing the texture. OBJ artwork/configuration
+        // changes already force the ordinary boundary through SpriteDirty.
+        if (GPU2D.Num == 0 && layer == 0 && cfg.Type == 6) continue;
+        const GLBGArtworkCache::Config source{cfg.Size[0], cfg.Size[1], cfg.Type,
+            cfg.PalOffset, cfg.TileOffset, cfg.MapOffset, cfg.Clamp};
+        if (NativeBGPrerenderTexture[layer] != BGLayerTex[layer] ||
+            !BGArtworkCache[layer].MatchesCurrent(source, vram, mask + 1,
+                UploadedBGPalette, std::size(UploadedBGPalette))) {
+                return false;
+            }
+    }
+    return true;
+}
+
+void GLRenderer2D::CaptureBitmapRow(int line, const u8* vram, u32 mask)
+{
+    if (line == 0)
+    {
+        if (!vram ||
+            ((DispCnt >> 16) & (GPU2D.Num ? 1u : 3u)) != 1 ||
+            WholeSceneHighResLayerFilterMode() != 0 ||
+            (GPU2D.Num == 0 && GPU.CaptureEnable)) return;
+        for (int layer = 2; layer < 4; ++layer)
+        {
+            if (BitmapRowSource(layer, line) < 0) continue;
+            BitmapRowLayer = layer;
+            const u32* mapping = GPU2D.Num ? GPU.VRAMMap_BBG : GPU.VRAMMap_ABG;
+            const size_t mappingSize = GPU2D.Num ? sizeof(GPU.VRAMMap_BBG) : sizeof(GPU.VRAMMap_ABG);
+            std::memcpy(BitmapRowMapping, mapping, mappingSize);
+            if (!CanContinueBitmapRows(vram, mask))
+            {
+                BitmapRowLayer = -1;
+                continue;
+            }
+            const auto plan = BuildWholeSceneOutputPlan(0, 1, BuildWholeScenePathDecisionInputs(0, 1));
+            if (!CanStageBitmapRows(plan.SelectedPath, WholeSceneHighResLayerFilterMode()))
+            { BitmapRowLayer = -1; return; }
+            BitmapRowStride = LayerConfig.uBGConfig[layer].Type == 5 ? 512 : 256;
+            BitmapRowBytes.resize(128 * 1024);
+            BitmapRowCandidate = true;
+            break;
+        }
+    }
+    if (!BitmapRowCandidate || BitmapRowEnd != line) return;
+    const int source = BitmapRowSource(BitmapRowLayer, line);
+    if (source < 0 || static_cast<u32>(source) > mask + 1 - BitmapRowStride)
+    {
+        // Continuation validates this before suppressing any boundary.
+        BitmapRowCandidate = false;
+        return;
+    }
+    std::memcpy(BitmapRowBytes.data() + line * BitmapRowStride, vram + source, BitmapRowStride);
+    std::copy(std::begin(BGLayerSourceGeneration), std::end(BGLayerSourceGeneration), BitmapRowGenerations[line]);
+    BitmapRowEnd = line + 1;
+}
+
+void GLRenderer2D::PrepareBitmapRowRender(int end)
+{
+    if (!BitmapRowDeferred || BitmapRowEnd <= LastLine || BitmapRowEnd != end) return;
+    auto config = LayerConfig;
+    config.uBGConfig[BitmapRowLayer].MapOffset = 0;
+    glBindBuffer(GL_UNIFORM_BUFFER, LayerConfigUBO);
+    glBufferSubData(GL_UNIFORM_BUFFER, 0, sizeof(config), &config);
+    glBindBufferBase(GL_UNIFORM_BUFFER, 20, LayerConfigUBO);
+    glUseProgram(LayerPreShader);
+    glUniform1i(LayerPreCurBGULoc, BitmapRowLayer);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, BitmapRowVRAMTex);
+    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 1024,
+        (end * BitmapRowStride + 1023) / 1024, GL_RED_INTEGER, GL_UNSIGNED_BYTE, BitmapRowBytes.data());
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_2D, PalTex_BG);
+    glBindFramebuffer(GL_FRAMEBUFFER, BitmapRowFB);
+    glDrawBuffer(GL_COLOR_ATTACHMENT0);
+    glViewport(0, 0, 256, 256);
+    glDisable(GL_DEPTH_TEST); glDisable(GL_STENCIL_TEST); glDisable(GL_BLEND);
+    glEnable(GL_SCISSOR_TEST);
+    glScissor(0, LastLine, 256, end - LastLine);
+    glColorMaski(0, GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glBindBuffer(GL_ARRAY_BUFFER, Parent.RectVtxBuffer);
+    glBindVertexArray(Parent.RectVtxArray);
+    glDrawArrays(GL_TRIANGLES, 0, 6);
+    glDisable(GL_SCISSOR_TEST);
+    glBindBuffer(GL_UNIFORM_BUFFER, LayerConfigUBO);
+    glBufferSubData(GL_UNIFORM_BUFFER, 0, sizeof(LayerConfig), &LayerConfig);
+    // Restore the ordinary current-source product for debug/source consumers.
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, VRAMTex_BG);
+    PrerenderLayer(BitmapRowLayer, true, false);
+    BitmapRowRendering = true;
+}
+
+void GLRenderer2D::FlushBitmapRowsBeforeGap(int nextLine)
+{
+    if (!BitmapRowCandidate || !BitmapRowDeferred || BitmapRowEnd == nextLine)
+        return;
+    // VCOUNT writes can suppress or skip draw callbacks. Finish the rows that
+    // were actually retained before the ordinary path handles the remainder.
+    if (BitmapRowEnd > LastLine)
+    {
+        PrepareBitmapRowRender(BitmapRowEnd);
+        DoRenderSprites(BitmapRowEnd);
+        DoRenderSpritesNative(BitmapRowEnd);
+        CountWholeScenePartialComposite(LastLine, BitmapRowEnd);
+        RenderScreen(LastLine, BitmapRowEnd);
+        LastLine = BitmapRowEnd;
+        BitmapRowRendering = false;
+        UploadCompositorScanlines(0, BitmapRowEnd);
+    }
+    BitmapRowCandidate = false;
+}
+
+void GLRenderer2D::UploadCompositorScanlines(int first, int end)
+{
+    glBindBuffer(GL_UNIFORM_BUFFER, ScanlineConfigUBO);
+    if (!BitmapRowRendering)
+    {
+        glBufferSubData(GL_UNIFORM_BUFFER, first * sizeof(sScanlineConfig::sScanline),
+            (end-first) * sizeof(sScanlineConfig::sScanline), &ScanlineConfig.uScanline[first]);
+        return;
+    }
+    auto& rows = *BitmapRowScanlines;
+    for (int y = first; y < end; ++y)
+    {
+        rows.uScanline[y] = ScanlineConfig.uScanline[y];
+        rows.uScanline[y].BGOffset[BitmapRowLayer][1] = y * 256 +
+            (rows.uScanline[y].BGOffset[BitmapRowLayer][1] & 255);
+    }
+    glBufferSubData(GL_UNIFORM_BUFFER, first * sizeof(sScanlineConfig::sScanline),
+        (end-first) * sizeof(sScanlineConfig::sScanline), &rows.uScanline[first]);
+}
 
 void GLRenderer2D::DrawScanline(u32 line)
 {
@@ -12076,6 +12509,9 @@ void GLRenderer2D::DrawScanline(u32 line)
 
 void GLRenderer2D::VBlank()
 {
+    FlushBitmapRowsBeforeGap(192);
+    if (BitmapRowCandidate) PrepareBitmapRowRender(192);
+    BitmapRowCandidate = false;
     WholeSceneScaleState = ClassifyWholeSceneScalePath();
     RecordWholeSceneNativeProductEligibility(WholeSceneScaleState);
     UpdateWholeSceneCaptureBackedHandoffGuard();
@@ -12095,6 +12531,12 @@ void GLRenderer2D::VBlank()
     {
         RenderScreenWholeSceneFinalizeFullFrame();
     }
+    if (BitmapRowRendering)
+    {
+        BitmapRowRendering = false;
+        UploadCompositorScanlines(0, 192);
+    }
+    RenderCopiedCaptureOverlay();
     AddWholeSceneUpdateTiming(WholeSceneUpdateTiming.VBlankComposite, ElapsedUS(phaseStart));
 
     LastSpriteLine = 0;
@@ -14193,7 +14635,7 @@ void GLRenderer2D::PrerenderSprites()
     glDrawArrays(GL_TRIANGLES, 0, vtxnum);
 }
 
-void GLRenderer2D::PrerenderLayer(int layer, bool partial)
+void GLRenderer2D::PrerenderLayer(int layer, bool partial, bool advanceGeneration)
 {
     auto& cfg = LayerConfig.uBGConfig[layer];
     if (cfg.Type >= 6)
@@ -14201,17 +14643,18 @@ void GLRenderer2D::PrerenderLayer(int layer, bool partial)
 
     // Preserve native history boundaries even if the exact decoded source is
     // unchanged. The existing dependency snapshot covers color AND metadata.
-    BGLayerSourceGeneration[layer]++;
+    if (advanceGeneration) BGLayerSourceGeneration[layer]++;
     const GLBGArtworkCache::Config source{cfg.Size[0], cfg.Size[1], cfg.Type,
         cfg.PalOffset, cfg.TileOffset, cfg.MapOffset, cfg.Clamp};
     bool artworkChanged = true;
-    if (!WholeSceneScaleRequested || !WholeSceneScaleHybridStrictAffineHighRes || ScaleFactor <= 1 ||
-        !UploadedBGPaletteValid)
+    // Native dependency identity is useful to every compositor, independently
+    // of enhancement settings. It includes metadata and backing-store ownership.
+    if (!UploadedBGPaletteValid)
         BGArtworkCache[layer].Reset();
     else
         artworkChanged = BGArtworkCache[layer].Update(source, BGVRAMUploadCache,
             UploadedBGPalette, std::size(UploadedBGPalette));
-    if (artworkChanged)
+    if (artworkChanged && advanceGeneration)
         BGLayerArtworkGeneration[layer]++;
     const bool reuse = !partial && !artworkChanged && BGLayerTex[layer] != 0 &&
         NativeBGPrerenderTexture[layer] == BGLayerTex[layer];
@@ -16054,11 +16497,7 @@ void GLRenderer2D::RenderCompositorPass(GLuint outputFB, GLuint objLayerTex,
     glBindBufferBase(GL_UNIFORM_BUFFER, 22, ScanlineConfigUBO);
     glBindBufferBase(GL_UNIFORM_BUFFER, 23, CompositorConfigUBO);
 
-    glBindBuffer(GL_UNIFORM_BUFFER, ScanlineConfigUBO);
-    glBufferSubData(GL_UNIFORM_BUFFER,
-                    ystart * sizeof(sScanlineConfig::sScanline),
-                    (yend - ystart) * sizeof(sScanlineConfig::sScanline),
-                    &ScanlineConfig.uScanline[ystart]);
+    UploadCompositorScanlines(ystart, yend);
 
     if (!preserveCompositorConfig)
         UpdateCompositorConfig(ystart, yend);
@@ -16080,7 +16519,8 @@ void GLRenderer2D::RenderCompositorPass(GLuint outputFB, GLuint objLayerTex,
             glBindTexture(
                 GL_TEXTURE_2D,
                 bgLayerTexOverride && bgLayerTexOverride[i] != 0
-                    ? bgLayerTexOverride[i] : BGLayerTex[i]);
+                    ? bgLayerTexOverride[i] :
+                    (BitmapRowRendering && BitmapRowLayer == i ? BitmapRowColorTex : BGLayerTex[i]));
 
         GLint wrapmode = LayerConfig.uBGConfig[i].Clamp ? GL_CLAMP_TO_BORDER : GL_REPEAT;
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, wrapmode);
@@ -16289,11 +16729,7 @@ void GLRenderer2D::RenderNativePrepass(int ystart, int yend)
     glBindBufferBase(GL_UNIFORM_BUFFER, 22, ScanlineConfigUBO);
     glBindBufferBase(GL_UNIFORM_BUFFER, 23, CompositorConfigUBO);
 
-    glBindBuffer(GL_UNIFORM_BUFFER, ScanlineConfigUBO);
-    glBufferSubData(GL_UNIFORM_BUFFER,
-                    ystart * sizeof(sScanlineConfig::sScanline),
-                    (yend - ystart) * sizeof(sScanlineConfig::sScanline),
-                    &ScanlineConfig.uScanline[ystart]);
+    UploadCompositorScanlines(ystart, yend);
 
     UpdateCompositorConfig(ystart, yend);
 
@@ -16303,7 +16739,7 @@ void GLRenderer2D::RenderNativePrepass(int ystart, int yend)
         if ((i == 0) && !GPU2D.Num && (DispCnt & (1<<3)))
             glBindTexture(GL_TEXTURE_2D, BlankColorTex);
         else
-            glBindTexture(GL_TEXTURE_2D, BGLayerTex[i]);
+            glBindTexture(GL_TEXTURE_2D, BitmapRowRendering && BitmapRowLayer == i ? BitmapRowColorTex : BGLayerTex[i]);
 
         GLint wrapmode = LayerConfig.uBGConfig[i].Clamp ? GL_CLAMP_TO_BORDER : GL_REPEAT;
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, wrapmode);
@@ -19532,7 +19968,9 @@ void GLRenderer2D::RenderOverlayComposite(GLuint overlayBlackTex,
                                           GLuint overlayOpaqueWhiteTex,
                                           GLuint native3DSemanticsTex,
                                           GLuint native3DOperatorTex,
-                                          bool explicit3DOperator)
+                                          bool explicit3DOperator,
+                                          int presentationScale,
+                                          bool useConfiguredDebugTint)
 {
     glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
     if (targetTex)
@@ -19553,9 +19991,10 @@ void GLRenderer2D::RenderOverlayComposite(GLuint overlayBlackTex,
     glColorMaski(0, GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
     glDepthMask(GL_FALSE);
 
-    glViewport(0, 0, ScreenW, ScreenH);
+    const int outputScale = presentationScale ? presentationScale : ScaleFactor;
+    glViewport(0, 0, 256 * outputScale, 192 * outputScale);
     glEnable(GL_SCISSOR_TEST);
-    glScissor(0, ystart * ScaleFactor, ScreenW, (yend - ystart) * ScaleFactor);
+    glScissor(0, ystart * outputScale, 256 * outputScale, (yend - ystart) * outputScale);
 
     const GLuint shader = conservativeHybrid ? OverlayHybridCompositeShader : OverlayCompositeShader;
     const GLint scaleULoc = conservativeHybrid ? OverlayHybridCompositeScaleULoc : OverlayCompositeScaleULoc;
@@ -19564,8 +20003,8 @@ void GLRenderer2D::RenderOverlayComposite(GLuint overlayBlackTex,
     const GLint direct3DPresentationSpaceULoc = conservativeHybrid ? OverlayHybridCompositeDirect3DPresentationSpaceULoc : OverlayCompositeDirect3DPresentationSpaceULoc;
 
     glUseProgram(shader);
-    glUniform1i(scaleULoc, ScaleFactor);
-    glUniform1i(debugTintULoc, forceDebugTint || WholeSceneScaleDebugTint);
+    glUniform1i(scaleULoc, outputScale);
+    glUniform1i(debugTintULoc, forceDebugTint || (useConfiguredDebugTint && WholeSceneScaleDebugTint));
     glUniform1i(legacyUnderlayULoc, WholeSceneScaleOverlayLegacyUnderlay);
     glUniform1i(direct3DPresentationSpaceULoc, direct3DPresentationSpace);
     if (!conservativeHybrid)
@@ -20592,8 +21031,8 @@ void GLRenderer2D::RenderScreenWholeSceneStrictAffineHighRes(int ystart, int yen
         {
             // Keep the proven-behind special roles in the normal semantic
             // compositor. Their mode-1/mode-3 effect is resolved against the
-            // real BG underlay before the reconstructed normal bandâ€”proven in
-            // front of their complete total-priority rangeâ€”is inserted.
+            // real BG underlay before the reconstructed normal band—proven in
+            // front of their complete total-priority range—is inserted.
             RenderSpritesToLayer(ystart,
                                  yend,
                                  0,
@@ -24282,8 +24721,8 @@ u64 GLRenderer2D::BuildWholeSceneRowSourceGeneration(
     };
 
     const auto& row = ScanlineConfig.uScanline[y];
-    const u64* generations = bgSourceGenerations
-        ? bgSourceGenerations : BGLayerSourceGeneration;
+    const u64* generations = bgSourceGenerations ? bgSourceGenerations :
+        (BitmapRowRendering && y < BitmapRowEnd ? BitmapRowGenerations[y] : BGLayerSourceGeneration);
     for (int layer = 0; layer < 4; layer++)
     {
         // Direct3D and capture-backed layers do not consume BGLayerTex. The

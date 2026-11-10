@@ -25,6 +25,7 @@
 #include <QLayout>
 #include <QPushButton>
 #include <QSignalBlocker>
+#include <QTimer>
 #include <QSpinBox>
 #include <QFormLayout>
 #include <QStandardItemModel>
@@ -38,6 +39,8 @@
 #include "GPU.h"
 #include "RendererSettings.h"
 #include "WideMelon.h"
+#include "WideGamePatches.h"
+#include "NDS.h"
 #include "main.h"
 
 #include "VideoSettingsDialog.h"
@@ -47,7 +50,7 @@
 bool VideoSettingsDialog::UsesGL()
 {
     auto& cfg = emuInstance->getGlobalConfig();
-    return WideMelon::Enabled() || cfg.GetBool("Screen.UseGL") || (cfg.GetInt("3D.Renderer") != renderer3D_Software);
+    return WideMelon::NeedsPresentation() || cfg.GetBool("Screen.UseGL") || (cfg.GetInt("3D.Renderer") != renderer3D_Software);
 }
 
 VideoSettingsDialog* VideoSettingsDialog::currentDlg = nullptr;
@@ -381,7 +384,7 @@ void VideoSettingsDialog::setEnabled()
 {
     auto& cfg = emuInstance->getGlobalConfig();
     int renderer = cfg.GetInt("3D.Renderer");
-    if (WideMelon::Enabled() && renderer == renderer3D_Software) renderer = renderer3D_OpenGL;
+    if (WideMelon::NeedsPresentation() && renderer == renderer3D_Software) renderer = renderer3D_OpenGL;
 
     bool softwareRenderer = renderer == renderer3D_Software;
     bool advancedSettings = UsesGL() && ui->cbAdvancedVideoSettings->isChecked();
@@ -696,9 +699,60 @@ VideoSettingsDialog::VideoSettingsDialog(QWidget* parent) : QDialog(parent), ui(
     Config::ConstrainVideoSettings(cfg, computeShadersAvailable);
     auto* wideGroup = new QGroupBox(tr("Widescreen"), this);
     auto* wideLayout = new QVBoxLayout(wideGroup);
+    wideLayout->setAlignment(Qt::AlignTop);
+    // Share label widths across the conditional sections, using the same
+    // style-provided spacing as the other video settings groups.
+    auto wideLabel = [this, wideGroup](const QString& text, QWidget* control = nullptr) {
+        auto* label = new QLabel(text, wideGroup);
+        label->setMinimumWidth(label->fontMetrics().horizontalAdvance(tr("Widescreen style:")));
+        if (control)
+        {
+            label->setBuddy(control);
+            label->setWhatsThis(control->whatsThis());
+            label->setToolTip(control->toolTip());
+        }
+        return label;
+    };
+    auto setupWideForm = [](QFormLayout* form) {
+        form->setContentsMargins(0,0,0,0);
+        form->setFieldGrowthPolicy(QFormLayout::AllNonFixedFieldsGrow);
+    };
+    auto* methodRow = new QFormLayout;
+    setupWideForm(methodRow);
+    widescreenMethodCombo = new QComboBox(wideGroup);
+    widescreenMethodCombo->setObjectName("widescreenMethod");
+    widescreenMethodCombo->addItem(tr("Off"), WideMelon::Off);
+    widescreenMethodCombo->addItem(tr("Expanded view (recommended)"), WideMelon::Renderer);
+    widescreenMethodCombo->addItem(tr("Game patch (experimental)"), WideMelon::GamePatch);
+    widescreenMethodCombo->setItemData(widescreenMethodCombo->findData(WideMelon::GamePatch),
+        tr("Includes 542 nonempty published patch variants. Most have not been tested with this emulator. Matching uses the published game ID and header CRC; translated or modified games may behave differently."), Qt::ToolTipRole);
+    setControlHelp(widescreenMethodCombo, tr(
+        "<p><b>Off:</b> Use the original screen shape.</p>"
+        "<p><b>Expanded view (recommended):</b> Show more scenery while keeping menus and interface proportions. "
+        "Works without a game patch, but some games still hide objects or effects outside the original view.</p>"
+        "<p><b>Game patch (experimental):</b> An alternative for supported games. May stretch menus and effects. "
+        "Uses a published game patch and stretches the final picture, without separate FOV expansion. "
+        "If no patch is available, the game keeps its original picture.</p>"
+        "<p>Reset or reopen the game to apply changes. Use a fresh boot when changing methods: "
+        "saved states can retain patches from the previous method.</p>"
+        "<p>Supports Classic OpenGL and Compute. With multiple emulator instances open, "
+        "close the other instances before resetting to apply widescreen changes.</p>"));
+    const bool oldNative = !cfg.GetBool("3D.GL.WidescreenCustom") &&
+        cfg.GetInt("3D.GL.WidescreenWidth") == 256 && cfg.GetInt("3D.GL.WidescreenHeight") == 192;
+    int method = WideMelon::ValidateMethod(cfg.GetInt("3D.GL.WidescreenMethod"));
+    if (method == WideMelon::Renderer && oldNative) method = WideMelon::Off;
+    widescreenMethodCombo->setCurrentIndex(widescreenMethodCombo->findData(method));
+    methodRow->addRow(wideLabel(tr("Widescreen method:"), widescreenMethodCombo), widescreenMethodCombo);
+    wideLayout->addLayout(methodRow);
+    widescreenMethodDescription = new QLabel(wideGroup);
+    widescreenMethodDescription->setWordWrap(true);
+    methodRow->addRow(nullptr, widescreenMethodDescription);
+    widescreenRendererControls = new QWidget(wideGroup);
+    auto* rendererWideLayout = new QFormLayout(widescreenRendererControls);
+    setupWideForm(rendererWideLayout);
     widescreenCombo = new QComboBox(wideGroup);
     widescreenCombo->setObjectName("widescreenMode");
-    widescreenCombo->addItem(tr("Off (native 4:3)"), 256);
+    widescreenCombo->addItem(tr("4:3"), 256);
     widescreenCombo->addItem(tr("16:10"), 308);
     widescreenCombo->addItem(tr("16:9"), 342);
     widescreenCombo->addItem(tr("21:9"), 448);
@@ -715,7 +769,8 @@ VideoSettingsDialog::VideoSettingsDialog(QWidget* parent) : QDialog(parent), ui(
         "The 3:4 and 9:16 options extend the scene vertically for rotated games. After a 90-degree screen rotation, these appear as 4:3 and 16:9. "
         "Custom lets you choose an aspect ratio and expand the field of view on both axes. "
         "Set screen rotation separately. Reset or reopen the game to apply changes. Off restores normal renderer selection."));
-    wideLayout->addWidget(widescreenCombo);
+    setControlHelp(widescreenCombo, widescreenCombo->whatsThis());
+    rendererWideLayout->addRow(wideLabel(tr("Aspect ratio:"), widescreenCombo), widescreenCombo);
     widescreenCustomControls = new QWidget(wideGroup);
     auto* customLayout = new QFormLayout(widescreenCustomControls);
     customLayout->setContentsMargins(0, 0, 0, 0);
@@ -733,8 +788,11 @@ VideoSettingsDialog::VideoSettingsDialog(QWidget* parent) : QDialog(parent), ui(
     ratioRow->addWidget(widescreenAspectHeight);
     ratioRow->addStretch();
     customLayout->addRow(tr("Aspect ratio:"), ratioRow);
+    qobject_cast<QLabel*>(customLayout->labelForField(ratioRow))->setBuddy(widescreenAspectWidth);
     widescreenAspectWidth->setToolTip(tr("Shape of the expanded view before screen rotation, for example 4:3 or 16:9."));
     widescreenAspectHeight->setToolTip(widescreenAspectWidth->toolTip());
+    setControlHelp(widescreenAspectWidth, widescreenAspectWidth->toolTip());
+    setControlHelp(widescreenAspectHeight, widescreenAspectHeight->toolTip());
     widescreenFOVPercent = new QSpinBox(widescreenCustomControls);
     widescreenFOVPercent->setObjectName("widescreenFOVPercent");
     widescreenFOVPercent->setRange(100, 300);
@@ -746,14 +804,55 @@ VideoSettingsDialog::VideoSettingsDialog(QWidget* parent) : QDialog(parent), ui(
         "This is view expansion, not an angle in degrees: 4:3 at 150% gives 384 × 288. "
         "Games can still hide objects or effects outside their original view."));
     customLayout->addRow(tr("FOV expansion:"), widescreenFOVPercent);
+    qobject_cast<QLabel*>(customLayout->labelForField(widescreenFOVPercent))->setBuddy(widescreenFOVPercent);
+    setControlHelp(widescreenFOVPercent, widescreenFOVPercent->toolTip());
     widescreenCustomPreview = new QLabel(widescreenCustomControls);
     widescreenCustomPreview->setObjectName("widescreenCustomPreview");
     widescreenCustomPreview->setWordWrap(true);
     customLayout->addRow(widescreenCustomPreview);
-    wideLayout->addWidget(widescreenCustomControls);
-    auto* displayRow = new QHBoxLayout;
-    auto* displayLabel = new QLabel(tr("Display:"), wideGroup);
+    rendererWideLayout->addRow(nullptr, widescreenCustomControls);
+    wideLayout->addWidget(widescreenRendererControls);
+    widescreenPatchControls = new QWidget(wideGroup);
+    auto* patchLayout = new QFormLayout(widescreenPatchControls);
+    setupWideForm(patchLayout);
+    widescreenPatchRatio = new QComboBox(widescreenPatchControls);
+    widescreenPatchRatio->setObjectName("widescreenPatchRatio");
+    widescreenPatchRatio->addItem(tr("16:10"), QSize(16,10));
+    widescreenPatchRatio->addItem(tr("16:9"), QSize(16,9));
+    widescreenPatchRatio->addItem(tr("21:9"), QSize(21,9));
+    widescreenPatchRatio->addItem(tr("32:9"), QSize(32,9));
+    widescreenPatchRatio->addItem(tr("Custom"), QSize(0,0));
+    widescreenPatchCustomControls = new QWidget(widescreenPatchControls);
+    auto* patchCustom = new QHBoxLayout(widescreenPatchCustomControls);
+    patchCustom->setContentsMargins(0,0,0,0);
+    widescreenPatchWidth = new QSpinBox(widescreenPatchCustomControls);
+    widescreenPatchHeight = new QSpinBox(widescreenPatchCustomControls);
+    widescreenPatchWidth->setObjectName("widescreenPatchAspectWidth");
+    widescreenPatchHeight->setObjectName("widescreenPatchAspectHeight");
+    widescreenPatchWidth->setRange(1,32); widescreenPatchHeight->setRange(1,32);
+    widescreenPatchWidth->setValue(cfg.GetInt("3D.GL.WidescreenPatchAspectWidth"));
+    widescreenPatchHeight->setValue(cfg.GetInt("3D.GL.WidescreenPatchAspectHeight"));
+    int patchChoice = widescreenPatchRatio->count()-1;
+    for (int i=0;i<widescreenPatchRatio->count()-1;++i)
+    {
+        const auto ratio = widescreenPatchRatio->itemData(i).toSize();
+        if (ratio.width()*widescreenPatchHeight->value() == ratio.height()*widescreenPatchWidth->value()) patchChoice=i;
+    }
+    widescreenPatchRatio->setCurrentIndex(patchChoice);
+    patchCustom->addWidget(widescreenPatchWidth);
+    patchCustom->addWidget(new QLabel(":")); patchCustom->addWidget(widescreenPatchHeight); patchCustom->addStretch();
+    patchLayout->addRow(wideLabel(tr("Aspect ratio:"), widescreenPatchRatio), widescreenPatchRatio);
+    patchLayout->addRow(nullptr, widescreenPatchCustomControls);
+    widescreenPatchStatus = new QLabel(widescreenPatchControls);
+    widescreenPatchStatus->setObjectName("widescreenPatchStatus");
+    widescreenPatchStatus->setWordWrap(true);
+    patchLayout->addRow(nullptr, widescreenPatchStatus);
+    wideLayout->addWidget(widescreenPatchControls);
+    auto* displayRow = new QFormLayout;
+    setupWideForm(displayRow);
+    auto* displayLabel = wideLabel(tr("Display:"));
     widescreenDisplayCombo = new QComboBox(wideGroup);
+    widescreenDisplayCombo->setObjectName("widescreenDisplay");
     widescreenDisplayCombo->addItem(tr("Top"), WideMelon::Top);
     widescreenDisplayCombo->addItem(tr("Bottom"), WideMelon::Bottom);
     widescreenDisplayCombo->addItem(tr("Both"), WideMelon::Both);
@@ -764,10 +863,10 @@ VideoSettingsDialog::VideoSettingsDialog(QWidget* parent) : QDialog(parent), ui(
         "On a wide bottom display, touch controls stay in the original center area. Reset or reopen the game to apply changes."));
     displayLabel->setBuddy(widescreenDisplayCombo);
     displayLabel->setWhatsThis(widescreenDisplayCombo->whatsThis());
-    displayRow->addWidget(displayLabel);
-    displayRow->addWidget(widescreenDisplayCombo, 1);
+    displayRow->addRow(displayLabel, widescreenDisplayCombo);
     wideLayout->addLayout(displayRow);
     widescreenExtendWindows = new QCheckBox(tr("Extend screen masks and transitions"), wideGroup);
+    widescreenExtendWindows->setObjectName("widescreenExtendWindows");
     widescreenExtendWindows->setChecked(cfg.GetBool("3D.GL.WidescreenExtendWindows"));
     widescreenExtendWindows->setWhatsThis(tr("Extend supported screen masks, the areas a game hides, and solid transition effects into the extra screen area. "
         "Uses the same rules across games, but cannot extend every effect. "
@@ -784,15 +883,29 @@ VideoSettingsDialog::VideoSettingsDialog(QWidget* parent) : QDialog(parent), ui(
         "and works with regular, rotated-game and Custom aspect ratios. "
         "Reset or reopen the game to apply changes."));
     wideLayout->addWidget(widescreenExpandNarrowBorders);
+    widescreenGameFixes = new QCheckBox(tr("Fix missing objects (experimental)"), wideGroup);
+    widescreenGameFixes->setObjectName("widescreenGameFixes");
+    widescreenGameFixes->setChecked(cfg.GetBool("3D.GL.WidescreenGameFixes"));
+    widescreenGameFixes->setToolTip(tr("Helps keep scenery, characters, and items visible at the edges of the expanded view. Supports tested USA versions of Mario Kart DS, Zelda: Phantom Hourglass, Dragon Quest Monsters: Joker, and Final Fantasy Tactics A2. Works with preset and Custom views. These experimental fixes may affect game behavior or performance. Reset or reopen the game to apply changes; use a fresh boot when turning fixes off."));
+    widescreenGameFixes->setWhatsThis(widescreenGameFixes->toolTip());
+    wideLayout->addWidget(widescreenGameFixes);
     connect(widescreenExtendWindows, &QCheckBox::toggled, this, &VideoSettingsDialog::updateWidescreenControls);
     connect(widescreenCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this, &VideoSettingsDialog::updateWidescreenControls);
     for (auto* spin : {widescreenAspectWidth, widescreenAspectHeight, widescreenFOVPercent})
         connect(spin, QOverload<int>::of(&QSpinBox::valueChanged), this, &VideoSettingsDialog::updateWidescreenControls);
+    connect(widescreenMethodCombo, QOverload<int>::of(&QComboBox::currentIndexChanged), this, &VideoSettingsDialog::updateWidescreenControls);
+    connect(widescreenPatchRatio, QOverload<int>::of(&QComboBox::currentIndexChanged), this, &VideoSettingsDialog::updateWidescreenControls);
+    for (auto* spin : {widescreenPatchWidth, widescreenPatchHeight})
+        connect(spin, QOverload<int>::of(&QSpinBox::valueChanged), this, &VideoSettingsDialog::updateWidescreenControls);
+    auto* patchStatusTimer = new QTimer(this);
+    patchStatusTimer->setInterval(1000);
+    connect(patchStatusTimer, &QTimer::timeout, this, [this] {
+        if (widescreenMethodCombo->currentData().toInt() == WideMelon::GamePatch) updateWidescreenControls();
+    });
+    patchStatusTimer->start();
     updateWidescreenControls();
-    auto* wideRestartHelp = new QLabel(tr("Reset or reopen the game to apply changes. Supports Classic OpenGL and Compute."), wideGroup);
+    auto* wideRestartHelp = new QLabel(tr("Reset or reopen the game to apply changes."), wideGroup);
     wideRestartHelp->setWordWrap(true);
-    wideRestartHelp->setToolTip(tr("With multiple emulator instances open, close the other instances before resetting to apply widescreen changes."));
-    wideRestartHelp->setWhatsThis(wideRestartHelp->toolTip());
     wideLayout->addWidget(wideRestartHelp);
     // Enhancement setup already occupies the diagnostics rows. Append this
     // independent section so expanding diagnostics cannot overlap it.
@@ -918,9 +1031,9 @@ VideoSettingsDialog::VideoSettingsDialog(QWidget* parent) : QDialog(parent), ui(
 #else
     connect(grp3DRenderer, SIGNAL(idClicked(int)), this, SLOT(onChange3DRenderer(int)));
 #endif
-    grp3DRenderer->button(WideMelon::Enabled() && oldRenderer == renderer3D_Software
+    grp3DRenderer->button(WideMelon::NeedsPresentation() && oldRenderer == renderer3D_Software
         ? renderer3D_OpenGL : oldRenderer)->setChecked(true);
-    if (WideMelon::Enabled())
+    if (WideMelon::NeedsPresentation())
     {
         ui->rb3DSoftware->setEnabled(false);
         ui->rb3DSoftware->setWhatsThis(tr("Widescreen requires Classic OpenGL or Compute. Turn widescreen off and reset or reopen the game to use Software."));
@@ -1055,6 +1168,15 @@ VideoSettingsDialog::~VideoSettingsDialog()
 
 void VideoSettingsDialog::updateWidescreenControls()
 {
+    const int method = widescreenMethodCombo->currentData().toInt();
+    const bool renderer = method == WideMelon::Renderer;
+    const bool patch = method == WideMelon::GamePatch;
+    widescreenRendererControls->setVisible(renderer);
+    widescreenPatchControls->setVisible(patch);
+    widescreenMethodDescription->setText(renderer ?
+        tr("Show more scenery while keeping menus and interface proportions. Some objects or effects may be missing.") : patch ?
+        tr("An alternative for supported games. May stretch menus and effects.") :
+        tr("Use the original screen shape."));
     const int choice = widescreenCombo->currentData().toInt();
     const bool custom = choice == 0;
     const auto extent = WideMelon::ResolveCustomView(widescreenAspectWidth->value(), widescreenAspectHeight->value(), widescreenFOVPercent->value());
@@ -1062,18 +1184,94 @@ void VideoSettingsDialog::updateWidescreenControls()
     widescreenCustomPreview->setText(extent.Valid ?
         tr("%1 × %2 view; original 256 × 192 picture stays centered.").arg(extent.Width).arg(extent.Height) :
         tr("This combination exceeds the supported 768 × 768 view. Reduce the FOV expansion or choose a less extreme aspect ratio."));
-    ui->buttonBox->button(QDialogButtonBox::Ok)->setEnabled(!custom || extent.Valid);
+    bool valid = !renderer || !custom || extent.Valid;
+    const auto* nds = emuInstance->getNDS();
+    const auto* cart = nds ? nds->GetNDSCart() : nullptr;
+    const auto* profile = cart ? melonDS::WideGamePatches::FindCommunity(cart->GetHeader().GameCode,cart->GetHeader().HeaderCRC16) : nullptr;
+    // Allow setting a preference before loading a game, but do not offer
+    // controls that have no effect for a known unsupported game.
+    const bool patchAvailable = !cart || profile;
+    widescreenPatchRatio->setEnabled(patchAvailable);
+    widescreenPatchCustomControls->setEnabled(!cart || (profile && profile->CustomAspect));
+    const auto selected = widescreenPatchRatio->currentData().toSize();
+    const int pw = selected.width() ? selected.width() : widescreenPatchWidth->value();
+    const int ph = selected.height() ? selected.height() : widescreenPatchHeight->value();
+    widescreenPatchCustomControls->setVisible(selected.width()==0);
+    if (auto* model = qobject_cast<QStandardItemModel*>(widescreenPatchRatio->model()))
+        for (int i=0;i<widescreenPatchRatio->count();++i)
+        {
+            const auto ratio=widescreenPatchRatio->itemData(i).toSize();
+            model->item(i)->setEnabled(!profile || profile->CustomAspect ||
+                (ratio.width()>0 && melonDS::WideGamePatches::SupportsAspect(*profile,ratio.width(),ratio.height())));
+        }
+    QString status, details;
+    if (!cart)
+    {
+        status=tr("Load a game to check patch support.");
+        details=tr("334 variants support calculated ratios; complex codes use their published 16:10 ratio.");
+    }
+    else if (!profile)
+    {
+        status=tr("No patch available for this game.");
+        details=tr("No nonempty patch matches this game and header revision. The game will keep its native picture in this mode.");
+    }
+    else if (!melonDS::WideGamePatches::SupportsAspect(*profile,pw,ph))
+    {
+        status=profile->CustomAspect ? tr("Choose a ratio from 4:3 through 32:9.") :
+            tr("This game supports 16:10 only. Select 16:10.");
+        details=tr("Custom ratios are available only for patches with a known aspect-ratio value. Complex patches retain their published ratio.");
+        if (patch) valid=false;
+    }
+    else
+    {
+        status=profile->CustomAspect ? tr("Custom aspect ratios supported.") : tr("Supports 16:10 only.");
+        details=tr("Community patch %1 — experimental. %2").arg(QString::fromLatin1(profile->ID),
+            profile->CustomAspect ? tr("Calculated ratios from 4:3 to 32:9 are available; those conversions need game testing.") : tr("Published 16:10 code; other ratios are unavailable."));
+        if (profile->HeaderCRC==0xFFFF) details+=tr(" This entry uses a wildcard header revision.");
+        const bool current=WideMelon::SelectedMethod==WideMelon::GamePatch && pw==WideMelon::PatchAspectWidth && ph==WideMelon::PatchAspectHeight;
+        details+=current ? (nds->AREngine.GetWidescreenStatus()==melonDS::AREngine::WidescreenStatus::Running ?
+            tr(" Patch writes observed in this session.") : nds->AREngine.GetWidescreenStatus()==melonDS::AREngine::WidescreenStatus::InvalidCode ?
+            tr(" Patch execution failed; it has been disabled for this session.") : tr(" Waiting for the game's patch conditions.")) : tr(" Reset or reopen the game to apply.");
+        if (current && nds->AREngine.GetWidescreenStatus()==melonDS::AREngine::WidescreenStatus::InvalidCode)
+            status=tr("Patch failed. Restart the game.");
+    }
+    if (patch && patchAvailable && !melonDS::WideGamePatches::ValidAspect(pw,ph)) valid=false;
+    widescreenPatchStatus->setText(status);
+    setControlHelp(widescreenPatchRatio, tr("Choose the screen shape used by the game's widescreen patch. "
+        "Some patches support calculated ratios from 4:3 to 32:9; others support only their published 16:10 ratio. "
+        "These controls are unavailable when the loaded game has no matching patch. Reset or reopen the game to apply changes.") + " " + details);
+    const QString patchCustomHelp = tr("Enter the width and height of the desired screen shape, for example 16 and 9. "
+        "Custom ratios from 4:3 to 32:9 are available only for patches with calculated ratio support. "
+        "Patches limited to 16:10 cannot use custom ratios.") + " " + details;
+    setControlHelp(widescreenPatchWidth, patchCustomHelp);
+    setControlHelp(widescreenPatchHeight, patchCustomHelp);
+    ui->buttonBox->button(QDialogButtonBox::Ok)->setEnabled(valid);
     const bool enabled = custom ? extent.Valid && (extent.Width > 256 || extent.Height > 192) : choice != 256;
-    widescreenDisplayCombo->setEnabled(enabled);
-    widescreenExtendWindows->setEnabled(enabled);
-    widescreenExpandNarrowBorders->setEnabled(enabled && widescreenExtendWindows->isChecked());
+    widescreenDisplayCombo->setEnabled((renderer && enabled) || (patch && patchAvailable));
+    setControlHelp(widescreenDisplayCombo, patch ?
+        tr("Choose which physical displays are stretched. Community codes may also change camera or screen routing. Touch coordinates follow the whole stretched bottom picture.") :
+        tr("Choose which physical displays show additional scenery. Both is useful for games that move 3D between displays; "
+        "it does not duplicate the scene. Touch controls stay in the original center area. Reset or reopen the game to apply changes."));
+    const bool advanced=ui->cbAdvancedVideoSettings->isChecked();
+    widescreenExtendWindows->setVisible(renderer && advanced);
+    widescreenExpandNarrowBorders->setVisible(renderer && advanced);
+    widescreenGameFixes->setVisible(renderer && advanced);
+    widescreenGameFixes->setEnabled(enabled);
+    widescreenExtendWindows->setEnabled(renderer && enabled);
+    widescreenExpandNarrowBorders->setEnabled(renderer && enabled && widescreenExtendWindows->isChecked());
 }
 
 void VideoSettingsDialog::on_VideoSettingsDialog_accepted()
 {
     const int wideChoice = widescreenCombo->currentData().toInt();
     const auto extent = WideMelon::ResolveCustomView(widescreenAspectWidth->value(), widescreenAspectHeight->value(), widescreenFOVPercent->value());
-    if (wideChoice == 0 && !extent.Valid) return;
+    const int method=widescreenMethodCombo->currentData().toInt();
+    if (method==WideMelon::Renderer && wideChoice == 0 && !extent.Valid) return;
+    const auto selected=widescreenPatchRatio->currentData().toSize();
+    emuInstance->getGlobalConfig().SetInt("3D.GL.WidescreenMethod",method);
+    emuInstance->getGlobalConfig().SetInt("3D.GL.WidescreenPatchAspectWidth",selected.width()?selected.width():widescreenPatchWidth->value());
+    emuInstance->getGlobalConfig().SetInt("3D.GL.WidescreenPatchAspectHeight",selected.height()?selected.height():widescreenPatchHeight->value());
+    emuInstance->getGlobalConfig().SetBool("3D.GL.WidescreenGameFixes",widescreenGameFixes->isChecked());
     emuInstance->getGlobalConfig().SetBool("3D.GL.WidescreenCustom", wideChoice == 0);
     emuInstance->getGlobalConfig().SetInt("3D.GL.WidescreenAspectWidth", widescreenAspectWidth->value());
     emuInstance->getGlobalConfig().SetInt("3D.GL.WidescreenAspectHeight", widescreenAspectHeight->value());
@@ -1361,7 +1559,7 @@ void VideoSettingsDialog::applyRecommendedDefaults()
 
 void VideoSettingsDialog::onChange3DRenderer(int renderer)
 {
-    if (WideMelon::Enabled() && renderer == renderer3D_Software) return;
+    if (WideMelon::NeedsPresentation() && renderer == renderer3D_Software) return;
     bool old_gl = UsesGL();
 
     auto& cfg = emuInstance->getGlobalConfig();

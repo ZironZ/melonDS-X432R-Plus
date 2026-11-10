@@ -4,7 +4,7 @@
 #include "WideMelon.h"
 
 bool ReadScreenPresentation(GLuint program, GLuint vertexArray, GLuint source,
-                            std::array<QImage, 2>& images, QString* error)
+                            std::array<QImage, 2>& images, QString* error, std::array<float,2> presentationAspect)
 {
     images = {};
     if (error) error->clear();
@@ -76,7 +76,7 @@ bool ReadScreenPresentation(GLuint program, GLuint vertexArray, GLuint source,
     bool ok = sourceWidth > 0 && sourceHeight > 0 && sourceWidth % WideMelon::Width() == 0;
     for (int screen = 0; ok && screen < 2; screen++)
     {
-        const int width = sourceWidth / WideMelon::Width() * WideMelon::DisplayWidth(screen);
+        const int width = int(sourceWidth / WideMelon::Width() * WideMelon::DisplayWidth(screen) * presentationAspect[screen] + 0.5f);
         const int height = sourceHeight / WideMelon::Height() * WideMelon::DisplayHeight(screen);
         QImage image(width, height, QImage::Format_RGBA8888);
         if (image.isNull()) { ok = false; break; }

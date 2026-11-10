@@ -376,7 +376,7 @@ void EmuInstance::emuStop(StopReason reason)
 
 bool EmuInstance::usesOpenGL()
 {
-    return WideMelon::Enabled() || (restartWidescreen && restartWidescreen->Enabled()) ||
+    return WideMelon::NeedsPresentation() || (restartWidescreen && restartWidescreen->NeedsPresentation()) ||
            globalCfg.GetBool("Screen.UseGL") ||
            (globalCfg.GetInt("3D.Renderer") != renderer3D_Software);
 }
@@ -393,7 +393,11 @@ void EmuInstance::prepareConsoleRestart()
         globalCfg.GetBool("3D.GL.WidescreenCustom"),
         globalCfg.GetInt("3D.GL.WidescreenAspectWidth"),
         globalCfg.GetInt("3D.GL.WidescreenAspectHeight"),
-        globalCfg.GetInt("3D.GL.WidescreenFOVPercent"));
+        globalCfg.GetInt("3D.GL.WidescreenFOVPercent"),
+        globalCfg.GetInt("3D.GL.WidescreenMethod"),
+        globalCfg.GetInt("3D.GL.WidescreenPatchAspectWidth"),
+        globalCfg.GetInt("3D.GL.WidescreenPatchAspectHeight"),
+        globalCfg.GetBool("3D.GL.WidescreenGameFixes"));
     if (requested == WideMelon::CurrentConfiguration()) return;
 
     // Dimensions are process-wide. Never invalidate another instance's live
@@ -407,7 +411,7 @@ void EmuInstance::prepareConsoleRestart()
     restartWidescreen = requested;
     if (usesOpenGL() != mainWindow->hasOpenGL())
         mainWindow->updateVideoSettings(true);
-    if (requested.Enabled() && !mainWindow->hasOpenGL())
+    if (requested.NeedsPresentation() && !mainWindow->hasOpenGL())
     {
         restartWidescreen.reset();
         osdAddMessage(0xFFC040, "Widescreen changes need an available OpenGL display");

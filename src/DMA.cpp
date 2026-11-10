@@ -614,6 +614,19 @@ void DMA::Run9()
         return;
     }
 
+    // Publish only completed, contiguous transfers. The renderer validates
+    // capture identity and every consumed byte; guest reads/writes stay unchanged.
+    if (SrcAddrInc == 1 && (DstAddrInc == 1 || DstAddrInc == 3))
+    {
+        const u32 count = (Cnt & 0x1FFFFFu) ? (Cnt & 0x1FFFFFu) : 0x200000u;
+        const u32 bytes = count * ((Cnt & (1u << 26)) ? 4u : 2u);
+        const u32 source = CurSrcAddr - bytes;
+        const u32 destination = CurDstAddr - bytes;
+        if ((destination >> 24) == 2 ||
+            ((destination >> 24) == 6 && destination < 0x06400000))
+            NDS.GPU.GetRenderer().NotifyDMA9Copy(source, destination, bytes);
+    }
+
     if (!(Cnt & (1<<25)))
         Cnt &= ~(1<<31);
 

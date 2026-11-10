@@ -13,6 +13,35 @@ using namespace melonDS;
 namespace
 {
 
+POLICY_TEST(BitmapRowCapabilitiesFollowConsumerRequirements)
+{
+    for (const auto path : {WholeSceneRenderPath::Current,
+                           WholeSceneRenderPath::HighResCompositor,
+                           WholeSceneRenderPath::LegacyNativeUpscale,
+                           WholeSceneRenderPath::FinalNativeUpscale,
+                           WholeSceneRenderPath::OverlayOperatorUpscale,
+                           WholeSceneRenderPath::ConservativeHybridUpscale,
+                           WholeSceneRenderPath::PhysicalFinalPostprocessInput})
+    {
+        CHECK(CanStageBitmapRows(path, 0));
+        CHECK(!CanStageBitmapRows(path, 1));
+    }
+    for (const auto path : {WholeSceneRenderPath::None,
+                           WholeSceneRenderPath::StrictAffineHighRes,
+                           WholeSceneRenderPath::NativeExactFloor,
+                           WholeSceneRenderPath::CaptureBackedHandoff,
+                           WholeSceneRenderPath::SourceACaptureReplacement,
+                           WholeSceneRenderPath::CaptureEpochOverlay})
+    {
+        CHECK(!CanStageBitmapRows(path, 0));
+        CHECK(CopiedBitmapPresentationFor(path) == CopiedBitmapPresentation::Unsupported);
+    }
+    CHECK(CopiedBitmapPresentationFor(WholeSceneRenderPath::Current) ==
+          CopiedBitmapPresentation::Compositor);
+    CHECK(CopiedBitmapPresentationFor(WholeSceneRenderPath::PhysicalFinalPostprocessInput) ==
+          CopiedBitmapPresentation::PhysicalNative);
+}
+
 StrictAffineHighResEligibilityInputs MakeStrictAffineEligibleInputs()
 {
     StrictAffineHighResEligibilityInputs inputs = {};

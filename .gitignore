@@ -16,6 +16,8 @@ test/policy/replay-local/
 /test/debug-export/*.md
 /test/renderer/*.md
 /test/renderer/*.py
+!/test/renderer/generate-widescreen-patches.py
+!/test/renderer/check-widescreen-methods.py
 /test/renderer/__pycache__/
 /md/
 .idea

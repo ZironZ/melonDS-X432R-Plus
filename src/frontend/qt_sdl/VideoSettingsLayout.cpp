@@ -90,6 +90,11 @@ QString ModeHelp(int value)
 }
 }
 
+void VideoSettingsDialog::setControlHelp(QWidget* widget, const QString& text)
+{
+    SetHelp(widget, text);
+}
+
 void VideoSettingsDialog::setupTabbedLayout(QGroupBox* widescreenGroup)
 {
     // Keep the controls, signal connections, and config bindings. Only their
@@ -382,8 +387,7 @@ void VideoSettingsDialog::updateTabVisibility(bool advanced)
     ui->cbGLDisplay->setVisible(advanced);
     ui->label_2->setVisible(advanced);
     ui->sbVSyncInterval->setVisible(advanced);
-    widescreenExtendWindows->setVisible(advanced);
-    widescreenExpandNarrowBorders->setVisible(advanced);
+    updateWidescreenControls();
     presentationGroup->setEnabled(UsesGL());
     ui->groupBox_2->setVisible(ui->rb3DSoftware->isChecked());
 }

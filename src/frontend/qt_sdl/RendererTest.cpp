@@ -240,10 +240,25 @@ RendererTestRunner* RendererTestRunner::fromManifest(const QString& manifestPath
     if (runner->warmupFrames < 0)
         runner->warmupFrames = 0;
 
+    bool checkpointAvailable = false;
     for (const QJsonValue& stepValue : root.value("steps").toArray())
     {
         const QJsonObject stepObject = stepValue.toObject();
         RendererTestStep step;
+        const QJsonValue checkpoint = stepObject.value("checkpoint");
+        if (!checkpoint.isUndefined())
+        {
+            step.checkpoint = checkpoint.toString();
+            if (!checkpoint.isString() ||
+                (step.checkpoint != "save" && step.checkpoint != "load") ||
+                (step.checkpoint == "load" && !checkpointAvailable))
+            {
+                errorstr = "Step checkpoint must be save or load; a load requires an earlier save.";
+                delete runner;
+                return nullptr;
+            }
+            checkpointAvailable = true;
+        }
         step.frames = stepObject.value("frames").toInt(0);
         if (step.frames < 0)
             step.frames = 0;
@@ -735,6 +750,18 @@ bool RendererTestRunner::advanceStep(EmuInstance* inst)
     }
 
     const RendererTestStep& step = steps[currentStep];
+    if (!step.checkpoint.isEmpty())
+    {
+        const auto path = (outputDir + "/replay-checkpoint.state").toStdString();
+        const bool ok = step.checkpoint == "save" ? inst->saveState(path) : inst->loadState(path);
+        printf("[renderer-test] checkpoint %s at frame %d: %s\n",
+               step.checkpoint.toUtf8().constData(), framesRun.load(), ok ? "PASS" : "FAIL");
+        if (!ok)
+        {
+            fail("Replay checkpoint " + step.checkpoint + " failed.");
+            return false;
+        }
+    }
     if (step.hasTouch)
         inst->touchScreen(step.touchX, step.touchY);
     else if (step.release)

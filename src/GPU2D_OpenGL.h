@@ -19,6 +19,7 @@
 #pragma once
 
 #include <atomic>
+#include <array>
 #include <memory>
 #include <optional>
 #include <string>
@@ -26,6 +27,7 @@
 #include <vector>
 #include "OpenGLSupport.h"
 #include "GPU2D.h"
+#include "CaptureCopyTracker.h"
 #include "GLBGVRAMUploadCache.h"
 #include "GLBGArtworkCache.h"
 #include "RendererDebug.h"
@@ -442,6 +444,9 @@ private:
 
     GLuint NativeOutputFB {};
     GLuint NativeOutputTex {};
+    // Presentation-only replacement; canonical native products remain intact.
+    GLuint CopiedBitmapNativePresentationTex {};
+    bool CopiedBitmapNativePresentationValid = false;
     GLuint NativeTopColorTex {};
     GLuint NativeSecondColorTex {};
     GLuint NativeMetaTex {};
@@ -1222,6 +1227,34 @@ private:
         u32 uBlendCoef[4] {};
     } CompositorConfig {};
 
+    // Immutable consumed bitmap rows. Only the sub-engine composed fallback
+    // can defer here; emulated DMA and VRAM uploads retain their original timing.
+    std::vector<u8> BitmapRowBytes;
+    std::unique_ptr<sScanlineConfig> BitmapRowScanlines;
+    u64 BitmapRowGenerations[192][4] {};
+    u32 BitmapRowMapping[32] {};
+    int BitmapRowLayer = -1, BitmapRowEnd = 0, BitmapRowStride = 0;
+    bool BitmapRowCandidate = false, BitmapRowDeferred = false, BitmapRowRendering = false;
+    GLuint BitmapRowVRAMTex = 0, BitmapRowColorTex = 0, BitmapRowFB = 0;
+    bool EnsureBitmapRowTargets();
+    int BitmapRowSource(int layer, int line) const;
+    void CaptureBitmapRow(int line, const u8* vram, u32 mask);
+    bool CanContinueBitmapRows(const u8* vram, u32 mask) const;
+    void PrepareBitmapRowRender(int end);
+    void FlushBitmapRowsBeforeGap(int nextLine);
+    void UploadCompositorScanlines(int first, int end);
+    void ObserveCopiedCaptureRow(int line, const u8* vram, u32 mask);
+    bool RenderCopiedCaptureOverlay();
+    CopiedCaptureFrameProof CopiedBitmapProof;
+    int CopiedBitmapLayer = -1;
+    u64 CopiedBitmapOtherSources[4] {};
+    std::array<u32, 12> CopiedBitmapPresentation {};
+    std::array<u32, 12> CopiedBitmapPresentationState() const;
+    GLuint CopiedBitmapEndpointTex[2] {};
+    int CopiedBitmapEndpointScale = 0;
+    u64 CopiedBitmapAppliedGeneration = 0, CopiedBitmapAppliedEvent = 0;
+    int CopiedBitmapAppliedBank = -1;
+
     int LastLine {};
 
     bool UnitEnabled {};
@@ -1253,7 +1286,7 @@ private:
 
     u16 TempPalBuffer[256 * (1 + (4*16))] {};
 
-    bool IsScreenOn();
+    bool IsScreenOn() const;
     std::string DescribeWholeSceneScaleState(WholeScene2DDebugReadContext* context = nullptr) const;
     std::string BuildWholeSceneScaleStateDescription() const;
     void AppendWholeSceneModeStatus(std::string& status) const;
@@ -1650,7 +1683,7 @@ private:
     void PrerenderSprites();
     void UpdateSpriteArtworkGenerations();
     u64 UpdateResolvedOrdinaryOBJArtwork(const u32* includedSprites, u64 oamHash);
-    void PrerenderLayer(int layer, bool partial = false);
+    void PrerenderLayer(int layer, bool partial = false, bool advanceGeneration = true);
     void PrerenderLayerRows(int layer, int firstRow, int lastRow);
 
     void DoRenderSprites(int line);
@@ -1924,7 +1957,9 @@ private:
                                 GLuint overlayOpaqueWhiteTex = 0,
                                 GLuint native3DSemanticsTex = 0,
                                 GLuint native3DOperatorTex = 0,
-                                bool explicit3DOperator = false);
+                                bool explicit3DOperator = false,
+                                int presentationScale = 0,
+                                bool useConfiguredDebugTint = true);
     void RenderOverlayDebugTexture(GLuint targetTex,
                                    int width,
                                    int height,

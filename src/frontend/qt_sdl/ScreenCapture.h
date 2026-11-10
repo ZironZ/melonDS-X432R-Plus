@@ -11,4 +11,5 @@
 // source/history textures and effect uniforms. No history is advanced here.
 // Images use internal resolution, without window layout or OSD.
 bool ReadScreenPresentation(GLuint program, GLuint vertexArray, GLuint source,
-                            std::array<QImage, 2>& images, QString* error);
+                            std::array<QImage, 2>& images, QString* error,
+                            std::array<float,2> presentationAspect = {1.f,1.f});

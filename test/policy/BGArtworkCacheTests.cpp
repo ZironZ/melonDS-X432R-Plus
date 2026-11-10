@@ -98,3 +98,26 @@ POLICY_TEST(BGArtworkDependenciesWrapVRAMAndFailClosedForUnknownInputs)
         CHECK(f.Changed()); CHECK(f.Changed());
     }
 }
+
+POLICY_TEST(BGArtworkCurrentMemoryProofDoesNotAdvanceUploadedDependencies)
+{
+    for (u32 type = 0; type < 4; ++type)
+    {
+        Fixture f; f.Config.Type = type; CHECK(f.Changed());
+        const auto matches = [&] { return f.Art.MatchesCurrent(f.Config, f.VRAM.data(),
+            f.VRAM.size(), f.Palette.data(), f.Palette.size()); };
+        CHECK(matches());
+        f.VRAM.back() ^= 1; CHECK(matches());
+        f.VRAM[65536] ^= 1; CHECK(!matches());
+        // A speculative current-memory check must not alter the uploaded key.
+        CHECK(!f.Changed());
+        f.VRAM[65536] ^= 1; CHECK(matches());
+        f.Palette[type == 0 ? 1 : 0x11] ^= 0x8000; CHECK(!matches());
+        f.Palette[type == 0 ? 1 : 0x11] ^= 0x8000; CHECK(matches());
+        CHECK(!f.Art.MatchesCurrent(f.Config, nullptr, f.VRAM.size(),
+            f.Palette.data(), f.Palette.size()));
+        CHECK(!f.Art.MatchesCurrent(f.Config, f.VRAM.data(), f.VRAM.size()/2,
+            f.Palette.data(), f.Palette.size()));
+        f.Art.Reset(); CHECK(!matches());
+    }
+}

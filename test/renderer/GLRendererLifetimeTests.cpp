@@ -17,6 +17,7 @@
 #include "GPU_OpenGL.h"
 #include "GPU_Soft.h"
 #include "WideMelon.h"
+#include "WideCaptureLayout.h"
 
 namespace
 {
@@ -239,6 +240,510 @@ namespace melonDS
 // frontend API. It exercises production lazy publication and per-engine scratch.
 struct GLRendererLifetimeTestAccess
 {
+    static void BitmapRowReference(GLRenderer& renderer, bool engineB)
+    {
+        auto& engine = static_cast<GLRenderer2D&>(*(engineB ? renderer.Rend2D_B : renderer.Rend2D_A));
+        auto& gpu = engine.GPU;
+        auto& regs = engine.GPU2D;
+        const auto oldMode = engine.WholeSceneScaleMode;
+        const auto oldAlgorithm = engine.WholeSceneScaleAlgorithm;
+        const bool oldRequested = engine.WholeSceneScaleRequested;
+        const bool oldPhysical = renderer.PhysicalFinalUpscale;
+        const u32 bank = engineB ? 2 : 0;
+        auto* mapping = engineB ? gpu.VRAMMap_BBG : gpu.VRAMMap_ABG;
+        const size_t mappingCount = engineB ? std::size(gpu.VRAMMap_BBG) : std::size(gpu.VRAMMap_ABG);
+        std::vector<u32> savedMapping(mapping, mapping + mappingCount);
+        std::fill(mapping, mapping + mappingCount, 1u << bank);
+        std::vector<u16> image(256 * 192);
+        for (int y = 0; y < 192; ++y)
+            for (int x = 0; x < 256; ++x)
+                image[y * 256 + x] = 0x8000 | ((x ^ y) & 31) |
+                    (((x / 3 + y) & 31) << 5) | (((x + y / 7) & 31) << 10);
+        // A stationary text overlay with alternating opaque/transparent pixels.
+        // Its map shares VRAM with the bitmap but lies outside the streamed row.
+        std::fill(image.begin() + 16384, image.begin() + 17408, 0x8000);
+        const auto render = [&](bool stream, int mode, RendererSettings::GLScaleAlgorithm algorithm) {
+            renderer.Reset();
+            engine.SetWholeSceneScaleMode(static_cast<RendererSettings::WholeScene2DScaleMode>(std::max(mode, 0)));
+            engine.SetWholeSceneScaleAlgorithm(algorithm);
+            engine.WholeSceneScaleRequested = mode >= 0;
+            renderer.PhysicalFinalUpscale = mode == 2;
+            gpu.ScreensEnabled = true;
+            gpu.CaptureEnable = false;
+            gpu.MasterBrightnessA = gpu.MasterBrightnessB = 0;
+            gpu.PaletteDirty = 0xF;
+            regs.Enabled = true;
+            regs.ForcedBlank = 0;
+            regs.DispCnt = (1u << 16) | (1u << 10) | (1u << 8) | 5;
+            regs.LayerEnable = (1u << 2) | 1;
+            regs.OBJEnable = false;
+            regs.BlendCnt = 0;
+            regs.BGCnt[0] = (6u << 2) | (16u << 8);
+            regs.BGXPos[0] = regs.BGYPos[0] = 0;
+            regs.BGCnt[2] = (1u << 7) | (1u << 2) | (1u << 14);
+            regs.BGRotA[0] = 256;
+            regs.BGRotB[0] = regs.BGRotC[0] = 0;
+            regs.BGRotD[0] = stream ? 1 : 256;
+            std::memcpy(gpu.VRAM[bank], image.data(), image.size() * sizeof(u16));
+            std::memset(gpu.VRAM[bank] + 98304, 0x01, 32);
+            reinterpret_cast<u16*>(gpu.Palette)[(engineB ? 512 : 0) + 129] = 31;
+            gpu.VRAMDirty[bank] = NonStupidBitField<256>(0, 256);
+            for (int y = 0; y < 192; ++y)
+            {
+                if (stream)
+                {
+                    std::memcpy(gpu.VRAM[bank], image.data() + y * 256, 512);
+                    gpu.VRAMDirty[bank][0] = true;
+                }
+                regs.BGXRefInternal[0] = 0;
+                regs.BGYRefInternal[0] = stream ? y : y * 256;
+                engine.DrawSprites(y);
+                engine.DrawScanline(y);
+            }
+            engine.VBlank();
+            if (stream && !engine.BitmapRowDeferred)
+                throw std::runtime_error("row stream not staged: engine " + std::to_string(engineB) +
+                    " mode " + std::to_string(mode) + " type " + std::to_string(engine.LayerConfig.uBGConfig[2].Type) +
+                    " source " + std::to_string(engine.BitmapRowSource(2, 0)) +
+                    " path " + std::to_string(static_cast<int>(engine.WholeSceneTrace.Path)));
+            glBindFramebuffer(GL_READ_FRAMEBUFFER, engine.OutputFB);
+            glReadBuffer(GL_COLOR_ATTACHMENT0);
+            std::vector<u8> pixels(engine.ScreenW * engine.ScreenH * 4);
+            glReadPixels(0, 0, engine.ScreenW, engine.ScreenH, GL_RGBA, GL_UNSIGNED_BYTE, pixels.data());
+            return pixels;
+        };
+        for (int mode = -1; mode < 5; ++mode)
+            for (const auto algorithm : {RendererSettings::GLScaleAlgorithm::Spline36,
+                                        RendererSettings::GLScaleAlgorithm::ArtCNNDN,
+                                        RendererSettings::GLScaleAlgorithm::XBRZ,
+                                        RendererSettings::GLScaleAlgorithm::ArtCNN,
+                                        RendererSettings::GLScaleAlgorithm::NNEDI3,
+                                        RendererSettings::GLScaleAlgorithm::CuNNy4x32})
+            {
+                // Source-space Spline36 requires neighbouring original rows:
+                // its ordinary fallback cannot equal a contiguous bitmap.
+                if (mode == 1 && algorithm == RendererSettings::GLScaleAlgorithm::Spline36) continue;
+                const auto reference = render(false, mode, algorithm);
+                const auto staged = render(true, mode, algorithm);
+                if (reference != staged)
+                    throw std::runtime_error("bitmap row reference differs: engine " + std::to_string(engineB) +
+                        " mode " + std::to_string(mode) + " algorithm " + std::to_string(static_cast<int>(algorithm)));
+            }
+        const int oldScale = renderer.ScaleFactor;
+        renderer.SetScaleFactor(1);
+        const auto nativeReference = render(false, -1, RendererSettings::GLScaleAlgorithm::Spline36);
+        Check(nativeReference == render(true, -1, RendererSettings::GLScaleAlgorithm::Spline36),
+              "native resolution row staging preserves exact pixels");
+        renderer.SetScaleFactor(oldScale);
+        // An owned capture must keep its high-resolution detail without
+        // enhancing native 2D text, or changing canonical native products.
+        for (int mode : {-1, 2})
+        {
+            const auto ordinary = render(true, mode, RendererSettings::GLScaleAlgorithm::Spline36);
+            std::vector<u8> source(engine.ScreenW * engine.ScreenH * 4);
+            for (int y = 0; y < engine.ScreenH; ++y)
+                for (int x = 0; x < engine.ScreenW; ++x)
+                {
+                    auto* pixel = source.data() + (y * engine.ScreenW + x) * 4;
+                    pixel[0] = 0;pixel[1] = (x & 1) ? 255 : 0;pixel[2] = (x & 1) ? 0 : 255;pixel[3] = 255;
+                }
+            glBindTexture(GL_TEXTURE_2D, renderer.HighResDisplayCaptureFullTex[0]);
+            glTexSubImage2D(GL_TEXTURE_2D,0,0,0,engine.ScreenW,engine.ScreenH,GL_RGBA,GL_UNSIGNED_BYTE,source.data());
+            const auto slot = renderer.CopiedCaptures.Store(0x18000,reinterpret_cast<const u8*>(image.data()));
+            Check(renderer.RetainCopiedCaptureProduct(slot,0), "retain capture for presentation-domain test");
+            engine.CopiedBitmapProof = {};
+            for (u32 y = 0; y < 192; ++y)
+                engine.CopiedBitmapProof.Observe(y, CaptureCopyTracker::Row{slot,renderer.CopiedCaptures.Get(slot).Generation,y});
+            engine.CopiedBitmapLayer = 2;
+            engine.CopiedBitmapPresentation = engine.CopiedBitmapPresentationState();
+            std::copy(std::begin(engine.BGLayerArtworkGeneration),std::end(engine.BGLayerArtworkGeneration),engine.CopiedBitmapOtherSources);
+            const auto readNative = [&] {
+                glBindFramebuffer(GL_READ_FRAMEBUFFER,engine.NativeOutputFB);glReadBuffer(GL_COLOR_ATTACHMENT0);
+                std::vector<u8> pixels(256*192*4);
+                glReadPixels(0,0,256,192,GL_RGBA,GL_UNSIGNED_BYTE,pixels.data());return pixels;
+            };
+            const auto canonical = readNative();
+            Check(engine.RenderCopiedCaptureOverlay(), "copied bitmap can use the selected presentation domain");
+            Check(readNative()==canonical, "copied presentation never overwrites canonical native pixels");
+            Check(engine.CopiedBitmapNativePresentationValid == (mode == 2), "physical postprocessing alone uses private native input");
+            if (mode == -1)
+            {
+                glBindFramebuffer(GL_READ_FRAMEBUFFER,engine.OutputFB);glReadBuffer(GL_COLOR_ATTACHMENT0);
+                std::vector<u8> actual(source.size());
+                glReadPixels(0,0,engine.ScreenW,engine.ScreenH,GL_RGBA,GL_UNSIGNED_BYTE,actual.data());
+                for (int y = 0; y < engine.ScreenH; ++y)
+                    for (int x = 0; x < engine.ScreenW; ++x)
+                    {
+                        const auto offset = (y * engine.ScreenW + x) * 4;
+                        const auto* expected = ((x / oldScale) & 1) ? source.data() : ordinary.data();
+                        Check(std::memcmp(actual.data()+offset,expected+offset,4)==0,
+                              "scaling off keeps native text pixels over high-resolution capture pixels");
+                    }
+            }
+        }
+        std::copy(savedMapping.begin(), savedMapping.end(), mapping);
+        engine.SetWholeSceneScaleMode(oldMode);
+        engine.SetWholeSceneScaleAlgorithm(oldAlgorithm);
+        engine.WholeSceneScaleRequested = oldRequested;
+        renderer.PhysicalFinalUpscale = oldPhysical;
+        renderer.Reset();
+        Check(glGetError() == GL_NO_ERROR, "bitmap row reference GL state");
+        std::puts("[GL lifetime] streamed rows match complete bitmap across compositors and scalers");
+    }
+
+    static void PostprocessingNativeArtwork(GLRenderer& renderer, bool engineB)
+    {
+        auto& engine = static_cast<GLRenderer2D&>(*(engineB ? renderer.Rend2D_B : renderer.Rend2D_A));
+        const auto mode = engine.WholeSceneScaleMode;
+        const bool requested = engine.WholeSceneScaleRequested;
+        const bool affine = engine.WholeSceneScaleHybridStrictAffineHighRes;
+        renderer.Reset();
+        engine.UpdateLayerConfig(); // Select the native BG backing textures, as a real scanline does.
+        engine.SetWholeSceneScaleMode(RendererSettings::WholeScene2DScaleMode::FinalNativeUpscale);
+        engine.WholeSceneScaleRequested = true;
+        engine.WholeSceneScaleHybridStrictAffineHighRes = false;
+        engine.LayerEnable = 1;
+        engine.LayerConfig.uVRAMMask = engineB ? 127 : 511;
+        auto& bg = engine.LayerConfig.uBGConfig[0];
+        bg = {};
+        bg.Type = 0;
+        bg.Size[0] = bg.Size[1] = 16;
+        bg.MapOffset = 8192;
+        std::vector<u8> vram((engine.LayerConfig.uVRAMMask + 1) * 1024);
+        std::fill(vram.begin(), vram.begin() + 32, 0x11);
+        std::fill(std::begin(engine.UploadedBGPalette), std::end(engine.UploadedBGPalette), 0);
+        engine.UploadedBGPalette[1] = 0x801F;
+        engine.UploadedBGPalette[2] = 0xFC00;
+        engine.UploadedBGPaletteValid = true;
+        const auto upload = [&] {
+            NonStupidBitField<1024> dirty(0, 1024);
+            engine.BGVRAMUploadCache.FilterUnchanged(vram.data(), vram.size(), dirty);
+            engine.BGVRAMUploadCache.RecordUpload(vram.data(), 0, vram.size());
+            glActiveTexture(GL_TEXTURE0);
+            glBindTexture(GL_TEXTURE_2D, engine.VRAMTex_BG);
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 1024, engine.LayerConfig.uVRAMMask + 1,
+                            GL_RED_INTEGER, GL_UNSIGNED_BYTE, vram.data());
+            glActiveTexture(GL_TEXTURE1);
+            glBindTexture(GL_TEXTURE_2D, engine.PalTex_BG);
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 256, 65, GL_RGBA,
+                            GL_UNSIGNED_SHORT_1_5_5_5_REV, engine.UploadedBGPalette);
+            glBindBuffer(GL_UNIFORM_BUFFER, engine.LayerConfigUBO);
+            glBufferSubData(GL_UNIFORM_BUFFER, 0, sizeof(engine.LayerConfig), &engine.LayerConfig);
+            const int rows[4] {};
+            engine.PrerenderDirtyLayers(1, 0, rows, rows, 0);
+        };
+        const auto pixels = [&] {
+            std::array<u8, 16 * 16 * 4 * 2> image;
+            glBindFramebuffer(GL_READ_FRAMEBUFFER, engine.BGLayerFB[0]);
+            for (int attachment = 0; attachment < 2; ++attachment)
+            {
+                glReadBuffer(GL_COLOR_ATTACHMENT0 + attachment);
+                glReadPixels(0, 0, 16, 16, GL_RGBA, GL_UNSIGNED_BYTE,
+                             image.data() + attachment * 16 * 16 * 4);
+            }
+            return image;
+        };
+        upload();
+        const auto original = pixels();
+        auto draws = DrawArraysCalls;
+        vram[32768] ^= 1;
+        upload();
+        Check(DrawArraysCalls == draws && pixels() == original,
+              "postprocessing retains exact native color/metadata with hybrid affine disabled");
+        engine.UploadedBGPalette[1] ^= 0x8000;
+        upload();
+        Check(DrawArraysCalls == draws + 1 && pixels() != original,
+              "postprocessing redraws a referenced palette high-bit change immediately");
+        const auto palette = pixels();
+        vram[0] = 0x22;
+        upload();
+        Check(DrawArraysCalls == draws + 2 && pixels() != palette,
+              "postprocessing redraws referenced tile changes immediately");
+        draws = DrawArraysCalls;
+        engine.NativeBGPrerenderTexture[0] = 0;
+        upload();
+        Check(DrawArraysCalls == draws + 1, "postprocessing requires native backing ownership");
+        engine.SetWholeSceneScaleMode(mode);
+        engine.WholeSceneScaleRequested = requested;
+        engine.WholeSceneScaleHybridStrictAffineHighRes = affine;
+        renderer.Reset();
+        Check(glGetError() == GL_NO_ERROR, "postprocessing native artwork GL state");
+        std::puts("[GL lifetime] postprocess native artwork: reuse, palette, tile, ownership passed");
+    }
+    static void BitmapCoveragePriority(GLRenderer& renderer)
+    {
+        renderer.Reset();
+        auto& engine = *static_cast<GLRenderer2D*>(renderer.Rend2D_B.get());
+        engine.DispCnt = 1u << 16;
+        engine.LayerEnable = (1u << 2) | (1u << 3);
+        for (int layer : {2, 3})
+        {
+            auto& cfg = engine.LayerConfig.uBGConfig[layer];
+            cfg.Type = 5;
+            cfg.Size[0] = cfg.Size[1] = 256;
+            cfg.MapOffset = 0;
+            engine.BGCnt[layer] = (1u << 14) | (layer - 2);
+            for (int y = 0; y < 192; ++y)
+            {
+                engine.ScanlineConfig.uScanline[y].BGOffset[layer][0] = 0;
+                engine.ScanlineConfig.uScanline[y].BGOffset[layer][1] = y * 256;
+                engine.ScanlineConfig.uScanline[y].BGRotscale[layer - 2][0] = 256;
+                engine.ScanlineConfig.uScanline[y].BGRotscale[layer - 2][2] = 0;
+            }
+        }
+        std::vector<u8> pixels(128 * 1024, 0x80);
+        const auto covered = [&] { return engine.CoveredByOpaqueBitmapBGLayerMask(0, 192, pixels.data(), pixels.size() - 1); };
+        Check(covered() == (1u << 3), "opaque upper bitmap covers lower-priority bitmap");
+        engine.BGCnt[3] &= ~3u;
+        Check(covered() == 0, "equal-priority bitmap is not treated as an opaque cover");
+        engine.BGCnt[3] |= 1;
+        pixels[1] = 0;
+        Check(covered() == 0, "one transparent sample prevents opaque coverage");
+        pixels[1] = 0x80;
+        engine.DispCnt |= 1u << 15;
+        Check(covered() == 0, "OBJ window retains ordinary bitmap rendering");
+        engine.DispCnt &= ~(1u << 15);
+        engine.BlendCnt = 1u << 6;
+        Check(covered() == 0, "blending retains ordinary bitmap rendering");
+        engine.BlendCnt = 0;
+        engine.BGCnt[2] |= 1u << 6;
+        Check(covered() == 0, "mosaic prevents an opaque bitmap proof");
+        engine.BGCnt[2] &= ~(1u << 6);
+        engine.LayerEnable = (1u << 0) | (1u << 2);
+        engine.LayerConfig.uBGConfig[0].Type = 0;
+        Check(covered() == 0, "a lone bitmap cannot suppress a text layer");
+        renderer.Reset();
+        std::puts("[GL lifetime] bitmap coverage: priority, alpha, windows, effects, mosaic passed");
+    }
+    static void CaptureSpriteInvalidation(GLRenderer& renderer)
+    {
+        renderer.Reset();
+        auto& a = *static_cast<GLRenderer2D*>(renderer.Rend2D_A.get());
+        auto& b = *static_cast<GLRenderer2D*>(renderer.Rend2D_B.get());
+        a.SpriteConfigDirty = b.SpriteConfigDirty = false;
+        renderer.AllocCapture(0, 0, 3);
+        Check(!a.SpriteConfigDirty && !b.SpriteConfigDirty,
+              "capture allocation does not invalidate empty decoded sprite lists");
+        Check(a.LayerConfigDirty && b.LayerConfigDirty,
+              "capture allocation still invalidates BG capture mappings");
+        a.NumSprites = 1;
+        renderer.AllocCapture(0, 0, 3);
+        Check(a.SpriteConfigDirty && !b.SpriteConfigDirty,
+              "capture allocation invalidates an active main-engine sprite consumer");
+        a.SpriteConfigDirty = false;
+        a.NumSprites = 0;
+        b.NumSprites = 1;
+        renderer.AllocCapture(0, 0, 3);
+        Check(!a.SpriteConfigDirty && b.SpriteConfigDirty,
+              "capture allocation invalidates an active sub-engine sprite consumer");
+        b.NumSprites = 0;
+        renderer.AllocCapture(0, 0, 3);
+        Check(b.SpriteConfigDirty, "empty-list optimization preserves pending sprite invalidation");
+        // A later guest OAM write must still start a fresh decode, even if the
+        // previous capture allocation found no sprite consumer.
+        auto& gpu = renderer.GPU;
+        const auto enabled = gpu.ScreensEnabled;
+        const auto oamDirty = gpu.OAMDirty;
+        gpu.ScreensEnabled = false;
+        a.SpriteDispCnt = a.GPU2D.DispCnt;
+        a.SpriteConfigDirty = a.SpriteDirty = false;
+        gpu.WriteOAM<u16>(0, gpu.ReadOAM<u16>(0));
+        a.DrawSprites(0);
+        Check(a.SpriteDirty && !(gpu.OAMDirty & 1),
+              "guest OAM writes still invalidate an empty decoded sprite list");
+        gpu.ScreensEnabled = enabled;
+        gpu.OAMDirty = oamDirty;
+        renderer.Reset();
+        Check(glGetError() == GL_NO_ERROR, "capture sprite invalidation GL state");
+        std::puts("[GL lifetime] capture invalidation: empty, active, pending, later OAM write passed");
+    }
+    static void CaptureColorPrecision(GLRenderer& renderer)
+    {
+        std::vector<u8> input(256*192*4);
+        for(int y=0;y<192;++y) for(int x=0;x<256;++x) {
+            const size_t i=(y*256+x)*4;
+            input[i]=x;input[i+1]=255-x;input[i+2]=(x*17)&255;input[i+3]=(x&1)?255:0;
+        }
+        GLuint texture=0;glGenTextures(1,&texture);glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D,texture);
+        glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAG_FILTER,GL_NEAREST);
+        glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA,256,192,0,GL_RGBA,GL_UNSIGNED_BYTE,input.data());
+        glActiveTexture(GL_TEXTURE1);glBindTexture(GL_TEXTURE_2D_ARRAY,renderer.AuxInputTex);
+        renderer.CaptureConfig={};renderer.CaptureConfig.uInvCaptureSize[0]=1.f/256;
+        renderer.CaptureConfig.uInvCaptureSize[1]=1.f/192;
+        glBindBuffer(GL_UNIFORM_BUFFER,renderer.CaptureConfigUBO);
+        glBufferSubData(GL_UNIFORM_BUFFER,0,sizeof(renderer.CaptureConfig),&renderer.CaptureConfig);
+        glBindBufferBase(GL_UNIFORM_BUFFER,31,renderer.CaptureConfigUBO);
+        const u16 vertices[]={0,192,0,192,256,0,256,0,256,192,256,192,
+                              0,192,0,192,0,0,0,0,256,0,256,0};
+        glBindBuffer(GL_ARRAY_BUFFER,renderer.CaptureVtxBuffer);
+        glBufferSubData(GL_ARRAY_BUFFER,0,sizeof(vertices),vertices);
+        glBindVertexArray(renderer.CaptureVtxArray);glUseProgram(renderer.CaptureShader);
+        glBindFramebuffer(GL_FRAMEBUFFER,renderer.CaptureOutput256FB[0]);
+        glDrawBuffer(GL_COLOR_ATTACHMENT0);glReadBuffer(GL_COLOR_ATTACHMENT0);
+        const int scale=renderer.ScaleFactor;
+        glViewport(0,0,256*scale,256*scale);glDisable(GL_SCISSOR_TEST);
+        glDisable(GL_BLEND);glDisable(GL_DITHER);glColorMask(GL_TRUE,GL_TRUE,GL_TRUE,GL_TRUE);
+        for (bool native : {false,true})
+        {
+            glUniform1i(renderer.CaptureQuantizeRGB555ULoc,native);
+            glDrawArrays(GL_TRIANGLES,0,6);
+            std::vector<u8> result(256*scale*192*scale*4);
+            glReadPixels(0,0,256*scale,192*scale,GL_RGBA,GL_UNSIGNED_BYTE,result.data());
+            for(int y=0;y<192*scale;++y) for(int x=0;x<256*scale;++x)
+                for(int c=0;c<4;++c) {
+                    const u8 source=input[((y/scale)*256+x/scale)*4+c];
+                    Check(result[(y*256*scale+x)*4+c]==(c==3||!native?source:(source&~7)),
+                          "capture keeps enhanced precision and matches RGB555 in native presentation");
+                }
+        }
+        glBindFramebuffer(GL_FRAMEBUFFER,0);glDeleteTextures(1,&texture);
+        Check(glGetError()==GL_NO_ERROR,"capture precision shader GL state");
+        std::puts("[GL lifetime] all 256 capture values: native RGB555 and enhanced precision preserved");
+    }
+    static void CopiedCaptureStorage(GLRenderer& renderer)
+    {
+        renderer.ClearCopiedCaptures();
+        std::vector<u8> bytes(CaptureCopyTracker::ImageBytes, 0xFF);
+        const auto source = renderer.HighResDisplayCaptureFullTex[0];
+        const GLfloat red[] = {1,0,0,1}, blue[] = {0,0,1,1};
+        auto fill = [&](const GLfloat* color) {
+            glBindFramebuffer(GL_DRAW_FRAMEBUFFER, renderer.HighResDisplayCaptureFullFB[0]);
+            glDrawBuffer(GL_COLOR_ATTACHMENT0);glDisable(GL_SCISSOR_TEST);
+            glColorMask(GL_TRUE,GL_TRUE,GL_TRUE,GL_TRUE);glClearBufferfv(GL_COLOR,0,color);
+        };
+        fill(red);
+        const auto slot = renderer.CopiedCaptures.Store(0x18000, bytes.data());
+        Check(renderer.RetainCopiedCaptureProduct(slot,0), "retain copied capture pixels");
+        const auto texture = renderer.CopiedCaptureProducts[slot].Texture;
+        const auto framebuffer = renderer.CopiedCaptureProducts[slot].Framebuffer;
+        const auto created = Textures.Created;
+        fill(blue);
+        Check(renderer.RetainCopiedCaptureProduct(slot,0), "reuse copied capture storage");
+        Check(Textures.Created==created && renderer.CopiedCaptureProducts[slot].Texture==texture,
+              "copied capture refresh reuses its owned allocation");
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, framebuffer);glReadBuffer(GL_COLOR_ATTACHMENT0);
+        std::array<u8,4> pixel{};glReadPixels(0,0,1,1,GL_RGBA,GL_UNSIGNED_BYTE,pixel.data());
+        Check(pixel==std::array<u8,4>{0,0,255,255}, "copied capture contains current source pixels");
+        // Ordinary captures are sufficient when no enhanced 2D product exists.
+        // Keep the source FBO array and the owned 2D snapshot independent.
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, renderer.CaptureOutput256FB[0]);
+        glDrawBuffer(GL_COLOR_ATTACHMENT0);
+        glClearBufferfv(GL_COLOR,0,red);
+        Check(renderer.RetainCopiedCaptureProduct(slot,0,false), "retain ordinary capture without a scaler");
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, framebuffer);glReadBuffer(GL_COLOR_ATTACHMENT0);
+        glReadPixels(0,0,1,1,GL_RGBA,GL_UNSIGNED_BYTE,pixel.data());
+        Check(pixel==std::array<u8,4>{255,0,0,255}, "ordinary capture snapshot uses the correct source");
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, renderer.CaptureOutput256FB[0]);
+        glClearBufferfv(GL_COLOR,0,blue);
+        glBindFramebuffer(GL_READ_FRAMEBUFFER, framebuffer);glReadBuffer(GL_COLOR_ATTACHMENT0);
+        glReadPixels(0,0,1,1,GL_RGBA,GL_UNSIGNED_BYTE,pixel.data());
+        Check(pixel==std::array<u8,4>{255,0,0,255}, "later capture writes cannot overwrite retained pixels");
+        Check(Textures.Created==created, "ordinary and enhanced snapshots reuse the same owned storage");
+        const auto other = renderer.CopiedCaptures.Store(0x38000, bytes.data());
+        FailScratchAllocation=true;
+        Check(!renderer.RetainCopiedCaptureProduct(other,0), "failed copied capture allocation is rejected");
+        FailScratchAllocation=false;
+        while(glGetError()!=GL_NO_ERROR) {}
+        Check(!renderer.CopiedCaptureProducts[other].Texture && !renderer.CopiedCaptureProducts[other].Framebuffer,
+              "failed copied capture allocation releases partial ownership");
+        Check(renderer.RetainCopiedCaptureProduct(other,0), "copied capture allocation can retry");
+        renderer.Reset();
+        Check(!glIsTexture(texture) && !glIsFramebuffer(framebuffer) && glIsTexture(source),
+              "reset deletes copied products without deleting borrowed capture sources");
+        Check(renderer.CopiedCaptures.Get(slot).Generation==0, "reset invalidates copied RAM provenance");
+        const auto resized = renderer.CopiedCaptures.Store(0x18000, bytes.data());
+        Check(renderer.RetainCopiedCaptureProduct(resized,0), "copied capture can restart after reset");
+        const auto oldTexture=renderer.CopiedCaptureProducts[resized].Texture;
+        const int oldScale=renderer.ScaleFactor;
+        renderer.SetScaleFactor(oldScale+1);
+        Check(!glIsTexture(oldTexture) && renderer.CopiedCaptures.Get(resized).Generation==0,
+              "resolution changes invalidate copied products and provenance together");
+        renderer.SetScaleFactor(oldScale);
+        Check(glGetError()==GL_NO_ERROR,"copied capture resource GL state");
+        std::puts("[GL lifetime] copied capture pixels, reuse, failed allocation, reset, resize passed");
+    }
+    static void CopiedWideCaptureStorage(GLRenderer& renderer)
+    {
+        auto& engine = *static_cast<GLRenderer2D*>(renderer.Rend2D_B.get());
+        renderer.ClearCopiedCaptures();
+        std::vector<u8> bytes(CaptureCopyTracker::ImageBytes, 0xFF);
+        const auto slot = renderer.CopiedCaptures.Store(0x18000, bytes.data());
+        auto& product = renderer.CopiedCaptureProducts[slot];
+        auto& state = renderer.WideCapture[0];
+        const WideCaptureStrips strips {WideMelon::Width(), WideMelon::CaptureOverlap()};
+        const int width = WideMelon::Rectangular() ? WideMelon::Width() * renderer.WideSourceScale :
+            WideMelon::Vertical() ? renderer.ScreenW : strips.PackedWidth() * renderer.ScaleFactor;
+        const int height = WideMelon::Rectangular() ? WideMelon::Height() * renderer.WideSourceScale :
+            WideMelon::Vertical() ? (WideMelon::Height()-192+2*WideMelon::VerticalCaptureOverlap()) * renderer.ScaleFactor :
+            renderer.ScreenH;
+        glGenTextures(1, &renderer.WideCaptureTex[0]);
+        glBindTexture(GL_TEXTURE_2D, renderer.WideCaptureTex[0]);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA8,width,height,0,GL_RGBA,GL_UNSIGNED_BYTE,nullptr);
+        glGenFramebuffers(1,&renderer.WideCaptureFB[0]);
+        glBindFramebuffer(GL_FRAMEBUFFER,renderer.WideCaptureFB[0]);
+        glFramebufferTexture2D(GL_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,renderer.WideCaptureTex[0],0);
+        glDrawBuffer(GL_COLOR_ATTACHMENT0);glDisable(GL_SCISSOR_TEST);
+        glColorMask(GL_TRUE,GL_TRUE,GL_TRUE,GL_TRUE);
+        const GLfloat red[]={1,0,0,1},blue[]={0,0,1,1};
+        glClearBufferfv(GL_COLOR,0,red);
+        state.Serial=product.EventSerial=renderer.HighResDisplayCapture256Event[0].Serial=73;
+        state.FullWidth=WideMelon::Vertical();
+        state.HorizontalBorders[50]=1;state.VerticalBorders[80]=2;
+        renderer.RetainCopiedWideCaptureProduct(slot,0);
+        const GLuint owned=product.WideTexture;
+        const size_t allocations=Textures.Created;
+        renderer.RetainCopiedWideCaptureProduct(slot,0);
+        Check(product.WideTexture==owned && Textures.Created==allocations,
+              "copied expanded capture reuses owned storage");
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER,renderer.WideCaptureFB[0]);
+        glClearBufferfv(GL_COLOR,0,blue);
+        state={}; // Reading/reusing the source bank must not affect the RAM copy.
+        glBindFramebuffer(GL_READ_FRAMEBUFFER,product.WideFramebuffer);glReadBuffer(GL_COLOR_ATTACHMENT0);
+        std::array<u8,4> pixel{};glReadPixels(width-1,height-1,1,1,GL_RGBA,GL_UNSIGNED_BYTE,pixel.data());
+        Check(pixel==std::array<u8,4>{255,0,0,255},"copied expanded pixels survive source bank reuse");
+        Check(product.WideState.HorizontalBorders[50]==1 && product.WideState.VerticalBorders[80]==2,
+              "copied margins retain their own border provenance");
+        engine.CopiedBitmapProof.Slot=slot;engine.CopiedBitmapLayer=2;
+        engine.CopiedBitmapAppliedGeneration=renderer.CopiedCaptures.Get(slot).Generation;
+        engine.CopiedBitmapAppliedEvent=73;
+        GLuint texture=0;int layer=-1;
+        Check(renderer.ResolveWideCapture(engine,0,192,layer,texture)==&product.WideState &&
+              texture==owned && layer==2,"verified copied frame selects its own expanded capture");
+        Check(!renderer.ResolveWideCapture(engine,0,191,layer,texture),"partial display cannot borrow a full-frame copy");
+        engine.CopiedBitmapAppliedEvent=74;
+        Check(!renderer.ResolveWideCapture(engine,0,192,layer,texture),"different capture event cannot borrow old margins");
+        engine.CopiedBitmapAppliedEvent=73;
+        renderer.CopiedCaptures.Invalidate(slot);
+        Check(!renderer.ResolveWideCapture(engine,0,192,layer,texture),"overwritten RAM invalidates copied margins");
+        renderer.CopiedCaptures.Store(0x18000,bytes.data());
+        Check(!renderer.ResolveWideCapture(engine,0,192,layer,texture),"slot reuse cannot match a previous generation");
+        // Reusing a slot for a capture without margins must discard old metadata.
+        renderer.RetainCopiedWideCaptureProduct(slot,0);
+        Check(!product.WideState.Serial,"missing wide source clears prior margin provenance");
+        engine.CopiedBitmapAppliedGeneration=renderer.CopiedCaptures.Get(slot).Generation;
+        engine.CopiedBitmapAppliedEvent=product.EventSerial=0;
+        Check(!renderer.ResolveWideCapture(engine,0,192,layer,texture),"missing capture serial cannot expose a reused texture");
+        state.Serial=renderer.HighResDisplayCapture256Event[0].Serial=75;
+        state.FullWidth=WideMelon::Vertical();
+        const auto failed=renderer.CopiedCaptures.Store(0x38000,bytes.data());
+        FailScratchAllocation=true;
+        renderer.RetainCopiedWideCaptureProduct(failed,0);
+        FailScratchAllocation=false;
+        while(glGetError()!=GL_NO_ERROR) {}
+        const auto& failedProduct=renderer.CopiedCaptureProducts[failed];
+        Check(!failedProduct.WideTexture && !failedProduct.WideFramebuffer && !failedProduct.WideState.Serial,
+              "failed expanded snapshot releases partial storage");
+        const GLuint borrowed=renderer.WideCaptureTex[0];
+        renderer.ClearCopiedCaptures();
+        Check(!glIsTexture(owned) && glIsTexture(borrowed),"clearing copied margins leaves capture bank ownership intact");
+        engine.CopiedBitmapAppliedGeneration=0;
+        glBindFramebuffer(GL_FRAMEBUFFER,0);
+        Check(glGetError()==GL_NO_ERROR,"copied expanded capture GL state");
+    }
     static void RectangularBorders(GLRenderer& renderer)
     {
         const int scale=renderer.ScaleFactor,w=WideMelon::Width()*scale,h=WideMelon::Height()*scale;
@@ -1367,6 +1872,14 @@ int RunGLRendererLifetimeTests()
                 settings.ScaleFactor = 2;
                 renderer.SetRenderSettings(settings);
                 GLRendererLifetimeTestAccess::CaptureProbeIsolation(renderer);
+                GLRendererLifetimeTestAccess::PostprocessingNativeArtwork(renderer, false);
+                GLRendererLifetimeTestAccess::PostprocessingNativeArtwork(renderer, true);
+                GLRendererLifetimeTestAccess::BitmapCoveragePriority(renderer);
+                GLRendererLifetimeTestAccess::CaptureSpriteInvalidation(renderer);
+                GLRendererLifetimeTestAccess::CaptureColorPrecision(renderer);
+                GLRendererLifetimeTestAccess::CopiedCaptureStorage(renderer);
+                GLRendererLifetimeTestAccess::BitmapRowReference(renderer, false);
+                GLRendererLifetimeTestAccess::BitmapRowReference(renderer, true);
                 if (!compute) GLRendererLifetimeTestAccess::UniformUploads(renderer);
                 GLRendererLifetimeTestAccess::ResultAlphaScratchStorage(renderer, false);
                 GLRendererLifetimeTestAccess::ResultAlphaScratchStorage(renderer, true);
@@ -1481,6 +1994,8 @@ int RunGLRendererLifetimeTests()
                   "widescreen restart allocates the requested output dimensions");
             if (config.Width==384 && config.Height==288)
                 GLRendererLifetimeTestAccess::RectangularBorders(*renderer);
+            if (WideMelon::Enabled())
+                GLRendererLifetimeTestAccess::CopiedWideCaptureStorage(*renderer);
             nds.reset();
             CheckReleased("widescreen restart");
         }

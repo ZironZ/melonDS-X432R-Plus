@@ -20,6 +20,13 @@ cmake --build build-policy --target policy-tests
 ctest --test-dir build-policy --output-on-failure
 ```
 
+### JIT tests
+
+Frontend builds with `ENABLE_JIT=ON` can enable `BUILD_JIT_TESTS` (defaults to
+`BUILD_DEBUG_EXPORT_TESTS`). Run `ctest --test-dir build -R '^jit-' --output-on-failure`.
+These synthetic CPU tests need no game files or graphics context. See
+[JIT regressions](jit/README.md) for coverage and platform limitations.
+
 ### Renderer and export tests
 
 With the frontend build dependencies installed, enable the additional tests:
@@ -54,6 +61,13 @@ is not the intended result and should be investigated.
 ## What the tests cover
 
 - **Policy tests:** rendering decisions using fixed inputs and expected results.
+- **Audio tests (in policy-tests):** pitch preservation and stereo coherence
+  from 0.5x to 32x, ring overflow and discontinuities, low-pass bypass and
+  attenuation, and pause/resume ramps. These use synthetic signals and need
+  no audio device. A normal-speed sync test also models batched Windows audio
+  callbacks and reproduces the 256-frame buffer's 50 FPS ceiling as a negative
+  control. `tools/audiobench.cpp` additionally measures throughput
+  and stresses the producer/consumer ring on two threads.
 - **Renderer tests:** scaling, transparency reconstruction, combining sprite
   and background pieces, widescreen output, and display capture. They exercise
   the production shaders using generated textures and buffers.

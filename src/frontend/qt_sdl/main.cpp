@@ -67,6 +67,9 @@
 #ifdef BUILD_GL_LIFETIME_TESTS
 int RunGLRendererLifetimeTests();
 #endif
+#ifdef BUILD_JIT_TESTS
+int RunJITRegressionTests(const char* group);
+#endif
 
 #include "Net_PCap.h"
 #include "Net_Slirp.h"
@@ -332,6 +335,12 @@ int main(int argc, char** argv)
     if (argc != 0 && (!strcasecmp(argv[0], "derpDS") || !strcasecmp(argv[0], "./derpDS")))
         printf("did you just call me a derp???\n");
 
+#ifdef BUILD_JIT_TESTS
+    // Synthetic CPU tests need no window, settings, audio, or user game files.
+    for (int i = 1; i < argc; ++i)
+        if (!strncmp(argv[i], "--test-jit-regressions=", 23))
+            return RunJITRegressionTests(argv[i] + 23);
+#endif
     MelonApplication melon(argc, argv);
 #ifdef BUILD_GL_LIFETIME_TESTS
     // The synthetic lifetime test needs Qt and a GL context, but no user config,
@@ -388,7 +397,11 @@ int main(int argc, char** argv)
         Config::GetGlobalTable().GetBool("3D.GL.WidescreenCustom"),
         Config::GetGlobalTable().GetInt("3D.GL.WidescreenAspectWidth"),
         Config::GetGlobalTable().GetInt("3D.GL.WidescreenAspectHeight"),
-        Config::GetGlobalTable().GetInt("3D.GL.WidescreenFOVPercent"));
+        Config::GetGlobalTable().GetInt("3D.GL.WidescreenFOVPercent"),
+        Config::GetGlobalTable().GetInt("3D.GL.WidescreenMethod"),
+        Config::GetGlobalTable().GetInt("3D.GL.WidescreenPatchAspectWidth"),
+        Config::GetGlobalTable().GetInt("3D.GL.WidescreenPatchAspectHeight"),
+        Config::GetGlobalTable().GetBool("3D.GL.WidescreenGameFixes"));
 
     camStarted[0] = false;
     camStarted[1] = false;

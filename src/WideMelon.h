@@ -32,6 +32,11 @@ constexpr int ValidateDisplayTarget(int target)
 inline int Target = Top;
 inline bool ExtendWindows = true;
 inline bool ExpandNarrowBorders = false;
+enum ViewMethod { Off = 0, Renderer = 1, GamePatch = 2 };
+inline int SelectedMethod = Renderer;
+inline int PatchAspectWidth = 16, PatchAspectHeight = 10;
+inline bool GameFixes = false;
+constexpr int ValidateMethod(int method) { return method >= Off && method <= GamePatch ? method : Renderer; }
 constexpr int ValidateHeight(int height)
 {
     return height >= 192 && height <= 768 && height % 2 == 0 ? height : 192;
@@ -74,22 +79,31 @@ struct Configuration
     int Target = Top;
     bool ExtendWindows = true;
     bool ExpandNarrowBorders = false;
+    int Method = Renderer;
+    int PatchWidth = 16, PatchHeight = 10;
+    bool CompatibilityFixes = false;
 
     bool Enabled() const { return Width > 256 || Height > 192; }
+    bool NeedsPresentation() const { return Enabled() || Method == GamePatch; }
     bool operator==(const Configuration& other) const
     {
         return Width == other.Width && Height == other.Height && Target == other.Target &&
-               ExtendWindows == other.ExtendWindows && ExpandNarrowBorders == other.ExpandNarrowBorders;
+               ExtendWindows == other.ExtendWindows && ExpandNarrowBorders == other.ExpandNarrowBorders &&
+               Method == other.Method && PatchWidth == other.PatchWidth && PatchHeight == other.PatchHeight &&
+               CompatibilityFixes == other.CompatibilityFixes;
     }
     bool operator!=(const Configuration& other) const { return !(*this == other); }
 };
 inline Configuration CurrentConfiguration()
 {
-    return {ViewWidth, ViewHeight, Target, ExtendWindows, ExpandNarrowBorders};
+    return {ViewWidth, ViewHeight, Target, ExtendWindows, ExpandNarrowBorders, SelectedMethod,
+        PatchAspectWidth, PatchAspectHeight, GameFixes};
 }
 inline Configuration ResolveConfiguration(int configuredWidth, int displayTarget = Top, int configuredHeight = 192,
                                           bool extendWindows = true, bool expandNarrowBorders = false,
-                                          bool custom = false, int aspectWidth = 4, int aspectHeight = 3, int fovPercent = 100)
+                                          bool custom = false, int aspectWidth = 4, int aspectHeight = 3, int fovPercent = 100,
+                                          int method = Renderer, int patchWidth = 16, int patchHeight = 10,
+                                          bool fixes = false)
 {
     Configuration result;
     if (custom)
@@ -112,6 +126,13 @@ inline Configuration ResolveConfiguration(int configuredWidth, int displayTarget
     result.Target = ValidateDisplayTarget(displayTarget);
     result.ExtendWindows = extendWindows;
     result.ExpandNarrowBorders = expandNarrowBorders;
+    result.Method = ValidateMethod(method);
+    result.PatchWidth = patchWidth;
+    result.PatchHeight = patchHeight;
+    result.CompatibilityFixes = fixes;
+    // A game code owns projection in patch mode. Never compound it with our
+    // expanded geometry, capture surfaces or development environment overrides.
+    if (result.Method != Renderer) { result.Width = 256; result.Height = 192; }
     return result;
 }
 inline void ApplyConfiguration(const Configuration& config)
@@ -121,15 +142,23 @@ inline void ApplyConfiguration(const Configuration& config)
     Target = config.Target;
     ExtendWindows = config.ExtendWindows;
     ExpandNarrowBorders = config.ExpandNarrowBorders;
+    SelectedMethod = config.Method;
+    PatchAspectWidth = config.PatchWidth;
+    PatchAspectHeight = config.PatchHeight;
+    GameFixes = config.CompatibilityFixes;
 }
 inline void Configure(int configuredWidth, int displayTarget = Top, int configuredHeight = 192,
                       bool extendWindows = true, bool expandNarrowBorders = false,
-                      bool custom = false, int aspectWidth = 4, int aspectHeight = 3, int fovPercent = 100)
+                      bool custom = false, int aspectWidth = 4, int aspectHeight = 3, int fovPercent = 100,
+                      int method = Renderer, int patchWidth = 16, int patchHeight = 10,
+                      bool fixes = false)
 {
     ApplyConfiguration(ResolveConfiguration(configuredWidth, displayTarget, configuredHeight,
                                             extendWindows, expandNarrowBorders,
-                                            custom, aspectWidth, aspectHeight, fovPercent));
+                                            custom, aspectWidth, aspectHeight, fovPercent,
+                                            method, patchWidth, patchHeight, fixes));
 }
+inline bool NeedsPresentation() { return CurrentConfiguration().NeedsPresentation(); }
 inline int Width() { return ViewWidth; }
 inline int Height() { return ViewHeight; }
 inline bool Vertical() { return Height() > 192; }

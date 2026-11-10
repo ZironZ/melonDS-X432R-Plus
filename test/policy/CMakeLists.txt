@@ -1,10 +1,13 @@
 add_executable(policy-tests
     PolicyTestHarness.h
     PolicyTestMain.cpp
+    AudioProcessingTests.cpp
     AffineReconstructionSettingsTests.cpp
     TextureAlphaSettingsTests.cpp
     BGVRAMUploadCacheTests.cpp
     BGArtworkCacheTests.cpp
+    BitmapRowStagingTests.cpp
+    CaptureCopyTrackerTests.cpp
     CapturePolicyTests.cpp
     CleanLegacyEligibilityTests.cpp
     CompositorInputPolicyTests.cpp
@@ -18,6 +21,7 @@ add_executable(policy-tests
     TextureReconstructionTests.cpp
     TextureCacheLifetimeTests.cpp
     WidescreenProfileTests.cpp
+    WideGamePatchTests.cpp
     WideWindowPolicyTests.cpp
     WideDisplayPolicyTests.cpp
     WideCapturePolicyTests.cpp

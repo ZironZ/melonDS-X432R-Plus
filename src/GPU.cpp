@@ -302,12 +302,12 @@ void GPU::DoSavestate(Savestate* file) noexcept
     GPU2D_B.DoSavestate(file);
     GPU3D.DoSavestate(file);
 
-    if (!file->Saving)
-    {
-        ResetVRAMCache();
-        OAMDirty = 0x3;
-        PaletteDirty = 0x5F;
-    }
+    // PostSavestate resets the OpenGL renderer after both saves and loads.
+    // Repopulate its discarded source caches even when saving did not change
+    // guest memory, including palettes and VRAM that the game leaves alone.
+    ResetVRAMCache();
+    OAMDirty = 0x3;
+    PaletteDirty = 0x5F;
 
     Rend->PostSavestate();
 }
@@ -1685,6 +1685,17 @@ int GPU::GetCaptureBlock_LCDC(u32 offset)
     if (flags & CBFlag_IsCapture)
         return ((offset >> 15) & 0xC) | (flags & 0x3);
     return -1;
+}
+
+bool GPU::IsCompleteCaptureCopy(u32 source, u32 bytes) const
+{
+    if (source < 0x06800000 || source >= 0x06880000 ||
+        (source & 0x1FFFF) != 0 || bytes != 256 * 192 * 2) return false;
+    const u32 bank = (source - 0x06800000) >> 17;
+    const u16 flags = VRAMCaptureBlockFlags[bank << 2];
+    return (VRAMMap_LCDC & (1u << bank)) &&
+        (flags & (CBFlag_IsCapture | CBFlag_Complete)) == (CBFlag_IsCapture | CBFlag_Complete) &&
+        (flags & 3) == 0 && ((flags >> 6) & 3) == 3;
 }
 
 bool GPU::HasUnsyncedVRAMCaptureBlock(u32 block) const

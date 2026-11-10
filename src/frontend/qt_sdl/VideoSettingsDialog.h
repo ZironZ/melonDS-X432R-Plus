@@ -135,9 +135,20 @@ private slots:
 
     void on_cbSoftwareThreaded_stateChanged(int state);
 private:
+    static void setControlHelp(QWidget* widget, const QString& text);
     bool computeShadersAvailable = true;
     void configureComputeOptions();
     QComboBox* widescreenCombo = nullptr;
+    QComboBox* widescreenMethodCombo = nullptr;
+    QLabel* widescreenMethodDescription = nullptr;
+    QWidget* widescreenRendererControls = nullptr;
+    QWidget* widescreenPatchControls = nullptr;
+    QComboBox* widescreenPatchRatio = nullptr;
+    QWidget* widescreenPatchCustomControls = nullptr;
+    QSpinBox* widescreenPatchWidth = nullptr;
+    QSpinBox* widescreenPatchHeight = nullptr;
+    QCheckBox* widescreenGameFixes = nullptr;
+    QLabel* widescreenPatchStatus = nullptr;
     QComboBox* widescreenDisplayCombo = nullptr;
     QCheckBox* widescreenExtendWindows = nullptr;
     QCheckBox* widescreenExpandNarrowBorders = nullptr;

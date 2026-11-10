@@ -46,6 +46,43 @@ enum class WholeSceneRenderPath
     StrictAffineHighRes,
 };
 
+// Copied captures preserve a renderer product; the consumer decides where its
+// ordinary 2D overlay belongs. This is independent of the scaler being enabled.
+enum class CopiedBitmapPresentation
+{
+    Unsupported,
+    Compositor,
+    UpscaledNative,
+    PhysicalNative,
+};
+
+constexpr CopiedBitmapPresentation CopiedBitmapPresentationFor(WholeSceneRenderPath path)
+{
+    switch (path)
+    {
+    case WholeSceneRenderPath::Current:
+    case WholeSceneRenderPath::HighResCompositor:
+        return CopiedBitmapPresentation::Compositor;
+    case WholeSceneRenderPath::LegacyNativeUpscale:
+    case WholeSceneRenderPath::FinalNativeUpscale:
+    case WholeSceneRenderPath::OverlayOperatorUpscale:
+    case WholeSceneRenderPath::ConservativeHybridUpscale:
+        return CopiedBitmapPresentation::UpscaledNative;
+    case WholeSceneRenderPath::PhysicalFinalPostprocessInput:
+        return CopiedBitmapPresentation::PhysicalNative;
+    default:
+        return CopiedBitmapPresentation::Unsupported;
+    }
+}
+
+constexpr bool CanStageBitmapRows(WholeSceneRenderPath path, int sourceFilter)
+{
+    // A row stream contains the pixels consumed on each scanline, not the
+    // same-time neighbouring source rows needed by source-space filtering.
+    return sourceFilter == 0 &&
+        CopiedBitmapPresentationFor(path) != CopiedBitmapPresentation::Unsupported;
+}
+
 enum class WholeSceneCurrentPathReason
 {
     None,

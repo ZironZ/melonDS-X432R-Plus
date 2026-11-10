@@ -25,6 +25,7 @@
 
 #include "OpenGLSupport.h"
 #include "GPU.h"
+#include "CaptureCopyTracker.h"
 #include "GPU2D_OpenGL.h"
 #include "GPU3D_OpenGL.h"
 #include "GPU3D_Compute.h"
@@ -56,6 +57,7 @@ public:
 
     void AllocCapture(u32 bank, u32 start, u32 len) override;
     void SetVRAMCaptureSyncReason(u32 reason) override;
+    void NotifyDMA9Copy(u32 source, u32 destination, u32 bytes) override;
     void NotifyVRAMWrite(u32 bank, u32 offset, u32 bytes, bool changed) override;
     void SyncVRAMCapture(u32 bank, u32 start, u32 len, bool complete, bool invalidate) override;
 
@@ -160,6 +162,8 @@ private:
                                  bool raw, int ystart, int yend, WideWindowRow (&windows)[448]);
     int FindWideCapture(const GLRenderer2D& renderer, int ystart, int yend, int& layer) const;
     int FindWideVRAMDisplay(u32 dispCnt) const;
+    const WideCaptureState* ResolveWideCapture(const GLRenderer2D& renderer,
+        int ystart, int yend, int& layer, GLuint& texture) const;
     void CopyWideCenter();
     GLuint OutputTex2D[2] {}; // Borrowed from the two 2D renderers.
 
@@ -364,6 +368,20 @@ private:
     GLuint HighResDisplayCaptureFullTex[4] {};
     GLuint HighResDisplayCaptureFullFB[4] {};
     GLuint HighResDisplayCaptureFullReadFB {};
+    CaptureCopyTracker CopiedCaptures;
+    struct CopiedCaptureProduct
+    {
+        GLuint Texture = 0, Framebuffer = 0;
+        GLuint WideTexture = 0, WideFramebuffer = 0;
+        int WideWidth = 0, WideHeight = 0;
+        WideCaptureState WideState {};
+        u64 EventSerial = 0;
+        u32 Bank = 0;
+    };
+    std::array<CopiedCaptureProduct, CaptureCopyTracker::Capacity> CopiedCaptureProducts;
+    void ClearCopiedCaptures();
+    bool RetainCopiedCaptureProduct(size_t slot, u32 bank, bool enhanced = true);
+    void RetainCopiedWideCaptureProduct(size_t slot, u32 bank);
 
     struct sCaptureBackgroundEpoch
     {
@@ -446,6 +464,7 @@ private:
     std::atomic_bool WholeSceneDebugViewsActive;
 
     GLuint CaptureShader {};
+    GLint CaptureQuantizeRGB555ULoc {};
     GLuint CaptureConfigUBO {};
 
     GLuint CaptureVtxBuffer {};

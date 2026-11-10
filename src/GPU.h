@@ -151,6 +151,7 @@ public:
     }
 
     int GetCaptureBlock_LCDC(u32 offset);
+    bool IsCompleteCaptureCopy(u32 source, u32 bytes) const;
     bool HasUnsyncedVRAMCaptureBlock(u32 block) const;
     void SyncVRAMCaptureBlockForRead(u32 block);
     void NotifyVRAMWrite(u32 bank, u32 offset, u32 bytes, bool changed) noexcept;
@@ -900,6 +901,7 @@ public:
     virtual void AllocCapture(u32 bank, u32 start, u32 len) = 0;
     virtual void SetVRAMCaptureSyncReason(u32 reason) {}
     virtual void NotifyVRAMWrite(u32 bank, u32 offset, u32 bytes, bool changed) {}
+    virtual void NotifyDMA9Copy(u32 source, u32 destination, u32 bytes) {}
     virtual void SyncVRAMCapture(u32 bank, u32 start, u32 len, bool complete, bool invalidate) = 0;
 
     // a renderer may render to RAM buffers, or to something else (ie. OpenGL)

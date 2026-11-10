@@ -1,6 +1,7 @@
 #version 140
 
 uniform sampler2D InputTexA;
+uniform bool uQuantizeRGB555;
 uniform sampler2DArray InputTexB;
 
 layout(std140) uniform ubCaptureConfig
@@ -69,5 +70,8 @@ void main()
         cap_out.a = (eva>0 ? aa : 0) | (evb>0 ? ab : 0);
     }
 
+    // Native presentation follows RGB555 storage. Enhanced capture products
+    // retain their extra precision, including across copies through main RAM.
+    if (uQuantizeRGB555) cap_out.rgb = (cap_out.rgb >> 3) << 3;
     oColor = vec4(vec3(cap_out.rgb) / 255.0, (cap_out.a>0) ? 1.0 : 0.0);
 }

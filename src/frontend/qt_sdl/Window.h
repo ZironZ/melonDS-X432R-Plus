@@ -92,6 +92,9 @@ public:
     void updateVideoSettings(bool glchange) { onUpdateVideoSettings(glchange); }
 
 protected:
+#ifdef Q_OS_WIN
+    bool eventFilter(QObject* object, QEvent* event) override;
+#endif
     void keyPressEvent(QKeyEvent* event) override;
     void keyReleaseEvent(QKeyEvent* event) override;
 
@@ -199,6 +202,10 @@ private slots:
 
 private:
     virtual void closeEvent(QCloseEvent* event) override;
+
+    // the part of the interface settings a new window has to pick up. kept out
+    // of the slot because that one also touches audio, which needs a pause.
+    void applyInterfaceSettings();
 
     QStringList currentROM;
     QStringList currentGBAROM;

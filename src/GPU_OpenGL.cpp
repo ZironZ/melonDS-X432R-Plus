@@ -156,6 +156,8 @@ bool GLRenderer::Init()
                                               {{"oColor", 0}}))
         return false;
 
+    CaptureQuantizeRGB555ULoc = glGetUniformLocation(CaptureShader, "uQuantizeRGB555");
+
     // vertex buffers
     if (WideMelon::Enabled())
     {
@@ -474,6 +476,7 @@ GLRenderer::~GLRenderer()
     delete[] AuxInputBuffer[0];
     delete[] AuxInputBuffer[1];
 
+    ClearCopiedCaptures();
     glDeleteTextures(1, &CaptureOutput256Tex);
     glDeleteFramebuffers(4, CaptureOutput256FB);
     glDeleteTextures(1, &CaptureOutput128Tex);
@@ -502,6 +505,7 @@ GLRenderer::~GLRenderer()
 
 void GLRenderer::Reset()
 {
+    ClearCopiedCaptures();
     for (auto& capture : WideCapture) capture = {};
     std::fill(std::begin(WideFeedbackSerial), std::end(WideFeedbackSerial), 0);
     memset(&FinalPassConfig, 0, sizeof(FinalPassConfig));
@@ -609,6 +613,7 @@ void GLRenderer::PostSavestate()
 
 void GLRenderer::SetRenderSettings(RendererSettings& settings)
 {
+    ClearCopiedCaptures();
     settings.ApplyComputeShaderSupport(GLAD_GL_VERSION_4_3);
     SetScaleFactor(settings.ScaleFactor);
     PhysicalFinalUpscale =
@@ -667,6 +672,7 @@ void GLRenderer::SetScaleFactor(int scale)
     if (scale == ScaleFactor)
         return;
 
+    ClearCopiedCaptures();
     ScaleFactor = scale;
     ScreenW = 256 * scale;
     ScreenH = 192 * scale;
@@ -985,6 +991,9 @@ void GLRenderer::DrawSprites(u32 line)
 
 void GLRenderer::Start3DRendering()
 {
+    // VCOUNT writes can reach a 3D update before the usual VBlank flush.
+    // Consume retained 2D rows while their live 3D source is still current.
+    static_cast<GLRenderer2D*>(Rend2D_A.get())->FlushBitmapRowsBeforeGap(-1);
     const auto phaseStart = std::chrono::steady_clock::now();
     Rend3D->RenderFrame();
     bool output3DUpdated = true;
@@ -1007,6 +1016,9 @@ void GLRenderer::Finish3DRendering()
 
 void GLRenderer::Restart3DRendering()
 {
+    // VCOUNT writes can reach a 3D update before the usual VBlank flush.
+    // Consume retained 2D rows while their live 3D source is still current.
+    static_cast<GLRenderer2D*>(Rend2D_A.get())->FlushBitmapRowsBeforeGap(-1);
     const auto phaseStart = std::chrono::steady_clock::now();
     Rend3D->RestartFrame();
     AddWholeScenePhaseTiming(WholeSceneFrameTiming.Restart3D, ElapsedUS(phaseStart));
@@ -1804,9 +1816,13 @@ void GLRenderer::RenderScreen(int ystart, int yend)
     if (CanRenderPhysicalFinalUpscaleForRange(ystart, yend))
     {
         const GLuint nativeMainInput =
-            PhysicalFinalNativeInputValid[0] ? rendA->NativeOutputTex : OutputTex2D[0];
+            PhysicalFinalNativeInputValid[0] ?
+                (rendA->CopiedBitmapNativePresentationValid ?
+                    rendA->CopiedBitmapNativePresentationTex : rendA->NativeOutputTex) : OutputTex2D[0];
         const GLuint nativeSubInput =
-            PhysicalFinalNativeInputValid[1] ? rendB->NativeOutputTex : OutputTex2D[1];
+            PhysicalFinalNativeInputValid[1] ?
+                (rendB->CopiedBitmapNativePresentationValid ?
+                    rendB->CopiedBitmapNativePresentationTex : rendB->NativeOutputTex) : OutputTex2D[1];
         RenderFinalPassToFramebuffer(ystart, yend,
                                      NativeFPOutputFB[backbuf],
                                      256, 192, 1,
@@ -2035,7 +2051,7 @@ void GLRenderer::RenderRectangularWings(int ystart, int yend)
 {
     GLuint textures[2] = {};
     int modes[2] = {};
-    int captureBanks[2] = {-1,-1};
+    const WideCaptureState* captureStates[2] = {};
     WideWindowRow windows[448] = {};
     for (int engine = 0; engine < 2; ++engine)
     {
@@ -2058,24 +2074,27 @@ void GLRenderer::RenderRectangularWings(int ystart, int yend)
             }
             else
             {
-                bank = FindWideCapture(renderer, ystart, yend, layer);
-                if (bank < 0) continue;
+                captureStates[engine] = ResolveWideCapture(renderer, ystart, yend, layer, textures[engine]);
+                if (!captureStates[engine]) continue;
                 modes[engine] = 2;
             }
         }
-        if (bank >= 0) textures[engine] = WideCaptureTex[bank];
-        captureBanks[engine] = bank;
+        if (bank >= 0)
+        {
+            textures[engine] = WideCaptureTex[bank];
+            captureStates[engine] = &WideCapture[bank];
+        }
         if (modes[engine]) BuildRectangularWindows(renderer, layer, engine, modes[engine] == 3,
                                                   ystart, yend, windows);
     }
     for (int engine = 0; engine < 2; ++engine)
     {
-        const int bank = captureBanks[engine];
+        const auto* capturedState = captureStates[engine];
         auto fill = [&](int index, int side, u8 capturedBorders) {
-            const u32 captured = bank < 0 ? 0 : WideEdgeVisible |
+            const u32 captured = !capturedState ? 0 : WideEdgeVisible |
                 ((capturedBorders & (1u << side)) ? WideNarrowBorder : 0);
             return modes[engine] && ShouldFillWideNarrowBorder(windows[index].Current[engine*2+side],
-                captured, bank >= 0);
+                captured, capturedState != nullptr);
         };
         for (int y = ystart; y < yend; ++y)
         {
@@ -2083,7 +2102,7 @@ void GLRenderer::RenderRectangularWings(int ystart, int yend)
             WideNarrowBorderRows[y][screen] = 0;
             if (WideMelon::WidenDisplay(screen))
                 for (int side = 0; side < 2; ++side)
-                    if (fill(y, side, bank < 0 ? 0 : WideCapture[bank].HorizontalBorders[y]))
+                    if (fill(y, side, !capturedState ? 0 : capturedState->HorizontalBorders[y]))
                         WideNarrowBorderRows[y][screen] |= 1u << side;
         }
         for (int side = 0; side < 2; ++side)
@@ -2095,7 +2114,7 @@ void GLRenderer::RenderRectangularWings(int ystart, int yend)
             {
                 WideNarrowBorderColumns[x][screen] &= ~(1u << side);
                 if (WideMelon::WidenDisplay(screen) &&
-                    fill(192+x, side, bank < 0 ? 0 : WideCapture[bank].VerticalBorders[x]))
+                    fill(192+x, side, !capturedState ? 0 : capturedState->VerticalBorders[x]))
                     WideNarrowBorderColumns[x][screen] |= 1u << side;
             }
         }
@@ -2267,7 +2286,7 @@ void GLRenderer::RenderVerticalWings(int ystart, int yend)
 {
     GLuint textures[2] = {};
     int modes[2] = {};
-    int captureBanks[2] = {-1, -1};
+    const WideCaptureState* captureStates[2] = {};
     WideWindowRow windows[256] = {};
     for (int engine = 0; engine < 2; ++engine)
     {
@@ -2290,13 +2309,16 @@ void GLRenderer::RenderVerticalWings(int ystart, int yend)
             }
             else
             {
-                bank = FindWideCapture(renderer, ystart, yend, layer);
-                if (bank < 0) continue;
+                captureStates[engine] = ResolveWideCapture(renderer, ystart, yend, layer, textures[engine]);
+                if (!captureStates[engine]) continue;
                 modes[engine] = 2;
             }
         }
-        if (bank >= 0) textures[engine] = WideCaptureTex[bank];
-        captureBanks[engine] = bank;
+        if (bank >= 0)
+        {
+            textures[engine] = WideCaptureTex[bank];
+            captureStates[engine] = &WideCapture[bank];
+        }
         const auto* rows = renderer.ScanlineConfig.uScanline;
         const bool expandBorder = ystart == 0 && yend == 192 && CanExpandVerticalNarrowBorder(rows);
         for (int x = 0; x < 256; ++x)
@@ -2316,9 +2338,9 @@ void GLRenderer::RenderVerticalWings(int ystart, int yend)
                 for (int engine = 0; engine < 2; ++engine)
                 {
                     const int screen = FinalPassConfig.uScreenSwap[y] ? engine : 1 - engine;
-                    const int bank = captureBanks[engine];
-                    const u32 capturedPolicy = bank < 0 ? 0 : WideEdgeVisible |
-                        ((WideCapture[bank].VerticalBorders[x] & (1u << side)) ? WideNarrowBorder : 0);
+                    const auto* capturedState = captureStates[engine];
+                    const u32 capturedPolicy = !capturedState ? 0 : WideEdgeVisible |
+                        ((capturedState->VerticalBorders[x] & (1u << side)) ? WideNarrowBorder : 0);
                     WideNarrowBorderColumns[x][screen] &= ~(1u << side);
                     if (WideMelon::WidenDisplay(screen) && modes[engine] &&
                         ShouldFillWideNarrowBorder(windows[x].Current[engine * 2 + side],
@@ -2729,6 +2751,32 @@ int GLRenderer::FindWideCapture(const GLRenderer2D& renderer,
     return bank;
 }
 
+const GLRenderer::WideCaptureState* GLRenderer::ResolveWideCapture(const GLRenderer2D& renderer,
+    int ystart, int yend, int& layer, GLuint& texture) const
+{
+    // The center overlay has already verified every consumed row and the
+    // presentation state. Never infer a copied source from a similar image.
+    if (ystart == 0 && yend == 192 && renderer.CopiedBitmapAppliedGeneration)
+    {
+        const auto slot = renderer.CopiedBitmapProof.Slot;
+        const auto& record = CopiedCaptures.Get(slot);
+        const auto& product = CopiedCaptureProducts[slot];
+        if (record.Generation == renderer.CopiedBitmapAppliedGeneration &&
+            product.EventSerial == renderer.CopiedBitmapAppliedEvent &&
+            product.WideTexture && product.WideState.Serial &&
+            product.WideState.Serial == product.EventSerial)
+        {
+            layer = renderer.CopiedBitmapLayer;
+            texture = product.WideTexture;
+            return &product.WideState;
+        }
+    }
+    const int bank = FindWideCapture(renderer, ystart, yend, layer);
+    if (bank < 0) return nullptr;
+    texture = WideCaptureTex[bank];
+    return &WideCapture[bank];
+}
+
 void GLRenderer::RenderWideWings(int ystart, int yend)
 {
     if (WideMelon::Rectangular()) { RenderRectangularWings(ystart, yend); return; }
@@ -2743,14 +2791,15 @@ void GLRenderer::RenderWideWings(int ystart, int yend)
         const u32 dispCnt = engine ? DispCntB : DispCntA;
         if (!GPU.ScreensEnabled || !renderer.GPU2D.Enabled || renderer.GPU2D.ForcedBlank) continue;
         int layer = 0;
-        int captureBank = -1;
+        const WideCaptureState* capturedState = nullptr;
         const bool directVRAM = engine == 0 && ((dispCnt >> 16) & 3) == 2;
         if (directVRAM)
         {
-            captureBank = FindWideVRAMDisplay(dispCnt);
+            const int captureBank = FindWideVRAMDisplay(dispCnt);
             if (captureBank < 0) continue;
             textures[engine] = WideCaptureTex[captureBank];
-            modes[engine] = WideCapture[captureBank].FullWidth ? 3 : 2;
+            capturedState = &WideCapture[captureBank];
+            modes[engine] = capturedState->FullWidth ? 3 : 2;
         }
         else if (((dispCnt >> 16) & 3) != 1) continue;
         else if (engine == 0 && WideOutputTex3D && (dispCnt & 0x108) == 0x108)
@@ -2760,11 +2809,9 @@ void GLRenderer::RenderWideWings(int ystart, int yend)
         }
         else
         {
-            const int bank = FindWideCapture(renderer, ystart, yend, layer);
-            if (bank < 0) continue;
-            textures[engine] = WideCaptureTex[bank];
-            modes[engine] = WideCapture[bank].FullWidth ? 3 : 2;
-            captureBank = bank;
+            capturedState = ResolveWideCapture(renderer, ystart, yend, layer, textures[engine]);
+            if (!capturedState) continue;
+            modes[engine] = capturedState->FullWidth ? 3 : 2;
         }
         for (int y = ystart; y < yend; ++y)
             for (int side = 0; side < 2; ++side)
@@ -2772,8 +2819,8 @@ void GLRenderer::RenderWideWings(int ystart, int yend)
                 windows[y].Current[engine * 2 + side] = directVRAM ? WideEdgeVisible : MakeWideWindowEdgePolicy(
                     renderer.ScanlineConfig.uScanline[y], layer, side != 0,
                     renderer.ScanlineConfig.uScanline[y].OBJWindowEnabled != 0);
-                if (captureBank >= 0)
-                    windows[y].Captured[engine * 2 + side] = WideCapture[captureBank].EdgePolicy[y][side];
+                if (capturedState)
+                    windows[y].Captured[engine * 2 + side] = capturedState->EdgePolicy[y][side];
             }
         if (modes[engine] == 1 && WideMelon::ExtendWindows)
         {
@@ -3065,6 +3112,7 @@ void GLRenderer::DoCapture(int ystart, int yend)
         yend = dstheight;
 
     glUseProgram(CaptureShader);
+    glUniform1i(CaptureQuantizeRGB555ULoc, ScaleFactor == 1);
 
     GLuint inputA;
     if (srcA)
@@ -3457,10 +3505,13 @@ void GLRenderer::AllocCapture(u32 bank, u32 start, u32 len)
 
     auto rend2D = dynamic_cast<GLRenderer2D*>(Rend2D_A.get());
     rend2D->LayerConfigDirty = true;
-    rend2D->SpriteConfigDirty = true;
+    // Capture remapping can change decoded capture-backed sprites. An empty
+    // decoded list has no capture consumer; later OAM/display changes still
+    // invalidate it normally. Preserve an already-pending invalidation.
+    if (rend2D->NumSprites != 0) rend2D->SpriteConfigDirty = true;
     rend2D = dynamic_cast<GLRenderer2D*>(Rend2D_B.get());
     rend2D->LayerConfigDirty = true;
-    rend2D->SpriteConfigDirty = true;
+    if (rend2D->NumSprites != 0) rend2D->SpriteConfigDirty = true;
 }
 
 void GLRenderer::DownscaleCapture(int width, int height, int layer)
@@ -3586,6 +3637,174 @@ void GLRenderer::NotifyVRAMWrite(u32 bank, u32 offset, u32 bytes, bool changed)
         epoch.DirtyYStart = std::min(epoch.DirtyYStart, dirtyYStart);
         epoch.DirtyYEnd = std::max(epoch.DirtyYEnd, dirtyYEnd);
     }
+}
+
+void GLRenderer::ClearCopiedCaptures()
+{
+    CopiedCaptures.Reset();
+    for (auto* engine : {Rend2D_A.get(), Rend2D_B.get()})
+        if (engine)
+            static_cast<GLRenderer2D*>(engine)->CopiedBitmapNativePresentationValid = false;
+    for (auto& product : CopiedCaptureProducts)
+    {
+        glDeleteTextures(1, &product.Texture);
+        glDeleteFramebuffers(1, &product.Framebuffer);
+        glDeleteTextures(1, &product.WideTexture);
+        glDeleteFramebuffers(1, &product.WideFramebuffer);
+        product = {};
+    }
+}
+
+void GLRenderer::NotifyDMA9Copy(u32 source, u32 destination, u32 bytes)
+{
+    if (ScaleFactor <= 1 && !WideMelon::Enabled()) return;
+
+    if ((destination >> 24) == 6 && destination < 0x06400000)
+    {
+        // Any DMA overwrite removes a prior row link, including untracked input.
+        CopiedCaptures.NoteCopy((source >> 24) == 2 ? source & GPU.NDS.MainRAMMask : 0xFFFFFFFFu,
+                                destination, bytes);
+        return;
+    }
+    if ((destination >> 24) == 2)
+        CopiedCaptures.InvalidateRAMRange(destination & GPU.NDS.MainRAMMask, bytes);
+    if ((destination >> 24) != 2 || (destination & 1) ||
+        !GPU.IsCompleteCaptureCopy(source, bytes)) return;
+    const u32 address = destination & GPU.NDS.MainRAMMask;
+    if (static_cast<u64>(address) + bytes > static_cast<u64>(GPU.NDS.MainRAMMask) + 1) return;
+    // Avoid retaining GPU copies for indexed streams and unrelated readbacks.
+    // Unsupported consumers remain native; no interpretation of RAM is guessed.
+    bool hasBitmapConsumer = false;
+    for (const auto* consumer : {static_cast<const GLRenderer2D*>(Rend2D_A.get()),
+                                static_cast<const GLRenderer2D*>(Rend2D_B.get())})
+        for (int layer = 2; layer < 4; ++layer)
+        {
+            const auto& cfg = consumer->LayerConfig.uBGConfig[layer];
+            hasBitmapConsumer |= (consumer->LayerEnable & (1u << layer)) &&
+                cfg.Type == 5 && cfg.Size[0] == 256 && cfg.Size[1] == 256;
+        }
+    if (!hasBitmapConsumer) return;
+    const u32 bank = (source - 0x06800000) >> 17;
+    const auto& event = HighResDisplayCapture256Event[bank];
+    const auto* renderer = static_cast<const GLRenderer2D*>(Rend2D_A.get());
+    const bool enhanced = renderer->WholeSceneScaleRequested && renderer->WholeSceneScaleCaptureBacked &&
+        IsFullDisplayHighResCaptureEventRecord(event, bank) &&
+        event.RejectReason == HighResCaptureRejectReason::None &&
+        (event.ProductMask & HighResCaptureProductFullEquivalent) && HighResDisplayCaptureFullTex[bank];
+    // The ordinary high-resolution capture exists even with 2D scaling off.
+    // It is sufficient for fidelity; optional enhanced products are separate.
+    if (!enhanced && (!CaptureOutput256Valid[bank] ||
+        !IsFullDisplaySourceACaptureRecord(LastDisplayCapture256Debug[bank], bank))) return;
+    const auto* data = GPU.NDS.MainRAM + address;
+    // A full opaque bitmap can be reconstructed with the existing black/white
+    // overlay endpoints. Transparent captures retain the ordinary native route.
+    for (u32 i = 1; i < bytes; i += 2) if (!(data[i] & 0x80)) return;
+
+    const size_t slot = CopiedCaptures.Store(address, data);
+    auto& product = CopiedCaptureProducts[slot];
+    if (!RetainCopiedCaptureProduct(slot, bank, enhanced))
+    {
+        CopiedCaptures.Invalidate(slot);
+        return;
+    }
+    product.EventSerial = event.Serial;
+    product.Bank = bank;
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+}
+
+
+bool GLRenderer::RetainCopiedCaptureProduct(size_t slot, u32 bank, bool enhanced)
+{
+    auto& product = CopiedCaptureProducts[slot];
+    if (!product.Texture)
+    {
+        glGenTextures(1, &product.Texture);
+        glBindTexture(GL_TEXTURE_2D, product.Texture);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, ScreenW, ScreenH, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+        glGenFramebuffers(1, &product.Framebuffer);
+        glBindFramebuffer(GL_DRAW_FRAMEBUFFER, product.Framebuffer);
+        glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, product.Texture, 0);
+        glDrawBuffer(GL_COLOR_ATTACHMENT0);
+    }
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, enhanced ? HighResDisplayCaptureFullFB[bank] : CaptureOutput256FB[bank]);
+    glReadBuffer(GL_COLOR_ATTACHMENT0);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, product.Framebuffer);
+    glDisable(GL_SCISSOR_TEST);
+    if (glCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
+    {
+        glDeleteTextures(1, &product.Texture);
+        glDeleteFramebuffers(1, &product.Framebuffer);
+        glDeleteTextures(1, &product.WideTexture);
+        glDeleteFramebuffers(1, &product.WideFramebuffer);
+        product = {};
+        glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        return false;
+    }
+    glBlitFramebuffer(0, 0, ScreenW, ScreenH, 0, 0, ScreenW, ScreenH, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    RetainCopiedWideCaptureProduct(slot, bank);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+    return true;
+}
+
+// Expanded pixels belong to the same capture generation as the native copy.
+// Retain owned storage before a VRAM read invalidates/reuses the original bank.
+void GLRenderer::RetainCopiedWideCaptureProduct(size_t slot, u32 bank)
+{
+    auto& product = CopiedCaptureProducts[slot];
+    product.WideState = {};
+    const auto& state = WideCapture[bank];
+    if (!WideMelon::Enabled() || !WideCaptureTex[bank] || !state.Serial ||
+        state.Serial != HighResDisplayCapture256Event[bank].Serial) return;
+    const bool rectangular = WideMelon::Rectangular();
+    const bool vertical = WideMelon::Vertical();
+    const WideCaptureStrips strips {WideMelon::Width(), WideMelon::CaptureOverlap()};
+    const int width = rectangular ? WideMelon::Width() * WideSourceScale :
+        vertical ? ScreenW : state.FullWidth ? WideMelon::Width() * WideSourceScale :
+        strips.PackedWidth() * ScaleFactor;
+    const int height = rectangular ? WideMelon::Height() * WideSourceScale :
+        vertical ? (WideMelon::Height() - 192 + 2 * WideMelon::VerticalCaptureOverlap()) * ScaleFactor :
+        192 * (state.FullWidth ? WideSourceScale : ScaleFactor);
+    if (!product.WideTexture || product.WideWidth != width || product.WideHeight != height)
+    {
+        // A failed resize must not leave an older, complete texture attached.
+        glDeleteTextures(1, &product.WideTexture);
+        glGenTextures(1, &product.WideTexture);
+        if (!product.WideFramebuffer) glGenFramebuffers(1, &product.WideFramebuffer);
+        glBindTexture(GL_TEXTURE_2D, WideCaptureTex[bank]);
+        GLint minFilter, magFilter;
+        glGetTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, &minFilter);
+        glGetTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, &magFilter);
+        glBindTexture(GL_TEXTURE_2D, product.WideTexture);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, minFilter);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, magFilter);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+        product.WideWidth = width;
+        product.WideHeight = height;
+    }
+    if (!WideCaptureReadFB) glGenFramebuffers(1, &WideCaptureReadFB);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, WideCaptureReadFB);
+    glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, WideCaptureTex[bank], 0);
+    glReadBuffer(GL_COLOR_ATTACHMENT0);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, product.WideFramebuffer);
+    glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, product.WideTexture, 0);
+    glDrawBuffer(GL_COLOR_ATTACHMENT0);
+    if (glCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
+    {
+        glDeleteTextures(1, &product.WideTexture);
+        glDeleteFramebuffers(1, &product.WideFramebuffer);
+        product.WideTexture = product.WideFramebuffer = 0;
+        product.WideWidth = product.WideHeight = 0;
+        return; // Optional margins must not discard the valid center product.
+    }
+    glDisable(GL_SCISSOR_TEST);
+    glBlitFramebuffer(0, 0, width, height, 0, 0, width, height, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+    product.WideState = state;
 }
 
 void GLRenderer::SyncVRAMCapture(u32 bank, u32 start, u32 len, bool complete, bool invalidate)

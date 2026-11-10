@@ -252,6 +252,13 @@ void ScreenPanel::setupScreenLayout()
         aspectTop = WideMelon::DisplayAspect(0);
         aspectBot = WideMelon::DisplayAspect(1);
     }
+    const auto* nds = emuInstance->getNDS();
+    const bool gamePatch = WideMelon::SelectedMethod == WideMelon::GamePatch;
+    if (gamePatch)
+    {
+        aspectTop = nds ? nds->AREngine.GamePatchAspect(0) : 1.f;
+        aspectBot = nds ? nds->AREngine.GamePatchAspect(1) : 1.f;
+    }
     layout.Setup(w, h,
                 static_cast<ScreenLayoutType>(screenLayout),
                 static_cast<ScreenRotation>(screenRotation),
@@ -260,7 +267,7 @@ void ScreenPanel::setupScreenLayout()
                 integerScaling != 0,
                 screenSwap != 0,
                 aspectTop,
-                aspectBot, WideMelon::Enabled(),
+                aspectBot, WideMelon::Enabled() || gamePatch,
                 WideMelon::DisplayHeightAspect(0), WideMelon::DisplayHeightAspect(1));
 
     numScreens = layout.GetScreenTransforms(screenMatrix[0], screenKind);
@@ -1378,7 +1385,7 @@ bool ScreenPanelGL::captureFinalDisplays(std::array<QImage, 2>& images, QString*
     // The same frame number does not advance the temporal history twice.
     prepareScreenShader(source, nds->NumFrames);
     const bool ok = ReadScreenPresentation(screenShaderProgram, screenVertexArray,
-                                           source, images, error);
+        source, images, error, {nds->AREngine.GamePatchAspect(0), nds->AREngine.GamePatchAspect(1)});
     screenSettingsLock.unlock();
     if (scissor) glEnable(GL_SCISSOR_TEST);
     for (int i = 0; i < 2; i++)

@@ -147,6 +147,7 @@ public:
     static u32 PageSize;
     static u32 PageShift;
 private:
+    friend struct JITRegressionAccess;
     friend class Compiler;
     struct Mapping
     {

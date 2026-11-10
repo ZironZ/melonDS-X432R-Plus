@@ -183,13 +183,17 @@ when things move.
 
 ### Widescreen and FOV
 
-`Widescreen` reveals more of the 3D scene. Choose a preset, or use `Custom` to
-set your own aspect ratio and FOV. Increasing FOV above 100% reveals more scenery
-above and below the original picture as well as to the sides. Some games hide
-objects outside their original view, so you may see missing scenery.
+`Expanded view (recommended)` reveals more of the 3D scene. Choose a preset,
+or use `Custom` to set your own aspect ratio and FOV. Increasing FOV above 100%
+reveals more scenery above and below the original picture as well as to the
+sides. Some games hide objects outside their original view, so you may see
+missing scenery.
 
-Touch controls stay in the original center area. Reset or reopen the game to
-apply widescreen changes.
+For supported games, try `Game patch (experimental)` as an alternative, or
+`Fix missing objects (experimental)` in `Advanced settings` for missing scenery.
+
+Touch controls stay in the original center area with Expanded view. Use a
+fresh boot to apply widescreen changes.
 
 If fades or transitions look wrong, try `Extend screen masks and transitions`
 in `Advanced settings`. If thin borders keep the scene boxed in, try
@@ -213,8 +217,10 @@ off if they make things worse.
   in some games, but you may need to turn filtering or texture scaling off.
 - Widescreen is still experimental. It can reveal missing scenery or things
   the game wasn't meant to show, and the extra screen area can look wrong or
-  flicker during fades and transitions. Menus, logos, and borders may stay at
-  their original size instead of filling the wider screen.
+  flicker during fades and transitions. With Expanded view, menus, logos, and
+  borders may stay at their original size instead of filling the wider screen.
+- Game patches can stretch menus and effects. Most haven't been tested with
+  this emulator, and are ported from TWiLight Menu++'s widescreen collection.
 - `3D anti-aliasing` will sometimes cause sporadic black or bright lines to
   appear.
 

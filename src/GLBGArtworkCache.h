@@ -29,6 +29,23 @@ public:
 
     void Reset() { Valid = false; }
 
+    // Compare against current flattened memory without changing the uploaded
+    // texture's dependency snapshot. Used before finishing a deferred batch.
+    bool MatchesCurrent(const Config& config, const u8* vram, size_t byteSize,
+                        const u16* palette, size_t paletteSize) const
+    {
+        if (!Valid || !(config == SourceConfig) || VRAMSize != byteSize || !vram)
+            return false;
+        for (const auto& chunk : Chunks)
+            if (chunk.Address + chunk.Bytes.size() > byteSize ||
+                std::memcmp(vram + chunk.Address, chunk.Bytes.data(), chunk.Bytes.size()))
+                return false;
+        for (const auto& entry : Palette)
+            if (entry.Index >= paletteSize || palette[entry.Index] != entry.Value)
+                return false;
+        return true;
+    }
+
     // Returns true unless the exact bytes used by the preceding source still
     // agree. Unknown/unuploaded inputs always invalidate; hashes never authorize
     // reuse. 32-byte chunks may conservatively include neighboring map entries.

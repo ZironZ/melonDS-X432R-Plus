@@ -22,6 +22,9 @@
 #include "DSi.h"
 #include "AREngine.h"
 #include "Platform.h"
+#include "WideMelon.h"
+#include "WideGamePatches.h"
+#include "sha1/sha1.hpp"
 
 namespace melonDS
 {
@@ -33,14 +36,120 @@ AREngine::AREngine(melonDS::NDS& nds) : NDS(nds)
 {
 }
 
+void AREngine::OnCartChanged()
+{
+    WidescreenCode = {};
+    VisibilityFix = nullptr;
+    PatchAspect = 1.f;
+    PatchStatus = WidescreenStatus::Unavailable;
+    ReportedCommunity = false;
+    ReportedCullMask = 0;
+    const auto* cart = NDS.GetNDSCart();
+    if (!cart) return;
+    const auto& header = cart->GetHeader();
+    const auto* candidate = WideGamePatches::FindVisibilityCandidate(header.GameCode,
+        header.ROMVersion, header.HeaderCRC16, header.ROMSize);
+    if (candidate && cart->GetROMLength() >= candidate->UsedSize)
+    {
+        SHA1_CTX sha;
+        std::array<u8,20> digest;
+        SHA1Init(&sha);
+        SHA1Update(&sha, cart->GetROM()+0x8000, header.ROMSize-0x8000);
+        SHA1Final(digest.data(), &sha);
+        if (digest == candidate->PayloadSHA1) VisibilityFix = candidate;
+    }
+    if (WideMelon::SelectedMethod != WideMelon::GamePatch) return;
+    const auto* profile = WideGamePatches::FindCommunity(header.GameCode, header.HeaderCRC16);
+    if (!profile) return;
+    if (!WideGamePatches::SupportsAspect(*profile, WideMelon::PatchAspectWidth, WideMelon::PatchAspectHeight))
+    { PatchStatus = WidescreenStatus::UnsupportedAspect; return; }
+    WidescreenCode.Code = WideGamePatches::BuildCommunityCode(*profile,
+        WideMelon::PatchAspectWidth, WideMelon::PatchAspectHeight);
+    if (WidescreenCode.Code.empty()) { PatchStatus = WidescreenStatus::InvalidCode; return; }
+    WidescreenCode.Name = profile->ID;
+    WidescreenCode.Enabled = true;
+    PatchAspect = float(WideMelon::PatchAspectWidth)*3.f/(WideMelon::PatchAspectHeight*4.f);
+    PatchStatus = WidescreenStatus::Waiting;
+    Log(LogLevel::Info, "Widescreen: community patch %s selected (%d:%d, experimental%s)\n",
+        profile->ID, WideMelon::PatchAspectWidth, WideMelon::PatchAspectHeight,
+        profile->HeaderCRC == 0xFFFF ? ", wildcard revision" : "");
+}
+
+void AREngine::ResetGamePatches()
+{
+    ReportedCommunity = false;
+    ReportedCullMask = 0;
+    if (!WidescreenCode.Code.empty()) PatchStatus = WidescreenStatus::Waiting;
+}
+
+float AREngine::GamePatchAspect(int screen) const
+{
+    return WideMelon::SelectedMethod == WideMelon::GamePatch &&
+        (WideMelon::Target == WideMelon::Both || WideMelon::Target == screen) ? PatchAspect.load() : 1.f;
+}
+
+void AREngine::RunGamePatches()
+{
+    if (WideMelon::SelectedMethod == WideMelon::GamePatch && !WidescreenCode.Code.empty())
+    {
+        u32 writes = 0;
+        if (!RunCheat(WidescreenCode, &writes))
+        {
+            Log(LogLevel::Warn, "Widescreen: community patch %s stopped (invalid operation or execution budget); restart before changing modes\n", WidescreenCode.Name.c_str());
+            PatchStatus = WidescreenStatus::InvalidCode;
+            PatchAspect = 1.f;
+            WidescreenCode.Code.clear();
+            return;
+        }
+        if (writes)
+        {
+            PatchStatus = WidescreenStatus::Running;
+            if (!ReportedCommunity)
+                Log(LogLevel::Info, "Widescreen: community patch %s running (write operations observed; experimental)\n", WidescreenCode.Name.c_str());
+            ReportedCommunity = true;
+        }
+    }
+    if (!VisibilityFix || !WideMelon::GameFixes || WideMelon::SelectedMethod != WideMelon::Renderer ||
+        !WideGamePatches::SupportsVisibilityView(WideMelon::Width(), WideMelon::Height())) return;
+    u32 mask = WideGamePatches::ApplyVisibilityFix(*VisibilityFix, NDS.ARM9.R[15],
+        [this](u32 a) { return NDS.ARM7Read32(a); },
+        [this](u32 a, u32 v) { NDS.ARM7Write32(a,v); });
+    if (VisibilityFix->SceneryWindow && WideGamePatches::ApplyZeldaCameraFix(
+        WideMelon::Width(), WideMelon::Height(), NDS.ARM9.R[15],
+        [this](u32 a) { return NDS.ARM7Read32(a); },
+        [this](u32 a, u32 v) { NDS.ARM7Write32(a,v); })) mask |= 0x80;
+    if (mask & ~ReportedCullMask)
+        Log(LogLevel::Info, "Widescreen: experimental visibility fix for %s (sites %02X)\n", VisibilityFix->Name, mask);
+    ReportedCullMask |= mask;
+}
+
 #define case16(x) \
     case ((x)+0x00): case ((x)+0x01): case ((x)+0x02): case ((x)+0x03): \
     case ((x)+0x04): case ((x)+0x05): case ((x)+0x06): case ((x)+0x07): \
     case ((x)+0x08): case ((x)+0x09): case ((x)+0x0A): case ((x)+0x0B): \
     case ((x)+0x0C): case ((x)+0x0D): case ((x)+0x0E): case ((x)+0x0F)
 
-void AREngine::RunCheat(const ARCode& arcode)
+bool AREngine::RunCheat(const ARCode& arcode, u32* changedWrites)
 {
+    if (arcode.Code.empty() || arcode.Code.size() % 2) return false;
+    unsigned budget = 100000;
+    // Avoid repeated RAM/JIT writes, while retaining the original behavior of
+    // hardware-register writes, which may have side effects even if unchanged.
+    auto write32 = [&](u32 a, u32 v) {
+        if (!changedWrites || a >> 24 != 2 || NDS.ARM7Read32(a) != v) {
+            NDS.ARM7Write32(a,v); if (changedWrites) ++*changedWrites;
+        }
+    };
+    auto write16 = [&](u32 a, u16 v) {
+        if (!changedWrites || a >> 24 != 2 || NDS.ARM7Read16(a) != v) {
+            NDS.ARM7Write16(a,v); if (changedWrites) ++*changedWrites;
+        }
+    };
+    auto write8 = [&](u32 a, u8 v) {
+        if (!changedWrites || a >> 24 != 2 || NDS.ARM7Read8(a) != v) {
+            NDS.ARM7Write8(a,v); if (changedWrites) ++*changedWrites;
+        }
+    };
     const u32* code = &arcode.Code[0];
 
     u32 offset = 0;
@@ -58,6 +167,7 @@ void AREngine::RunCheat(const ARCode& arcode)
 
     for (;;)
     {
+        if (changedWrites && budget-- == 0) return false;
         if (code > &arcode.Code[arcode.Code.size() - 1])
             // If the instruction pointer is past the end of the cheat code...
             break;
@@ -84,15 +194,15 @@ void AREngine::RunCheat(const ARCode& arcode)
         switch (op)
         {
         case16(0x00): // 32-bit write
-            NDS.ARM7Write32((a & 0x0FFFFFFF) + offset, b);
+            write32((a & 0x0FFFFFFF) + offset, b);
             break;
 
         case16(0x10): // 16-bit write
-            NDS.ARM7Write16((a & 0x0FFFFFFF) + offset, b & 0xFFFF);
+            write16((a & 0x0FFFFFFF) + offset, b & 0xFFFF);
             break;
 
         case16(0x20): // 8-bit write
-            NDS.ARM7Write8((a & 0x0FFFFFFF) + offset, b & 0xFF);
+            write8((a & 0x0FFFFFFF) + offset, b & 0xFF);
             break;
 
         case16(0x30): // IF b > u32[a]
@@ -224,7 +334,7 @@ void AREngine::RunCheat(const ARCode& arcode)
             // could be implemented with some hackery, but, does anything even
             // use it??
             Log(LogLevel::Error, "AR: !! THE FUCKING C4000000 OPCODE. TELL ARISOTURA.\n");
-            return;
+            return false;
 
         case 0xC5: // count++ / IF (count & b.l) == b.h
             {
@@ -245,7 +355,7 @@ void AREngine::RunCheat(const ARCode& arcode)
             break;
 
         case 0xC6: // u32[b] = offset
-            NDS.ARM7Write32(b, offset);
+            write32(b, offset);
             break;
 
         case 0xD0: // ENDIF
@@ -325,17 +435,17 @@ void AREngine::RunCheat(const ARCode& arcode)
             break;
 
         case 0xD6: // u32[b+offset] = datareg / offset += 4
-            NDS.ARM7Write32(b + offset, datareg);
+            write32(b + offset, datareg);
             offset += 4;
             break;
 
         case 0xD7: // u16[b+offset] = datareg / offset += 2
-            NDS.ARM7Write16(b + offset, datareg & 0xFFFF);
+            write16(b + offset, datareg & 0xFFFF);
             offset += 2;
             break;
 
         case 0xD8: // u8[b+offset] = datareg / offset += 1
-            NDS.ARM7Write8(b + offset, datareg & 0xFF);
+            write8(b + offset, datareg & 0xFF);
             offset += 1;
             break;
 
@@ -361,10 +471,11 @@ void AREngine::RunCheat(const ARCode& arcode)
 
                 u32 dstaddr = (a & 0x0FFFFFFF) + offset;
                 u32 bytesleft = b;
+                if (changedWrites && ((u64(b)+7)/8)*2 > size_t(arcode.Code.data()+arcode.Code.size()-code)) return false;
                 while (bytesleft >= 8)
                 {
-                    NDS.ARM7Write32(dstaddr, *code++); dstaddr += 4;
-                    NDS.ARM7Write32(dstaddr, *code++); dstaddr += 4;
+                    write32(dstaddr, *code++); dstaddr += 4;
+                    write32(dstaddr, *code++); dstaddr += 4;
                     bytesleft -= 8;
                 }
                 if (bytesleft > 0)
@@ -373,13 +484,13 @@ void AREngine::RunCheat(const ARCode& arcode)
                     code += 2;
                     if (bytesleft >= 4)
                     {
-                        NDS.ARM7Write32(dstaddr, *(u32*)leftover); dstaddr += 4;
+                        write32(dstaddr, *(u32*)leftover); dstaddr += 4;
                         leftover += 4;
                         bytesleft -= 4;
                     }
                     while (bytesleft > 0)
                     {
-                        NDS.ARM7Write8(dstaddr, *leftover++); dstaddr++;
+                        write8(dstaddr, *leftover++); dstaddr++;
                         bytesleft--;
                     }
                 }
@@ -393,16 +504,17 @@ void AREngine::RunCheat(const ARCode& arcode)
                 u32 srcaddr = offset;
                 u32 dstaddr = (a & 0x0FFFFFFF);
                 u32 bytesleft = b;
+                if (changedWrites && b > 0x100000) return false;
                 while (bytesleft >= 4)
                 {
-                    NDS.ARM7Write32(dstaddr, NDS.ARM7Read32(srcaddr));
+                    write32(dstaddr, NDS.ARM7Read32(srcaddr));
                     srcaddr += 4;
                     dstaddr += 4;
                     bytesleft -= 4;
                 }
                 while (bytesleft > 0)
                 {
-                    NDS.ARM7Write8(dstaddr, NDS.ARM7Read8(srcaddr));
+                    write8(dstaddr, NDS.ARM7Read8(srcaddr));
                     srcaddr++;
                     dstaddr++;
                     bytesleft--;
@@ -412,19 +524,19 @@ void AREngine::RunCheat(const ARCode& arcode)
 
         default:
             Log(LogLevel::Warn, "!! bad AR opcode %08X %08X\n", a, b);
-            return;
+            return false;
         }
     }
+    return true;
 }
 
 void AREngine::RunCheats()
 {
-    if (Cheats.empty()) return;
-
     for (const ARCode& code : Cheats)
     {
         if (code.Enabled)
             RunCheat(code);
     }
+    RunGamePatches();
 }
 }

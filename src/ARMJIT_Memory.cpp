@@ -203,24 +203,25 @@ void ARMJIT_Memory::SigsegvHandler(int sig, siginfo_t* info, void* rawContext)
         // We are not interested in other signals - handle it as usual.
         return;
     }
-    if (info->si_code != SEGV_MAPERR && info->si_code != SEGV_ACCERR)
+    // Only access faults can belong to fastmem. Chain other signals/faults
+    // instead of repeatedly returning to the same faulting instruction.
+    auto* const nds = NDS::Current;
+    if ((info->si_code == SEGV_MAPERR || info->si_code == SEGV_ACCERR) &&
+        nds && nds->JIT.FastMemoryEnabled())
     {
-        // Huh? Return.
-        return;
-    }
+        ucontext_t* context = (ucontext_t*)rawContext;
+        FaultDescription desc {};
+        auto* curArea = static_cast<u8*>(nds->CurCPU == 0 ?
+            nds->JIT.Memory.FastMem9Start : nds->JIT.Memory.FastMem7Start);
 
-    ucontext_t* context = (ucontext_t*)rawContext;
+        desc.EmulatedFaultAddr = (u8*)info->si_addr - curArea;
+        desc.FaultPC = (u8*)context->CONTEXT_PC;
 
-    FaultDescription desc {};
-    u8* curArea = (u8*)(NDS::Current->CurCPU == 0 ? NDS::Current->JIT.Memory.FastMem9Start : NDS::Current->JIT.Memory.FastMem7Start);
-
-    desc.EmulatedFaultAddr = (u8*)info->si_addr - curArea;
-    desc.FaultPC = (u8*)context->CONTEXT_PC;
-
-    if (FaultHandler(desc, *NDS::Current))
-    {
-        context->CONTEXT_PC = (u64)desc.FaultPC;
-        return;
+        if (FaultHandler(desc, *nds))
+        {
+            context->CONTEXT_PC = (u64)desc.FaultPC;
+            return;
+        }
     }
 
     struct sigaction* oldSa;
@@ -237,6 +238,7 @@ void ARMJIT_Memory::SigsegvHandler(int sig, siginfo_t* info, void* rawContext)
     if (oldSa->sa_handler == SIG_DFL)
     {
       signal(sig, SIG_DFL);
+      raise(sig);
       return;
     }
     if (oldSa->sa_handler == SIG_IGN)
@@ -820,6 +822,11 @@ void ARMJIT_Memory::UnregisterFaultHandler()
 
 bool ARMJIT_Memory::FaultHandler(FaultDescription& faultDesc, melonDS::NDS& nds)
 {
+    // Apple disables fastmem before PageShift is initialized. A fault in JIT
+    // code must not index the mapping tables or rewrite code in that case.
+    if (!nds.JIT.FastMemoryEnabled())
+        return false;
+
     if (nds.JIT.JITCompiler.IsJITFault(faultDesc.FaultPC))
     {
         bool rewriteToSlowPath = true;

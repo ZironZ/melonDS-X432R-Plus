@@ -9,6 +9,7 @@
 #include <QOpenGLShaderProgram>
 #include <cstdio>
 #include <cstdlib>
+#include <cmath>
 #include <vector>
 
 static void Check(bool ok, const char* message)
@@ -110,6 +111,34 @@ int main(int argc, char** argv)
             Check(images[screen].width()==expectedWidth && images[screen].height()==h, "physical display dimensions");
             for (int y : {0, 1, h/2, h-1}) for (int x : {0, 1, expectedWidth/2, expectedWidth-1})
                 Check(images[screen].pixelColor(x,y)==QColor((x+left)%251,y%253,screen?211:31), "correct layer, center crop, orientation and wings");
+        }
+    }
+    // Game-patch presentation stretches the native logical image rather than
+    // borrowing renderer wings. Verify its screenshot uses the same transform.
+    WideMelon::ViewWidth=256; WideMelon::ViewHeight=192;
+    for (int scale : {1,4}) for (float stretch : {1.2f,4.f/3.f,8.f/3.f})
+    {
+        const int w=256*scale,h=192*scale;
+        std::vector<unsigned char> pixels(w*h*2*4);
+        for (int s=0;s<2;++s) for(int y=0;y<h;++y) for(int x=0;x<w;++x)
+        {
+            const int i=((s*h+y)*w+x)*4;
+            pixels[i]=x%251; pixels[i+1]=y%253; pixels[i+2]=s?211:31; pixels[i+3]=255;
+        }
+        configure(source,0);glTexImage3D(GL_TEXTURE_2D_ARRAY,0,GL_RGBA8,w,h,2,0,GL_RGBA,GL_UNSIGNED_BYTE,pixels.data());
+        Check(ReadScreenPresentation(program.programId(),vao,source,images,&error,{stretch,1.f}),qPrintable(error));
+        const int stretched=int(w*stretch+0.5f);
+        Check(images[0].width()==stretched && images[1].width()==w,"game-patch presentation sizes");
+        for(int y : {0,h/2,h-1}) for(int x : {0,stretched/2,stretched-1})
+        {
+            const double texel=(x+0.5)*w/stretched;
+            const int sx=std::min(int(texel),w-1);
+            const auto actual=images[0].pixelColor(x,y);
+            // At an exact nearest-sampling boundary, interpolated GL floats
+            // may land on either adjacent texel. All other samples are exact.
+            const bool boundary=sx>0 && std::abs(texel-std::round(texel))<0.00001;
+            Check(actual==QColor(sx%251,y%253,31) ||
+                (boundary && actual==QColor((sx-1)%251,y%253,31)),"game-patch full-image stretch and orientation");
         }
     }
     // A moving black/white alternation should retain the live LCD shader's

@@ -22,7 +22,6 @@
 #include <QThread>
 #include <QFile>
 #include <QMutex>
-#include <QSemaphore>
 #include <QWaitCondition>
 #include <QQueue>
 #include <QVariant>
@@ -31,10 +30,12 @@
 #include <variant>
 #include <optional>
 #include <list>
+#include <memory>
 
 #include "types.h"
 #include "NDSCart.h"
 #include "GBACart.h"
+#include "EmuThreadCommand.h"
 
 namespace melonDS
 {
@@ -93,13 +94,13 @@ public:
     {
         MessageType type;
         QVariant param;
+        std::shared_ptr<EmuThreadCommandReply> reply;
     };
 
-    void sendMessage(Message msg);
-    void waitMessage(int num = 1);
-    void waitAllMessages();
+    std::shared_ptr<EmuThreadCommandReply> sendMessage(Message msg);
+    static EmuThreadCommandResult waitMessage(const std::shared_ptr<EmuThreadCommandReply>& reply);
 
-    void sendMessage(MessageType type)
+    std::shared_ptr<EmuThreadCommandReply> sendMessage(MessageType type)
     {
         return sendMessage({.type = type});
     }
@@ -164,6 +165,7 @@ signals:
     void windowLimitFPSChange();
 
     void autoScreenSizingChange(int sizing);
+    void widescreenPresentationChange();
 
     void windowFullscreenToggle();
 
@@ -208,18 +210,15 @@ private:
     constexpr static int emuPauseStackPauseThreshold = 1;
     int emuPauseStack;
 
-    int msgResult = 0;
-    QString msgError;
-
     bool glBorrowed = false; // protected by glBorrowMutex
 
     QMutex msgMutex;
-    QSemaphore msgSemaphore;
     QQueue<Message> msgQueue;
 
     EmuInstance* emuInstance;
 
     int autoScreenSizing;
+    float lastPatchAspect = 0.f;
 
     int lastVideoRenderer = -1;
 

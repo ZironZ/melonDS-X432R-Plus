@@ -21,9 +21,11 @@
 
 #include <vector>
 #include "ARCodeFile.h"
+#include <atomic>
 
 namespace melonDS
 {
+namespace WideGamePatches { struct VisibilityProfile; }
 class NDS;
 class AREngine
 {
@@ -31,12 +33,24 @@ public:
     AREngine(melonDS::NDS& nds);
 
     std::vector<ARCode> Cheats {};
+    enum class WidescreenStatus { Unavailable, UnsupportedAspect, Waiting, Running, InvalidCode };
+    void OnCartChanged();
+    void ResetGamePatches();
+    void RunGamePatches();
+    float GamePatchAspect(int screen) const;
+    WidescreenStatus GetWidescreenStatus() const { return PatchStatus.load(); }
 private:
     friend class ARM;
     void RunCheats();
-    void RunCheat(const ARCode& arcode);
+    bool RunCheat(const ARCode& arcode, u32* changedWrites = nullptr);
 
     melonDS::NDS& NDS;
+    ARCode WidescreenCode {};
+    const WideGamePatches::VisibilityProfile* VisibilityFix = nullptr;
+    u32 ReportedCullMask = 0;
+    bool ReportedCommunity = false;
+    std::atomic<float> PatchAspect {1.f};
+    std::atomic<WidescreenStatus> PatchStatus {WidescreenStatus::Unavailable};
 };
 
 }

@@ -730,6 +730,18 @@ MainWindow::MainWindow(int id, EmuInstance* inst, QWidget* parent) :
     }
     show();
 
+#ifdef Q_OS_WIN
+    // Create native menu windows on first use to avoid a startup burst of window
+    // creation. The close-event filter retains them for subsequent openings.
+    if (hasMenu)
+    {
+        for (auto* menu : menuBar()->findChildren<QMenu*>())
+        {
+            menu->installEventFilter(this);
+        }
+    }
+#endif
+
     panel = nullptr;
     createScreenPanel();
 
@@ -833,7 +845,7 @@ MainWindow::MainWindow(int id, EmuInstance* inst, QWidget* parent) :
     }
 
     QObject::connect(qApp, &QApplication::applicationStateChanged, this, &MainWindow::onAppStateChanged);
-    onUpdateInterfaceSettings();
+    applyInterfaceSettings();
 
     updateMPInterface(MPInterface::GetType());
 }
@@ -859,6 +871,25 @@ void MainWindow::saveEnabled(bool enabled)
     windowCfg.SetBool("Enabled", enabled);
     enabledSaved = true;
 }
+
+#ifdef Q_OS_WIN
+bool MainWindow::eventFilter(QObject* object, QEvent* event)
+{
+    if (event->type() == QEvent::Close)
+    {
+        auto* menu = qobject_cast<QMenu*>(object);
+        if (menu && menu->windowType() == Qt::Popup && !menu->testAttribute(Qt::WA_DeleteOnClose))
+        {
+            // QMenu closes through QWindow, which normally destroys the HWND.
+            // Hiding still releases popup grabs and runs QMenu's hide cleanup.
+            menu->hide();
+            event->ignore();
+            return true;
+        }
+    }
+    return QMainWindow::eventFilter(object, event);
+}
+#endif
 
 void MainWindow::closeEvent(QCloseEvent* event)
 {
@@ -911,11 +942,11 @@ void MainWindow::createScreenPanel()
         // Check that creating the context hasn't failed
         if (panelGL->createContext() == false)
         {
-            if (WideMelon::Enabled())
+            if (WideMelon::NeedsPresentation())
             {
                 QMessageBox::critical(this, tr("Widescreen requires OpenGL"),
                     tr("Could not create the OpenGL context required by widescreen. "
-                       "Start with WIDEMELON_VIEW_WIDTH=256 and WIDEMELON_VIEW_HEIGHT=192 to turn widescreen off."));
+                       "Set WidescreenMethod to 0 in the [3D.GL] section of melonDS.toml to turn widescreen off before restarting."));
                 std::exit(EXIT_FAILURE);
             }
             Log(Platform::LogLevel::Error, "Failed to create OpenGL context, falling back to Software Renderer.\n");
@@ -2228,6 +2259,9 @@ void MainWindow::onUpdateAudioVolume(int vol, int dsisync)
 
 void MainWindow::onUpdateAudioSettings()
 {
+    // before the emuIsActive check: these are atomics and need no console
+    emuInstance->audioUpdateSpeedUpSettings();
+
     if (!emuThread->emuIsActive()) return;
     assert(emuInstance->nds != nullptr);
 
@@ -2288,6 +2322,16 @@ void MainWindow::onOpenInterfaceSettings()
 }
 
 void MainWindow::onUpdateInterfaceSettings()
+{
+    applyInterfaceSettings();
+
+    // only from the settings dialog, which pauses first: this reaches
+    // blip_set_rates, which is not safe against a running emu thread. opening
+    // a new window must not come through here.
+    emuInstance->audioUpdateOutputSkew();
+}
+
+void MainWindow::applyInterfaceSettings()
 {
     pauseOnLostFocus = globalCfg.GetBool("PauseLostFocus");
     emuInstance->targetFPS = globalCfg.GetDouble("TargetFPS");

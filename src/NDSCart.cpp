@@ -554,6 +554,7 @@ void NDSCartSlot::SetCart(std::unique_ptr<CartCommon>&& cart) noexcept
     Log(LogLevel::Info, "Inserted cart with game code: %.4s\n", header.GameCode);
     Log(LogLevel::Info, "Inserted cart with ID: %08X\n", Cart->ID());
     Log(LogLevel::Info, "ROM entry: %08X %08X\n", romparams.ROMSize, romparams.SaveMemType);
+    if (Num == 0) NDS.AREngine.OnCartChanged();
 }
 
 void NDSCartSlot::SetSaveMemory(const u8* savedata, u32 savelen) noexcept
@@ -586,6 +587,7 @@ std::unique_ptr<CartCommon> NDSCartSlot::EjectCart() noexcept
     CartActive = false;
     auto oldcart = std::move(Cart);
     Cart = nullptr;
+    if (Num == 0) NDS.AREngine.OnCartChanged();
 
     UpdateCartState();
 

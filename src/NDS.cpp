@@ -473,6 +473,7 @@ void NDS::Reset()
     memset(MainRAM, 0, MainRAMMask + 1);
     memset(SharedWRAM, 0, 0x8000);
     memset(ARM7WRAM, 0, 0x10000);
+    AREngine.ResetGamePatches();
 
     MapSharedWRAM(0);
 
@@ -766,6 +767,8 @@ bool NDS::DoSavestate(Savestate* file)
 #ifdef JIT_ENABLED
         JIT.Reset();
 #endif
+        AREngine.ResetGamePatches();
+        if (!file->Error && AREngine.Cheats.empty()) AREngine.RunGamePatches();
     }
 
     file->Finish();
