@@ -120,11 +120,11 @@ private:
     friend struct GLRendererLifetimeTestAccess;
     GLRenderer& Parent;
 
-    int ScaleFactor;
+    int ScaleFactor {};
     int ScreenW {}, ScreenH {};
 
     GLuint LayerPreShader {};
-    GLint LayerPreCurBGULoc;
+    GLint LayerPreCurBGULoc {};
 
     GLuint ScanlineConfigUBO {};
     GLuint SpriteScanlineConfigUBO {};
@@ -135,7 +135,7 @@ private:
     u16 SpritePreVtxData[(3 * 6) * 128];
 
     GLuint SpriteShader {};
-    GLint SpriteRenderTransULoc;
+    GLint SpriteRenderTransULoc {};
     GLint SpriteFilterModeULoc;
     GLint SpriteAffineSourceEnhancementOnlyULoc;
     GLint SpriteUseEnhancedSourceULoc;
@@ -151,7 +151,7 @@ private:
 
     GLuint CompositorShader {};
     GLuint CompositorConfigUBO {};
-    GLint CompositorScaleULoc;
+    GLint CompositorScaleULoc {};
     GLint CompositorOBJNativeResolutionULoc;
     GLint CompositorLayerFilterModeULoc;
     GLint CompositorLayerFilterNoWrapULoc;
@@ -1103,7 +1103,7 @@ private:
             u32 Clamp;
             u32 __pad0[1];
         } uBGConfig[4];
-    } LayerConfig;
+    } LayerConfig {};
 
     struct sSpriteConfig
     {
@@ -1125,7 +1125,7 @@ private:
             u32 BGPrio;
             u32 Mosaic;
         } uOAM[128];
-    } SpriteConfig;
+    } SpriteConfig {};
 
     struct EnhancedOBJSourceKey
     {
@@ -1179,8 +1179,8 @@ private:
     u64 SpriteArtworkGeneration[128] {};
     u64 SpriteArtworkSerial = 0;
     int SpriteOAMIndex[128] {};
-    int NumSprites;
-    bool SpriteUseMosaic;
+    int NumSprites {};
+    bool SpriteUseMosaic {};
 
     struct sScanlineConfig
     {
@@ -1205,53 +1205,53 @@ private:
             u32 BlendEffect;
             u32 BlendCoef[4];
         } uScanline[192];
-    } ScanlineConfig;
+    } ScanlineConfig {};
 
     struct sSpriteScanlineConfig
     {
-        s32 uMosaicLine[192];
-    } SpriteScanlineConfig;
+        s32 uMosaicLine[192] {};
+    } SpriteScanlineConfig {};
 
     struct sCompositorConfig
     {
-        u32 uBGPrio[4];
-        u32 uEnableOBJ;
-        u32 uEnable3D;
-        u32 uBlendCnt;
-        u32 uBlendEffect;
-        u32 uBlendCoef[4];
-    } CompositorConfig;
+        u32 uBGPrio[4] {};
+        u32 uEnableOBJ {};
+        u32 uEnable3D {};
+        u32 uBlendCnt {};
+        u32 uBlendEffect {};
+        u32 uBlendCoef[4] {};
+    } CompositorConfig {};
 
-    int LastLine;
+    int LastLine {};
 
-    bool UnitEnabled;
+    bool UnitEnabled {};
 
-    u32 DispCnt;
-    u8 LayerEnable;
-    u8 OBJEnable;
-    u8 ForcedBlank;
-    u16 BGCnt[4];
-    u16 BlendCnt;
-    u8 EVA, EVB, EVY;
+    u32 DispCnt {};
+    u8 LayerEnable {};
+    u8 OBJEnable {};
+    u8 ForcedBlank {};
+    u16 BGCnt[4] {};
+    u16 BlendCnt {};
+    u8 EVA {}, EVB {}, EVY {};
 
-    u32 BGVRAMRange[4][4];
+    u32 BGVRAMRange[4][4] {};
     GLBGVRAMUploadCache BGVRAMUploadCache;
     u8 WideCoverUnstableBGMask = 0;
 
-    bool LayerConfigDirty;
+    bool LayerConfigDirty {};
     u8 DeferredLayerPrerenderDirty;
     int DeferredLayerPrerenderFirstRow[4];
     int DeferredLayerPrerenderLastRow[4];
 
-    int LastSpriteLine;
-    u16 OAM[512];
+    int LastSpriteLine {};
+    u16 OAM[512] {};
     u32 WideOBJWindowProofBits = 0;
 
-    u32 SpriteDispCnt;
-    bool SpriteConfigDirty;
-    bool SpriteDirty;
+    u32 SpriteDispCnt {};
+    bool SpriteConfigDirty {};
+    bool SpriteDirty {};
 
-    u16 TempPalBuffer[256 * (1 + (4*16))];
+    u16 TempPalBuffer[256 * (1 + (4*16))] {};
 
     bool IsScreenOn();
     std::string DescribeWholeSceneScaleState(WholeScene2DDebugReadContext* context = nullptr) const;

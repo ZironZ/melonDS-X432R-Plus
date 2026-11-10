@@ -110,10 +110,10 @@ private:
     friend class GLRenderer3D;
     friend class ComputeRenderer3D;
 
-    bool IsCompute;
+    bool IsCompute {};
 
-    int ScaleFactor;
-    int ScreenW, ScreenH;
+    int ScaleFactor {};
+    int ScreenW {}, ScreenH {};
     bool PhysicalFinalUpscale;
 
     GLuint RectVtxBuffer {};
@@ -176,7 +176,7 @@ private:
         u32 uBrightFactorB;
         float uAuxColorFactor;
         u32 __pad0[3];
-    } FinalPassConfig;
+    } FinalPassConfig {};
 
     GLuint FPShader {};
     GLuint FPConfigUBO {};
@@ -234,7 +234,7 @@ private:
         float uSrcAOffset[192];
         float uSrcBColorFactor;
         u32 __pad0[3];
-    } CaptureConfig;
+    } CaptureConfig {};
 
     struct sLastDisplayCaptureDebug
     {
@@ -458,7 +458,7 @@ private:
     GLuint CaptureOutput128Tex {};
 
     GLuint CapDownShader {};
-    GLint CapDownInputLayerULoc;
+    GLint CapDownInputLayerULoc {};
 
     GLuint CaptureSyncFB {};
     GLuint CaptureSyncTex {};
@@ -471,7 +471,7 @@ private:
     u64 CaptureLumaProbeReadbacks = 0;
 
     u16* AuxInputBuffer[2] {};
-    u8 AuxUsageMask;
+    u8 AuxUsageMask {};
 
     struct sPhaseTiming
     {
@@ -493,15 +493,15 @@ private:
         sPhaseTiming VBlankEnd;
     } WholeSceneFrameTiming;
 
-    u32 DispCntA, DispCntB;
-    u16 MasterBrightnessA, MasterBrightnessB;
+    u32 DispCntA {}, DispCntB {};
+    u16 MasterBrightnessA {}, MasterBrightnessB {};
     u16 FrameStartMasterBrightnessA, FrameStartMasterBrightnessB;
-    u32 CaptureCnt;
+    u32 CaptureCnt {};
 
-    bool NeedPartialRender;
-    int LastLine;
-    int LastCapLine;
-    int Aux0VRAMCap;
+    bool NeedPartialRender {};
+    int LastLine {};
+    int LastCapLine {};
+    int Aux0VRAMCap {};
     bool FinalPassInvalidCaptureReseed;
     bool PhysicalFinalNativeRowValid[192];
     u32 PhysicalFinalNativeValidRows;

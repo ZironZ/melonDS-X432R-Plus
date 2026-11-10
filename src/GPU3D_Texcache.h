@@ -37,22 +37,22 @@ private:
 
     struct TexCacheEntry
     {
-        u32 LastVariant; // very cheap way to make variant lookup faster
+        u32 LastVariant {}; // very cheap way to make variant lookup faster
 
         u64 BaseKey;
         u32 RawTexParam;
         u32 PalBase;
-        u32 TextureRAMStart[2], TextureRAMSize[2];
-        u32 TexPalStart, TexPalSize;
+        u32 TextureRAMStart[2] {}, TextureRAMSize[2] {};
+        u32 TexPalStart {}, TexPalSize {};
         u32 SourceWidth = 0;
         u32 SourceHeight = 0;
         u32 ResultWidth = 0;
         u32 ResultHeight = 0;
         u32 ScaleFactor = 1;
         int OutputFormat = outputFmt_RGB6A5;
-        u8 WidthLog2, HeightLog2;
+        u8 WidthLog2 {}, HeightLog2 {};
         u8 StorageBucket;
-        TexArrayEntry Texture;
+        TexArrayEntry Texture {};
         bool BinaryAlphaTexture = false;
         bool UsedFrequentChangeFallback = false;
         bool DeferredScalePending = false;
@@ -66,8 +66,8 @@ private:
         u64 CreatedFrame = 0;
         u64 LastUsedFrame = 0;
 
-        u64 TextureHash[2];
-        u64 TexPalHash;
+        u64 TextureHash[2] {};
+        u64 TexPalHash {};
     };
 
     struct FrequentChangeEntry
